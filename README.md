@@ -2,7 +2,7 @@
 
 A production-quality SQLite-backed MCP Memory server with WAL concurrent safety (10+ sessions), FTS5 BM25 search, and session tracking.
 
-Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 3 new tools for session tracking and cross-project search.
+Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 6 additional tools for session tracking, cross-project search, and cross-machine bridge sync.
 
 ## Why SQLite?
 
@@ -27,7 +27,8 @@ SQLite hits the sweet spot:
 - **FTS5 BM25 ranked search** -- Full-text search across entity names, types, and observations with relevance ranking
 - **Session tracking** -- Save and recall session snapshots for context continuity across restarts
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
-- **Drop-in compatible** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically, plus 3 new tools
+- **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
+- **Drop-in compatible** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically, plus 6 new tools
 - **Zero dependencies beyond stdlib** -- Only `fastmcp` for the MCP protocol; `sqlite3` is Python stdlib
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
@@ -83,7 +84,7 @@ The `SQLITE_MEMORY_DB` environment variable controls where the database is store
 ┌──────────────┐     stdio      ┌──────────────────┐
 │  Claude Code  │◄──────────────►│  FastMCP Server   │
 │  (session 1)  │               │                    │
-├──────────────┤               │  12 MCP Tools      │
+├──────────────┤               │  15 MCP Tools      │
 │  Claude Code  │◄─────────────►│  ┌──────────────┐ │
 │  (session 2)  │               │  │  SQLite WAL   │ │
 ├──────────────┤               │  │  memory.db    │ │
@@ -181,6 +182,84 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 | 10 | `session_save` | Save a session snapshot with session ID, project, summary, and active files. |
 | 11 | `session_recall` | Recall the N most recent sessions, ordered by start time. |
 | 12 | `search_by_project` | FTS5 BM25 search scoped to a specific project. |
+
+### Bridge Tools (cross-machine sync)
+
+| # | Tool | Description |
+|---|------|-------------|
+| 13 | `bridge_push` | Push entities tagged with `project LIKE 'shared%'` to a bridge git repo as JSON. Git commit + push. |
+| 14 | `bridge_pull` | Pull shared entities from the bridge git repo. Git pull + import with dedup via UNIQUE constraints. |
+| 15 | `bridge_status` | Show sync status — local shared entities vs repo contents, with diff summary. |
+
+## Bridge Sync (Cross-Machine)
+
+Share knowledge graph entities between machines (e.g., personal laptop + work computer) via a private git repo.
+
+### How it works
+
+1. Tag entities for sharing by setting `project` to any value starting with `"shared"` (e.g., `"shared"`, `"shared:trading"`, `"shared:hooks"`)
+2. `bridge_push()` exports all shared entities + their observations and inter-relations to `shared.json` in a local git repo, then commits and pushes
+3. `bridge_pull()` on the other machine does `git pull` + imports new entities/observations/relations (UNIQUE constraints handle dedup)
+4. `bridge_status()` shows what's in sync vs only-local vs only-remote
+
+### Setup
+
+```bash
+# One-time setup on each machine
+mkdir -p ~/.claude/memory/bridge
+cd ~/.claude/memory/bridge
+git init
+
+# Create a private GitHub repo
+gh repo create memory-bridge --private
+git remote add origin https://github.com/YOUR_USER/memory-bridge.git
+
+# Initialize
+echo '{}' > shared.json
+git add shared.json
+git commit -m "init: bridge repo"
+git push -u origin main
+```
+
+On the second machine, clone instead of init:
+
+```bash
+git clone https://github.com/YOUR_USER/memory-bridge.git ~/.claude/memory/bridge
+```
+
+Add `BRIDGE_REPO` to your MCP server config in `~/.claude/settings.json`:
+
+```json
+"sqlite_memory": {
+  "command": "python3",
+  "args": ["/path/to/server.py"],
+  "env": {
+    "SQLITE_MEMORY_DB": "/home/user/.claude/memory/memory.db",
+    "BRIDGE_REPO": "/home/user/.claude/memory/bridge"
+  }
+}
+```
+
+### Usage
+
+```python
+# Tag an entity for sharing
+create_entities([{
+    "name": "WAL-mode-pattern",
+    "entityType": "TechnicalInsight",
+    "project": "shared:sqlite",
+    "observations": ["SQLite WAL mode enables concurrent readers + writers"]
+}])
+
+# Push to bridge repo
+bridge_push()  # pushes all project LIKE 'shared%'
+
+# On another machine: pull
+bridge_pull()  # imports new entities with dedup
+
+# Check sync status
+bridge_status()
+```
 
 ## WAL Mode & Concurrency
 

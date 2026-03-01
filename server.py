@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sqlite3
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,11 @@ mcp = FastMCP(
 DB_PATH = os.environ.get(
     "SQLITE_MEMORY_DB",
     os.path.expanduser("~/.claude/memory/memory.db"),
+)
+
+BRIDGE_REPO = os.environ.get(
+    "BRIDGE_REPO",
+    os.path.expanduser("~/.claude/memory/bridge"),
 )
 
 _PRAGMAS = (
@@ -736,6 +743,244 @@ def search_by_project(query: str, project: str) -> str:
         query, project, len(results),
     )
     return json.dumps({"entities": results, "query": query, "project": project})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Bridge helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    """Run a git command in the bridge repo. Never prints to stdout."""
+    result = subprocess.run(
+        ["git", "-C", BRIDGE_REPO, *args],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        logger.warning("git %s failed: %s", " ".join(args), result.stderr.strip())
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tools 13-15: Cross-Machine Bridge Sync
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def bridge_push(tag: str = "shared") -> str:
+    """Push tagged entities to the bridge git repo for cross-machine sync.
+
+    Exports entities where project LIKE '{tag}%' with their observations
+    and inter-relations to JSON. Git add, commit, push.
+    """
+    if not Path(BRIDGE_REPO).is_dir():
+        return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}. "
+                           "Run: mkdir -p {BRIDGE_REPO} && git -C {BRIDGE_REPO} init"})
+
+    with _get_conn() as conn:
+        ent_rows = conn.execute(
+            "SELECT id, name, entity_type, project, created_at, updated_at "
+            "FROM entities WHERE project LIKE ? ORDER BY name",
+            (f"{tag}%",),
+        ).fetchall()
+
+        entities_out = []
+        entity_ids = set()
+        for e in ent_rows:
+            entity_ids.add(e["id"])
+            obs = conn.execute(
+                "SELECT content, created_at FROM observations "
+                "WHERE entity_id = ? ORDER BY id", (e["id"],),
+            ).fetchall()
+            entities_out.append({
+                "name": e["name"],
+                "entityType": e["entity_type"],
+                "project": e["project"],
+                "observations": [{"content": o["content"], "createdAt": o["created_at"]} for o in obs],
+                "createdAt": e["created_at"],
+                "updatedAt": e["updated_at"],
+            })
+
+        # Relations where BOTH endpoints are in the shared set
+        relations_out = []
+        if entity_ids:
+            ph = ",".join("?" * len(entity_ids))
+            ids = list(entity_ids)
+            rel_rows = conn.execute(
+                f"SELECT ef.name AS from_name, et.name AS to_name, r.relation_type, r.created_at "
+                f"FROM relations r "
+                f"JOIN entities ef ON r.from_id = ef.id "
+                f"JOIN entities et ON r.to_id = et.id "
+                f"WHERE r.from_id IN ({ph}) AND r.to_id IN ({ph})",
+                ids + ids,
+            ).fetchall()
+            relations_out = [
+                {"from": r["from_name"], "to": r["to_name"],
+                 "relationType": r["relation_type"], "createdAt": r["created_at"]}
+                for r in rel_rows
+            ]
+
+    hostname = socket.gethostname()
+    payload = {
+        "version": 1,
+        "pushed_at": _now(),
+        "machine_id": hostname,
+        "entities": entities_out,
+        "relations": relations_out,
+    }
+
+    shared_path = Path(BRIDGE_REPO) / "shared.json"
+    shared_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    n_obs = sum(len(e["observations"]) for e in entities_out)
+    msg = f"bridge: push {len(entities_out)} entities from {hostname}"
+
+    _git("add", "shared.json")
+    commit_result = _git("commit", "-m", msg)
+    if commit_result.returncode != 0 and "nothing to commit" in commit_result.stdout:
+        logger.info("bridge_push: no changes to commit")
+        return json.dumps({"pushed": 0, "message": "No changes — already up to date"})
+
+    push_result = _git("push")
+    pushed = push_result.returncode == 0
+
+    logger.info("bridge_push: %d entities, %d observations, %d relations, push=%s",
+                len(entities_out), n_obs, len(relations_out), pushed)
+    return json.dumps({
+        "entities": len(entities_out),
+        "observations": n_obs,
+        "relations": len(relations_out),
+        "pushed_to_remote": pushed,
+        "message": msg,
+    })
+
+
+@mcp.tool()
+def bridge_pull() -> str:
+    """Pull shared entities from the bridge git repo into local memory.
+
+    Git pull, read shared.json, import new entities/observations/relations.
+    UNIQUE constraints handle deduplication automatically.
+    """
+    if not Path(BRIDGE_REPO).is_dir():
+        return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}"})
+
+    pull_result = _git("pull", "--rebase")
+    if pull_result.returncode != 0:
+        logger.warning("bridge_pull: git pull failed, proceeding with local copy")
+
+    shared_path = Path(BRIDGE_REPO) / "shared.json"
+    if not shared_path.exists():
+        return json.dumps({"error": "shared.json not found in bridge repo"})
+
+    try:
+        payload = json.loads(shared_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return json.dumps({"error": f"Failed to read shared.json: {exc}"})
+
+    entities = payload.get("entities", [])
+    relations = payload.get("relations", [])
+    now = _now()
+    new_entities = 0
+    new_observations = 0
+    new_relations = 0
+
+    with _get_conn() as conn:
+        for ent in entities:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO entities "
+                "(name, entity_type, project, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ent["name"], ent["entityType"], ent.get("project"),
+                 ent.get("createdAt", now), ent.get("updatedAt", now)),
+            )
+            new_entities += cur.rowcount
+
+            row = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (ent["name"],)
+            ).fetchone()
+            if row:
+                eid = row["id"]
+                for obs in ent.get("observations", []):
+                    content = obs["content"] if isinstance(obs, dict) else obs
+                    created = obs.get("createdAt", now) if isinstance(obs, dict) else now
+                    cur2 = conn.execute(
+                        "INSERT OR IGNORE INTO observations "
+                        "(entity_id, content, created_at) VALUES (?, ?, ?)",
+                        (eid, content, created),
+                    )
+                    new_observations += cur2.rowcount
+                _fts_sync(conn, eid)
+
+        for rel in relations:
+            from_row = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (rel["from"],)
+            ).fetchone()
+            to_row = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (rel["to"],)
+            ).fetchone()
+            if from_row and to_row:
+                cur3 = conn.execute(
+                    "INSERT OR IGNORE INTO relations "
+                    "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
+                    (from_row["id"], to_row["id"], rel["relationType"],
+                     rel.get("createdAt", now)),
+                )
+                new_relations += cur3.rowcount
+
+    logger.info("bridge_pull: %d new entities, %d new observations, %d new relations",
+                new_entities, new_observations, new_relations)
+    return json.dumps({
+        "new_entities": new_entities,
+        "new_observations": new_observations,
+        "new_relations": new_relations,
+        "source_machine": payload.get("machine_id", "unknown"),
+        "pushed_at": payload.get("pushed_at", "unknown"),
+    })
+
+
+@mcp.tool()
+def bridge_status() -> str:
+    """Show bridge sync status — local shared entities vs repo contents."""
+    if not Path(BRIDGE_REPO).is_dir():
+        return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}"})
+
+    with _get_conn() as conn:
+        local_rows = conn.execute(
+            "SELECT name FROM entities WHERE project LIKE 'shared%' ORDER BY name"
+        ).fetchall()
+    local_names = {r["name"] for r in local_rows}
+
+    shared_path = Path(BRIDGE_REPO) / "shared.json"
+    remote_names: set[str] = set()
+    repo_meta = {}
+    if shared_path.exists():
+        try:
+            payload = json.loads(shared_path.read_text(encoding="utf-8"))
+            remote_names = {e["name"] for e in payload.get("entities", [])}
+            repo_meta = {
+                "pushed_at": payload.get("pushed_at"),
+                "machine_id": payload.get("machine_id"),
+                "version": payload.get("version"),
+            }
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    only_local = sorted(local_names - remote_names)
+    only_remote = sorted(remote_names - local_names)
+    in_sync = sorted(local_names & remote_names)
+
+    # Git log for last push/pull timestamps
+    log_result = _git("log", "-1", "--format=%ci %s")
+    last_commit = log_result.stdout.strip() if log_result.returncode == 0 else None
+
+    return json.dumps({
+        "local_shared_count": len(local_names),
+        "remote_count": len(remote_names),
+        "in_sync": len(in_sync),
+        "only_local": only_local,
+        "only_remote": only_remote,
+        "last_commit": last_commit,
+        "repo_meta": repo_meta,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
