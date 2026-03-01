@@ -1,0 +1,16 @@
+[project]
+name = "sqlite-memory-mcp"
+version = "0.1.0"
+description = "SQLite-backed MCP Memory Server with WAL concurrent safety, FTS5 search, and session tracking"
+requires-python = ">=3.10"
+dependencies = ["fastmcp>=2.0.0"]
+license = {text = "MIT"}
+authors = [{name = "rmanov"}]
+readme = "README.md"
+
+[project.scripts]
+sqlite-memory-mcp = "server:mcp.run"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
