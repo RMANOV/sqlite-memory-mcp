@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at     TEXT    DEFAULT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_entities_type    ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
+CREATE INDEX IF NOT EXISTS idx_obs_entity       ON observations(entity_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
     tokenize = "unicode61 remove_diacritics 2"
@@ -244,20 +249,28 @@ def _migrate_jsonl() -> None:
                 conn.execute(
                     "INSERT OR IGNORE INTO relations "
                     "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
-                    (from_row["id"], to_row["id"], rel.get("relationType", "related_to"), now),
+                    (
+                        from_row["id"],
+                        to_row["id"],
+                        rel.get("relationType", "related_to"),
+                        now,
+                    ),
                 )
 
     migrated_path = json_path.with_suffix(".json.migrated")
     json_path.rename(migrated_path)
     logger.info(
         "Migration complete: %d entities, %d relations. Old file → %s",
-        len(entities), len(relations), migrated_path,
+        len(entities),
+        len(relations),
+        migrated_path,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tools 1-3: Create
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 def create_entities(entities: list[dict[str, Any]]) -> str:
@@ -304,7 +317,9 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                     )
                 _fts_sync(conn, eid)
 
-    logger.info("create_entities: %d created out of %d requested", created, len(entities))
+    logger.info(
+        "create_entities: %d created out of %d requested", created, len(entities)
+    )
     return json.dumps({"created": created, "total_requested": len(entities)})
 
 
@@ -334,9 +349,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                     (eid, content, now),
                 )
                 added += cur.rowcount
-            conn.execute(
-                "UPDATE entities SET updated_at = ? WHERE id = ?", (now, eid)
-            )
+            conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, eid))
             _fts_sync(conn, eid)
 
     logger.info("add_observations: %d observations added", added)
@@ -377,13 +390,16 @@ def create_relations(relations: list[dict[str, Any]]) -> str:
             )
             created += cur.rowcount
 
-    logger.info("create_relations: %d created out of %d requested", created, len(relations))
+    logger.info(
+        "create_relations: %d created out of %d requested", created, len(relations)
+    )
     return json.dumps({"created": created, "total_requested": len(relations)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tools 4-6: Delete
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 def delete_entities(entityNames: list[str]) -> str:
@@ -468,6 +484,7 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
 # Tool 7: read_graph
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @mcp.tool()
 def read_graph() -> str:
     """Read the full knowledge graph.
@@ -504,7 +521,11 @@ def read_graph() -> str:
         ).fetchall()
 
         relations_out = [
-            {"from": r["from_name"], "to": r["to_name"], "relationType": r["relation_type"]}
+            {
+                "from": r["from_name"],
+                "to": r["to_name"],
+                "relationType": r["relation_type"],
+            }
             for r in rel_rows
         ]
 
@@ -514,6 +535,7 @@ def read_graph() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 8: search_nodes (FTS5 BM25)
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def _fts_query(raw: str) -> str:
     """Sanitize a user query for FTS5 MATCH.
@@ -570,6 +592,7 @@ def search_nodes(query: str) -> str:
 # Tool 9: open_nodes
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @mcp.tool()
 def open_nodes(names: list[str]) -> str:
     """Open specific entities and retrieve their inter-relations.
@@ -615,7 +638,11 @@ def open_nodes(names: list[str]) -> str:
                 found_ids + found_ids,
             ).fetchall()
             relations_out = [
-                {"from": r["from_name"], "to": r["to_name"], "relationType": r["relation_type"]}
+                {
+                    "from": r["from_name"],
+                    "to": r["to_name"],
+                    "relationType": r["relation_type"],
+                }
                 for r in rel_rows
             ]
 
@@ -625,6 +652,7 @@ def open_nodes(names: list[str]) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 10: session_save
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 def session_save(
@@ -672,6 +700,7 @@ def session_save(
 # Tool 11: session_recall
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @mcp.tool()
 def session_recall(last_n: int = 5) -> str:
     """Recall the last N sessions, ordered by most recent first.
@@ -692,7 +721,9 @@ def session_recall(last_n: int = 5) -> str:
             "session_id": r["session_id"],
             "project": r["project"],
             "summary": r["summary"],
-            "active_files": json.loads(r["active_files"]) if r["active_files"] else None,
+            "active_files": json.loads(r["active_files"])
+            if r["active_files"]
+            else None,
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
         }
@@ -704,6 +735,7 @@ def session_recall(last_n: int = 5) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 12: search_by_project (FTS5 scoped)
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 def search_by_project(query: str, project: str) -> str:
@@ -731,16 +763,20 @@ def search_by_project(query: str, project: str) -> str:
                 "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
                 (eid,),
             ).fetchall()
-            results.append({
-                "name": r["name"],
-                "entityType": r["entity_type"],
-                "project": project,
-                "observations": [o["content"] for o in obs],
-            })
+            results.append(
+                {
+                    "name": r["name"],
+                    "entityType": r["entity_type"],
+                    "project": project,
+                    "observations": [o["content"] for o in obs],
+                }
+            )
 
     logger.info(
         "search_by_project: query=%r project=%r matched=%d",
-        query, project, len(results),
+        query,
+        project,
+        len(results),
     )
     return json.dumps({"entities": results, "query": query, "project": project})
 
@@ -749,11 +785,14 @@ def search_by_project(query: str, project: str) -> str:
 # Bridge helper
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def _git(*args: str) -> subprocess.CompletedProcess:
     """Run a git command in the bridge repo. Never prints to stdout."""
     result = subprocess.run(
         ["git", "-C", BRIDGE_REPO, *args],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if result.returncode != 0:
         logger.warning("git %s failed: %s", " ".join(args), result.stderr.strip())
@@ -764,6 +803,7 @@ def _git(*args: str) -> subprocess.CompletedProcess:
 # Tools 13-15: Cross-Machine Bridge Sync
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @mcp.tool()
 def bridge_push(tag: str = "shared") -> str:
     """Push tagged entities to the bridge git repo for cross-machine sync.
@@ -772,8 +812,12 @@ def bridge_push(tag: str = "shared") -> str:
     and inter-relations to JSON. Git add, commit, push.
     """
     if not Path(BRIDGE_REPO).is_dir():
-        return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}. "
-                           "Run: mkdir -p {BRIDGE_REPO} && git -C {BRIDGE_REPO} init"})
+        return json.dumps(
+            {
+                "error": f"Bridge repo not found at {BRIDGE_REPO}. "
+                "Run: mkdir -p {BRIDGE_REPO} && git -C {BRIDGE_REPO} init"
+            }
+        )
 
     with _get_conn() as conn:
         ent_rows = conn.execute(
@@ -788,16 +832,22 @@ def bridge_push(tag: str = "shared") -> str:
             entity_ids.add(e["id"])
             obs = conn.execute(
                 "SELECT content, created_at FROM observations "
-                "WHERE entity_id = ? ORDER BY id", (e["id"],),
+                "WHERE entity_id = ? ORDER BY id",
+                (e["id"],),
             ).fetchall()
-            entities_out.append({
-                "name": e["name"],
-                "entityType": e["entity_type"],
-                "project": e["project"],
-                "observations": [{"content": o["content"], "createdAt": o["created_at"]} for o in obs],
-                "createdAt": e["created_at"],
-                "updatedAt": e["updated_at"],
-            })
+            entities_out.append(
+                {
+                    "name": e["name"],
+                    "entityType": e["entity_type"],
+                    "project": e["project"],
+                    "observations": [
+                        {"content": o["content"], "createdAt": o["created_at"]}
+                        for o in obs
+                    ],
+                    "createdAt": e["created_at"],
+                    "updatedAt": e["updated_at"],
+                }
+            )
 
         # Relations where BOTH endpoints are in the shared set
         relations_out = []
@@ -813,8 +863,12 @@ def bridge_push(tag: str = "shared") -> str:
                 ids + ids,
             ).fetchall()
             relations_out = [
-                {"from": r["from_name"], "to": r["to_name"],
-                 "relationType": r["relation_type"], "createdAt": r["created_at"]}
+                {
+                    "from": r["from_name"],
+                    "to": r["to_name"],
+                    "relationType": r["relation_type"],
+                    "createdAt": r["created_at"],
+                }
                 for r in rel_rows
             ]
 
@@ -828,7 +882,9 @@ def bridge_push(tag: str = "shared") -> str:
     }
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
-    shared_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    shared_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     n_obs = sum(len(e["observations"]) for e in entities_out)
     msg = f"bridge: push {len(entities_out)} entities from {hostname}"
@@ -842,15 +898,22 @@ def bridge_push(tag: str = "shared") -> str:
     push_result = _git("push")
     pushed = push_result.returncode == 0
 
-    logger.info("bridge_push: %d entities, %d observations, %d relations, push=%s",
-                len(entities_out), n_obs, len(relations_out), pushed)
-    return json.dumps({
-        "entities": len(entities_out),
-        "observations": n_obs,
-        "relations": len(relations_out),
-        "pushed_to_remote": pushed,
-        "message": msg,
-    })
+    logger.info(
+        "bridge_push: %d entities, %d observations, %d relations, push=%s",
+        len(entities_out),
+        n_obs,
+        len(relations_out),
+        pushed,
+    )
+    return json.dumps(
+        {
+            "entities": len(entities_out),
+            "observations": n_obs,
+            "relations": len(relations_out),
+            "pushed_to_remote": pushed,
+            "message": msg,
+        }
+    )
 
 
 @mcp.tool()
@@ -889,8 +952,13 @@ def bridge_pull() -> str:
                 "INSERT OR IGNORE INTO entities "
                 "(name, entity_type, project, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (ent["name"], ent["entityType"], ent.get("project"),
-                 ent.get("createdAt", now), ent.get("updatedAt", now)),
+                (
+                    ent["name"],
+                    ent["entityType"],
+                    ent.get("project"),
+                    ent.get("createdAt", now),
+                    ent.get("updatedAt", now),
+                ),
             )
             new_entities += cur.rowcount
 
@@ -901,7 +969,9 @@ def bridge_pull() -> str:
                 eid = row["id"]
                 for obs in ent.get("observations", []):
                     content = obs["content"] if isinstance(obs, dict) else obs
-                    created = obs.get("createdAt", now) if isinstance(obs, dict) else now
+                    created = (
+                        obs.get("createdAt", now) if isinstance(obs, dict) else now
+                    )
                     cur2 = conn.execute(
                         "INSERT OR IGNORE INTO observations "
                         "(entity_id, content, created_at) VALUES (?, ?, ?)",
@@ -921,20 +991,30 @@ def bridge_pull() -> str:
                 cur3 = conn.execute(
                     "INSERT OR IGNORE INTO relations "
                     "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
-                    (from_row["id"], to_row["id"], rel["relationType"],
-                     rel.get("createdAt", now)),
+                    (
+                        from_row["id"],
+                        to_row["id"],
+                        rel["relationType"],
+                        rel.get("createdAt", now),
+                    ),
                 )
                 new_relations += cur3.rowcount
 
-    logger.info("bridge_pull: %d new entities, %d new observations, %d new relations",
-                new_entities, new_observations, new_relations)
-    return json.dumps({
-        "new_entities": new_entities,
-        "new_observations": new_observations,
-        "new_relations": new_relations,
-        "source_machine": payload.get("machine_id", "unknown"),
-        "pushed_at": payload.get("pushed_at", "unknown"),
-    })
+    logger.info(
+        "bridge_pull: %d new entities, %d new observations, %d new relations",
+        new_entities,
+        new_observations,
+        new_relations,
+    )
+    return json.dumps(
+        {
+            "new_entities": new_entities,
+            "new_observations": new_observations,
+            "new_relations": new_relations,
+            "source_machine": payload.get("machine_id", "unknown"),
+            "pushed_at": payload.get("pushed_at", "unknown"),
+        }
+    )
 
 
 @mcp.tool()
@@ -972,15 +1052,17 @@ def bridge_status() -> str:
     log_result = _git("log", "-1", "--format=%ci %s")
     last_commit = log_result.stdout.strip() if log_result.returncode == 0 else None
 
-    return json.dumps({
-        "local_shared_count": len(local_names),
-        "remote_count": len(remote_names),
-        "in_sync": len(in_sync),
-        "only_local": only_local,
-        "only_remote": only_remote,
-        "last_commit": last_commit,
-        "repo_meta": repo_meta,
-    })
+    return json.dumps(
+        {
+            "local_shared_count": len(local_names),
+            "remote_count": len(remote_names),
+            "in_sync": len(in_sync),
+            "only_local": only_local,
+            "only_remote": only_remote,
+            "last_commit": last_commit,
+            "repo_meta": repo_meta,
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
