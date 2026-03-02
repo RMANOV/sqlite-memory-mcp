@@ -1,9 +1,4 @@
 __pycache__/
 *.pyc
-*.db
-*.log
-.venv/
-dist/
-*.egg-info/
-press-releases/
-.worktrees/
+server.py.v1.bak
+test_runtime.py
