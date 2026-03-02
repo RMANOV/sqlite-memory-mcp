@@ -97,10 +97,30 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at     TEXT    DEFAULT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tasks (
+    id          TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'not_started',
+    priority    TEXT DEFAULT 'medium',
+    section     TEXT DEFAULT 'inbox',
+    due_date    TEXT DEFAULT NULL,
+    project     TEXT DEFAULT NULL,
+    parent_id   TEXT DEFAULT NULL REFERENCES tasks(id),
+    notes       TEXT DEFAULT NULL,
+    recurring   TEXT DEFAULT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_entities_type    ON entities(entity_type);
 CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
 CREATE INDEX IF NOT EXISTS idx_obs_entity       ON observations(entity_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_status     ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_section    ON tasks(section);
+CREATE INDEX IF NOT EXISTS idx_tasks_due        ON tasks(due_date);
+CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
@@ -779,6 +799,386 @@ def search_by_project(query: str, project: str) -> str:
         len(results),
     )
     return json.dumps({"entities": results, "query": query, "project": project})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tools 13-18: Task Management
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_TASK_STATUSES = ("not_started", "in_progress", "done", "archived", "cancelled")
+_TASK_PRIORITIES = ("low", "medium", "high", "critical")
+_TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting")
+
+
+@mcp.tool()
+def create_task(
+    title: str,
+    section: str = "inbox",
+    priority: str = "medium",
+    due_date: str | None = None,
+    project: str | None = None,
+    parent_id: str | None = None,
+    notes: str | None = None,
+    recurring: str | None = None,
+) -> str:
+    """Create a new task. Returns the task UUID.
+
+    Args:
+        title: Task title (required).
+        section: inbox | today | next | someday | waiting.
+        priority: low | medium | high | critical.
+        due_date: YYYY-MM-DD format or None.
+        project: Project tag for grouping.
+        parent_id: UUID of parent task (for subtasks).
+        notes: Freeform notes.
+        recurring: JSON config for recurrence (e.g. '{"every":"week","day":"monday"}').
+    """
+    import uuid
+
+    task_id = str(uuid.uuid4())
+    now = _now()
+
+    if section not in _TASK_SECTIONS:
+        return json.dumps(
+            {"error": f"Invalid section: {section}. Use: {_TASK_SECTIONS}"}
+        )
+    if priority not in _TASK_PRIORITIES:
+        return json.dumps(
+            {"error": f"Invalid priority: {priority}. Use: {_TASK_PRIORITIES}"}
+        )
+
+    with _get_conn() as conn:
+        if parent_id:
+            parent = conn.execute(
+                "SELECT id FROM tasks WHERE id = ?", (parent_id,)
+            ).fetchone()
+            if not parent:
+                return json.dumps({"error": f"Parent task {parent_id} not found"})
+
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, section, due_date, "
+            "project, parent_id, notes, recurring, created_at, updated_at) "
+            "VALUES (?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                title,
+                priority,
+                section,
+                due_date,
+                project,
+                parent_id,
+                notes,
+                recurring,
+                now,
+                now,
+            ),
+        )
+
+    logger.info("create_task: %s (%s)", title, task_id)
+    return json.dumps({"task_id": task_id, "title": title, "status": "not_started"})
+
+
+@mcp.tool()
+def update_task(
+    task_id: str,
+    title: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    section: str | None = None,
+    due_date: str | None = None,
+    project: str | None = None,
+    parent_id: str | None = None,
+    notes: str | None = None,
+    recurring: str | None = None,
+) -> str:
+    """Update a task's fields. Only provided fields are changed.
+
+    Args:
+        task_id: UUID of the task to update (required).
+        title: New title.
+        status: not_started | in_progress | done | archived | cancelled.
+        priority: low | medium | high | critical.
+        section: inbox | today | next | someday | waiting.
+        due_date: YYYY-MM-DD or None.
+        project: Project tag.
+        parent_id: Parent task UUID.
+        notes: Freeform notes.
+        recurring: JSON recurrence config.
+    """
+    fields = {
+        "title": title,
+        "status": status,
+        "priority": priority,
+        "section": section,
+        "due_date": due_date,
+        "project": project,
+        "parent_id": parent_id,
+        "notes": notes,
+        "recurring": recurring,
+    }
+    updates = {k: v for k, v in fields.items() if v is not None}
+    if not updates:
+        return json.dumps({"error": "No valid fields to update"})
+
+    if "status" in updates and updates["status"] not in _TASK_STATUSES:
+        return json.dumps(
+            {"error": f"Invalid status: {updates['status']}. Use: {_TASK_STATUSES}"}
+        )
+    if "priority" in updates and updates["priority"] not in _TASK_PRIORITIES:
+        return json.dumps(
+            {
+                "error": f"Invalid priority: {updates['priority']}. Use: {_TASK_PRIORITIES}"
+            }
+        )
+    if "section" in updates and updates["section"] not in _TASK_SECTIONS:
+        return json.dumps(
+            {"error": f"Invalid section: {updates['section']}. Use: {_TASK_SECTIONS}"}
+        )
+
+    updates["updated_at"] = _now()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [task_id]
+
+    with _get_conn() as conn:
+        cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
+        if cur.rowcount == 0:
+            return json.dumps({"error": f"Task {task_id} not found"})
+
+    logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
+    return json.dumps({"updated": task_id, "fields": list(updates.keys())})
+
+
+@mcp.tool()
+def query_tasks(
+    section: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    project: str | None = None,
+    parent_id: str | None = None,
+    overdue_only: bool = False,
+    limit: int = 50,
+) -> str:
+    """Query tasks with optional filters. Returns markdown table.
+
+    Filters are combined with AND. Omit a filter to skip it.
+    overdue_only=True shows only tasks past due_date that are not done/archived.
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if section:
+        conditions.append("section = ?")
+        params.append(section)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if priority:
+        conditions.append("priority = ?")
+        params.append(priority)
+    if project:
+        conditions.append("project = ?")
+        params.append(project)
+    if parent_id:
+        conditions.append("parent_id = ?")
+        params.append(parent_id)
+    if overdue_only:
+        conditions.append("due_date < date('now')")
+        conditions.append("status NOT IN ('done', 'archived', 'cancelled')")
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+    params.append(limit)
+
+    with _get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT id, title, status, priority, section, due_date, project, parent_id "
+            f"FROM tasks WHERE {where} "
+            f"ORDER BY "
+            f"  CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+            f"       WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, "
+            f"  due_date ASC NULLS LAST, created_at ASC "
+            f"LIMIT ?",
+            params,
+        ).fetchall()
+
+    if not rows:
+        return json.dumps(
+            {"tasks": [], "count": 0, "message": "No tasks match filters"}
+        )
+
+    # Build markdown table
+    lines = [
+        "| # | Title | Status | Priority | Section | Due | Project |",
+        "|---|-------|--------|----------|---------|-----|---------|",
+    ]
+    for i, r in enumerate(rows, 1):
+        due = r["due_date"] or "—"
+        proj = r["project"] or "—"
+        lines.append(
+            f"| {i} | {r['title']} | {r['status']} | {r['priority']} "
+            f"| {r['section']} | {due} | {proj} |"
+        )
+
+    tasks_json = [dict(r) for r in rows]
+    return json.dumps(
+        {
+            "tasks": tasks_json,
+            "count": len(rows),
+            "markdown": "\n".join(lines),
+        }
+    )
+
+
+@mcp.tool()
+def task_digest(
+    sections: list[str] | None = None,
+    include_overdue: bool = True,
+    limit: int = 20,
+) -> str:
+    """Generate a formatted task digest for session start.
+
+    Shows pending/in-progress tasks grouped by section,
+    plus overdue tasks highlighted separately.
+    """
+    target_sections = sections or ["today", "inbox", "next"]
+
+    with _get_conn() as conn:
+        # Active tasks by section
+        ph = ",".join("?" * len(target_sections))
+        active = conn.execute(
+            f"SELECT id, title, status, priority, section, due_date, project "
+            f"FROM tasks "
+            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') "
+            f"ORDER BY "
+            f"  CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
+            f"       WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
+            f"  CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+            f"       WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END "
+            f"LIMIT ?",
+            target_sections + [limit],
+        ).fetchall()
+
+        # Overdue tasks
+        overdue = []
+        if include_overdue:
+            overdue = conn.execute(
+                "SELECT id, title, status, priority, section, due_date, project "
+                "FROM tasks "
+                "WHERE due_date < date('now') AND status NOT IN ('done', 'archived', 'cancelled') "
+                "ORDER BY due_date ASC LIMIT 10"
+            ).fetchall()
+
+        # Counts
+        counts = conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM tasks "
+            "WHERE status NOT IN ('archived', 'cancelled') GROUP BY status"
+        ).fetchall()
+
+    # Format digest
+    lines = ["## Task Digest"]
+
+    if counts:
+        stats = {r["status"]: r["cnt"] for r in counts}
+        total = sum(stats.values())
+        lines.append(
+            f"**Total active:** {total} | "
+            f"Not started: {stats.get('not_started', 0)} | "
+            f"In progress: {stats.get('in_progress', 0)} | "
+            f"Done: {stats.get('done', 0)}"
+        )
+        lines.append("")
+
+    if overdue:
+        lines.append(f"### OVERDUE ({len(overdue)})")
+        for t in overdue:
+            lines.append(
+                f"- [{t['priority'].upper()}] {t['title']} (due: {t['due_date']})"
+            )
+        lines.append("")
+
+    # Group by section
+    by_section: dict[str, list] = {}
+    for t in active:
+        by_section.setdefault(t["section"], []).append(t)
+
+    for sec in target_sections:
+        tasks = by_section.get(sec, [])
+        if tasks:
+            lines.append(f"### {sec.upper()} ({len(tasks)})")
+            for t in tasks:
+                due = f" [due: {t['due_date']}]" if t["due_date"] else ""
+                prio = (
+                    f"[{t['priority'].upper()}] " if t["priority"] != "medium" else ""
+                )
+                lines.append(f"- {prio}{t['title']}{due}")
+            lines.append("")
+
+    digest_text = "\n".join(lines)
+    return json.dumps(
+        {
+            "digest": digest_text,
+            "active_count": len(active),
+            "overdue_count": len(overdue),
+        }
+    )
+
+
+@mcp.tool()
+def archive_done_tasks(older_than_days: int = 7) -> str:
+    """Archive completed tasks older than N days.
+
+    Moves tasks with status='done' and updated_at older than
+    the threshold to status='archived'.
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', updated_at = ? "
+            "WHERE status = 'done' "
+            "AND updated_at < datetime('now', ? || ' days')",
+            (_now(), f"-{older_than_days}"),
+        )
+        archived = cur.rowcount
+
+    logger.info(
+        "archive_done_tasks: %d tasks archived (older than %d days)",
+        archived,
+        older_than_days,
+    )
+    return json.dumps({"archived": archived, "threshold_days": older_than_days})
+
+
+@mcp.tool()
+def bump_overdue_priority(target_priority: str = "high") -> str:
+    """Bump priority of overdue tasks that are not done/archived.
+
+    Only bumps tasks whose current priority is lower than target.
+    """
+    if target_priority not in _TASK_PRIORITIES:
+        return json.dumps({"error": f"Invalid priority: {target_priority}"})
+
+    priority_rank = {p: i for i, p in enumerate(_TASK_PRIORITIES)}
+    target_rank = priority_rank[target_priority]
+
+    # Only bump priorities lower than target
+    lower_priorities = [p for p, r in priority_rank.items() if r < target_rank]
+    if not lower_priorities:
+        return json.dumps({"bumped": 0, "message": "No lower priorities to bump"})
+
+    ph = ",".join("?" * len(lower_priorities))
+    now = _now()
+
+    with _get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE tasks SET priority = ?, updated_at = ? "
+            f"WHERE due_date < date('now') "
+            f"AND status NOT IN ('done', 'archived', 'cancelled') "
+            f"AND priority IN ({ph})",
+            [target_priority, now] + lower_priorities,
+        )
+        bumped = cur.rowcount
+
+    logger.info("bump_overdue_priority: %d tasks bumped to %s", bumped, target_priority)
+    return json.dumps({"bumped": bumped, "target_priority": target_priority})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
