@@ -2,7 +2,7 @@
 
 A production-quality SQLite-backed MCP Memory server with WAL concurrent safety (10+ sessions), FTS5 BM25 search, and session tracking.
 
-Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 6 additional tools for session tracking, cross-project search, and cross-machine bridge sync.
+Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 12 additional tools for session tracking, task management, cross-project search, and cross-machine bridge sync.
 
 ## Why SQLite?
 
@@ -26,9 +26,11 @@ SQLite hits the sweet spot:
 - **WAL mode** -- 10+ concurrent Claude Code sessions with no file locking conflicts
 - **FTS5 BM25 ranked search** -- Full-text search across entity names, types, and observations with relevance ranking
 - **Session tracking** -- Save and recall session snapshots for context continuity across restarts
+- **Task management** -- Structured task CRUD with typed queries, priorities, sections, due dates, and recurring tasks
+- **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
-- **Drop-in compatible** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically, plus 6 new tools
+- **Drop-in compatible** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically, plus 12 new tools
 - **Zero dependencies beyond stdlib** -- Only `fastmcp` for the MCP protocol; `sqlite3` is Python stdlib
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
@@ -41,6 +43,7 @@ SQLite hits the sweet spot:
 | Concurrent 10+ sessions | WAL mode | file locks | cloud | no WAL | file locks | yes | yes | no | yes |
 | FTS5 BM25 search | yes | substring | no | no | no | vector | vector | no | Cypher |
 | Session tracking | built-in | no | no | no | no | no | no | no | no |
+| Task management | built-in | no | no | no | no | no | no | no | no |
 | Cross-project sharing | project field | no | no | no | no | no | no | no | no |
 | Drop-in compatible | 9/9 tools | baseline | no | partial | no | no | no | partial | no |
 | Setup effort | pip install | npx | API key + pip | pip | npx | Docker + pip | Docker + pip | pip | Docker + Neo4j |
@@ -84,7 +87,7 @@ The `SQLITE_MEMORY_DB` environment variable controls where the database is store
 ┌──────────────┐     stdio      ┌──────────────────┐
 │  Claude Code  │◄──────────────►│  FastMCP Server   │
 │  (session 1)  │               │                    │
-├──────────────┤               │  15 MCP Tools      │
+├──────────────┤               │  21 MCP Tools      │
 │  Claude Code  │◄─────────────►│  ┌──────────────┐ │
 │  (session 2)  │               │  │  SQLite WAL   │ │
 ├──────────────┤               │  │  memory.db    │ │
@@ -97,7 +100,7 @@ Each Claude Code session spawns its own `server.py` process via stdio. All proce
 
 ## Schema
 
-The database has 4 tables and 1 FTS5 virtual table:
+The database has 5 tables and 1 FTS5 virtual table:
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -144,6 +147,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at     TEXT    DEFAULT NULL
 );
 
+-- Structured task management
+CREATE TABLE IF NOT EXISTS tasks (
+    id          TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    description TEXT DEFAULT NULL,
+    status      TEXT NOT NULL DEFAULT 'not_started',
+    priority    TEXT DEFAULT 'medium',
+    section     TEXT DEFAULT 'inbox',
+    due_date    TEXT DEFAULT NULL,
+    project     TEXT DEFAULT NULL,
+    parent_id   TEXT DEFAULT NULL REFERENCES tasks(id),
+    notes       TEXT DEFAULT NULL,
+    recurring   TEXT DEFAULT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 -- Full-text search index (BM25 ranked)
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
@@ -158,6 +178,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 - `relations` uses `UNIQUE(from_id, to_id, relation_type)` -- same deduplication pattern.
 - `ON DELETE CASCADE` on foreign keys ensures deleting an entity cleans up all its observations and relations.
 - `memory_fts` is a virtual table that concatenates entity name, type, and all observations into a single searchable document. It is synced on every write.
+- `tasks.id` is a UUID (TEXT), not an integer -- tasks are identified by UUID for stability across machines.
 
 ## Tool Reference
 
@@ -183,13 +204,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 | 11 | `session_recall` | Recall the N most recent sessions, ordered by start time. |
 | 12 | `search_by_project` | FTS5 BM25 search scoped to a specific project. |
 
+### Task Management Tools
+
+| # | Tool | Description |
+|---|------|-------------|
+| 13 | `create_task` | Create a new task. Params: `title` (required), `description`, `section` (inbox/today/next/someday/waiting), `priority` (low/medium/high/critical), `due_date` (YYYY-MM-DD), `project`, `parent_id`, `notes`, `recurring`. Returns UUID. |
+| 14 | `update_task` | Update a task's fields by UUID. All fields optional except `task_id`. Partial update -- only provided fields are changed. |
+| 15 | `query_tasks` | Query tasks with optional filters: `section`, `status`, `priority`, `project`, `parent_id`, `overdue_only`, `limit`. Filters combined with AND. Returns markdown table + JSON. |
+| 16 | `task_digest` | Generate a formatted session-start digest. Shows pending/in-progress tasks grouped by section plus overdue tasks highlighted separately. Params: `sections`, `include_overdue`, `limit`. |
+| 17 | `archive_done_tasks` | Archive completed tasks older than N days. Param: `older_than_days` (default 7). Moves `status='done'` tasks to `status='archived'`. |
+| 18 | `bump_overdue_priority` | Escalate priority of overdue tasks. Param: `target_priority` (default `high`). Only bumps tasks whose current priority is lower than the target. |
+
 ### Bridge Tools (cross-machine sync)
 
 | # | Tool | Description |
 |---|------|-------------|
-| 13 | `bridge_push` | Push entities tagged with `project LIKE 'shared%'` to a bridge git repo as JSON. Git commit + push. |
-| 14 | `bridge_pull` | Pull shared entities from the bridge git repo. Git pull + import with dedup via UNIQUE constraints. |
-| 15 | `bridge_status` | Show sync status — local shared entities vs repo contents, with diff summary. |
+| 19 | `bridge_push` | Push entities tagged with `project LIKE 'shared%'` to a bridge git repo as JSON. Payload v2 includes tasks. Git commit + push. |
+| 20 | `bridge_pull` | Pull shared entities and tasks from the bridge git repo. Git pull + import with dedup via UNIQUE constraints. Last-write-wins for tasks (compared by `updated_at`). |
+| 21 | `bridge_status` | Show sync status -- local shared entities vs repo contents, with diff summary. |
 
 ## Bridge Sync (Cross-Machine)
 
@@ -198,8 +230,8 @@ Share knowledge graph entities between machines (e.g., personal laptop + work co
 ### How it works
 
 1. Tag entities for sharing by setting `project` to any value starting with `"shared"` (e.g., `"shared"`, `"shared:trading"`, `"shared:hooks"`)
-2. `bridge_push()` exports all shared entities + their observations and inter-relations to `shared.json` in a local git repo, then commits and pushes
-3. `bridge_pull()` on the other machine does `git pull` + imports new entities/observations/relations (UNIQUE constraints handle dedup)
+2. `bridge_push()` exports all shared entities + their observations and inter-relations to `shared.json` in a local git repo, then commits and pushes. The v2 payload also includes shared tasks.
+3. `bridge_pull()` on the other machine does `git pull` + imports new entities/observations/relations (UNIQUE constraints handle dedup). Tasks use last-write-wins based on `updated_at` comparison.
 4. `bridge_status()` shows what's in sync vs only-local vs only-remote
 
 ### Setup
@@ -343,6 +375,123 @@ Returns the 3 most recent sessions with their summaries, projects, active files,
 ### Hook integration
 
 You can extend your Claude Code session hook (`~/.claude/hooks/session_context.py`) to automatically recall recent sessions and inject them into the system prompt. See `examples/session_context_hook.py` for a reference implementation.
+
+## Task Management
+
+Structured task tracking built directly into the memory server. No external service required.
+
+### Section-based workflow
+
+Tasks are organized into five sections following a GTD-style workflow:
+
+| Section | Purpose |
+|---------|---------|
+| `inbox` | Unprocessed tasks (default) |
+| `today` | Tasks to complete today |
+| `next` | Next actions queue |
+| `someday` | Deferred / maybe |
+| `waiting` | Blocked on someone else |
+
+### Priority levels
+
+Four priority levels: `low`, `medium` (default), `high`, `critical`. The `query_tasks` and `task_digest` tools always sort by priority descending, then by `due_date` ascending.
+
+### Statuses
+
+`not_started` (default), `in_progress`, `done`, `archived`, `cancelled`.
+
+### Example usage
+
+```python
+# Create a task
+create_task(
+    title="Review pull request #42",
+    section="today",
+    priority="high",
+    due_date="2026-03-05",
+    project="sqlite-memory-mcp"
+)
+
+# Query pending tasks for today
+query_tasks(section="today", status="not_started")
+
+# Mark a task in progress
+update_task(task_id="<uuid>", status="in_progress")
+
+# Get a session-start digest
+task_digest(sections=["today", "inbox"], include_overdue=True)
+
+# Archive done tasks older than 3 days
+archive_done_tasks(older_than_days=3)
+
+# Escalate overdue tasks to high priority
+bump_overdue_priority(target_priority="high")
+```
+
+### Subtasks
+
+Link a task to a parent via `parent_id`:
+
+```python
+parent = create_task(title="Implement feature X")
+# parent returns {"task_id": "<parent-uuid>", ...}
+
+create_task(
+    title="Write tests for feature X",
+    parent_id="<parent-uuid>"
+)
+```
+
+Query subtasks with `query_tasks(parent_id="<parent-uuid>")`.
+
+### Recurring tasks
+
+Pass a JSON recurrence config in the `recurring` field:
+
+```python
+create_task(
+    title="Weekly review",
+    section="today",
+    recurring='{"every": "week", "day": "monday"}'
+)
+```
+
+The automation script `~/notion_automations/recurring_tasks.py` reads this field and recreates tasks on schedule.
+
+### Automation scripts
+
+Four scripts automate routine task hygiene:
+
+| Script | Function |
+|--------|----------|
+| `daily_digest.py` | Sends formatted task digest at session start |
+| `auto_archive.py` | Archives done tasks older than 7 days |
+| `overdue_bump.py` | Escalates overdue tasks to `high` priority |
+| `recurring_tasks.py` | Recreates recurring tasks on schedule |
+
+All scripts are pure stdlib Python operating directly on `memory.db` via SQL -- zero external dependencies.
+
+## Kanban Board
+
+`task_report.py` generates a static HTML kanban board from the tasks table:
+
+```bash
+python task_report.py
+# Writes: index.html
+```
+
+The generated `index.html` shows tasks grouped by section as kanban columns, with priority color-coding. Commit it to the bridge repo to publish via GitHub Pages.
+
+```bash
+# Publish to GitHub Pages
+cp index.html ~/.claude/memory/bridge/
+cd ~/.claude/memory/bridge
+git add index.html
+git commit -m "chore: update kanban board"
+git push
+```
+
+Enable GitHub Pages on the bridge repo (Settings > Pages > Branch: main) to get a live URL.
 
 ## License
 

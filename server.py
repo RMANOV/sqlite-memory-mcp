@@ -39,7 +39,8 @@ mcp = FastMCP(
     "sqlite-memory",
     instructions=(
         "SQLite-backed persistent memory with WAL concurrent safety, "
-        "FTS5 search, and session tracking"
+        "FTS5 search, session tracking, structured task management, "
+        "and cross-machine bridge sync"
     ),
 )
 
