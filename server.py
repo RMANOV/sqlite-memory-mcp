@@ -1272,13 +1272,22 @@ def bridge_push(tag: str = "shared") -> str:
                 for r in rel_rows
             ]
 
+        # Export all non-archived tasks for cross-machine sync
+        task_rows = conn.execute(
+            "SELECT id, title, status, priority, section, due_date, project, "
+            "parent_id, notes, recurring, created_at, updated_at "
+            "FROM tasks WHERE status != 'archived' ORDER BY created_at"
+        ).fetchall()
+        tasks_out = [dict(r) for r in task_rows]
+
     hostname = socket.gethostname()
     payload = {
-        "version": 1,
+        "version": 2,
         "pushed_at": _now(),
         "machine_id": hostname,
         "entities": entities_out,
         "relations": relations_out,
+        "tasks": tasks_out,
     }
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
@@ -1287,7 +1296,10 @@ def bridge_push(tag: str = "shared") -> str:
     )
 
     n_obs = sum(len(e["observations"]) for e in entities_out)
-    msg = f"bridge: push {len(entities_out)} entities from {hostname}"
+    msg = (
+        f"bridge: push {len(entities_out)} entities, "
+        f"{len(tasks_out)} tasks from {hostname}"
+    )
 
     _git("add", "shared.json")
     commit_result = _git("commit", "-m", msg)
@@ -1299,10 +1311,11 @@ def bridge_push(tag: str = "shared") -> str:
     pushed = push_result.returncode == 0
 
     logger.info(
-        "bridge_push: %d entities, %d observations, %d relations, push=%s",
+        "bridge_push: %d entities, %d observations, %d relations, %d tasks, push=%s",
         len(entities_out),
         n_obs,
         len(relations_out),
+        len(tasks_out),
         pushed,
     )
     return json.dumps(
@@ -1310,6 +1323,7 @@ def bridge_push(tag: str = "shared") -> str:
             "entities": len(entities_out),
             "observations": n_obs,
             "relations": len(relations_out),
+            "tasks": len(tasks_out),
             "pushed_to_remote": pushed,
             "message": msg,
         }
@@ -1341,10 +1355,13 @@ def bridge_pull() -> str:
 
     entities = payload.get("entities", [])
     relations = payload.get("relations", [])
+    tasks = payload.get("tasks", [])  # v2 — backward compat with v1
     now = _now()
     new_entities = 0
     new_observations = 0
     new_relations = 0
+    new_tasks = 0
+    updated_tasks = 0
 
     with _get_conn() as conn:
         for ent in entities:
@@ -1400,17 +1417,75 @@ def bridge_pull() -> str:
                 )
                 new_relations += cur3.rowcount
 
+        # Import tasks (last-write-wins by updated_at)
+        for task in tasks:
+            tid = task.get("id")
+            if not tid:
+                continue
+            existing = conn.execute(
+                "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            if existing:
+                # Only overwrite if remote is newer
+                if task.get("updated_at", "") > existing["updated_at"]:
+                    conn.execute(
+                        "UPDATE tasks SET title=?, status=?, priority=?, section=?, "
+                        "due_date=?, project=?, parent_id=?, notes=?, recurring=?, "
+                        "updated_at=? WHERE id=?",
+                        (
+                            task["title"],
+                            task["status"],
+                            task["priority"],
+                            task["section"],
+                            task.get("due_date"),
+                            task.get("project"),
+                            task.get("parent_id"),
+                            task.get("notes"),
+                            task.get("recurring"),
+                            task["updated_at"],
+                            tid,
+                        ),
+                    )
+                    updated_tasks += 1
+            else:
+                conn.execute(
+                    "INSERT INTO tasks (id, title, status, priority, section, "
+                    "due_date, project, parent_id, notes, recurring, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        tid,
+                        task["title"],
+                        task["status"],
+                        task["priority"],
+                        task["section"],
+                        task.get("due_date"),
+                        task.get("project"),
+                        task.get("parent_id"),
+                        task.get("notes"),
+                        task.get("recurring"),
+                        task.get("created_at", now),
+                        task.get("updated_at", now),
+                    ),
+                )
+                new_tasks += 1
+
     logger.info(
-        "bridge_pull: %d new entities, %d new observations, %d new relations",
+        "bridge_pull: %d new entities, %d new observations, %d new relations, "
+        "%d new tasks, %d updated tasks",
         new_entities,
         new_observations,
         new_relations,
+        new_tasks,
+        updated_tasks,
     )
     return json.dumps(
         {
             "new_entities": new_entities,
             "new_observations": new_observations,
             "new_relations": new_relations,
+            "new_tasks": new_tasks,
+            "updated_tasks": updated_tasks,
             "source_machine": payload.get("machine_id", "unknown"),
             "pushed_at": payload.get("pushed_at", "unknown"),
         }
@@ -1427,15 +1502,20 @@ def bridge_status() -> str:
         local_rows = conn.execute(
             "SELECT name FROM entities WHERE project LIKE 'shared%' ORDER BY name"
         ).fetchall()
+        local_task_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE status != 'archived'"
+        ).fetchone()["cnt"]
     local_names = {r["name"] for r in local_rows}
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     remote_names: set[str] = set()
+    remote_task_count = 0
     repo_meta = {}
     if shared_path.exists():
         try:
             payload = json.loads(shared_path.read_text(encoding="utf-8"))
             remote_names = {e["name"] for e in payload.get("entities", [])}
+            remote_task_count = len(payload.get("tasks", []))
             repo_meta = {
                 "pushed_at": payload.get("pushed_at"),
                 "machine_id": payload.get("machine_id"),
@@ -1459,6 +1539,8 @@ def bridge_status() -> str:
             "in_sync": len(in_sync),
             "only_local": only_local,
             "only_remote": only_remote,
+            "local_tasks": local_task_count,
+            "remote_tasks": remote_task_count,
             "last_commit": last_commit,
             "repo_meta": repo_meta,
         }
