@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS tasks (
     id          TEXT PRIMARY KEY,
     title       TEXT NOT NULL,
+    description TEXT DEFAULT NULL,
     status      TEXT NOT NULL DEFAULT 'not_started',
     priority    TEXT DEFAULT 'medium',
     section     TEXT DEFAULT 'inbox',
@@ -153,11 +154,26 @@ def _get_conn():
 
 
 # ── Schema init ──────────────────────────────────────────────────────────
+_MIGRATIONS = [
+    # (check_query, migration_sql, description)
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='description'",
+        "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
+        "tasks.description column",
+    ),
+]
+
+
 def _init_db() -> None:
-    """Create tables if they don't exist, set WAL mode."""
+    """Create tables if they don't exist, run migrations, set WAL mode."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:
         conn.executescript(_SCHEMA_SQL)
+        # Run migrations for existing databases
+        for check_q, migrate_q, desc in _MIGRATIONS:
+            if not conn.execute(check_q).fetchone():
+                conn.execute(migrate_q)
+                logger.info("Migration applied: %s", desc)
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -814,6 +830,7 @@ _TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting")
 @mcp.tool()
 def create_task(
     title: str,
+    description: str | None = None,
     section: str = "inbox",
     priority: str = "medium",
     due_date: str | None = None,
@@ -826,6 +843,7 @@ def create_task(
 
     Args:
         title: Task title (required).
+        description: Unlimited-length task description/details.
         section: inbox | today | next | someday | waiting.
         priority: low | medium | high | critical.
         due_date: YYYY-MM-DD format or None.
@@ -857,12 +875,13 @@ def create_task(
                 return json.dumps({"error": f"Parent task {parent_id} not found"})
 
         conn.execute(
-            "INSERT INTO tasks (id, title, status, priority, section, due_date, "
-            "project, parent_id, notes, recurring, created_at, updated_at) "
-            "VALUES (?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, title, description, status, priority, section, "
+            "due_date, project, parent_id, notes, recurring, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
+                description,
                 priority,
                 section,
                 due_date,
@@ -883,6 +902,7 @@ def create_task(
 def update_task(
     task_id: str,
     title: str | None = None,
+    description: str | None = None,
     status: str | None = None,
     priority: str | None = None,
     section: str | None = None,
@@ -897,6 +917,7 @@ def update_task(
     Args:
         task_id: UUID of the task to update (required).
         title: New title.
+        description: Unlimited-length task description/details.
         status: not_started | in_progress | done | archived | cancelled.
         priority: low | medium | high | critical.
         section: inbox | today | next | someday | waiting.
@@ -908,6 +929,7 @@ def update_task(
     """
     fields = {
         "title": title,
+        "description": description,
         "status": status,
         "priority": priority,
         "section": section,
@@ -991,7 +1013,7 @@ def query_tasks(
 
     with _get_conn() as conn:
         rows = conn.execute(
-            f"SELECT id, title, status, priority, section, due_date, project, parent_id "
+            f"SELECT id, title, description, status, priority, section, due_date, project, parent_id "
             f"FROM tasks WHERE {where} "
             f"ORDER BY "
             f"  CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
@@ -1274,8 +1296,8 @@ def bridge_push(tag: str = "shared") -> str:
 
         # Export all non-archived tasks for cross-machine sync
         task_rows = conn.execute(
-            "SELECT id, title, status, priority, section, due_date, project, "
-            "parent_id, notes, recurring, created_at, updated_at "
+            "SELECT id, title, description, status, priority, section, due_date, "
+            "project, parent_id, notes, recurring, created_at, updated_at "
             "FROM tasks WHERE status != 'archived' ORDER BY created_at"
         ).fetchall()
         tasks_out = [dict(r) for r in task_rows]
@@ -1429,11 +1451,12 @@ def bridge_pull() -> str:
                 # Only overwrite if remote is newer
                 if task.get("updated_at", "") > existing["updated_at"]:
                     conn.execute(
-                        "UPDATE tasks SET title=?, status=?, priority=?, section=?, "
-                        "due_date=?, project=?, parent_id=?, notes=?, recurring=?, "
-                        "updated_at=? WHERE id=?",
+                        "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
+                        "section=?, due_date=?, project=?, parent_id=?, notes=?, "
+                        "recurring=?, updated_at=? WHERE id=?",
                         (
                             task["title"],
+                            task.get("description"),
                             task["status"],
                             task["priority"],
                             task["section"],
@@ -1449,13 +1472,14 @@ def bridge_pull() -> str:
                     updated_tasks += 1
             else:
                 conn.execute(
-                    "INSERT INTO tasks (id, title, status, priority, section, "
-                    "due_date, project, parent_id, notes, recurring, "
+                    "INSERT INTO tasks (id, title, description, status, priority, "
+                    "section, due_date, project, parent_id, notes, recurring, "
                     "created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         tid,
                         task["title"],
+                        task.get("description"),
                         task["status"],
                         task["priority"],
                         task["section"],
