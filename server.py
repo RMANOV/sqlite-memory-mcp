@@ -1574,10 +1574,11 @@ def bridge_status() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Startup
+# Startup — always init DB on import (ensures tables exist for all callers)
 # ═══════════════════════════════════════════════════════════════════════════
 
+_init_db()
+
 if __name__ == "__main__":
-    _init_db()
     _migrate_jsonl()
     mcp.run(transport="stdio")
