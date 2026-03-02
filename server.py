@@ -2,10 +2,11 @@
 """SQLite-backed MCP Memory Server.
 
 Production-quality persistent memory with WAL concurrent safety,
-FTS5 BM25-ranked search, and session tracking.
+FTS5 BM25-ranked search, session tracking, cross-machine bridge sync,
+and structured task management.
 
 Drop-in compatible with @modelcontextprotocol/server-memory (tools 1-9)
-plus 3 additional tools: session_save, session_recall, search_by_project.
+plus extended tools: session (10-12), task management (13-18), bridge (19-21).
 """
 
 from __future__ import annotations
