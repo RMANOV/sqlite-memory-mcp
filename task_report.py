@@ -65,7 +65,8 @@ def _get_tasks() -> tuple[list[dict], set[str]]:
 
 def _sort_key(task: dict) -> tuple:
     priority = PRIORITY_ORDER.get(task.get("priority", "low"), 3)
-    due = task.get("due_date") or "9999-12-31"
+    parsed = _parse_date(task.get("due_date"))
+    due = parsed.isoformat() if parsed else "9999-12-31"
     return (priority, due)
 
 
@@ -77,18 +78,32 @@ def _html_escape(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
+        .replace("'", "&#x27;")
     )
+
+
+def _parse_date(s: str | None) -> date | None:
+    """Parse YYYY-MM-DD to date, or None on invalid/missing input."""
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
 
 
 def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
     title = _html_escape(task.get("title") or "Untitled")
     priority = (task.get("priority") or "low").lower()
+    if priority not in PRIORITY_ORDER:
+        priority = "low"
     due_date = task.get("due_date")
     project = task.get("project")
     task_id = task.get("id", "")
     has_children = task_id in parent_ids
 
-    is_overdue = bool(due_date and due_date < today_str)
+    parsed_due = _parse_date(due_date)
+    is_overdue = bool(parsed_due and parsed_due < date.today())
 
     card_class = "card"
     if is_overdue:
@@ -165,7 +180,7 @@ def _build_html(tasks: list[dict], parent_ids: set[str]) -> str:
         by_section[section].sort(key=_sort_key)
 
     total = len(tasks)
-    overdue = sum(1 for t in tasks if t.get("due_date") and t["due_date"] < today_str)
+    overdue = sum(1 for t in tasks if _parse_date(t.get("due_date")) is not None and _parse_date(t.get("due_date")) < today)
 
     columns_html = "".join(
         _render_column(s, by_section[s], today_str, parent_ids) for s in SECTIONS
@@ -462,6 +477,7 @@ def generate_report() -> str:
     tasks, parent_ids = _get_tasks()
     html = _build_html(tasks, parent_ids)
 
+    os.makedirs(BRIDGE_REPO, exist_ok=True)
     output_path = os.path.join(BRIDGE_REPO, "index.html")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)

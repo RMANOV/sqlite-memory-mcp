@@ -17,6 +17,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,8 @@ logger = logging.getLogger("sqlite-memory")
 logger.setLevel(logging.DEBUG)
 _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(_fh)
+if not logger.handlers:
+    logger.addHandler(_fh)
 
 # ── FastMCP app ──────────────────────────────────────────────────────────
 from fastmcp import FastMCP
@@ -108,7 +110,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     section     TEXT DEFAULT 'inbox',
     due_date    TEXT DEFAULT NULL,
     project     TEXT DEFAULT NULL,
-    parent_id   TEXT DEFAULT NULL REFERENCES tasks(id),
+    parent_id   TEXT DEFAULT NULL REFERENCES tasks(id) ON DELETE SET NULL,  -- only affects fresh installs
     notes       TEXT DEFAULT NULL,
     recurring   TEXT DEFAULT NULL,
     created_at  TEXT NOT NULL,
@@ -171,7 +173,8 @@ def _init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:
         conn.executescript(_SCHEMA_SQL)
-        # Run migrations for existing databases
+    # Migrations in separate transaction for proper rollback
+    with _get_conn() as conn:
         for check_q, migrate_q, desc in _MIGRATIONS:
             if not conn.execute(check_q).fetchone():
                 conn.execute(migrate_q)
@@ -755,13 +758,15 @@ def session_recall(last_n: int = 5) -> str:
 
     sessions = []
     for r in rows:
+        try:
+            _af = json.loads(r["active_files"]) if r["active_files"] else None
+        except (json.JSONDecodeError, TypeError):
+            _af = None
         session = {
             "session_id": r["session_id"],
             "project": r["project"],
             "summary": r["summary"],
-            "active_files": json.loads(r["active_files"])
-            if r["active_files"]
-            else None,
+            "active_files": _af,
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
         }
@@ -854,8 +859,6 @@ def create_task(
         notes: Freeform notes.
         recurring: JSON config for recurrence (e.g. '{"every":"week","day":"monday"}').
     """
-    import uuid
-
     task_id = str(uuid.uuid4())
     now = _now()
 
@@ -867,6 +870,13 @@ def create_task(
         return json.dumps(
             {"error": f"Invalid priority: {priority}. Use: {_TASK_PRIORITIES}"}
         )
+    if due_date:
+        try:
+            datetime.strptime(due_date, "%Y-%m-%d")
+        except ValueError:
+            return json.dumps(
+                {"error": f"Invalid due_date: {due_date}. Use YYYY-MM-DD format"}
+            )
 
     with _get_conn() as conn:
         if parent_id:
@@ -941,7 +951,12 @@ def update_task(
         "notes": notes,
         "recurring": recurring,
     }
-    updates = {k: v for k, v in fields.items() if v is not None}
+    updates = {}
+    for k, v in fields.items():
+        if v == "":
+            updates[k] = None  # empty string = clear field to NULL
+        elif v is not None:
+            updates[k] = v
     if not updates:
         return json.dumps({"error": "No valid fields to update"})
 
@@ -959,6 +974,13 @@ def update_task(
         return json.dumps(
             {"error": f"Invalid section: {updates['section']}. Use: {_TASK_SECTIONS}"}
         )
+    if "due_date" in updates and updates["due_date"] is not None:
+        try:
+            datetime.strptime(updates["due_date"], "%Y-%m-%d")
+        except ValueError:
+            return json.dumps(
+                {"error": f"Invalid due_date: {updates['due_date']}. Use YYYY-MM-DD"}
+            )
 
     updates["updated_at"] = _now()
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -1154,21 +1176,28 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
     Moves tasks with status='done' and updated_at older than
     the threshold to status='archived'.
     """
+    try:
+        days = int(older_than_days)
+    except (ValueError, TypeError):
+        return json.dumps({"error": "older_than_days must be an integer"})
+    if days < 0:
+        return json.dumps({"error": "older_than_days must be non-negative"})
+
     with _get_conn() as conn:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', updated_at = ? "
             "WHERE status = 'done' "
             "AND updated_at < datetime('now', ? || ' days')",
-            (_now(), f"-{older_than_days}"),
+            (_now(), f"-{days}"),
         )
         archived = cur.rowcount
 
     logger.info(
         "archive_done_tasks: %d tasks archived (older than %d days)",
         archived,
-        older_than_days,
+        days,
     )
-    return json.dumps({"archived": archived, "threshold_days": older_than_days})
+    return json.dumps({"archived": archived, "threshold_days": days})
 
 
 @mcp.tool()
@@ -1327,7 +1356,7 @@ def bridge_push(tag: str = "shared") -> str:
 
     _git("add", "shared.json")
     commit_result = _git("commit", "-m", msg)
-    if commit_result.returncode != 0 and "nothing to commit" in commit_result.stdout:
+    if commit_result.returncode != 0 and "nothing to commit" in commit_result.stderr:
         logger.info("bridge_push: no changes to commit")
         return json.dumps({"pushed": 0, "message": "No changes — already up to date"})
 
@@ -1442,10 +1471,19 @@ def bridge_pull() -> str:
                 new_relations += cur3.rowcount
 
         # Import tasks (last-write-wins by updated_at)
-        for task in tasks:
+        # Sort parents before children to avoid FK violations
+        tasks_sorted = sorted(tasks, key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")))
+        for task in tasks_sorted:
             tid = task.get("id")
             if not tid:
                 continue
+            # Validate imported enum fields
+            if task.get("status") not in _TASK_STATUSES:
+                task["status"] = "not_started"
+            if task.get("priority") not in _TASK_PRIORITIES:
+                task["priority"] = "medium"
+            if task.get("section") not in _TASK_SECTIONS:
+                task["section"] = "inbox"
             existing = conn.execute(
                 "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
