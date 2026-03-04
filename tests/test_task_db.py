@@ -84,3 +84,29 @@ class TestTaskDB:
         s = db.get_summary()
         assert s["total"] >= 2
         assert s["overdue"] >= 1
+
+    def test_mark_done_then_undo(self, db):
+        tid = db.add_task("Toggle")
+        db.mark_done(tid)
+        db.update_task(tid, status="not_started")
+        assert db.get_tasks()[0]["status"] == "not_started"
+
+    def test_add_task_to_each_section(self, db):
+        for section in ("today", "inbox", "next", "waiting", "someday"):
+            db.add_task(f"Task in {section}", section=section)
+        assert len(db.get_tasks()) == 5
+
+    def test_hidden_statuses_filtered(self, db):
+        db.add_task("Visible")
+        tid = db.add_task("Hidden")
+        db.update_task(tid, status="archived")
+        assert len(db.get_tasks()) == 1
+
+    def test_on_change_callback(self, db):
+        calls = []
+        db.on_change = lambda: calls.append(1)
+        db.add_task("Trigger")
+        db.mark_done(db.get_tasks()[0]["id"])
+        db.update_task(db.get_tasks()[0]["id"], title="Changed")
+        db.delete_task(db.get_tasks()[0]["id"])
+        assert len(calls) == 4
