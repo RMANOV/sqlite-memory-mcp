@@ -171,7 +171,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
-from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtCore import QSettings, Qt, QTimer, QPoint
 
 
 def create_tray_icon_pixmap(overdue_count=0):
@@ -221,6 +221,10 @@ class TrayPopup(QWidget):
         self.setMaximumHeight(500)
         self.setStyleSheet(self._stylesheet())
         self._build_ui()
+
+        # Auto-refresh timer (only ticks when visible)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self.refresh)
 
     def _stylesheet(self):
         return """
@@ -309,12 +313,23 @@ class TrayPopup(QWidget):
         self.task_layout.addStretch()
 
     def _make_task_row(self, task):
+        is_overdue = (
+            task.get("due_date")
+            and task["due_date"] < date.today().isoformat()
+            and task["status"] != "done"
+        )
         row = QWidget()
+        if is_overdue:
+            row.setStyleSheet(
+                "border-left: 3px solid #e53e3e; background: rgba(229,62,62,0.05);"
+            )
         hl = QHBoxLayout(row)
         hl.setContentsMargins(14, 2, 14, 2)
 
         cb = QCheckBox(task["title"])
         cb.setChecked(task["status"] == "done")
+        if task["status"] == "done":
+            cb.setStyleSheet("color: #276749; text-decoration: line-through;")
         task_id = task["id"]
         cb.toggled.connect(lambda checked, tid=task_id: self._on_toggle(tid, checked))
         hl.addWidget(cb, 1)
@@ -359,6 +374,14 @@ class TrayPopup(QWidget):
         self.move(QPoint(x, y))
         self.show()
         self.activateWindow()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_timer.start(30000)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._refresh_timer.stop()
 
 
 # ── FullWindow ──────────────────────────────────────────────────────
@@ -446,6 +469,8 @@ class TaskListWidget(QListWidget):
             priority = (task.get("priority") or "medium").upper()
             due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
             item.setText(f"[{priority}] {task['title']}{due}")
+            if task["status"] == "done":
+                item.setForeground(QColor("#276749"))
             self.addItem(item)
 
     def _on_double_click(self, item):
@@ -476,6 +501,17 @@ class FullWindow(QMainWindow):
         self.db = db
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
+
+        # Center on screen (overridden by saved geometry if available)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.center() - self.rect().center())
+
+        # Restore saved geometry
+        self._settings = QSettings("TaskTray", "FullWindow")
+        geometry = self._settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
         self.setStyleSheet("""
             QMainWindow { background: #f0f4f8; }
             QTabWidget::pane { border: none; }
@@ -554,6 +590,7 @@ class FullWindow(QMainWindow):
         self.refresh()
 
     def closeEvent(self, event):
+        self._settings.setValue("geometry", self.saveGeometry())
         event.ignore()
         self.hide()
 
@@ -581,6 +618,9 @@ class TaskTrayApp:
         open_action = QAction("Open Full Window", menu)
         open_action.triggered.connect(self._open_full)
         menu.addAction(open_action)
+        add_task_action = QAction("Add Task", menu)
+        add_task_action.triggered.connect(self._quick_add_from_tray)
+        menu.addAction(add_task_action)
         menu.addSeparator()
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(self.app.quit)
@@ -612,6 +652,16 @@ class TaskTrayApp:
             self.popup = TrayPopup(self.db, self._open_full)
         geo = self.tray.geometry()
         self.popup.show_near_tray(geo)
+
+    def _quick_add_from_tray(self):
+        task = {"title": "", "section": "today", "priority": "medium"}
+        dlg = EditTaskDialog(task)
+        dlg.setWindowTitle("Add Task")
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            vals = dlg.get_values()
+            title = vals.pop("title", "")
+            if title:
+                self.db.add_task(title, **vals)
 
     def _open_full(self):
         if self.popup:
