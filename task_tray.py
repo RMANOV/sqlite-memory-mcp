@@ -464,9 +464,9 @@ class TaskListWidget(QListWidget):
         super().__init__(parent)
         self.db = db
         self.setStyleSheet("""
-            QListWidget { background: #f0f4f8; border: none; }
-            QListWidget::item { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
-            QListWidget::item:selected { background: #ebf8ff; }
+            QListWidget { background: #f0f4f8; color: #1a202c; border: none; }
+            QListWidget::item { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; color: #1a202c; }
+            QListWidget::item:selected { background: #ebf8ff; color: #1a202c; }
         """)
         self.itemDoubleClicked.connect(self._on_double_click)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -536,10 +536,12 @@ class FullWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
         self.setStyleSheet("""
-            QMainWindow { background: #f0f4f8; }
+            QMainWindow { background: #f0f4f8; color: #1a202c; }
             QTabWidget::pane { border: none; }
-            QTabBar::tab { padding: 8px 20px; font-weight: bold; }
+            QTabBar::tab { padding: 8px 20px; font-weight: bold; color: #1a202c; }
             QTabBar::tab:selected { background: #1a2332; color: white; }
+            QToolBar { background: #e2e8f0; color: #1a202c; }
+            QStatusBar { color: #4a5568; }
         """)
 
         # Tabs
