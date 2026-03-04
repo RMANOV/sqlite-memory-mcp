@@ -16,6 +16,20 @@ SECTIONS = ("today", "inbox", "next", "waiting", "someday")
 PRIORITIES = ("critical", "high", "medium", "low")
 STATUSES = ("not_started", "in_progress", "pending", "done", "archived", "cancelled")
 HIDDEN_STATUSES = ("archived", "cancelled")
+ALLOWED_FIELDS = frozenset(
+    {
+        "title",
+        "description",
+        "status",
+        "section",
+        "priority",
+        "due_date",
+        "project",
+        "notes",
+        "recurring",
+        "updated_at",
+    }
+)
 
 
 class TaskDB:
@@ -127,6 +141,9 @@ class TaskDB:
         """Update arbitrary fields on a task."""
         if not fields:
             return
+        invalid = set(fields) - ALLOWED_FIELDS
+        if invalid:
+            raise ValueError(f"Unknown task fields: {invalid}")
         fields["updated_at"] = datetime.now(UTC).isoformat()
         sets = ", ".join(f"{k}=?" for k in fields)
         vals = list(fields.values()) + [task_id]
@@ -368,7 +385,13 @@ class TrayPopup(QWidget):
         self.adjustSize()
         x = tray_geometry.x() - self.width() // 2
         y = tray_geometry.y() - self.height()
-        screen = QApplication.primaryScreen().availableGeometry()
+        primary = QApplication.primaryScreen()
+        if primary is None:
+            self.move(QPoint(x, y))
+            self.show()
+            self.activateWindow()
+            return
+        screen = primary.availableGeometry()
         x = max(screen.left(), min(x, screen.right() - self.width()))
         y = max(screen.top(), min(y, screen.bottom() - self.height()))
         self.move(QPoint(x, y))
@@ -429,12 +452,8 @@ class EditTaskDialog(QDialog):
             "section": self.section_combo.currentText(),
             "priority": self.priority_combo.currentText(),
         }
-        due = self.due_edit.text().strip()
-        if due:
-            vals["due_date"] = due
-        proj = self.project_edit.text().strip()
-        if proj:
-            vals["project"] = proj
+        vals["due_date"] = self.due_edit.text().strip() or None
+        vals["project"] = self.project_edit.text().strip() or None
         return vals
 
 
@@ -456,6 +475,7 @@ class TaskListWidget(QListWidget):
 
     def load_tasks(self, tasks):
         self._tasks = tasks
+        self.blockSignals(True)
         self.clear()
         for task in tasks:
             item = QListWidgetItem()
@@ -472,6 +492,7 @@ class TaskListWidget(QListWidget):
             if task["status"] == "done":
                 item.setForeground(QColor("#276749"))
             self.addItem(item)
+        self.blockSignals(False)
 
     def _on_double_click(self, item):
         task_id = item.data(Qt.ItemDataRole.UserRole)
@@ -503,8 +524,10 @@ class FullWindow(QMainWindow):
         self.resize(800, 600)
 
         # Center on screen (overridden by saved geometry if available)
-        screen = QApplication.primaryScreen().availableGeometry()
-        self.move(screen.center() - self.rect().center())
+        primary = QApplication.primaryScreen()
+        if primary:
+            screen = primary.availableGeometry()
+            self.move(screen.center() - self.rect().center())
 
         # Restore saved geometry
         self._settings = QSettings("TaskTray", "FullWindow")
@@ -546,10 +569,9 @@ class FullWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # Auto-refresh every 30s
+        # Auto-refresh every 30s (started/stopped in showEvent/closeEvent)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
-        self._refresh_timer.start(30000)
 
         self.refresh()
 
@@ -587,10 +609,12 @@ class FullWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._refresh_timer.start(30000)
         self.refresh()
 
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
+        self._refresh_timer.stop()
         event.ignore()
         self.hide()
 
@@ -606,6 +630,7 @@ class TaskTrayApp:
         self.app.setQuitOnLastWindowClosed(False)
         self.db = TaskDB()
         self.db.on_change = self._refresh_all
+        self.app.aboutToQuit.connect(self._on_quit)
 
         # Tray icon
         self.tray = QSystemTrayIcon()
@@ -680,6 +705,9 @@ class TaskTrayApp:
             self.popup.refresh()
         if self.full_window and self.full_window.isVisible():
             self.full_window.refresh()
+
+    def _on_quit(self):
+        self.db.close()
 
     def run(self):
         return self.app.exec()
