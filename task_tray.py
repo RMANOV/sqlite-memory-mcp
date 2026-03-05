@@ -91,6 +91,38 @@ class TaskDB:
             self._conn.commit()
         return cur.rowcount
 
+    def get_suggested_tasks(self, limit=20):
+        """Return prioritized mix: overdue + high/critical + nearest due."""
+        excluded = list(HIDDEN_STATUSES) + ["done"]
+        ph = ",".join("?" for _ in excluded)
+        rows = self._conn.execute(
+            f"SELECT * FROM tasks WHERE status NOT IN ({ph}) "
+            "ORDER BY "
+            "CASE WHEN due_date IS NOT NULL AND due_date < date('now') THEN 0 ELSE 1 END, "
+            "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+            "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, "
+            "CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, "
+            "created_at DESC "
+            f"LIMIT ?",
+            excluded + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_tasks(self, query):
+        """Search across title, project, priority, section, due_date."""
+        excluded = list(HIDDEN_STATUSES)
+        ph = ",".join("?" for _ in excluded)
+        pattern = f"%{query}%"
+        rows = self._conn.execute(
+            f"SELECT * FROM tasks WHERE status NOT IN ({ph}) "
+            "AND (title LIKE ? OR COALESCE(project,'') LIKE ? "
+            "OR priority LIKE ? OR section LIKE ? "
+            "OR COALESCE(due_date,'') LIKE ? OR status LIKE ?) "
+            "ORDER BY created_at DESC",
+            excluded + [pattern] * 6,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_overdue(self):
         """Return non-hidden tasks with due_date in the past."""
         today = date.today().isoformat()
@@ -541,21 +573,31 @@ class TaskListWidget(QListWidget):
 
 
 class FullWindow(QMainWindow):
-    """Full task manager window with tabs."""
+    """Full task manager window with tabs, search, sort, and suggested view."""
+
+    # Sort modes cycle: priority → due → created → priority ...
+    _SORT_MODES = ("priority", "due", "created")
+    _SORT_LABELS = {
+        "priority": "Sort: Priority",
+        "due": "Sort: Due Date",
+        "created": "Sort: Created",
+    }
+    # Priority rank for sorting (critical=0, high=1, medium=2, low=3)
+    _PRI_RANK = {p: i for i, p in enumerate(reversed(TASK_PRIORITIES))}
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
+        self._sort_mode = "priority"
+        self._search_text = ""
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
 
-        # Center on screen (overridden by saved geometry if available)
         primary = QApplication.primaryScreen()
         if primary:
             screen = primary.availableGeometry()
             self.move(screen.center() - self.rect().center())
 
-        # Restore saved geometry
         self._settings = QSettings("TaskTray", "FullWindow")
         geometry = self._settings.value("geometry")
         if geometry:
@@ -575,28 +617,38 @@ class FullWindow(QMainWindow):
             QToolBar QToolButton { background: #ffffff; color: #000000; border: 1px solid #a0aec0;
                                    padding: 4px 12px; font-weight: bold; }
             QToolBar QToolButton:hover { background: #1a2332; color: #ffffff; }
+            QToolBar QToolButton:checked { background: #1a2332; color: #ffffff; }
             QStatusBar { background: #e2e8f0; color: #000000; font-weight: bold;
                          border-top: 1px solid #cbd5e0; padding: 2px 8px; }
-            QMenuBar { background: #e2e8f0; color: #000000; }
             QMenu { background: #ffffff; color: #000000; border: 1px solid #a0aec0; }
             QMenu::item:selected { background: #1a2332; color: #ffffff; }
+            QLineEdit#search { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+                               border-radius: 4px; padding: 4px 8px; min-width: 200px; }
+            QLineEdit#search:focus { border-color: #1a2332; }
         """)
 
-        # Tabs
+        # Central widget with tabs
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
+        # Tab order: Suggested, Today, Inbox, Next, All, Done
+        self._tab_keys = ["suggested", "today", "inbox", "next", "all", "done"]
+        self._tab_labels = {
+            "suggested": "Suggested",
+            "today": "Today",
+            "inbox": "Inbox",
+            "next": "Next",
+            "all": "All",
+            "done": "Done",
+        }
         self.tab_lists = {}
-        for section in ("today", "inbox", "next", "all", "done"):
+        for key in self._tab_keys:
             lw = TaskListWidget(self.db)
-            lw.itemChanged.connect(lambda item, s=section: self._on_item_changed(item))
-            self.tab_lists[section] = lw
-            label = (
-                section.title() if section not in ("all", "done") else section.title()
-            )
-            self.tabs.addTab(lw, label)
+            lw.itemChanged.connect(lambda item, k=key: self._on_item_changed(item))
+            self.tab_lists[key] = lw
+            self.tabs.addTab(lw, self._tab_labels[key])
 
-        # Toolbar
+        # Toolbar: actions + search + sort
         toolbar = QToolBar()
         toolbar.setMovable(False)
         add_action = QAction("+ Add Task", self)
@@ -605,33 +657,116 @@ class FullWindow(QMainWindow):
         refresh_action = QAction("Refresh", self)
         refresh_action.triggered.connect(self.refresh)
         toolbar.addAction(refresh_action)
+        toolbar.addSeparator()
+
+        # Sort button (click to cycle modes)
+        self._sort_action = QAction(self._SORT_LABELS[self._sort_mode], self)
+        self._sort_action.triggered.connect(self._cycle_sort)
+        toolbar.addAction(self._sort_action)
+        toolbar.addSeparator()
+
+        # Instant search bar
+        self._search_input = QLineEdit()
+        self._search_input.setObjectName("search")
+        self._search_input.setPlaceholderText("Search tasks...")
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self._on_search)
+        toolbar.addWidget(self._search_input)
+
         self.addToolBar(toolbar)
 
         # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # Auto-refresh every 30s (started/stopped in showEvent/closeEvent)
+        # Auto-refresh every 30s
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
 
         self.refresh()
 
+    def _sort_tasks(self, tasks):
+        """Sort tasks by current sort mode."""
+        mode = self._sort_mode
+        if mode == "priority":
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    self._PRI_RANK.get(t.get("priority", "low"), 3),
+                    0 if t.get("due_date") else 1,
+                    t.get("due_date") or "9999-12-31",
+                ),
+            )
+        if mode == "due":
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    0 if t.get("due_date") else 1,
+                    t.get("due_date") or "9999-12-31",
+                    self._PRI_RANK.get(t.get("priority", "low"), 3),
+                ),
+            )
+        # mode == "created"
+        return sorted(tasks, key=lambda t: t.get("created_at") or "", reverse=True)
+
+    def _cycle_sort(self):
+        """Cycle to next sort mode and refresh."""
+        idx = self._SORT_MODES.index(self._sort_mode)
+        self._sort_mode = self._SORT_MODES[(idx + 1) % len(self._SORT_MODES)]
+        self._sort_action.setText(self._SORT_LABELS[self._sort_mode])
+        self.refresh()
+
+    def _on_search(self, text):
+        """Instant search filter."""
+        self._search_text = text.strip().lower()
+        self.refresh()
+
+    def _filter(self, tasks):
+        """Apply search filter to task list."""
+        q = self._search_text
+        if not q:
+            return tasks
+        return [
+            t
+            for t in tasks
+            if q
+            in (
+                f"{t.get('title', '')} {t.get('priority', '')} {t.get('project', '')} "
+                f"{t.get('due_date', '')} {t.get('section', '')} {t.get('status', '')}"
+            ).lower()
+        ]
+
     def refresh(self):
         # Auto-purge done tasks older than 30 days
         purged = self.db.purge_old_done(days=30)
 
-        for section, lw in self.tab_lists.items():
-            if section == "done":
-                lw.load_tasks(self.db.get_done_tasks())
-            elif section == "all":
-                lw.load_tasks(self.db.get_tasks())
-            else:
-                lw.load_tasks(self.db.get_tasks(section=section))
+        # Load tasks per tab
+        raw = {
+            "suggested": self.db.get_suggested_tasks(),
+            "today": self.db.get_tasks(section="today"),
+            "inbox": self.db.get_tasks(section="inbox"),
+            "next": self.db.get_tasks(section="next"),
+            "all": self.db.get_tasks(),
+            "done": self.db.get_done_tasks(),
+        }
 
+        # Apply filter + sort, load into widgets, track counts
+        for key in self._tab_keys:
+            tasks = self._filter(raw[key])
+            tasks = self._sort_tasks(tasks) if key != "done" else tasks
+            self.tab_lists[key].load_tasks(tasks)
+
+        # Hide empty tabs (suggested always visible)
+        for i, key in enumerate(self._tab_keys):
+            count = self.tab_lists[key].count()
+            self.tabs.setTabVisible(i, count > 0 or key == "suggested")
+
+        # Status bar
         s = self.db.get_summary()
-        done_count = len(self.db.get_done_tasks())
+        done_count = len(raw["done"])
         msg = f"Active: {s['total']} | Done: {done_count} | Overdue: {s['overdue']}"
+        if self._search_text:
+            msg += f" | Filter: '{self._search_text}'"
         if purged:
             msg += f" | Purged: {purged}"
         self.status.showMessage(msg)
