@@ -185,6 +185,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QCheckBox,
     QLineEdit,
+    QTextEdit,
     QPushButton,
     QScrollArea,
     QFrame,
@@ -267,6 +268,9 @@ class TrayPopup(QWidget):
                               border-radius: 3px; }
             QLineEdit { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
                         color: #f7fafc; padding: 6px 10px; margin: 2px 14px; }
+            QTextEdit { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
+                        color: #f7fafc; padding: 6px 10px; margin: 2px 14px; font-family: 'Segoe UI';
+                        font-size: 13px; }
             QComboBox { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
                         color: #f7fafc; padding: 4px 8px; margin: 2px 14px; }
             QComboBox QAbstractItemView { background: #2d3748; color: #f7fafc;
@@ -311,8 +315,9 @@ class TrayPopup(QWidget):
         self._add_title = QLineEdit()
         self._add_title.setPlaceholderText("Title...")
         form_layout.addWidget(self._add_title)
-        self._add_desc = QLineEdit()
+        self._add_desc = QTextEdit()
         self._add_desc.setPlaceholderText("Description...")
+        self._add_desc.setMaximumHeight(60)
         form_layout.addWidget(self._add_desc)
         self._add_due = QLineEdit()
         self._add_due.setPlaceholderText("Due date (YYYY-MM-DD)")
@@ -370,7 +375,8 @@ class TrayPopup(QWidget):
                 for t in tasks
                 if q
                 in (
-                    f"{t.get('title', '')} {t.get('priority', '')} "
+                    f"{t.get('title', '')} {t.get('description', '')} "
+                    f"{t.get('priority', '')} "
                     f"{t.get('project', '')} {t.get('due_date', '')}"
                 ).lower()
             ]
@@ -415,6 +421,10 @@ class TrayPopup(QWidget):
         plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, '#718096')};")
         hl.addWidget(plbl)
 
+        desc = task.get("description")
+        if desc:
+            row.setToolTip(desc)
+
         return row
 
     def _on_toggle(self, task_id, checked):
@@ -437,7 +447,7 @@ class TrayPopup(QWidget):
         if not title:
             return
         kwargs = {"section": "inbox", "priority": self._add_priority.currentText()}
-        desc = self._add_desc.text().strip()
+        desc = self._add_desc.toPlainText().strip()
         due = self._add_due.text().strip()
         if due:
             kwargs["due_date"] = due
@@ -500,6 +510,9 @@ class EditTaskDialog(QDialog):
             QLineEdit { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
                         border-radius: 4px; padding: 6px; }
             QLineEdit:focus { border-color: #1a2332; }
+            QTextEdit { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+                        border-radius: 4px; padding: 6px; font-family: 'Segoe UI'; font-size: 13px; }
+            QTextEdit:focus { border-color: #1a2332; }
             QComboBox { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
                         border-radius: 4px; padding: 4px 8px; }
             QComboBox:focus { border-color: #1a2332; }
@@ -514,6 +527,12 @@ class EditTaskDialog(QDialog):
 
         self.title_edit = QLineEdit(task.get("title", ""))
         layout.addRow("Title:", self.title_edit)
+
+        self.desc_edit = QTextEdit()
+        self.desc_edit.setPlainText(task.get("description", "") or "")
+        self.desc_edit.setMaximumHeight(80)
+        self.desc_edit.setPlaceholderText("Description...")
+        layout.addRow("Description:", self.desc_edit)
 
         self.section_combo = QComboBox()
         self.section_combo.addItems(SECTIONS)
@@ -542,6 +561,7 @@ class EditTaskDialog(QDialog):
     def get_values(self):
         vals = {
             "title": self.title_edit.text().strip(),
+            "description": self.desc_edit.toPlainText().strip() or None,
             "section": self.section_combo.currentText(),
             "priority": self.priority_combo.currentText(),
         }
@@ -589,7 +609,15 @@ class TaskListWidget(QListWidget):
             )
             priority = (task.get("priority") or "medium").upper()
             due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
-            item.setText(f"[{priority}] {task['title']}{due}")
+            desc = task.get("description") or ""
+            preview = (
+                f" — {desc[:50]}..."
+                if len(desc) > 50
+                else (f" — {desc}" if desc else "")
+            )
+            item.setText(f"[{priority}] {task['title']}{due}{preview}")
+            if desc:
+                item.setToolTip(desc)
             if task["status"] == "done":
                 item.setForeground(QColor("#1a5632"))
             self.addItem(item)
@@ -782,7 +810,8 @@ class FullWindow(QMainWindow):
             for t in tasks
             if q
             in (
-                f"{t.get('title', '')} {t.get('priority', '')} {t.get('project', '')} "
+                f"{t.get('title', '')} {t.get('description', '')} "
+                f"{t.get('priority', '')} {t.get('project', '')} "
                 f"{t.get('due_date', '')} {t.get('section', '')} {t.get('status', '')}"
             ).lower()
         ]
