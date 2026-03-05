@@ -142,7 +142,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 """
 
 
-
 # ── Connection helper ────────────────────────────────────────────────────
 @contextmanager
 def _get_conn():
@@ -1343,7 +1342,31 @@ def bridge_push(tag: str = "shared") -> str:
         "tasks": tasks_out,
     }
 
+    # Preserve extra *_tasks keys from remote (e.g. reading_tasks from Fedora)
+    # until they are absorbed into the unified tasks table via bridge_pull
     shared_path = Path(BRIDGE_REPO) / "shared.json"
+    if shared_path.exists():
+        try:
+            existing = json.loads(shared_path.read_text(encoding="utf-8"))
+            known_keys = {
+                "version",
+                "pushed_at",
+                "machine_id",
+                "entities",
+                "relations",
+                "tasks",
+            }
+            for key, val in existing.items():
+                if key not in known_keys and isinstance(val, list):
+                    payload[key] = val
+                    logger.info(
+                        "bridge_push: preserving extra key '%s' (%d items)",
+                        key,
+                        len(val),
+                    )
+        except (json.JSONDecodeError, OSError):
+            pass
+
     shared_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -1408,7 +1431,12 @@ def bridge_pull() -> str:
 
     entities = payload.get("entities", [])
     relations = payload.get("relations", [])
-    tasks = payload.get("tasks", [])  # v2 — backward compat with v1
+    # Collect tasks from all *_tasks keys (tasks, reading_tasks, etc.)
+    tasks = list(payload.get("tasks", []))
+    for key, val in payload.items():
+        if key.endswith("_tasks") and key != "tasks" and isinstance(val, list):
+            tasks.extend(val)
+            logger.info("bridge_pull: merged %d tasks from '%s'", len(val), key)
     now = _now()
     new_entities = 0
     new_observations = 0
@@ -1472,7 +1500,10 @@ def bridge_pull() -> str:
 
         # Import tasks (last-write-wins by updated_at)
         # Sort parents before children to avoid FK violations
-        tasks_sorted = sorted(tasks, key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")))
+        tasks_sorted = sorted(
+            tasks,
+            key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")),
+        )
         for task in tasks_sorted:
             tid = task.get("id")
             if not tid:
