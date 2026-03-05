@@ -4,32 +4,25 @@ System tray widget with dual mode: compact popup + full window.
 Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
-import os
 import sqlite3
 import uuid
-from datetime import UTC, date, datetime
+from datetime import date
 
-
-DB_PATH = os.path.expanduser("~/.claude/memory/memory.db")
-
-SECTIONS = ("today", "inbox", "next", "waiting", "someday")
-PRIORITIES = ("critical", "high", "medium", "low")
-STATUSES = ("not_started", "in_progress", "pending", "done", "archived", "cancelled")
-HIDDEN_STATUSES = ("archived", "cancelled")
-ALLOWED_FIELDS = frozenset(
-    {
-        "title",
-        "description",
-        "status",
-        "section",
-        "priority",
-        "due_date",
-        "project",
-        "notes",
-        "recurring",
-        "updated_at",
-    }
+from db_utils import (
+    DB_PATH,
+    PRIORITY_COLORS,
+    TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
+    TASK_HIDDEN_STATUSES as HIDDEN_STATUSES,
+    TASK_PRIORITIES,
+    TASK_SECTIONS as SECTIONS,
+    is_overdue,
+    now_iso,
 )
+
+PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
+
+# Upper-case priority colors for UI lookups
+_PRIORITY_COLORS_UPPER = {k.upper(): v for k, v in PRIORITY_COLORS.items()}
 
 
 class TaskDB:
@@ -95,11 +88,10 @@ class TaskDB:
     def get_summary(self):
         """Return dict with total, overdue counts."""
         tasks = self.get_tasks()
-        today = date.today().isoformat()
         overdue = sum(
             1
             for t in tasks
-            if t.get("due_date") and t["due_date"] < today and t["status"] != "done"
+            if is_overdue(t.get("due_date")) and t["status"] != "done"
         )
         return {"total": len(tasks), "overdue": overdue}
 
@@ -114,7 +106,7 @@ class TaskDB:
     ):
         """Insert new task, return its ID."""
         task_id = str(uuid.uuid4())
-        now = datetime.now(UTC).isoformat()
+        now = now_iso()
         self._conn.execute(
             "INSERT INTO tasks (id, title, status, section, priority, "
             "due_date, project, created_at, updated_at) "
@@ -128,7 +120,7 @@ class TaskDB:
 
     def mark_done(self, task_id):
         """Set status=done."""
-        now = datetime.now(UTC).isoformat()
+        now = now_iso()
         self._conn.execute(
             "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
             (now, task_id),
@@ -144,7 +136,7 @@ class TaskDB:
         invalid = set(fields) - ALLOWED_FIELDS
         if invalid:
             raise ValueError(f"Unknown task fields: {invalid}")
-        fields["updated_at"] = datetime.now(UTC).isoformat()
+        fields["updated_at"] = now_iso()
         sets = ", ".join(f"{k}=?" for k in fields)
         vals = list(fields.values()) + [task_id]
         self._conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals)
@@ -330,13 +322,9 @@ class TrayPopup(QWidget):
         self.task_layout.addStretch()
 
     def _make_task_row(self, task):
-        is_overdue = (
-            task.get("due_date")
-            and task["due_date"] < date.today().isoformat()
-            and task["status"] != "done"
-        )
+        overdue = is_overdue(task.get("due_date")) and task["status"] != "done"
         row = QWidget()
-        if is_overdue:
+        if overdue:
             row.setStyleSheet(
                 "border-left: 3px solid #e53e3e; background: rgba(229,62,62,0.05);"
             )
@@ -352,15 +340,9 @@ class TrayPopup(QWidget):
         hl.addWidget(cb, 1)
 
         priority = (task.get("priority") or "medium").upper()
-        colors = {
-            "CRITICAL": "#e53e3e",
-            "HIGH": "#dd6b20",
-            "MEDIUM": "#2b6cb0",
-            "LOW": "#718096",
-        }
         plbl = QLabel(priority)
         plbl.setObjectName("priority")
-        plbl.setStyleSheet(f"color: {colors.get(priority, '#718096')};")
+        plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, '#718096')};")
         hl.addWidget(plbl)
 
         return row
@@ -658,14 +640,16 @@ class TaskTrayApp:
         self.popup = None
         self.full_window = None
 
-    def _update_icon(self):
-        summary = self.db.get_summary()
+    def _update_icon(self, summary=None):
+        if summary is None:
+            summary = self.db.get_summary()
         pm = create_tray_icon_pixmap(summary["overdue"])
         self.tray.setIcon(QIcon(pm))
 
-    def _tooltip(self):
-        s = self.db.get_summary()
-        return f"Tasks: {s['total']} | Overdue: {s['overdue']}"
+    def _tooltip(self, summary=None):
+        if summary is None:
+            summary = self.db.get_summary()
+        return f"Tasks: {summary['total']} | Overdue: {summary['overdue']}"
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -701,8 +685,9 @@ class TaskTrayApp:
 
     def _refresh_all(self):
         """Update tray icon badge + tooltip after any change."""
-        self._update_icon()
-        self.tray.setToolTip(self._tooltip())
+        summary = self.db.get_summary()
+        self._update_icon(summary)
+        self.tray.setToolTip(self._tooltip(summary))
         if self.popup and self.popup.isVisible():
             self.popup.refresh()
         if self.full_window and self.full_window.isVisible():

@@ -9,13 +9,12 @@ Usage:
 """
 
 import os
-import sqlite3
 from datetime import date, datetime
 
-DB_PATH = os.path.expanduser("~/.claude/memory/memory.db")
-BRIDGE_REPO = os.path.expanduser("~/.claude/memory/bridge")
+from db_utils import BRIDGE_REPO, TASK_SECTIONS as SECTIONS
+from db_utils import PRIORITY_RANK, get_conn, is_overdue as _is_overdue
+from db_utils import priority_sort_key
 
-SECTIONS = ["today", "inbox", "next", "waiting", "someday"]
 SECTION_LABELS = {
     "today": "Today",
     "inbox": "Inbox",
@@ -24,7 +23,7 @@ SECTION_LABELS = {
     "someday": "Someday",
 }
 
-PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+PRIORITY_ORDER = {p: len(PRIORITY_RANK) - 1 - r for p, r in PRIORITY_RANK.items()}
 
 
 def _get_tasks() -> tuple[list[dict], set[str]]:
@@ -34,11 +33,7 @@ def _get_tasks() -> tuple[list[dict], set[str]]:
     tasks_list: all non-archived, non-cancelled tasks as dicts.
     parent_ids_set: set of IDs that are referenced as parent_id by any task.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+    with get_conn() as conn:
         cur = conn.cursor()
 
         cur.execute(
@@ -59,15 +54,7 @@ def _get_tasks() -> tuple[list[dict], set[str]]:
             parent_ids.add(row[0])
 
         return tasks, parent_ids
-    finally:
-        conn.close()
 
-
-def _sort_key(task: dict) -> tuple:
-    priority = PRIORITY_ORDER.get(task.get("priority", "low"), 3)
-    parsed = _parse_date(task.get("due_date"))
-    due = parsed.isoformat() if parsed else "9999-12-31"
-    return (priority, due)
 
 
 def _html_escape(text: str) -> str:
@@ -82,15 +69,6 @@ def _html_escape(text: str) -> str:
     )
 
 
-def _parse_date(s: str | None) -> date | None:
-    """Parse YYYY-MM-DD to date, or None on invalid/missing input."""
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s)
-    except ValueError:
-        return None
-
 
 def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
     title = _html_escape(task.get("title") or "Untitled")
@@ -102,11 +80,10 @@ def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
     task_id = task.get("id", "")
     has_children = task_id in parent_ids
 
-    parsed_due = _parse_date(due_date)
-    is_overdue = bool(parsed_due and parsed_due < date.today())
+    overdue = _is_overdue(due_date)
 
     card_class = "card"
-    if is_overdue:
+    if overdue:
         card_class += " card--overdue"
 
     priority_label = priority.upper()
@@ -114,7 +91,7 @@ def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
 
     badges_html = f'<span class="{priority_class}">{priority_label}</span>'
 
-    if is_overdue:
+    if overdue:
         badges_html += ' <span class="badge badge--overdue">OVERDUE</span>'
 
     if has_children:
@@ -177,10 +154,10 @@ def _build_html(tasks: list[dict], parent_ids: set[str]) -> str:
 
     # Sort within each section
     for section in SECTIONS:
-        by_section[section].sort(key=_sort_key)
+        by_section[section].sort(key=priority_sort_key)
 
     total = len(tasks)
-    overdue = sum(1 for t in tasks if _parse_date(t.get("due_date")) is not None and _parse_date(t.get("due_date")) < today)
+    overdue = sum(1 for t in tasks if _is_overdue(t.get("due_date")))
 
     columns_html = "".join(
         _render_column(s, by_section[s], today_str, parent_ids) for s in SECTIONS

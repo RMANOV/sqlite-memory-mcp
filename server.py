@@ -19,9 +19,17 @@ import sqlite3
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from db_utils import (
+    TASK_SECTIONS as _TASK_SECTIONS,
+    TASK_PRIORITIES as _TASK_PRIORITIES,
+    TASK_STATUSES as _TASK_STATUSES,
+    build_priority_order_sql,
+    now_iso as _now,
+)
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
 LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
@@ -133,10 +141,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 );
 """
 
-
-def _now() -> str:
-    """ISO 8601 UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
 
 
 # ── Connection helper ────────────────────────────────────────────────────
@@ -829,9 +833,7 @@ def search_by_project(query: str, project: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-_TASK_STATUSES = ("not_started", "in_progress", "done", "archived", "cancelled")
-_TASK_PRIORITIES = ("low", "medium", "high", "critical")
-_TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting")
+# _TASK_STATUSES, _TASK_PRIORITIES, _TASK_SECTIONS imported from db_utils
 
 
 @mcp.tool()
@@ -1040,8 +1042,7 @@ def query_tasks(
             f"SELECT id, title, description, status, priority, section, due_date, project, parent_id "
             f"FROM tasks WHERE {where} "
             f"ORDER BY "
-            f"  CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-            f"       WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, "
+            f"  {build_priority_order_sql()}, "
             f"  due_date ASC NULLS LAST, created_at ASC "
             f"LIMIT ?",
             params,
@@ -1098,8 +1099,7 @@ def task_digest(
             f"ORDER BY "
             f"  CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
             f"       WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
-            f"  CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-            f"       WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END "
+            f"  {build_priority_order_sql()} "
             f"LIMIT ?",
             target_sections + [limit],
         ).fetchall()
