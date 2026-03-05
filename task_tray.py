@@ -124,15 +124,27 @@ class TaskDB:
         due_date=None,
         project=None,
         status="not_started",
+        description=None,
     ):
         """Insert new task, return its ID."""
         task_id = str(uuid.uuid4())
         now = now_iso()
         self._conn.execute(
-            "INSERT INTO tasks (id, title, status, section, priority, "
+            "INSERT INTO tasks (id, title, description, status, section, priority, "
             "due_date, project, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, title, status, section, priority, due_date, project, now, now),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                title,
+                description,
+                status,
+                section,
+                priority,
+                due_date,
+                project,
+                now,
+                now,
+            ),
         )
         self._conn.commit()
         if self.on_change:
