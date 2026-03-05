@@ -340,28 +340,15 @@ class TrayPopup(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-        today_tasks = self.db.get_tasks(section="today")
-        overdue = self.db.get_overdue()
+        tasks = self.db.get_suggested_tasks(limit=8)
 
-        # Remove duplicates (overdue today tasks)
-        today_ids = {t["id"] for t in today_tasks}
-        overdue_only = [t for t in overdue if t["id"] not in today_ids]
-
-        if today_tasks:
-            lbl = QLabel(f"Today ({len(today_tasks)})")
+        if tasks:
+            lbl = QLabel(f"Suggested ({len(tasks)})")
             lbl.setObjectName("section-header")
             self.task_layout.addWidget(lbl)
-            for task in today_tasks:
+            for task in tasks:
                 self.task_layout.addWidget(self._make_task_row(task))
-
-        if overdue_only:
-            lbl = QLabel(f"Overdue ({len(overdue_only)})")
-            lbl.setObjectName("section-header")
-            self.task_layout.addWidget(lbl)
-            for task in overdue_only:
-                self.task_layout.addWidget(self._make_task_row(task))
-
-        if not today_tasks and not overdue_only:
+        else:
             lbl = QLabel("All clear!")
             lbl.setObjectName("section-header")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
