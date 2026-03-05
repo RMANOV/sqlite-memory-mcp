@@ -4,6 +4,7 @@ System tray widget with dual mode: compact popup + full window.
 Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
+import html as _html
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -630,12 +631,6 @@ class TaskReaderDialog(QDialog):
 
         layout.addWidget(self._header)
 
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color: #e2e8f0;")
-        layout.addWidget(sep)
-
         # Body scroll area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -708,8 +703,6 @@ class TaskReaderDialog(QDialog):
         # Body
         desc = self.task.get("description") or ""
         if desc:
-            import html as _html
-
             escaped = _html.escape(desc)
             paragraphs = escaped.split("\n\n")
             body_html = "".join(
@@ -787,12 +780,14 @@ class TaskListWidget(QListWidget):
             self.addItem(item)
         self.blockSignals(False)
 
-    def _on_double_click(self, item):
-        task_id = item.data(Qt.ItemDataRole.UserRole)
+    def _open_reader(self, task_id):
         task = next((t for t in self._tasks if t["id"] == task_id), None)
         if task:
             dlg = TaskReaderDialog(task, self.db, self)
             dlg.exec()
+
+    def _on_double_click(self, item):
+        self._open_reader(item.data(Qt.ItemDataRole.UserRole))
 
     def _context_menu(self, pos):
         item = self.itemAt(pos)
@@ -804,16 +799,13 @@ class TaskListWidget(QListWidget):
             "QMenu { background: #ffffff; color: #000000; border: 1px solid #a0aec0; }"
             "QMenu::item:selected { background: #1a2332; color: #ffffff; }"
         )
-        delete_action = menu.addAction("Delete")
         view_action = menu.addAction("View")
+        delete_action = menu.addAction("Delete")
         action = menu.exec(self.mapToGlobal(pos))
-        if action == delete_action:
+        if action == view_action:
+            self._open_reader(task_id)
+        elif action == delete_action:
             self.db.delete_task(task_id)
-        elif action == view_action:
-            task = next((t for t in self._tasks if t["id"] == task_id), None)
-            if task:
-                dlg = TaskReaderDialog(task, self.db, self)
-                dlg.exec()
 
 
 _REFRESH_INTERVAL_MS = 30_000
