@@ -266,7 +266,7 @@ def create_tray_icon_pixmap(overdue_count=0):
 
 
 class TrayPopup(QWidget):
-    """Compact popup showing Today + Overdue tasks."""
+    """Compact popup showing top suggested tasks."""
 
     def __init__(self, db, on_open_full, parent=None):
         super().__init__(
