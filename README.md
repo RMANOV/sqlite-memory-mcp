@@ -1,8 +1,8 @@
 # SQLite Memory MCP Server
 
-A production-quality SQLite-backed MCP Memory server with WAL concurrent safety (10+ sessions), FTS5 BM25 search, and session tracking.
+A production-quality SQLite-backed MCP Memory server with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, and a native system tray task manager.
 
-Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 12 additional tools for session tracking, task management, cross-project search, and cross-machine bridge sync.
+Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 12 additional tools for session tracking, task management, cross-project search, and cross-machine bridge sync. Includes a PyQt6 desktop app for visual task management and five standalone automation scripts.
 
 ## Why SQLite?
 
@@ -86,17 +86,21 @@ The `SQLITE_MEMORY_DB` environment variable controls where the database is store
 ```
 ┌──────────────┐     stdio      ┌──────────────────┐
 │  Claude Code  │◄──────────────►│  FastMCP Server   │
-│  (session 1)  │               │                    │
+│  (session N)  │               │  server.py         │
 ├──────────────┤               │  21 MCP Tools      │
-│  Claude Code  │◄─────────────►│  ┌──────────────┐ │
-│  (session 2)  │               │  │  SQLite WAL   │ │
+│  Task Tray    │──── direct ──►│  ┌──────────────┐ │
+│  (PyQt6 GUI)  │   sqlite3     │  │  SQLite WAL   │ │
 ├──────────────┤               │  │  memory.db    │ │
-│  Claude Code  │◄─────────────►│  │  FTS5 index   │ │
-│  (session N)  │               │  └──────────────┘ │
+│  Utility      │──── direct ──►│  │  FTS5 index   │ │
+│  Scripts      │   sqlite3     │  └──────────────┘ │
 └──────────────┘               └──────────────────┘
+                                        │
+                                   db_utils.py
+                               (shared constants,
+                                connection, helpers)
 ```
 
-Each Claude Code session spawns its own `server.py` process via stdio. All processes connect to the same `memory.db` file. SQLite WAL mode allows concurrent reads and writes without blocking.
+Each Claude Code session spawns its own `server.py` process via stdio. The Task Tray GUI and utility scripts connect directly to the same `memory.db`. All consumers share `db_utils.py` for consistent DB access. SQLite WAL mode handles concurrency between all processes.
 
 ## Schema
 
@@ -456,7 +460,7 @@ create_task(
 )
 ```
 
-The automation script `~/notion_automations/recurring_tasks.py` reads this field and recreates tasks on schedule.
+The automation script `recurring_tasks.py` reads this field and recreates tasks on schedule.
 
 ### Automation scripts
 
@@ -492,6 +496,42 @@ git push
 ```
 
 Enable GitHub Pages on the bridge repo (Settings > Pages > Branch: main) to get a live URL.
+
+## Task Tray (Desktop App)
+
+`task_tray.py` is a native PyQt6 system tray application for visual task management:
+
+- **System tray icon** with overdue badge counter
+- **Compact popup** (left-click) -- Today + Overdue tasks, checkbox toggle, quick-add
+- **Full window** (right-click > Open Full Window) -- tabbed view with Today / Inbox / Next / All
+- **Auto-refresh** every 30 seconds when visible
+- **Window geometry** persisted via QSettings
+
+```bash
+# Install PyQt6 (one-time)
+pip install PyQt6
+
+# Run
+python3 task_tray.py
+```
+
+The tray app reads/writes directly to `memory.db` via `db_utils.py`, so changes are immediately visible in Claude Code sessions and vice versa.
+
+### Shared Module -- `db_utils.py`
+
+All Python files share constants and helpers via `db_utils.py`:
+
+```python
+from db_utils import (
+    DB_PATH, BRIDGE_REPO,
+    TASK_SECTIONS, TASK_PRIORITIES, TASK_STATUSES,
+    PRIORITY_RANK, PRIORITY_COLORS,
+    get_conn, now_iso, parse_iso_date, is_overdue,
+    build_priority_order_sql, priority_sort_key,
+)
+```
+
+This eliminates duplication of DB connection setup, task constants, and timestamp helpers across `server.py`, `task_tray.py`, and the utility scripts.
 
 ## License
 
