@@ -6,7 +6,7 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 
 import sqlite3
 import uuid
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from db_utils import (
     DB_PATH,
@@ -62,16 +62,34 @@ class TaskDB:
         self._conn.close()
 
     def get_tasks(self, section=None):
-        """Return non-hidden tasks, optionally filtered by section."""
-        placeholders = ",".join("?" for _ in HIDDEN_STATUSES)
+        """Return active tasks (excludes done, archived, cancelled)."""
+        excluded = list(HIDDEN_STATUSES) + ["done"]
+        placeholders = ",".join("?" for _ in excluded)
         sql = f"SELECT * FROM tasks WHERE status NOT IN ({placeholders})"
-        params = list(HIDDEN_STATUSES)
+        params = list(excluded)
         if section:
             sql += " AND section = ?"
             params.append(section)
         sql += " ORDER BY created_at"
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def get_done_tasks(self):
+        """Return completed tasks, newest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE status = 'done' ORDER BY updated_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def purge_old_done(self, days=30):
+        """Delete done tasks older than `days` days. Returns count deleted."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cur = self._conn.execute(
+            "DELETE FROM tasks WHERE status = 'done' AND updated_at < ?", (cutoff,)
+        )
+        if cur.rowcount:
+            self._conn.commit()
+        return cur.rowcount
 
     def get_overdue(self):
         """Return non-hidden tasks with due_date in the past."""
@@ -569,11 +587,13 @@ class FullWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self.tab_lists = {}
-        for section in ("today", "inbox", "next", "all"):
+        for section in ("today", "inbox", "next", "all", "done"):
             lw = TaskListWidget(self.db)
             lw.itemChanged.connect(lambda item, s=section: self._on_item_changed(item))
             self.tab_lists[section] = lw
-            label = section.title() if section != "all" else "All"
+            label = (
+                section.title() if section not in ("all", "done") else section.title()
+            )
             self.tabs.addTab(lw, label)
 
         # Toolbar
@@ -598,15 +618,23 @@ class FullWindow(QMainWindow):
         self.refresh()
 
     def refresh(self):
+        # Auto-purge done tasks older than 30 days
+        purged = self.db.purge_old_done(days=30)
+
         for section, lw in self.tab_lists.items():
-            if section == "all":
-                tasks = self.db.get_tasks()
+            if section == "done":
+                lw.load_tasks(self.db.get_done_tasks())
+            elif section == "all":
+                lw.load_tasks(self.db.get_tasks())
             else:
-                tasks = self.db.get_tasks(section=section)
-            lw.load_tasks(tasks)
+                lw.load_tasks(self.db.get_tasks(section=section))
 
         s = self.db.get_summary()
-        self.status.showMessage(f"Tasks: {s['total']} | Overdue: {s['overdue']}")
+        done_count = len(self.db.get_done_tasks())
+        msg = f"Active: {s['total']} | Done: {done_count} | Overdue: {s['overdue']}"
+        if purged:
+            msg += f" | Purged: {purged}"
+        self.status.showMessage(msg)
 
     def _on_item_changed(self, item):
         task_id = item.data(Qt.ItemDataRole.UserRole)
