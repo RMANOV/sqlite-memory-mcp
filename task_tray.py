@@ -600,7 +600,9 @@ class TaskReaderDialog(QDialog):
             QLabel#reader-meta { color: #4a5568; font-size: 12px; padding: 2px 6px; }
             QLabel#reader-priority { font-size: 11px; font-weight: bold; padding: 2px 8px;
                                      border-radius: 3px; }
-            QLabel#reader-body { color: #1a202c; font-size: 13px; padding: 16px; }
+            QScrollArea { background: #ffffff; border: none; }
+            QLabel#reader-body { color: #1a202c; font-size: 13px; padding: 16px;
+                                 background: #ffffff; }
             QFrame#reader-header { background: #f7fafc; border-bottom: 1px solid #e2e8f0; }
             QPushButton { background: #e2e8f0; color: #000000; border: 1px solid #a0aec0;
                           border-radius: 4px; padding: 8px 20px; font-weight: bold;
