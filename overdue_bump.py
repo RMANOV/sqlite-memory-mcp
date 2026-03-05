@@ -8,7 +8,17 @@ and current priority is lower than the target. Updates them to target priority.
 import argparse
 import sys
 
-from db_utils import DB_PATH, PRIORITY_RANK, TASK_PRIORITIES, get_conn, now_iso
+from db_utils import (
+    DB_PATH,
+    PRIORITY_RANK,
+    TASK_ACTIVE_EXCLUSIONS,
+    TASK_PRIORITIES,
+    get_conn,
+    now_iso,
+)
+
+# Pre-built SQL fragment for active-task exclusion filter
+_EXCL_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
 
 
 def run(db_path: str, target_priority: str, dry_run: bool) -> int:
@@ -34,9 +44,9 @@ def run(db_path: str, target_priority: str, dry_run: bool) -> int:
             rows = conn.execute(
                 f"SELECT id, title, priority, due_date FROM tasks "
                 f"WHERE due_date < date('now') "
-                f"AND status NOT IN ('done', 'archived', 'cancelled') "
+                f"AND status NOT IN ({_EXCL_PH}) "
                 f"AND priority IN ({ph})",
-                lower_priorities,
+                list(TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
             ).fetchall()
             if not rows:
                 print("Dry run: no overdue tasks would be bumped.")
@@ -54,9 +64,11 @@ def run(db_path: str, target_priority: str, dry_run: bool) -> int:
             cur = conn.execute(
                 f"UPDATE tasks SET priority = ?, updated_at = ? "
                 f"WHERE due_date < date('now') "
-                f"AND status NOT IN ('done', 'archived', 'cancelled') "
+                f"AND status NOT IN ({_EXCL_PH}) "
                 f"AND priority IN ({ph})",
-                [target_priority, now] + lower_priorities,
+                [target_priority, now]
+                + list(TASK_ACTIVE_EXCLUSIONS)
+                + lower_priorities,
             )
             print(f"Bumped {cur.rowcount} task(s) to '{target_priority}'.")
 

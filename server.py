@@ -24,12 +24,16 @@ from pathlib import Path
 from typing import Any
 
 from db_utils import (
+    TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
     TASK_STATUSES as _TASK_STATUSES,
     build_priority_order_sql,
     now_iso as _now,
 )
+
+# Pre-built SQL fragment for active-task exclusion filter
+_EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
 LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
@@ -1031,7 +1035,8 @@ def query_tasks(
         params.append(parent_id)
     if overdue_only:
         conditions.append("due_date < date('now')")
-        conditions.append("status NOT IN ('done', 'archived', 'cancelled')")
+        conditions.append(f"status NOT IN ({_EXCL_PH})")
+        params.extend(_TASK_ACTIVE_EXCLUSIONS)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     params.append(limit)
@@ -1109,8 +1114,9 @@ def task_digest(
             overdue = conn.execute(
                 "SELECT id, title, status, priority, section, due_date, project "
                 "FROM tasks "
-                "WHERE due_date < date('now') AND status NOT IN ('done', 'archived', 'cancelled') "
-                "ORDER BY due_date ASC LIMIT 10"
+                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) "
+                "ORDER BY due_date ASC LIMIT 10",
+                list(_TASK_ACTIVE_EXCLUSIONS),
             ).fetchall()
 
         # Counts
@@ -1223,9 +1229,9 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
         cur = conn.execute(
             f"UPDATE tasks SET priority = ?, updated_at = ? "
             f"WHERE due_date < date('now') "
-            f"AND status NOT IN ('done', 'archived', 'cancelled') "
+            f"AND status NOT IN ({_EXCL_PH}) "
             f"AND priority IN ({ph})",
-            [target_priority, now] + lower_priorities,
+            [target_priority, now] + list(_TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
         )
         bumped = cur.rowcount
 

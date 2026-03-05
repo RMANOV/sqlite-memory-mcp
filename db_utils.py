@@ -31,6 +31,7 @@ TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting")
 TASK_PRIORITIES = ("low", "medium", "high", "critical")  # ascending rank
 TASK_STATUSES = ("not_started", "in_progress", "done", "archived", "cancelled")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
+TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 
 PRIORITY_RANK = {p: i for i, p in enumerate(TASK_PRIORITIES)}
 

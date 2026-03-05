@@ -6,23 +6,29 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 
 import sqlite3
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from db_utils import (
     DB_PATH,
     PRIORITY_COLORS,
+    TASK_ACTIVE_EXCLUSIONS,
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
-    TASK_HIDDEN_STATUSES as HIDDEN_STATUSES,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
+    build_priority_order_sql,
     is_overdue,
     now_iso,
+    priority_sort_key,
 )
 
 PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
 
 # Upper-case priority colors for UI lookups
 _PRIORITY_COLORS_UPPER = {k.upper(): v for k, v in PRIORITY_COLORS.items()}
+
+# SQL fragment for active-task exclusion (reused across queries)
+_ACTIVE_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
+_ACTIVE_PARAMS = list(TASK_ACTIVE_EXCLUSIONS)
 
 
 class TaskDB:
@@ -61,17 +67,13 @@ class TaskDB:
     def close(self):
         self._conn.close()
 
-    def get_tasks(self, section=None):
-        """Return active tasks (excludes done, archived, cancelled)."""
-        excluded = list(HIDDEN_STATUSES) + ["done"]
-        placeholders = ",".join("?" for _ in excluded)
-        sql = f"SELECT * FROM tasks WHERE status NOT IN ({placeholders})"
-        params = list(excluded)
-        if section:
-            sql += " AND section = ?"
-            params.append(section)
-        sql += " ORDER BY created_at"
-        rows = self._conn.execute(sql, params).fetchall()
+    def get_all_active(self):
+        """Return all active tasks (excludes done, archived, cancelled)."""
+        rows = self._conn.execute(
+            f"SELECT * FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
+            "ORDER BY created_at",
+            _ACTIVE_PARAMS,
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def get_done_tasks(self):
@@ -93,54 +95,24 @@ class TaskDB:
 
     def get_suggested_tasks(self, limit=20):
         """Return prioritized mix: overdue + high/critical + nearest due."""
-        excluded = list(HIDDEN_STATUSES) + ["done"]
-        ph = ",".join("?" for _ in excluded)
+        pri_sql = build_priority_order_sql()
         rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE status NOT IN ({ph}) "
+            f"SELECT * FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
             "ORDER BY "
             "CASE WHEN due_date IS NOT NULL AND due_date < date('now') THEN 0 ELSE 1 END, "
-            "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-            "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, "
+            f"{pri_sql}, "
             "CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, "
             "created_at DESC "
-            f"LIMIT ?",
-            excluded + [limit],
+            "LIMIT ?",
+            _ACTIVE_PARAMS + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def search_tasks(self, query):
-        """Search across title, project, priority, section, due_date."""
-        excluded = list(HIDDEN_STATUSES)
-        ph = ",".join("?" for _ in excluded)
-        pattern = f"%{query}%"
-        rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE status NOT IN ({ph}) "
-            "AND (title LIKE ? OR COALESCE(project,'') LIKE ? "
-            "OR priority LIKE ? OR section LIKE ? "
-            "OR COALESCE(due_date,'') LIKE ? OR status LIKE ?) "
-            "ORDER BY created_at DESC",
-            excluded + [pattern] * 6,
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_overdue(self):
-        """Return non-hidden tasks with due_date in the past."""
-        today = date.today().isoformat()
-        placeholders = ",".join("?" for _ in HIDDEN_STATUSES)
-        sql = (
-            f"SELECT * FROM tasks WHERE status NOT IN ({placeholders}) "
-            "AND due_date IS NOT NULL AND due_date < ? AND status <> 'done' "
-            "ORDER BY due_date"
-        )
-        params = list(HIDDEN_STATUSES) + [today]
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
-
-    def get_summary(self):
-        """Return dict with total, overdue counts."""
-        tasks = self.get_tasks()
-        overdue = sum(
-            1 for t in tasks if is_overdue(t.get("due_date")) and t["status"] != "done"
-        )
+    def get_summary(self, tasks=None):
+        """Return dict with total, overdue counts. Accepts pre-fetched tasks."""
+        if tasks is None:
+            tasks = self.get_all_active()
+        overdue = sum(1 for t in tasks if is_overdue(t.get("due_date")))
         return {"total": len(tasks), "overdue": overdue}
 
     def add_task(
@@ -286,7 +258,7 @@ class TrayPopup(QWidget):
     def _stylesheet(self):
         return """
             QWidget { background: #1a2332; color: #f7fafc; font-family: 'Segoe UI'; }
-            QLabel#header { font-size: 15px; font-weight: bold; padding: 10px 14px; }
+            QLabel#header { font-size: 15px; font-weight: bold; padding: 10px 0 10px 14px; }
             QLabel#section-header { font-size: 11px; color: #a0aec0; padding: 6px 14px 2px;
                                     text-transform: uppercase; letter-spacing: 1px; }
             QCheckBox { font-size: 13px; padding: 6px 14px; }
@@ -294,7 +266,18 @@ class TrayPopup(QWidget):
             QLabel#priority { font-size: 10px; font-weight: bold; padding: 2px 6px;
                               border-radius: 3px; }
             QLineEdit { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
-                        color: #f7fafc; padding: 6px 10px; margin: 6px 14px; }
+                        color: #f7fafc; padding: 6px 10px; margin: 2px 14px; }
+            QComboBox { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
+                        color: #f7fafc; padding: 4px 8px; margin: 2px 14px; }
+            QComboBox QAbstractItemView { background: #2d3748; color: #f7fafc;
+                                          selection-background-color: #4a5568; }
+            QPushButton#add-btn { background: transparent; border: none; color: #a0aec0;
+                                  font-size: 18px; font-weight: bold; padding: 4px 10px; }
+            QPushButton#add-btn:hover { color: #ffffff; }
+            QPushButton#submit-btn { background: #2d3748; border: 1px solid #4a5568;
+                                     border-radius: 4px; color: #f7fafc; padding: 6px;
+                                     margin: 2px 14px; font-weight: bold; }
+            QPushButton#submit-btn:hover { background: #4a5568; }
             QPushButton#open-full { background: #2d3748; border: none; color: #a0aec0;
                                     padding: 8px; font-size: 12px; }
             QPushButton#open-full:hover { background: #4a5568; color: #ffffff; }
@@ -305,10 +288,45 @@ class TrayPopup(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header
+        # Header row: "Tasks" + "+" button
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 8, 0)
         header = QLabel("Tasks")
         header.setObjectName("header")
-        layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch()
+        self._add_btn = QPushButton("+")
+        self._add_btn.setObjectName("add-btn")
+        self._add_btn.setFixedSize(30, 30)
+        self._add_btn.clicked.connect(self._toggle_add_form)
+        header_row.addWidget(self._add_btn)
+        layout.addLayout(header_row)
+
+        # Collapsible add-task form (hidden by default)
+        self._add_form = QWidget()
+        self._add_form.setVisible(False)
+        form_layout = QVBoxLayout(self._add_form)
+        form_layout.setContentsMargins(0, 0, 0, 4)
+        form_layout.setSpacing(0)
+        self._add_title = QLineEdit()
+        self._add_title.setPlaceholderText("Title...")
+        form_layout.addWidget(self._add_title)
+        self._add_desc = QLineEdit()
+        self._add_desc.setPlaceholderText("Description...")
+        form_layout.addWidget(self._add_desc)
+        self._add_due = QLineEdit()
+        self._add_due.setPlaceholderText("Due date (YYYY-MM-DD)")
+        form_layout.addWidget(self._add_due)
+        self._add_priority = QComboBox()
+        self._add_priority.addItems(PRIORITIES)
+        self._add_priority.setCurrentText("medium")
+        form_layout.addWidget(self._add_priority)
+        submit = QPushButton("Add Task")
+        submit.setObjectName("submit-btn")
+        submit.clicked.connect(self._submit_task)
+        self._add_title.returnPressed.connect(self._submit_task)
+        form_layout.addWidget(submit)
+        layout.addWidget(self._add_form)
 
         # Scroll area for tasks
         self.scroll = QScrollArea()
@@ -321,17 +339,19 @@ class TrayPopup(QWidget):
         self.scroll.setWidget(self.task_container)
         layout.addWidget(self.scroll)
 
-        # Quick add
-        self.add_input = QLineEdit()
-        self.add_input.setPlaceholderText("+ Quick add task...")
-        self.add_input.returnPressed.connect(self._quick_add)
-        layout.addWidget(self.add_input)
+        # Search bar (bottom)
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search tasks...")
+        self._search_input.textChanged.connect(self._on_search)
+        layout.addWidget(self._search_input)
 
         # Open full button
         btn = QPushButton("Open Full Window")
         btn.setObjectName("open-full")
         btn.clicked.connect(self.on_open_full)
         layout.addWidget(btn)
+
+        self._search_text = ""
 
     def refresh(self):
         """Reload tasks from DB and rebuild list."""
@@ -342,14 +362,29 @@ class TrayPopup(QWidget):
 
         tasks = self.db.get_suggested_tasks(limit=8)
 
+        # Apply search filter if active
+        q = self._search_text
+        if q:
+            tasks = [
+                t
+                for t in tasks
+                if q
+                in (
+                    f"{t.get('title', '')} {t.get('priority', '')} "
+                    f"{t.get('project', '')} {t.get('due_date', '')}"
+                ).lower()
+            ]
+
         if tasks:
-            lbl = QLabel(f"Suggested ({len(tasks)})")
+            label = f"Suggested ({len(tasks)})"
+            lbl = QLabel(label)
             lbl.setObjectName("section-header")
             self.task_layout.addWidget(lbl)
             for task in tasks:
                 self.task_layout.addWidget(self._make_task_row(task))
         else:
-            lbl = QLabel("All clear!")
+            msg = "No matches" if q else "All clear!"
+            lbl = QLabel(msg)
             lbl.setObjectName("section-header")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.task_layout.addWidget(lbl)
@@ -389,12 +424,37 @@ class TrayPopup(QWidget):
             self.db.update_task(task_id, status="not_started")
         QTimer.singleShot(300, self.refresh)
 
-    def _quick_add(self):
-        text = self.add_input.text().strip()
-        if text:
-            self.db.add_task(text, section="today")
-            self.add_input.clear()
-            self.refresh()
+    def _toggle_add_form(self):
+        visible = not self._add_form.isVisible()
+        self._add_form.setVisible(visible)
+        self._add_btn.setText("\u2212" if visible else "+")
+        if visible:
+            self._add_title.setFocus()
+        self.adjustSize()
+
+    def _submit_task(self):
+        title = self._add_title.text().strip()
+        if not title:
+            return
+        kwargs = {"section": "inbox", "priority": self._add_priority.currentText()}
+        desc = self._add_desc.text().strip()
+        due = self._add_due.text().strip()
+        if due:
+            kwargs["due_date"] = due
+        task_id = self.db.add_task(title, **kwargs)
+        if desc:
+            self.db.update_task(task_id, description=desc)
+        self._add_title.clear()
+        self._add_desc.clear()
+        self._add_due.clear()
+        self._add_priority.setCurrentText("medium")
+        self._add_form.setVisible(False)
+        self._add_btn.setText("+")
+        self.refresh()
+
+    def _on_search(self, text):
+        self._search_text = text.strip().lower()
+        self.refresh()
 
     def show_near_tray(self, tray_geometry):
         """Position popup near the tray icon."""
@@ -417,7 +477,7 @@ class TrayPopup(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._refresh_timer.start(30000)
+        self._refresh_timer.start(_REFRESH_INTERVAL_MS)
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -559,6 +619,10 @@ class TaskListWidget(QListWidget):
             self.db.delete_task(task_id)
 
 
+_REFRESH_INTERVAL_MS = 30_000
+_PURGE_INTERVAL_MS = 3_600_000  # 1 hour
+
+
 class FullWindow(QMainWindow):
     """Full task manager window with tabs, search, sort, and suggested view."""
 
@@ -569,8 +633,6 @@ class FullWindow(QMainWindow):
         "due": "Sort: Due Date",
         "created": "Sort: Created",
     }
-    # Priority rank for sorting (critical=0, high=1, medium=2, low=3)
-    _PRI_RANK = {p: i for i, p in enumerate(reversed(TASK_PRIORITIES))}
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -670,27 +732,29 @@ class FullWindow(QMainWindow):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
 
+        # Purge done tasks once at startup, then hourly
+        self._last_purged = self.db.purge_old_done(days=30)
+        self._purge_timer = QTimer(self)
+        self._purge_timer.timeout.connect(self._run_purge)
+        self._purge_timer.start(_PURGE_INTERVAL_MS)
+
         self.refresh()
+
+    def _run_purge(self):
+        self._last_purged = self.db.purge_old_done(days=30)
 
     def _sort_tasks(self, tasks):
         """Sort tasks by current sort mode."""
         mode = self._sort_mode
         if mode == "priority":
-            return sorted(
-                tasks,
-                key=lambda t: (
-                    self._PRI_RANK.get(t.get("priority", "low"), 3),
-                    0 if t.get("due_date") else 1,
-                    t.get("due_date") or "9999-12-31",
-                ),
-            )
+            return sorted(tasks, key=priority_sort_key)
         if mode == "due":
             return sorted(
                 tasks,
                 key=lambda t: (
                     0 if t.get("due_date") else 1,
                     t.get("due_date") or "9999-12-31",
-                    self._PRI_RANK.get(t.get("priority", "low"), 3),
+                    priority_sort_key(t),
                 ),
             )
         # mode == "created"
@@ -724,20 +788,21 @@ class FullWindow(QMainWindow):
         ]
 
     def refresh(self):
-        # Auto-purge done tasks older than 30 days
-        purged = self.db.purge_old_done(days=30)
+        # Single query for all active tasks, then filter by section in Python
+        all_active = self.db.get_all_active()
+        done = self.db.get_done_tasks()
+        suggested = self.db.get_suggested_tasks()
 
-        # Load tasks per tab
         raw = {
-            "suggested": self.db.get_suggested_tasks(),
-            "today": self.db.get_tasks(section="today"),
-            "inbox": self.db.get_tasks(section="inbox"),
-            "next": self.db.get_tasks(section="next"),
-            "all": self.db.get_tasks(),
-            "done": self.db.get_done_tasks(),
+            "suggested": suggested,
+            "today": [t for t in all_active if t.get("section") == "today"],
+            "inbox": [t for t in all_active if t.get("section") == "inbox"],
+            "next": [t for t in all_active if t.get("section") == "next"],
+            "all": all_active,
+            "done": done,
         }
 
-        # Apply filter + sort, load into widgets, track counts
+        # Apply filter + sort, load into widgets
         for key in self._tab_keys:
             tasks = self._filter(raw[key])
             tasks = self._sort_tasks(tasks) if key != "done" else tasks
@@ -748,14 +813,12 @@ class FullWindow(QMainWindow):
             count = self.tab_lists[key].count()
             self.tabs.setTabVisible(i, count > 0 or key == "suggested")
 
-        # Status bar
-        s = self.db.get_summary()
-        done_count = len(raw["done"])
+        # Status bar — derive summary from already-fetched data
+        s = self.db.get_summary(all_active)
+        done_count = len(done)
         msg = f"Active: {s['total']} | Done: {done_count} | Overdue: {s['overdue']}"
         if self._search_text:
             msg += f" | Filter: '{self._search_text}'"
-        if purged:
-            msg += f" | Purged: {purged}"
         self.status.showMessage(msg)
 
     def _on_item_changed(self, item):
@@ -781,7 +844,7 @@ class FullWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._refresh_timer.start(30000)
+        self._refresh_timer.start(_REFRESH_INTERVAL_MS)
         self.refresh()
 
     def closeEvent(self, event):

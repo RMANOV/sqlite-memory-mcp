@@ -15,7 +15,10 @@ import os
 import sys
 
 from db_utils import DB_PATH as DEFAULT_DB
-from db_utils import get_conn, now_iso
+from db_utils import TASK_ACTIVE_EXCLUSIONS, build_priority_order_sql, get_conn, now_iso
+
+# Pre-built SQL fragment for active-task exclusion filter
+_EXCL_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
 
 
 def run_digest(
@@ -36,8 +39,7 @@ def run_digest(
             f"ORDER BY "
             f"  CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
             f"       WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
-            f"  CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-            f"       WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END "
+            f"  {build_priority_order_sql()} "
             f"LIMIT ?",
             sections + [limit],
         ).fetchall()
@@ -48,8 +50,9 @@ def run_digest(
             overdue = conn.execute(
                 "SELECT id, title, status, priority, section, due_date, project "
                 "FROM tasks "
-                "WHERE due_date < date('now') AND status NOT IN ('done', 'archived', 'cancelled') "
-                "ORDER BY due_date ASC LIMIT 10"
+                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) "
+                "ORDER BY due_date ASC LIMIT 10",
+                list(TASK_ACTIVE_EXCLUSIONS),
             ).fetchall()
 
         # Status counts (active + done, excluding archived/cancelled)
@@ -81,9 +84,7 @@ def run_digest(
         lines.append(f"### OVERDUE ({len(overdue)})")
         for t in overdue:
             priority = t["priority"] or "medium"
-            lines.append(
-                f"- [{priority.upper()}] {t['title']} (due: {t['due_date']})"
-            )
+            lines.append(f"- [{priority.upper()}] {t['title']} (due: {t['due_date']})")
         lines.append("")
 
     # Group active tasks by section
