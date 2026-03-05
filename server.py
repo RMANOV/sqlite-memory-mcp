@@ -1356,7 +1356,7 @@ def bridge_push(tag: str = "shared") -> str:
 
     _git("add", "shared.json")
     commit_result = _git("commit", "-m", msg)
-    if commit_result.returncode != 0 and "nothing to commit" in commit_result.stderr:
+    if commit_result.returncode != 0 and "nothing to commit" in commit_result.stdout:
         logger.info("bridge_push: no changes to commit")
         return json.dumps({"pushed": 0, "message": "No changes — already up to date"})
 

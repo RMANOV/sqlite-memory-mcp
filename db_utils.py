@@ -50,6 +50,7 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
         "priority",
         "due_date",
         "project",
+        "parent_id",
         "notes",
         "recurring",
         "updated_at",
