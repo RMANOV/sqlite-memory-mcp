@@ -570,6 +570,170 @@ class EditTaskDialog(QDialog):
         return vals
 
 
+class TaskReaderDialog(QDialog):
+    """Read-only view for task descriptions with comfortable reading layout."""
+
+    def __init__(self, task, db, parent=None):
+        super().__init__(parent)
+        self.task = task
+        self.db = db
+
+        # Size: 60% x 85% of screen or 700x900 minimum
+        screen = QApplication.primaryScreen()
+        if screen:
+            sg = screen.availableGeometry()
+            w = max(700, int(sg.width() * 0.6))
+            h = max(900, int(sg.height() * 0.85))
+        else:
+            w, h = 700, 900
+        self.resize(w, h)
+        self.setMinimumSize(700, 900)
+
+        title_text = (task.get("title") or "")[:60]
+        self.setWindowTitle(title_text)
+
+        self.setStyleSheet("""
+            QDialog { background: #ffffff; }
+            QLabel#reader-title { color: #000000; font-size: 18px; font-weight: bold;
+                                  padding: 12px 16px 4px; }
+            QLabel#reader-meta { color: #4a5568; font-size: 12px; padding: 2px 6px; }
+            QLabel#reader-priority { font-size: 11px; font-weight: bold; padding: 2px 8px;
+                                     border-radius: 3px; }
+            QLabel#reader-body { color: #1a202c; font-size: 13px; padding: 16px; }
+            QFrame#reader-header { background: #f7fafc; border-bottom: 1px solid #e2e8f0; }
+            QPushButton { background: #e2e8f0; color: #000000; border: 1px solid #a0aec0;
+                          border-radius: 4px; padding: 8px 20px; font-weight: bold;
+                          font-size: 13px; }
+            QPushButton:hover { background: #1a2332; color: #ffffff; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header
+        self._header = QFrame()
+        self._header.setObjectName("reader-header")
+        header_layout = QVBoxLayout(self._header)
+        header_layout.setContentsMargins(0, 0, 0, 8)
+        header_layout.setSpacing(4)
+
+        self._title_label = QLabel()
+        self._title_label.setObjectName("reader-title")
+        self._title_label.setWordWrap(True)
+        header_layout.addWidget(self._title_label)
+
+        self._meta_layout = QHBoxLayout()
+        self._meta_layout.setContentsMargins(16, 0, 16, 0)
+        self._meta_layout.setSpacing(8)
+        header_layout.addLayout(self._meta_layout)
+
+        layout.addWidget(self._header)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #e2e8f0;")
+        layout.addWidget(sep)
+
+        # Body scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._body_label = QLabel()
+        self._body_label.setObjectName("reader-body")
+        self._body_label.setWordWrap(True)
+        self._body_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._body_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        scroll.setWidget(self._body_label)
+        layout.addWidget(scroll, 1)
+
+        # Button bar
+        btn_bar = QHBoxLayout()
+        btn_bar.setContentsMargins(16, 8, 16, 8)
+        btn_bar.addStretch()
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self._on_edit)
+        btn_bar.addWidget(edit_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_bar.addWidget(close_btn)
+        layout.addLayout(btn_bar)
+
+        self._refresh_display()
+
+        # Center on screen
+        if screen:
+            sg = screen.availableGeometry()
+            self.move(sg.center() - self.rect().center())
+
+    def _refresh_display(self):
+        self._title_label.setText(self.task.get("title") or "Untitled")
+
+        # Clear old meta labels
+        while self._meta_layout.count():
+            item = self._meta_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Priority badge
+        priority = (self.task.get("priority") or "medium").upper()
+        plbl = QLabel(priority)
+        plbl.setObjectName("reader-priority")
+        color = _PRIORITY_COLORS_UPPER.get(priority, "#718096")
+        plbl.setStyleSheet(
+            f"color: #ffffff; background: {color}; font-size: 11px; "
+            f"font-weight: bold; padding: 2px 8px; border-radius: 3px;"
+        )
+        self._meta_layout.addWidget(plbl)
+
+        # Optional meta items
+        for key, label in [
+            ("section", "Section"),
+            ("due_date", "Due"),
+            ("project", "Project"),
+        ]:
+            val = self.task.get(key)
+            if val:
+                mlbl = QLabel(f"{label}: {val}")
+                mlbl.setObjectName("reader-meta")
+                self._meta_layout.addWidget(mlbl)
+
+        self._meta_layout.addStretch()
+
+        # Body
+        desc = self.task.get("description") or ""
+        if desc:
+            import html as _html
+
+            escaped = _html.escape(desc)
+            paragraphs = escaped.split("\n\n")
+            body_html = "".join(
+                f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs
+            )
+            self._body_label.setText(
+                f'<div style="font-family: Segoe UI; font-size: 13px; '
+                f'line-height: 160%; color: #1a202c;">{body_html}</div>'
+            )
+        else:
+            self._body_label.setText(
+                '<div style="font-family: Segoe UI; font-size: 13px; '
+                'color: #a0aec0; font-style: italic;">No description</div>'
+            )
+
+    def _on_edit(self):
+        dlg = EditTaskDialog(self.task, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            vals = dlg.get_values()
+            self.db.update_task(self.task["id"], **vals)
+            self.task.update(vals)
+            self._refresh_display()
+
+
 class TaskListWidget(QListWidget):
     """Custom list widget for tasks with checkbox + priority badge."""
 
@@ -627,9 +791,8 @@ class TaskListWidget(QListWidget):
         task_id = item.data(Qt.ItemDataRole.UserRole)
         task = next((t for t in self._tasks if t["id"] == task_id), None)
         if task:
-            dlg = EditTaskDialog(task, self)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                self.db.update_task(task_id, **dlg.get_values())
+            dlg = TaskReaderDialog(task, self.db, self)
+            dlg.exec()
 
     def _context_menu(self, pos):
         item = self.itemAt(pos)
@@ -642,9 +805,15 @@ class TaskListWidget(QListWidget):
             "QMenu::item:selected { background: #1a2332; color: #ffffff; }"
         )
         delete_action = menu.addAction("Delete")
+        view_action = menu.addAction("View")
         action = menu.exec(self.mapToGlobal(pos))
         if action == delete_action:
             self.db.delete_task(task_id)
+        elif action == view_action:
+            task = next((t for t in self._tasks if t["id"] == task_id), None)
+            if task:
+                dlg = TaskReaderDialog(task, self.db, self)
+                dlg.exec()
 
 
 _REFRESH_INTERVAL_MS = 30_000
