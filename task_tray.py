@@ -1256,9 +1256,9 @@ class FullWindow(QMainWindow):
 
         # Bridge sync progress bar (hidden by default)
         self._sync_bar = QProgressBar()
-        self._sync_bar.setFixedWidth(220)
+        self._sync_bar.setFixedWidth(280)
         self._sync_bar.setTextVisible(True)
-        self._sync_bar.setFormat("%v%  %s")
+        self._sync_bar.setRange(0, 100)
         self._sync_bar.hide()
         self.status.addPermanentWidget(self._sync_bar)
 
@@ -1299,10 +1299,12 @@ class FullWindow(QMainWindow):
         self._sync_bar.show()
 
     def _on_sync_done(self, msg):
+        is_error = msg.startswith("Sync error")
         self._sync_bar.setValue(100)
-        self._sync_bar.setFormat(f"100%  {msg}")
-        QTimer.singleShot(3000, self._sync_bar.hide)
-        self.status.showMessage(msg, 5000)
+        self._sync_bar.setFormat(msg[:50])
+        hide_ms = 15000 if is_error else 4000
+        QTimer.singleShot(hide_ms, self._sync_bar.hide)
+        self.status.showMessage(msg, hide_ms)
 
     def _sync_bridge(self):
         """Export full memory (entities+relations+tasks) → shared.json, then git push."""
