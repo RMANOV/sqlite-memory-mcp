@@ -520,7 +520,7 @@ class TrayPopup(QWidget):
         row = QWidget()
         if overdue:
             row.setStyleSheet(
-                "border-left: 3px solid #e53e3e; background: rgba(229,62,62,0.05);"
+                "border-left: 3px solid #e53e3e; background: rgba(229,62,62,0.12);"
             )
         hl = QHBoxLayout(row)
         hl.setContentsMargins(14, 2, 14, 2)
@@ -528,7 +528,7 @@ class TrayPopup(QWidget):
         cb = QCheckBox(task["title"])
         cb.setChecked(task["status"] == "done")
         if task["status"] == "done":
-            cb.setStyleSheet("color: #276749; text-decoration: line-through;")
+            cb.setStyleSheet("color: #38a169; text-decoration: line-through;")
         task_id = task["id"]
         cb.toggled.connect(lambda checked, tid=task_id: self._on_toggle(tid, checked))
         hl.addWidget(cb, 1)
@@ -641,28 +641,28 @@ class EditTaskDialog(QDialog):
         self.setWindowTitle("Edit Task")
         self.setMinimumWidth(380)
         self.setStyleSheet("""
-            QDialog { background: #ffffff; color: #000000; }
-            QLabel { color: #000000; font-weight: bold; }
-            QLineEdit { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+            QDialog { background: #0f1923; color: #e2e8f0; }
+            QLabel { color: #a0aec0; font-weight: bold; }
+            QLineEdit { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
                         border-radius: 4px; padding: 6px; }
-            QLineEdit:focus { border-color: #1a2332; }
-            QTextEdit { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+            QLineEdit:focus { border-color: #3182ce; }
+            QTextEdit { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
                         border-radius: 4px; padding: 6px; font-family: 'Segoe UI'; font-size: 13px; }
-            QTextEdit:focus { border-color: #1a2332; }
-            QComboBox { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+            QTextEdit:focus { border-color: #3182ce; }
+            QComboBox { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
                         border-radius: 4px; padding: 4px 8px; }
-            QComboBox:focus { border-color: #1a2332; }
-            QComboBox QAbstractItemView { background: #ffffff; color: #000000;
-                                          selection-background-color: #1a2332;
+            QComboBox:focus { border-color: #3182ce; }
+            QComboBox QAbstractItemView { background: #1a2332; color: #e2e8f0;
+                                          selection-background-color: #3182ce;
                                           selection-color: #ffffff; }
-            QDateEdit { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+            QDateEdit { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
                         border-radius: 4px; padding: 6px; }
-            QDateEdit:focus { border-color: #1a2332; }
+            QDateEdit:focus { border-color: #3182ce; }
             QDateEdit::drop-down { subcontrol-origin: padding; subcontrol-position: right center;
-                                   width: 20px; border-left: 1px solid #a0aec0; }
-            QPushButton { background: #e2e8f0; color: #000000; border: 1px solid #a0aec0;
+                                   width: 20px; border-left: 1px solid #4a5568; }
+            QPushButton { background: #2d3748; color: #e2e8f0; border: 1px solid #4a5568;
                           border-radius: 4px; padding: 6px 16px; font-weight: bold; }
-            QPushButton:hover { background: #1a2332; color: #ffffff; }
+            QPushButton:hover { background: #3182ce; color: #ffffff; }
         """)
         layout = QFormLayout(self)
 
@@ -799,20 +799,20 @@ class TaskReaderDialog(QDialog):
         self.setWindowTitle(title_text)
 
         self.setStyleSheet("""
-            QDialog { background: #ffffff; }
-            QLabel#reader-title { color: #000000; font-size: 18px; font-weight: bold;
+            QDialog { background: #0f1923; }
+            QLabel#reader-title { color: #e2e8f0; font-size: 18px; font-weight: bold;
                                   padding: 12px 16px 4px; }
-            QLabel#reader-meta { color: #4a5568; font-size: 12px; padding: 2px 6px; }
+            QLabel#reader-meta { color: #a0aec0; font-size: 12px; padding: 2px 6px; }
             QLabel#reader-priority { font-size: 11px; font-weight: bold; padding: 2px 8px;
                                      border-radius: 3px; }
-            QScrollArea { background: #ffffff; border: none; }
-            QLabel#reader-body { color: #1a202c; font-size: 13px; padding: 16px;
-                                 background: #ffffff; }
-            QFrame#reader-header { background: #f7fafc; border-bottom: 1px solid #e2e8f0; }
-            QPushButton { background: #e2e8f0; color: #000000; border: 1px solid #a0aec0;
+            QScrollArea { background: #0f1923; border: none; }
+            QLabel#reader-body { color: #e2e8f0; font-size: 13px; padding: 16px;
+                                 background: #0f1923; }
+            QFrame#reader-header { background: #1a2332; border-bottom: 1px solid #2d3748; }
+            QPushButton { background: #2d3748; color: #e2e8f0; border: 1px solid #4a5568;
                           border-radius: 4px; padding: 8px 20px; font-weight: bold;
                           font-size: 13px; }
-            QPushButton:hover { background: #1a2332; color: #ffffff; }
+            QPushButton:hover { background: #3182ce; color: #ffffff; }
         """)
 
         layout = QVBoxLayout(self)
@@ -917,12 +917,12 @@ class TaskReaderDialog(QDialog):
             )
             self._body_label.setText(
                 f'<div style="font-family: Segoe UI; font-size: 13px; '
-                f'line-height: 160%; color: #1a202c;">{body_html}</div>'
+                f'line-height: 160%; color: #e2e8f0;">{body_html}</div>'
             )
         else:
             self._body_label.setText(
                 '<div style="font-family: Segoe UI; font-size: 13px; '
-                'color: #a0aec0; font-style: italic;">No description</div>'
+                'color: #4a5568; font-style: italic;">No description</div>'
             )
 
     def _on_edit(self):
@@ -941,17 +941,17 @@ class TaskListWidget(QListWidget):
         super().__init__(parent)
         self.db = db
         self.setStyleSheet("""
-            QListWidget { background: #ffffff; color: #000000; border: none;
+            QListWidget { background: #0f1923; color: #e2e8f0; border: none;
                           font-size: 13px; }
-            QListWidget::item { padding: 8px 12px; border-bottom: 1px solid #cbd5e0;
-                                color: #000000; background: #ffffff; }
-            QListWidget::item:selected { background: #dbeafe; color: #000000; }
-            QListWidget::item:hover { background: #f0f4f8; }
+            QListWidget::item { padding: 8px 12px; border-bottom: 1px solid #2d3748;
+                                color: #e2e8f0; background: #0f1923; }
+            QListWidget::item:selected { background: #2d3748; color: #ffffff; }
+            QListWidget::item:hover { background: #1a2332; }
             QListWidget::indicator { width: 18px; height: 18px; }
-            QListWidget::indicator:unchecked { border: 2px solid #1a2332;
-                                               background: #ffffff; border-radius: 3px; }
-            QListWidget::indicator:checked { border: 2px solid #1a2332;
-                                             background: #1a2332; border-radius: 3px; }
+            QListWidget::indicator:unchecked { border: 2px solid #4a5568;
+                                               background: #1a2332; border-radius: 3px; }
+            QListWidget::indicator:checked { border: 2px solid #3182ce;
+                                             background: #3182ce; border-radius: 3px; }
         """)
         self.itemDoubleClicked.connect(self._on_double_click)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -987,12 +987,12 @@ class TaskListWidget(QListWidget):
             if desc:
                 item.setToolTip(desc)
             if task["status"] == "done":
-                item.setForeground(QColor("#1a5632"))
+                item.setForeground(QColor("#38a169"))
             if task.get("type") == "note":
-                item.setBackground(QColor("#f0f4ff"))
+                item.setBackground(QColor("#1e2d3d"))
             if is_overdue(task.get("due_date")) and task["status"] != "done":
-                item.setBackground(QColor("#fce4e4"))
-                item.setForeground(QColor("#9b1c1c"))
+                item.setBackground(QColor("#3b1c1c"))
+                item.setForeground(QColor("#fc8181"))
             self.addItem(item)
         self.blockSignals(False)
 
@@ -1013,8 +1013,8 @@ class TaskListWidget(QListWidget):
             # Project header item (non-interactive)
             header = QListWidgetItem(f"── {proj_name} ({len(proj_tasks)}) ──")
             header.setFlags(Qt.ItemFlag.NoItemFlags)
-            header.setBackground(QColor("#edf2f7"))
-            header.setForeground(QColor("#1a2332"))
+            header.setBackground(QColor("#1e2836"))
+            header.setForeground(QColor("#a0aec0"))
             font = header.font()
             font.setBold(True)
             header.setFont(font)
@@ -1032,13 +1032,23 @@ class TaskListWidget(QListWidget):
                 )
                 priority = (task.get("priority") or "medium").upper()
                 due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
+                desc = task.get("description") or ""
+                preview = (
+                    f" — {desc[:50]}..."
+                    if len(desc) > 50
+                    else (f" — {desc}" if desc else "")
+                )
                 type_prefix = "[N] " if task.get("type") == "note" else ""
-                item.setText(f"  {type_prefix}[{priority}] {task['title']}{due}")
+                item.setText(
+                    f"  {type_prefix}[{priority}] {task['title']}{due}{preview}"
+                )
+                if desc:
+                    item.setToolTip(desc)
                 if task["status"] == "done":
-                    item.setForeground(QColor("#1a5632"))
+                    item.setForeground(QColor("#38a169"))
                 if is_overdue(task.get("due_date")) and task["status"] != "done":
-                    item.setBackground(QColor("#fce4e4"))
-                    item.setForeground(QColor("#9b1c1c"))
+                    item.setBackground(QColor("#3b1c1c"))
+                    item.setForeground(QColor("#fc8181"))
                 self.addItem(item)
 
         self.blockSignals(False)
@@ -1054,17 +1064,17 @@ class TaskListWidget(QListWidget):
                 continue
             header = QListWidgetItem(f"── {group_label} ({len(group_tasks)}) ──")
             header.setFlags(Qt.ItemFlag.NoItemFlags)
-            header.setBackground(QColor("#edf2f7"))
-            header.setForeground(QColor("#1a2332"))
+            header.setBackground(QColor("#1e2836"))
+            header.setForeground(QColor("#a0aec0"))
             font = header.font()
             font.setBold(True)
             header.setFont(font)
             if group_label == "⚠ Overdue":
-                header.setBackground(QColor("#fff5f5"))
-                header.setForeground(QColor("#c53030"))
+                header.setBackground(QColor("#3b1c1c"))
+                header.setForeground(QColor("#fc8181"))
             elif group_label == "Urgent":
-                header.setBackground(QColor("#fffaf0"))
-                header.setForeground(QColor("#c05621"))
+                header.setBackground(QColor("#3b2c1c"))
+                header.setForeground(QColor("#f6ad55"))
             self.addItem(header)
             for task in group_tasks:
                 item = QListWidgetItem()
@@ -1078,13 +1088,23 @@ class TaskListWidget(QListWidget):
                 priority = (task.get("priority") or "medium").upper()
                 due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
                 proj = f" | {task['project']}" if task.get("project") else ""
+                desc = task.get("description") or ""
+                preview = (
+                    f" — {desc[:50]}..."
+                    if len(desc) > 50
+                    else (f" — {desc}" if desc else "")
+                )
                 type_prefix = "[N] " if task.get("type") == "note" else ""
-                item.setText(f"  {type_prefix}[{priority}] {task['title']}{due}{proj}")
+                item.setText(
+                    f"  {type_prefix}[{priority}] {task['title']}{due}{proj}{preview}"
+                )
+                if desc:
+                    item.setToolTip(desc)
                 if task["status"] == "done":
-                    item.setForeground(QColor("#1a5632"))
+                    item.setForeground(QColor("#38a169"))
                 if is_overdue(task.get("due_date")) and task["status"] != "done":
-                    item.setBackground(QColor("#fce4e4"))
-                    item.setForeground(QColor("#9b1c1c"))
+                    item.setBackground(QColor("#3b1c1c"))
+                    item.setForeground(QColor("#fc8181"))
                 self.addItem(item)
         self.blockSignals(False)
 
@@ -1104,8 +1124,8 @@ class TaskListWidget(QListWidget):
         task_id = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
         menu.setStyleSheet(
-            "QMenu { background: #ffffff; color: #000000; border: 1px solid #a0aec0; }"
-            "QMenu::item:selected { background: #1a2332; color: #ffffff; }"
+            "QMenu { background: #1a2332; color: #e2e8f0; border: 1px solid #4a5568; }"
+            "QMenu::item:selected { background: #3182ce; color: #ffffff; }"
         )
         view_action = menu.addAction("View")
         task = next((t for t in self._tasks if t["id"] == task_id), None)
@@ -1160,27 +1180,27 @@ class FullWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
         self.setStyleSheet("""
-            QMainWindow { background: #ffffff; color: #000000; }
-            QTabWidget::pane { border: none; background: #ffffff; }
-            QTabBar { background: #e2e8f0; }
+            QMainWindow { background: #0f1923; color: #e2e8f0; }
+            QTabWidget::pane { border: none; background: #0f1923; }
+            QTabBar { background: #1a2332; }
             QTabBar::tab { padding: 8px 20px; font-weight: bold;
-                           background: #e2e8f0; color: #000000;
-                           border: 1px solid #cbd5e0; border-bottom: none;
+                           background: #1a2332; color: #a0aec0;
+                           border: 1px solid #2d3748; border-bottom: none;
                            margin-right: 2px; }
-            QTabBar::tab:selected { background: #1a2332; color: #ffffff; }
-            QTabBar::tab:hover:!selected { background: #cbd5e0; color: #000000; }
-            QToolBar { background: #e2e8f0; border-bottom: 1px solid #cbd5e0; spacing: 4px; }
-            QToolBar QToolButton { background: #ffffff; color: #000000; border: 1px solid #a0aec0;
+            QTabBar::tab:selected { background: #3182ce; color: #ffffff; }
+            QTabBar::tab:hover:!selected { background: #2d3748; color: #e2e8f0; }
+            QToolBar { background: #1a2332; border-bottom: 1px solid #2d3748; spacing: 4px; }
+            QToolBar QToolButton { background: #2d3748; color: #e2e8f0; border: 1px solid #4a5568;
                                    padding: 4px 12px; font-weight: bold; }
-            QToolBar QToolButton:hover { background: #1a2332; color: #ffffff; }
-            QToolBar QToolButton:checked { background: #1a2332; color: #ffffff; }
-            QStatusBar { background: #e2e8f0; color: #000000; font-weight: bold;
-                         border-top: 1px solid #cbd5e0; padding: 2px 8px; }
-            QMenu { background: #ffffff; color: #000000; border: 1px solid #a0aec0; }
-            QMenu::item:selected { background: #1a2332; color: #ffffff; }
-            QLineEdit#search { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+            QToolBar QToolButton:hover { background: #3182ce; color: #ffffff; }
+            QToolBar QToolButton:checked { background: #3182ce; color: #ffffff; }
+            QStatusBar { background: #1a2332; color: #a0aec0; font-weight: bold;
+                         border-top: 1px solid #2d3748; padding: 2px 8px; }
+            QMenu { background: #1a2332; color: #e2e8f0; border: 1px solid #4a5568; }
+            QMenu::item:selected { background: #3182ce; color: #ffffff; }
+            QLineEdit#search { background: #2d3748; color: #e2e8f0; border: 2px solid #4a5568;
                                border-radius: 4px; padding: 4px 8px; min-width: 200px; }
-            QLineEdit#search:focus { border-color: #1a2332; }
+            QLineEdit#search:focus { border-color: #3182ce; }
         """)
 
         # Central widget with tabs
