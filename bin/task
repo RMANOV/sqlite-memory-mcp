@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# task — dead-simple CLI for SQLite Memory tasks
+# Usage: task add "title" [--priority high] [--section today] [--due 2026-03-10] [--project X] [--desc "..."]
+#        task note "title" [--content "..."] [--priority high] [--project X]
+#        task done "title"
+#        task ls [--section today] [--status done] [--project X]
+
+set -euo pipefail
+
+export TASK_DB="$HOME/.claude/memory/memory.db"
+REFRESH="$HOME/.claude/memory/.task_refresh"
+
+# Find working python (python3 is broken Windows Store alias)
+PY="python"
+command -v python >/dev/null 2>&1 || PY="py"
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+add|note)
+    export TASK_TITLE="${1:?Usage: task $cmd \"title\"}"
+    shift
+    export TASK_PRIORITY="medium"
+    export TASK_SECTION="inbox"
+    export TASK_DUE=""
+    export TASK_PROJECT=""
+    export TASK_DESC=""
+    export TASK_TYPE="task"
+    [[ "$cmd" == "note" ]] && export TASK_TYPE="note"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --priority) export TASK_PRIORITY="$2"; shift 2;;
+            --section)  export TASK_SECTION="$2";  shift 2;;
+            --due)      export TASK_DUE="$2";      shift 2;;
+            --project)  export TASK_PROJECT="$2";  shift 2;;
+            --desc)     export TASK_DESC="$2";     shift 2;;
+            --content)  export TASK_DESC="$2";     shift 2;;
+            *) echo "Unknown flag: $1"; exit 1;;
+        esac
+    done
+    $PY -c "
+import sqlite3, uuid, datetime, os
+c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
+c.execute('PRAGMA busy_timeout=10000')
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+t, s, p = os.environ['TASK_TITLE'], os.environ['TASK_SECTION'], os.environ['TASK_PRIORITY']
+c.execute(
+    'INSERT INTO tasks (id,title,description,status,section,priority,due_date,project,type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    (str(uuid.uuid4()), t, os.environ['TASK_DESC'] or None, 'not_started', s, p,
+     os.environ['TASK_DUE'] or None, os.environ['TASK_PROJECT'] or None,
+     os.environ['TASK_TYPE'], now, now))
+c.close()
+print(f'Created {os.environ[\"TASK_TYPE\"]}: {t} [{s}/{p}]')
+"
+    touch "$REFRESH"
+    ;;
+
+done)
+    export TASK_TITLE="${1:?Usage: task done \"title\"}"
+    $PY -c "
+import sqlite3, datetime, os
+c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
+c.execute('PRAGMA busy_timeout=10000')
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+cur = c.execute(
+    \"UPDATE tasks SET status='done', section='done', updated_at=? WHERE title LIKE ? AND status != 'done'\",
+    (now, '%' + os.environ['TASK_TITLE'] + '%'))
+c.close()
+print(f'Marked {cur.rowcount} task(s) done matching: {os.environ[\"TASK_TITLE\"]}')
+"
+    touch "$REFRESH"
+    ;;
+
+ls)
+    export TASK_SECTION=""
+    export TASK_STATUS=""
+    export TASK_PROJECT=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --section) export TASK_SECTION="$2"; shift 2;;
+            --status)  export TASK_STATUS="$2";  shift 2;;
+            --project) export TASK_PROJECT="$2"; shift 2;;
+            *) echo "Unknown flag: $1"; exit 1;;
+        esac
+    done
+    $PY -c "
+import sqlite3, os
+c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
+c.execute('PRAGMA busy_timeout=10000')
+c.row_factory = sqlite3.Row
+where, params = [], []
+s, st, pr = os.environ['TASK_SECTION'], os.environ['TASK_STATUS'], os.environ['TASK_PROJECT']
+if s:  where.append('section=?'); params.append(s)
+if st: where.append('status=?');  params.append(st)
+if pr: where.append('project=?'); params.append(pr)
+if not st: where.append(\"status != 'done'\")
+clause = ' AND '.join(where) if where else '1=1'
+rows = c.execute(f'SELECT id,title,status,section,priority,due_date,project,type FROM tasks WHERE {clause} ORDER BY section,priority', params).fetchall()
+c.close()
+if not rows:
+    print('No tasks found.')
+else:
+    for r in rows:
+        due = f' due:{r[\"due_date\"]}' if r['due_date'] else ''
+        proj = f' [{r[\"project\"]}]' if r['project'] else ''
+        typ = 'N' if r['type']=='note' else 'T'
+        print(f'  {typ} [{r[\"priority\"][0].upper()}] {r[\"section\"]:>7} | {r[\"title\"]}{due}{proj}')
+    print(f'  --- {len(rows)} item(s)')
+"
+    ;;
+
+help|*)
+    echo "task -- CLI for SQLite Memory tasks"
+    echo ""
+    echo "  task add \"title\" [--priority high] [--section today] [--due DATE] [--project X] [--desc \"...\"]"
+    echo "  task note \"title\" [--content \"...\"] [--priority high] [--project X]"
+    echo "  task done \"title\""
+    echo "  task ls [--section today] [--status done] [--project X]"
+    ;;
+esac
