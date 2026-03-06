@@ -5,7 +5,9 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
 import html as _html
+import json
 import os
+import socket
 import sqlite3
 import subprocess
 import threading
