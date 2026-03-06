@@ -1321,6 +1321,11 @@ class FullWindow(QMainWindow):
                     creationflags=self._SP_FLAGS,
                 )
 
+                # Thread-safe: fresh connection for background thread
+                conn = sqlite3.connect(self.db.db_path, timeout=10)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=5000")
+
                 # 0. Pull remote changes + import new entities
                 self._bridge_progress.emit(5, "git pull...")
                 subprocess.run(["git", "pull", "--rebase"], timeout=30, **git_kw)
@@ -1330,13 +1335,14 @@ class FullWindow(QMainWindow):
                         remote_data = json.loads(
                             shared_path.read_text(encoding="utf-8")
                         )
-                        self._import_remote_entities(remote_data.get("entities", []))
+                        self._import_remote_entities(
+                            remote_data.get("entities", []), conn
+                        )
                     except (json.JSONDecodeError, OSError):
                         pass
 
                 # 1. Export entities + observations
                 self._bridge_progress.emit(15, "Exporting entities...")
-                conn = self.db._conn
                 ent_rows = conn.execute(
                     "SELECT id, name, entity_type, project, created_at, updated_at "
                     "FROM entities WHERE project LIKE 'shared%' ORDER BY name"
@@ -1448,12 +1454,14 @@ class FullWindow(QMainWindow):
                 self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
             except Exception as exc:
                 self._bridge_done.emit(f"Sync error: {exc}")
+            finally:
+                conn.close()
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _import_remote_entities(self, remote_entities):
+    def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""
-        conn = self.db._conn
+        conn = conn or self.db._conn
         for e in remote_entities:
             existing = conn.execute(
                 "SELECT id FROM entities WHERE name = ?", (e["name"],)
