@@ -141,6 +141,14 @@ class TaskDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_project_names(self):
+        """Return sorted list of distinct non-null project names."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT project FROM tasks WHERE project IS NOT NULL "
+            "ORDER BY project"
+        ).fetchall()
+        return [r["project"] for r in rows]
+
     def get_summary(self, tasks=None):
         """Return dict with total, overdue counts. Accepts pre-fetched tasks."""
         if tasks is None:
@@ -247,9 +255,11 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialogButtonBox,
     QProgressBar,
+    QDateEdit,
+    QCompleter,
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
-from PyQt6.QtCore import QEvent, QSettings, Qt, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import QDate, QEvent, QSettings, Qt, QTimer, QPoint, pyqtSignal
 
 
 def create_tray_icon_pixmap(overdue_count=0):
@@ -560,12 +570,22 @@ class TrayPopup(QWidget):
 
 
 class EditTaskDialog(QDialog):
-    """Dialog for editing task fields."""
+    """Dialog for editing task fields with smart defaults."""
 
-    def __init__(self, task, parent=None):
+    # Section → date intelligence
+    _SECTION_DATE = {
+        "inbox": 1,  # tomorrow
+        "today": 0,  # today
+        "next": 1,  # tomorrow
+        "someday": None,  # no date
+        "waiting": 7,  # +1 week
+    }
+
+    def __init__(self, task, parent=None, db=None):
         super().__init__(parent)
+        self._db = db
         self.setWindowTitle("Edit Task")
-        self.setMinimumWidth(350)
+        self.setMinimumWidth(380)
         self.setStyleSheet("""
             QDialog { background: #ffffff; color: #000000; }
             QLabel { color: #000000; font-weight: bold; }
@@ -581,6 +601,11 @@ class EditTaskDialog(QDialog):
             QComboBox QAbstractItemView { background: #ffffff; color: #000000;
                                           selection-background-color: #1a2332;
                                           selection-color: #ffffff; }
+            QDateEdit { background: #ffffff; color: #000000; border: 2px solid #a0aec0;
+                        border-radius: 4px; padding: 6px; }
+            QDateEdit:focus { border-color: #1a2332; }
+            QDateEdit::drop-down { subcontrol-origin: padding; subcontrol-position: right center;
+                                   width: 20px; border-left: 1px solid #a0aec0; }
             QPushButton { background: #e2e8f0; color: #000000; border: 1px solid #a0aec0;
                           border-radius: 4px; padding: 6px 16px; font-weight: bold; }
             QPushButton:hover { background: #1a2332; color: #ffffff; }
@@ -604,6 +629,7 @@ class EditTaskDialog(QDialog):
         self.section_combo = QComboBox()
         self.section_combo.addItems(SECTIONS)
         self.section_combo.setCurrentText(task.get("section", "inbox"))
+        self.section_combo.currentTextChanged.connect(self._on_section_changed)
         layout.addRow("Section:", self.section_combo)
 
         self.priority_combo = QComboBox()
@@ -611,12 +637,45 @@ class EditTaskDialog(QDialog):
         self.priority_combo.setCurrentText(task.get("priority", "medium"))
         layout.addRow("Priority:", self.priority_combo)
 
-        self.due_edit = QLineEdit(task.get("due_date", "") or "")
-        self.due_edit.setPlaceholderText("YYYY-MM-DD")
-        layout.addRow("Due Date:", self.due_edit)
+        # Due date — QDateEdit with calendar popup, DD.MM.YYYY format
+        self.due_edit = QDateEdit()
+        self.due_edit.setCalendarPopup(True)
+        self.due_edit.setDisplayFormat("dd.MM.yyyy")
+        self.due_edit.setSpecialValueText("—")  # shown when "no date"
+        self._due_cleared = False  # track if user explicitly cleared date
+        existing_due = task.get("due_date", "") or ""
+        if existing_due:
+            parsed = QDate.fromString(existing_due, "yyyy-MM-dd")
+            if parsed.isValid():
+                self.due_edit.setDate(parsed)
+            else:
+                self._set_smart_date(task.get("section", "inbox"))
+        else:
+            self._set_smart_date(task.get("section", "inbox"))
 
-        self.project_edit = QLineEdit(task.get("project", "") or "")
-        layout.addRow("Project:", self.project_edit)
+        due_row = QHBoxLayout()
+        due_row.addWidget(self.due_edit, 1)
+        self.due_clear_btn = QPushButton("✕")
+        self.due_clear_btn.setFixedWidth(28)
+        self.due_clear_btn.setToolTip("Clear date")
+        self.due_clear_btn.clicked.connect(self._clear_due)
+        due_row.addWidget(self.due_clear_btn)
+        layout.addRow("Due Date:", due_row)
+
+        # Project — editable combo with autocomplete from existing projects
+        self.project_combo = QComboBox()
+        self.project_combo.setEditable(True)
+        existing_projects = db.get_project_names() if db else []
+        if "general" not in existing_projects:
+            existing_projects.insert(0, "general")
+        self.project_combo.addItems(existing_projects)
+        completer = QCompleter(existing_projects)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.project_combo.setCompleter(completer)
+        current_project = task.get("project", "") or "general"
+        self.project_combo.setCurrentText(current_project)
+        layout.addRow("Project:", self.project_combo)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -625,6 +684,26 @@ class EditTaskDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
 
+    def _set_smart_date(self, section):
+        """Set due date based on section intelligence."""
+        offset = self._SECTION_DATE.get(section)
+        if offset is not None:
+            self.due_edit.setDate(QDate.currentDate().addDays(offset))
+            self._due_cleared = False
+        else:
+            # "someday" / unknown → minimum date = visual "no date"
+            self.due_edit.setDate(self.due_edit.minimumDate())
+            self._due_cleared = True
+
+    def _on_section_changed(self, section):
+        """Auto-adjust due date when section changes."""
+        self._set_smart_date(section)
+
+    def _clear_due(self):
+        """Clear due date (set to minimum = special value)."""
+        self.due_edit.setDate(self.due_edit.minimumDate())
+        self._due_cleared = True
+
     def get_values(self):
         vals = {
             "title": self.title_edit.text().strip(),
@@ -632,8 +711,13 @@ class EditTaskDialog(QDialog):
             "section": self.section_combo.currentText(),
             "priority": self.priority_combo.currentText(),
         }
-        vals["due_date"] = self.due_edit.text().strip() or None
-        vals["project"] = self.project_edit.text().strip() or None
+        # Due date: None if cleared, else YYYY-MM-DD for DB storage
+        if self._due_cleared or self.due_edit.date() == self.due_edit.minimumDate():
+            vals["due_date"] = None
+        else:
+            vals["due_date"] = self.due_edit.date().toString("yyyy-MM-dd")
+        project = self.project_combo.currentText().strip()
+        vals["project"] = project if project else None
         vals["type"] = self.type_combo.currentText().lower()
         return vals
 
@@ -788,7 +872,7 @@ class TaskReaderDialog(QDialog):
             )
 
     def _on_edit(self):
-        dlg = EditTaskDialog(self.task, self)
+        dlg = EditTaskDialog(self.task, self, db=self.db)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
             self.db.update_task(self.task["id"], **vals)
@@ -856,6 +940,54 @@ class TaskListWidget(QListWidget):
             self.addItem(item)
         self.blockSignals(False)
 
+    def load_grouped_by_project(self, tasks):
+        """Load tasks grouped by project with section headers."""
+        from collections import OrderedDict
+
+        self._tasks = tasks
+        self.blockSignals(True)
+        self.clear()
+
+        groups: OrderedDict[str, list] = OrderedDict()
+        for t in tasks:
+            proj = t.get("project") or "(no project)"
+            groups.setdefault(proj, []).append(t)
+
+        for proj_name, proj_tasks in groups.items():
+            # Project header item (non-interactive)
+            header = QListWidgetItem(f"── {proj_name} ({len(proj_tasks)}) ──")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            header.setBackground(QColor("#edf2f7"))
+            header.setForeground(QColor("#1a2332"))
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            self.addItem(header)
+
+            # Tasks under this project
+            for task in proj_tasks:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, task["id"])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if task["status"] == "done"
+                    else Qt.CheckState.Unchecked
+                )
+                priority = (task.get("priority") or "medium").upper()
+                due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
+                type_prefix = "[N] " if task.get("type") == "note" else ""
+                item.setText(f"  {type_prefix}[{priority}] {task['title']}{due}")
+                if task["status"] == "done":
+                    item.setForeground(QColor("#1a5632"))
+                if is_overdue(task.get("due_date")) and task["status"] != "done":
+                    item.setBackground(QColor("#fff5f5"))
+                    item.setForeground(QColor("#c53030"))
+                    item.setText(f"  ⚠ {item.text().strip()}")
+                self.addItem(item)
+
+        self.blockSignals(False)
+
     def _open_reader(self, task_id):
         task = next((t for t in self._tasks if t["id"] == task_id), None)
         if task:
@@ -901,11 +1033,12 @@ class FullWindow(QMainWindow):
     _bridge_progress = pyqtSignal(int, str)  # (percent, step_label)
 
     # Sort modes cycle: priority → due → created → priority ...
-    _SORT_MODES = ("priority", "due", "created")
+    _SORT_MODES = ("priority", "due", "created", "project")
     _SORT_LABELS = {
         "priority": "Sort: Priority",
         "due": "Sort: Due Date",
         "created": "Sort: Created",
+        "project": "Sort: Project",
     }
 
     def __init__(self, db, parent=None):
@@ -955,12 +1088,22 @@ class FullWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         # Tab order: Suggested, Today, Inbox, Next, Notes, All, Done
-        self._tab_keys = ["suggested", "today", "inbox", "next", "notes", "all", "done"]
+        self._tab_keys = [
+            "suggested",
+            "today",
+            "inbox",
+            "next",
+            "projects",
+            "notes",
+            "all",
+            "done",
+        ]
         self._tab_labels = {
             "suggested": "Suggested",
             "today": "Today",
             "inbox": "Inbox",
             "next": "Next",
+            "projects": "Projects",
             "notes": "Notes",
             "all": "All",
             "done": "Done",
@@ -1241,6 +1384,14 @@ class FullWindow(QMainWindow):
                     priority_sort_key(t),
                 ),
             )
+        if mode == "project":
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    t.get("project") or "zzz_none",
+                    priority_sort_key(t),
+                ),
+            )
         # mode == "created"
         return sorted(tasks, key=lambda t: t.get("created_at") or "", reverse=True)
 
@@ -1297,6 +1448,7 @@ class FullWindow(QMainWindow):
                 if t.get("section") == "next" and t.get("type", "task") != "note"
             ],
             "notes": notes,
+            "projects": [t for t in all_active if t.get("type", "task") != "note"],
             "all": all_active,
             "done": done,
         }
@@ -1307,12 +1459,24 @@ class FullWindow(QMainWindow):
             tasks = (
                 self._sort_tasks(tasks) if key not in ("done", "suggested") else tasks
             )
-            self.tab_lists[key].load_tasks(tasks)
+            if key == "projects":
+                # Group by project with headers
+                proj_sorted = sorted(
+                    tasks,
+                    key=lambda t: (
+                        t.get("project") or "zzz_none",
+                        priority_sort_key(t),
+                    ),
+                )
+                self.tab_lists[key].load_grouped_by_project(proj_sorted)
+            else:
+                self.tab_lists[key].load_tasks(tasks)
 
-        # Hide empty tabs (suggested and notes always visible)
+        # Hide empty tabs (suggested, notes, projects always visible)
+        always_visible = ("suggested", "notes", "projects")
         for i, key in enumerate(self._tab_keys):
             count = self.tab_lists[key].count()
-            self.tabs.setTabVisible(i, count > 0 or key in ("suggested", "notes"))
+            self.tabs.setTabVisible(i, count > 0 or key in always_visible)
 
         # Status bar — derive summary from already-fetched data
         s = self.db.get_summary(all_active)
@@ -1336,7 +1500,7 @@ class FullWindow(QMainWindow):
 
     def _add_task(self):
         task = {"title": "", "section": "inbox", "priority": "medium"}
-        dlg = EditTaskDialog(task, self)
+        dlg = EditTaskDialog(task, self, db=self.db)
         dlg.setWindowTitle("Add Task")
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
@@ -1420,7 +1584,7 @@ class TaskTrayApp:
 
     def _quick_add_from_tray(self):
         task = {"title": "", "section": "today", "priority": "medium"}
-        dlg = EditTaskDialog(task)
+        dlg = EditTaskDialog(task, db=self.db)
         dlg.setWindowTitle("Add Task")
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
