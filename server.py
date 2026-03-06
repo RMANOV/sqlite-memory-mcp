@@ -28,6 +28,7 @@ from db_utils import (
     TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
     TASK_STATUSES as _TASK_STATUSES,
+    TASK_TYPES as _TASK_TYPES,
     build_priority_order_sql,
     now_iso as _now,
 )
@@ -125,6 +126,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_id   TEXT DEFAULT NULL REFERENCES tasks(id) ON DELETE SET NULL,  -- only affects fresh installs
     notes       TEXT DEFAULT NULL,
     recurring   TEXT DEFAULT NULL,
+    type        TEXT NOT NULL DEFAULT 'task',
+    assignee    TEXT DEFAULT NULL,
+    shared_by   TEXT DEFAULT NULL,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -138,6 +142,28 @@ CREATE INDEX IF NOT EXISTS idx_tasks_section    ON tasks(section);
 CREATE INDEX IF NOT EXISTS idx_tasks_due        ON tasks(due_date);
 CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_type       ON tasks(type);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee   ON tasks(assignee);
+
+CREATE TABLE IF NOT EXISTS pending_shared_tasks (
+    id          TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    description TEXT DEFAULT NULL,
+    status      TEXT NOT NULL DEFAULT 'not_started',
+    priority    TEXT DEFAULT 'medium',
+    section     TEXT DEFAULT 'inbox',
+    due_date    TEXT DEFAULT NULL,
+    project     TEXT DEFAULT NULL,
+    parent_id   TEXT DEFAULT NULL,
+    notes       TEXT DEFAULT NULL,
+    recurring   TEXT DEFAULT NULL,
+    type        TEXT NOT NULL DEFAULT 'task',
+    assignee    TEXT DEFAULT NULL,
+    shared_by   TEXT DEFAULT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
@@ -171,6 +197,48 @@ _MIGRATIONS = [
         "SELECT 1 FROM pragma_table_info('tasks') WHERE name='description'",
         "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
         "tasks.description column",
+    ),
+    # v0.5.0: type column
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='type'",
+        "ALTER TABLE tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'task'",
+        "tasks.type column (task/note)",
+    ),
+    # v0.5.0: assignee column
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='assignee'",
+        "ALTER TABLE tasks ADD COLUMN assignee TEXT DEFAULT NULL",
+        "tasks.assignee column",
+    ),
+    # v0.5.0: shared_by column
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='shared_by'",
+        "ALTER TABLE tasks ADD COLUMN shared_by TEXT DEFAULT NULL",
+        "tasks.shared_by column",
+    ),
+    # v0.5.0: type index
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_type'",
+        "CREATE INDEX idx_tasks_type ON tasks(type)",
+        "idx_tasks_type index",
+    ),
+    # v0.5.0: assignee index
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_assignee'",
+        "CREATE INDEX idx_tasks_assignee ON tasks(assignee)",
+        "idx_tasks_assignee index",
+    ),
+    # v0.5.0: pending_shared_tasks staging table
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_shared_tasks'",
+        "CREATE TABLE pending_shared_tasks ("
+        "id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, "
+        "status TEXT NOT NULL DEFAULT 'not_started', priority TEXT DEFAULT 'medium', "
+        "section TEXT DEFAULT 'inbox', due_date TEXT, project TEXT, parent_id TEXT, "
+        "notes TEXT, recurring TEXT, type TEXT NOT NULL DEFAULT 'task', "
+        "assignee TEXT, shared_by TEXT, created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL, received_at TEXT NOT NULL)",
+        "pending_shared_tasks staging table",
     ),
 ]
 
@@ -842,6 +910,7 @@ def search_by_project(query: str, project: str) -> str:
 @mcp.tool()
 def create_task(
     title: str,
+    type: str = "task",
     description: str | None = None,
     section: str = "inbox",
     priority: str = "medium",
@@ -851,10 +920,11 @@ def create_task(
     notes: str | None = None,
     recurring: str | None = None,
 ) -> str:
-    """Create a new task. Returns the task UUID.
+    """Create a new task or note. Returns the UUID.
 
     Args:
         title: Task title (required).
+        type: task | note.
         description: Unlimited-length task description/details.
         section: inbox | today | next | someday | waiting.
         priority: low | medium | high | critical.
@@ -875,6 +945,8 @@ def create_task(
         return json.dumps(
             {"error": f"Invalid priority: {priority}. Use: {_TASK_PRIORITIES}"}
         )
+    if type not in _TASK_TYPES:
+        return json.dumps({"error": f"Invalid type: {type}. Use: {_TASK_TYPES}"})
     if due_date:
         try:
             datetime.strptime(due_date, "%Y-%m-%d")
@@ -893,8 +965,9 @@ def create_task(
 
         conn.execute(
             "INSERT INTO tasks (id, title, description, status, priority, section, "
-            "due_date, project, parent_id, notes, recurring, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "due_date, project, parent_id, notes, recurring, type, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -906,13 +979,16 @@ def create_task(
                 parent_id,
                 notes,
                 recurring,
+                type,
                 now,
                 now,
             ),
         )
 
     logger.info("create_task: %s (%s)", title, task_id)
-    return json.dumps({"task_id": task_id, "title": title, "status": "not_started"})
+    return json.dumps(
+        {"task_id": task_id, "title": title, "type": type, "status": "not_started"}
+    )
 
 
 @mcp.tool()
@@ -928,6 +1004,7 @@ def update_task(
     parent_id: str | None = None,
     notes: str | None = None,
     recurring: str | None = None,
+    type: str | None = None,
 ) -> str:
     """Update a task's fields. Only provided fields are changed.
 
@@ -955,6 +1032,7 @@ def update_task(
         "parent_id": parent_id,
         "notes": notes,
         "recurring": recurring,
+        "type": type,
     }
     updates = {}
     for k, v in fields.items():
@@ -978,6 +1056,10 @@ def update_task(
     if "section" in updates and updates["section"] not in _TASK_SECTIONS:
         return json.dumps(
             {"error": f"Invalid section: {updates['section']}. Use: {_TASK_SECTIONS}"}
+        )
+    if "type" in updates and updates["type"] not in _TASK_TYPES:
+        return json.dumps(
+            {"error": f"Invalid type: {updates['type']}. Use: {_TASK_TYPES}"}
         )
     if "due_date" in updates and updates["due_date"] is not None:
         try:
@@ -1007,6 +1089,7 @@ def query_tasks(
     priority: str | None = None,
     project: str | None = None,
     parent_id: str | None = None,
+    type: str | None = None,
     overdue_only: bool = False,
     limit: int = 50,
 ) -> str:
@@ -1033,6 +1116,9 @@ def query_tasks(
     if parent_id:
         conditions.append("parent_id = ?")
         params.append(parent_id)
+    if type:
+        conditions.append("type = ?")
+        params.append(type)
     if overdue_only:
         conditions.append("due_date < date('now')")
         conditions.append(f"status NOT IN ({_EXCL_PH})")
@@ -1099,7 +1185,7 @@ def task_digest(
         active = conn.execute(
             f"SELECT id, title, status, priority, section, due_date, project "
             f"FROM tasks "
-            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') "
+            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') AND type = 'task' "
             f"ORDER BY "
             f"  CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
             f"       WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
@@ -1114,7 +1200,7 @@ def task_digest(
             overdue = conn.execute(
                 "SELECT id, title, status, priority, section, due_date, project "
                 "FROM tasks "
-                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) "
+                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) AND type = 'task' "
                 "ORDER BY due_date ASC LIMIT 10",
                 list(_TASK_ACTIVE_EXCLUSIONS),
             ).fetchall()
@@ -1191,7 +1277,7 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
     with _get_conn() as conn:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', updated_at = ? "
-            "WHERE status = 'done' "
+            "WHERE status = 'done' AND type = 'task' "
             "AND updated_at < datetime('now', ? || ' days')",
             (_now(), f"-{days}"),
         )
@@ -1239,6 +1325,160 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
     return json.dumps({"bumped": bumped, "target_priority": target_priority})
 
 
+@mcp.tool()
+def assign_task(task_id: str, assignee: str | None = None) -> str:
+    """Assign a task or note to a GitHub user for collaboration.
+
+    Sets assignee field. On next bridge_push, the item will be
+    pushed to https://github.com/{assignee}/memory-bridge.
+    Pass assignee=None to unassign.
+    """
+    now = _now()
+    with _get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not existing:
+            return json.dumps({"error": f"Task {task_id} not found"})
+
+        shared_by = None
+        if assignee:
+            try:
+                result = subprocess.run(
+                    ["git", "config", "--global", "user.name"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                shared_by = result.stdout.strip() or None
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        conn.execute(
+            "UPDATE tasks SET assignee = ?, shared_by = ?, updated_at = ? WHERE id = ?",
+            (assignee, shared_by, now, task_id),
+        )
+
+    action = f"assigned to {assignee}" if assignee else "unassigned"
+    logger.info("assign_task: %s %s", task_id, action)
+    return json.dumps(
+        {"task_id": task_id, "assignee": assignee, "shared_by": shared_by}
+    )
+
+
+@mcp.tool()
+def review_shared_tasks(
+    action: str = "list",
+    task_ids: list[str] | None = None,
+) -> str:
+    """Review shared tasks pending approval from other users.
+
+    Shared tasks from bridge_pull are staged — never auto-imported.
+    Use this tool to list, approve, or reject them.
+
+    Args:
+        action: list | approve | reject.
+        task_ids: UUIDs to approve/reject. If None with approve/reject, applies to ALL pending.
+    """
+    if action not in ("list", "approve", "reject"):
+        return json.dumps({"error": "action must be: list, approve, reject"})
+
+    with _get_conn() as conn:
+        if action == "list":
+            rows = conn.execute(
+                "SELECT id, title, type, priority, shared_by, received_at "
+                "FROM pending_shared_tasks ORDER BY received_at DESC"
+            ).fetchall()
+            if not rows:
+                return json.dumps(
+                    {"pending": [], "count": 0, "message": "No pending shared tasks"}
+                )
+            items = [dict(r) for r in rows]
+            return json.dumps({"pending": items, "count": len(items)})
+
+        # Build WHERE for specific IDs or all
+        if task_ids:
+            ph = ",".join("?" * len(task_ids))
+            where = f"id IN ({ph})"
+            params = list(task_ids)
+        else:
+            where = "1=1"
+            params = []
+
+        if action == "approve":
+            rows = conn.execute(
+                f"SELECT * FROM pending_shared_tasks WHERE {where}", params
+            ).fetchall()
+            imported = 0
+            for row in rows:
+                t = dict(row)
+                tid = t["id"]
+                existing = conn.execute(
+                    "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                if existing:
+                    if t.get("updated_at", "") > existing["updated_at"]:
+                        conn.execute(
+                            "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
+                            "section=?, due_date=?, project=?, parent_id=?, notes=?, "
+                            "recurring=?, type=?, assignee=?, shared_by=?, updated_at=? "
+                            "WHERE id=?",
+                            (
+                                t["title"],
+                                t.get("description"),
+                                t["status"],
+                                t["priority"],
+                                t["section"],
+                                t.get("due_date"),
+                                t.get("project"),
+                                t.get("parent_id"),
+                                t.get("notes"),
+                                t.get("recurring"),
+                                t.get("type", "task"),
+                                t.get("assignee"),
+                                t.get("shared_by"),
+                                t["updated_at"],
+                                tid,
+                            ),
+                        )
+                        imported += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO tasks (id, title, description, status, priority, "
+                        "section, due_date, project, parent_id, notes, recurring, "
+                        "type, assignee, shared_by, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            tid,
+                            t["title"],
+                            t.get("description"),
+                            t["status"],
+                            t["priority"],
+                            t["section"],
+                            t.get("due_date"),
+                            t.get("project"),
+                            t.get("parent_id"),
+                            t.get("notes"),
+                            t.get("recurring"),
+                            t.get("type", "task"),
+                            t.get("assignee"),
+                            t.get("shared_by"),
+                            t.get("created_at"),
+                            t["updated_at"],
+                        ),
+                    )
+                    imported += 1
+                conn.execute("DELETE FROM pending_shared_tasks WHERE id = ?", (tid,))
+            logger.info("review_shared_tasks: approved %d tasks", imported)
+            return json.dumps({"approved": imported, "imported": imported})
+
+        # action == "reject"
+        cur = conn.execute(f"DELETE FROM pending_shared_tasks WHERE {where}", params)
+        rejected = cur.rowcount
+        logger.info("review_shared_tasks: rejected %d tasks", rejected)
+        return json.dumps({"rejected": rejected})
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Bridge helper
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1255,6 +1495,77 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     if result.returncode != 0:
         logger.warning("git %s failed: %s", " ".join(args), result.stderr.strip())
     return result
+
+
+def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
+    """Push assigned tasks to another user's memory-bridge repo."""
+    import tempfile
+
+    repo_url = f"https://github.com/{assignee}/memory-bridge.git"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clone = subprocess.run(
+            ["git", "clone", "--depth=1", repo_url, tmpdir],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if clone.returncode != 0:
+            logger.warning(
+                "_push_to_assignee: clone failed for %s: %s",
+                assignee,
+                clone.stderr.strip(),
+            )
+            return
+
+        shared_path = Path(tmpdir) / "shared.json"
+        existing: dict = {}
+        if shared_path.exists():
+            try:
+                existing = json.loads(shared_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Merge into shared_tasks array (upsert by id, last-write-wins)
+        shared_tasks = {t["id"]: t for t in existing.get("shared_tasks", [])}
+        for t in tasks:
+            if t.get("updated_at", "") >= shared_tasks.get(t["id"], {}).get(
+                "updated_at", ""
+            ):
+                shared_tasks[t["id"]] = t
+        existing["shared_tasks"] = list(shared_tasks.values())
+
+        shared_path.write_text(
+            json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        subprocess.run(
+            ["git", "-C", tmpdir, "add", "shared.json"], capture_output=True, timeout=10
+        )
+        hostname = socket.gethostname()
+        msg = f"bridge: shared {len(tasks)} tasks from {hostname} to {assignee}"
+        commit = subprocess.run(
+            ["git", "-C", tmpdir, "commit", "-m", msg],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if commit.returncode == 0:
+            push = subprocess.run(
+                ["git", "-C", tmpdir, "push"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if push.returncode == 0:
+                logger.info(
+                    "_push_to_assignee: pushed %d tasks to %s", len(tasks), assignee
+                )
+            else:
+                logger.warning(
+                    "_push_to_assignee: push failed for %s: %s",
+                    assignee,
+                    push.stderr.strip(),
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1333,7 +1644,8 @@ def bridge_push(tag: str = "shared") -> str:
         # Export all non-archived tasks for cross-machine sync
         task_rows = conn.execute(
             "SELECT id, title, description, status, priority, section, due_date, "
-            "project, parent_id, notes, recurring, created_at, updated_at "
+            "project, parent_id, notes, recurring, type, assignee, shared_by, "
+            "created_at, updated_at "
             "FROM tasks WHERE status != 'archived' ORDER BY created_at"
         ).fetchall()
         tasks_out = [dict(r) for r in task_rows]
@@ -1361,6 +1673,7 @@ def bridge_push(tag: str = "shared") -> str:
                 "entities",
                 "relations",
                 "tasks",
+                "shared_tasks",
             }
             for key, val in existing.items():
                 if key not in known_keys and isinstance(val, list):
@@ -1376,6 +1689,18 @@ def bridge_push(tag: str = "shared") -> str:
     shared_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+    # Cross-account push: send assigned tasks to other users' repos
+    by_assignee: dict[str, list] = {}
+    for t in tasks_out:
+        if t.get("assignee"):
+            by_assignee.setdefault(t["assignee"], []).append(t)
+
+    for target_user, assigned_tasks in by_assignee.items():
+        try:
+            _push_to_assignee(target_user, assigned_tasks)
+        except Exception as exc:
+            logger.warning("bridge_push: failed to push to %s: %s", target_user, exc)
 
     n_obs = sum(len(e["observations"]) for e in entities_out)
     msg = (
@@ -1440,9 +1765,17 @@ def bridge_pull() -> str:
     # Collect tasks from all *_tasks keys (tasks, reading_tasks, etc.)
     tasks = list(payload.get("tasks", []))
     for key, val in payload.items():
-        if key.endswith("_tasks") and key != "tasks" and isinstance(val, list):
+        if (
+            key.endswith("_tasks")
+            and key != "tasks"
+            and key != "shared_tasks"
+            and isinstance(val, list)
+        ):
             tasks.extend(val)
             logger.info("bridge_pull: merged %d tasks from '%s'", len(val), key)
+    # Stage shared_tasks for review (never auto-import from other accounts)
+    shared_tasks = payload.get("shared_tasks", [])
+    staged_count = 0
     now = _now()
     new_entities = 0
     new_observations = 0
@@ -1521,6 +1854,8 @@ def bridge_pull() -> str:
                 task["priority"] = "medium"
             if task.get("section") not in _TASK_SECTIONS:
                 task["section"] = "inbox"
+            if task.get("type") not in _TASK_TYPES:
+                task["type"] = "task"
             existing = conn.execute(
                 "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
@@ -1530,7 +1865,7 @@ def bridge_pull() -> str:
                     conn.execute(
                         "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
                         "section=?, due_date=?, project=?, parent_id=?, notes=?, "
-                        "recurring=?, updated_at=? WHERE id=?",
+                        "recurring=?, type=?, assignee=?, shared_by=?, updated_at=? WHERE id=?",
                         (
                             task["title"],
                             task.get("description"),
@@ -1542,6 +1877,9 @@ def bridge_pull() -> str:
                             task.get("parent_id"),
                             task.get("notes"),
                             task.get("recurring"),
+                            task.get("type", "task"),
+                            task.get("assignee"),
+                            task.get("shared_by"),
                             task["updated_at"],
                             tid,
                         ),
@@ -1551,8 +1889,8 @@ def bridge_pull() -> str:
                 conn.execute(
                     "INSERT INTO tasks (id, title, description, status, priority, "
                     "section, due_date, project, parent_id, notes, recurring, "
-                    "created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "type, assignee, shared_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         tid,
                         task["title"],
@@ -1565,32 +1903,77 @@ def bridge_pull() -> str:
                         task.get("parent_id"),
                         task.get("notes"),
                         task.get("recurring"),
+                        task.get("type", "task"),
+                        task.get("assignee"),
+                        task.get("shared_by"),
                         task.get("created_at", now),
                         task.get("updated_at", now),
                     ),
                 )
                 new_tasks += 1
 
+        # Stage shared_tasks for manual review (security: never auto-import)
+        for st in shared_tasks:
+            sid = st.get("id")
+            if not sid:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_shared_tasks "
+                "(id, title, description, status, priority, section, due_date, "
+                "project, parent_id, notes, recurring, type, assignee, shared_by, "
+                "created_at, updated_at, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sid,
+                    st.get("title", "Untitled"),
+                    st.get("description"),
+                    st.get("status", "not_started"),
+                    st.get("priority", "medium"),
+                    st.get("section", "inbox"),
+                    st.get("due_date"),
+                    st.get("project"),
+                    st.get("parent_id"),
+                    st.get("notes"),
+                    st.get("recurring"),
+                    st.get("type", "task"),
+                    st.get("assignee"),
+                    st.get("shared_by"),
+                    st.get("created_at", now),
+                    st.get("updated_at", now),
+                    now,
+                ),
+            )
+            staged_count += 1
+
+    if staged_count:
+        logger.info("bridge_pull: staged %d shared tasks for review", staged_count)
+
     logger.info(
         "bridge_pull: %d new entities, %d new observations, %d new relations, "
-        "%d new tasks, %d updated tasks",
+        "%d new tasks, %d updated tasks, %d staged for review",
         new_entities,
         new_observations,
         new_relations,
         new_tasks,
         updated_tasks,
+        staged_count,
     )
-    return json.dumps(
-        {
-            "new_entities": new_entities,
-            "new_observations": new_observations,
-            "new_relations": new_relations,
-            "new_tasks": new_tasks,
-            "updated_tasks": updated_tasks,
-            "source_machine": payload.get("machine_id", "unknown"),
-            "pushed_at": payload.get("pushed_at", "unknown"),
-        }
-    )
+    result: dict[str, Any] = {
+        "new_entities": new_entities,
+        "new_observations": new_observations,
+        "new_relations": new_relations,
+        "new_tasks": new_tasks,
+        "updated_tasks": updated_tasks,
+        "source_machine": payload.get("machine_id", "unknown"),
+        "pushed_at": payload.get("pushed_at", "unknown"),
+    }
+    if staged_count:
+        result["staged_shared_tasks"] = staged_count
+        result["review_required"] = (
+            f"{staged_count} shared task(s) pending review. "
+            "Use review_shared_tasks() to approve or reject."
+        )
+    return json.dumps(result)
 
 
 @mcp.tool()

@@ -26,6 +26,7 @@ def run_digest(
     sections: list[str],
     include_overdue: bool,
     limit: int,
+    include_notes: bool = False,
 ) -> str:
     """Query the DB and return a markdown digest string."""
 
@@ -35,7 +36,7 @@ def run_digest(
         active = conn.execute(
             f"SELECT id, title, status, priority, section, due_date, project "
             f"FROM tasks "
-            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') "
+            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') AND type = 'task' "
             f"ORDER BY "
             f"  CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
             f"       WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
@@ -50,7 +51,7 @@ def run_digest(
             overdue = conn.execute(
                 "SELECT id, title, status, priority, section, due_date, project "
                 "FROM tasks "
-                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) "
+                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) AND type = 'task' "
                 "ORDER BY due_date ASC LIMIT 10",
                 list(TASK_ACTIVE_EXCLUSIONS),
             ).fetchall()
@@ -58,8 +59,18 @@ def run_digest(
         # Status counts (active + done, excluding archived/cancelled)
         counts = conn.execute(
             "SELECT status, COUNT(*) as cnt FROM tasks "
-            "WHERE status NOT IN ('archived', 'cancelled') GROUP BY status"
+            "WHERE status NOT IN ('archived', 'cancelled') AND type = 'task' GROUP BY status"
         ).fetchall()
+
+        note_rows: list = []
+        if include_notes:
+            note_rows = conn.execute(
+                "SELECT id, title, priority, updated_at FROM tasks "
+                "WHERE type = 'note' AND status NOT IN ('archived', 'cancelled') "
+                f"ORDER BY {build_priority_order_sql()}, updated_at DESC "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
 
     # ── Format markdown ───────────────────────────────────────────────────────
     now_utc = now_iso()
@@ -103,6 +114,13 @@ def run_digest(
                 lines.append(f"- {prio}{t['title']}{due}")
             lines.append("")
 
+    if note_rows:
+        lines.append(f"### NOTES ({len(note_rows)})")
+        for n in note_rows:
+            prio = f"[{n['priority'].upper()}] " if n["priority"] != "medium" else ""
+            lines.append(f"- {prio}{n['title']}")
+        lines.append("")
+
     if not active and not overdue:
         lines.append("*No tasks found for the selected sections.*")
         lines.append("")
@@ -142,6 +160,12 @@ def main() -> int:
         metavar="N",
         help="Max tasks to fetch per query (default: 20)",
     )
+    parser.add_argument(
+        "--include-notes",
+        action="store_true",
+        default=False,
+        help="Include notes in the digest output",
+    )
 
     args = parser.parse_args()
 
@@ -161,6 +185,7 @@ def main() -> int:
         sections=sections,
         include_overdue=args.include_overdue,
         limit=args.limit,
+        include_notes=args.include_notes,
     )
     print(digest)
     return 0

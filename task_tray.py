@@ -62,6 +62,9 @@ class TaskDB:
                 parent_id TEXT,
                 notes TEXT,
                 recurring TEXT,
+                type TEXT NOT NULL DEFAULT 'task',
+                assignee TEXT,
+                shared_by TEXT,
                 created_at TEXT,
                 updated_at TEXT
             )
@@ -91,7 +94,8 @@ class TaskDB:
         """Delete done tasks older than `days` days. Returns count deleted."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         cur = self._conn.execute(
-            "DELETE FROM tasks WHERE status = 'done' AND updated_at < ?", (cutoff,)
+            "DELETE FROM tasks WHERE status = 'done' AND type = 'task' AND updated_at < ?",
+            (cutoff,),
         )
         if cur.rowcount:
             self._conn.commit()
@@ -101,7 +105,7 @@ class TaskDB:
         """Return prioritized mix: overdue + high/critical + nearest due."""
         pri_sql = build_priority_order_sql()
         rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
+            f"SELECT * FROM tasks WHERE (status NOT IN ({_ACTIVE_PH}) OR (type = 'note' AND status = 'done' AND due_date IS NULL)) "
             "ORDER BY "
             "CASE WHEN due_date IS NOT NULL AND due_date < date('now') THEN 0 ELSE 1 END, "
             f"{pri_sql}, "
@@ -109,6 +113,16 @@ class TaskDB:
             "created_at DESC "
             "LIMIT ?",
             _ACTIVE_PARAMS + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_notes(self):
+        """All notes (never-deleted). Excludes archived/cancelled."""
+        pri_sql = build_priority_order_sql()
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE type = 'note' "
+            "AND status NOT IN ('archived', 'cancelled') "
+            f"ORDER BY {pri_sql}, updated_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -128,14 +142,15 @@ class TaskDB:
         project=None,
         status="not_started",
         description=None,
+        type="task",
     ):
         """Insert new task, return its ID."""
         task_id = str(uuid.uuid4())
         now = now_iso()
         self._conn.execute(
             "INSERT INTO tasks (id, title, description, status, section, priority, "
-            "due_date, project, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "due_date, project, type, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -145,6 +160,7 @@ class TaskDB:
                 priority,
                 due_date,
                 project,
+                type,
                 now,
                 now,
             ),
@@ -345,6 +361,9 @@ class TrayPopup(QWidget):
         self._add_priority.addItems(PRIORITIES)
         self._add_priority.setCurrentText("medium")
         form_layout.addWidget(self._add_priority)
+        self._add_type = QComboBox()
+        self._add_type.addItems(["Task", "Note"])
+        form_layout.addWidget(self._add_type)
         submit = QPushButton("Add Task")
         submit.setObjectName("submit-btn")
         submit.clicked.connect(self._submit_task)
@@ -470,13 +489,15 @@ class TrayPopup(QWidget):
         due = self._add_due.text().strip()
         if due:
             kwargs["due_date"] = due
-        task_id = self.db.add_task(title, **kwargs)
+        task_type = self._add_type.currentText().lower()
+        task_id = self.db.add_task(title, type=task_type, **kwargs)
         if desc:
             self.db.update_task(task_id, description=desc)
         self._add_title.clear()
         self._add_desc.clear()
         self._add_due.clear()
         self._add_priority.setCurrentText("medium")
+        self._add_type.setCurrentText("Task")
         self._add_form.setVisible(False)
         self._add_btn.setText("+")
         self.refresh()
@@ -550,6 +571,11 @@ class EditTaskDialog(QDialog):
         """)
         layout = QFormLayout(self)
 
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Task", "Note"])
+        self.type_combo.setCurrentText(task.get("type", "task").title())
+        layout.addRow("Type:", self.type_combo)
+
         self.title_edit = QLineEdit(task.get("title", ""))
         layout.addRow("Title:", self.title_edit)
 
@@ -592,6 +618,7 @@ class EditTaskDialog(QDialog):
         }
         vals["due_date"] = self.due_edit.text().strip() or None
         vals["project"] = self.project_edit.text().strip() or None
+        vals["type"] = self.type_combo.currentText().lower()
         return vals
 
 
@@ -798,11 +825,14 @@ class TaskListWidget(QListWidget):
                 if len(desc) > 50
                 else (f" — {desc}" if desc else "")
             )
-            item.setText(f"[{priority}] {task['title']}{due}{preview}")
+            type_prefix = "[N] " if task.get("type") == "note" else ""
+            item.setText(f"{type_prefix}[{priority}] {task['title']}{due}{preview}")
             if desc:
                 item.setToolTip(desc)
             if task["status"] == "done":
                 item.setForeground(QColor("#1a5632"))
+            if task.get("type") == "note":
+                item.setBackground(QColor("#f0f4ff"))
             self.addItem(item)
         self.blockSignals(False)
 
@@ -826,10 +856,16 @@ class TaskListWidget(QListWidget):
             "QMenu::item:selected { background: #1a2332; color: #ffffff; }"
         )
         view_action = menu.addAction("View")
+        task = next((t for t in self._tasks if t["id"] == task_id), None)
+        current_type = task.get("type", "task") if task else "task"
+        target_type = "note" if current_type == "task" else "task"
+        convert_action = menu.addAction(f"Convert to {target_type.title()}")
         delete_action = menu.addAction("Delete")
         action = menu.exec(self.mapToGlobal(pos))
         if action == view_action:
             self._open_reader(task_id)
+        elif action == convert_action:
+            self.db.update_task(task_id, type=target_type)
         elif action == delete_action:
             self.db.delete_task(task_id)
 
@@ -897,13 +933,14 @@ class FullWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        # Tab order: Suggested, Today, Inbox, Next, All, Done
-        self._tab_keys = ["suggested", "today", "inbox", "next", "all", "done"]
+        # Tab order: Suggested, Today, Inbox, Next, Notes, All, Done
+        self._tab_keys = ["suggested", "today", "inbox", "next", "notes", "all", "done"]
         self._tab_labels = {
             "suggested": "Suggested",
             "today": "Today",
             "inbox": "Inbox",
             "next": "Next",
+            "notes": "Notes",
             "all": "All",
             "done": "Done",
         }
@@ -984,16 +1021,22 @@ class FullWindow(QMainWindow):
             try:
                 subprocess.run(
                     ["git", "add", "-A"],
-                    cwd=self._BRIDGE_DIR, capture_output=True, timeout=10,
+                    cwd=self._BRIDGE_DIR,
+                    capture_output=True,
+                    timeout=10,
                 )
                 result = subprocess.run(
                     ["git", "commit", "-m", "bridge: sync from task tray"],
-                    cwd=self._BRIDGE_DIR, capture_output=True, timeout=10,
+                    cwd=self._BRIDGE_DIR,
+                    capture_output=True,
+                    timeout=10,
                 )
                 if result.returncode == 0:
                     subprocess.run(
                         ["git", "push"],
-                        cwd=self._BRIDGE_DIR, capture_output=True, timeout=30,
+                        cwd=self._BRIDGE_DIR,
+                        capture_output=True,
+                        timeout=30,
                     )
                     return "Bridge synced to GitHub"
                 return "Bridge: nothing to sync"
@@ -1057,11 +1100,25 @@ class FullWindow(QMainWindow):
         done = self.db.get_done_tasks()
         suggested = self.db.get_suggested_tasks()
 
+        notes = self.db.get_all_notes()
         raw = {
             "suggested": suggested,
-            "today": [t for t in all_active if t.get("section") == "today"],
-            "inbox": [t for t in all_active if t.get("section") == "inbox"],
-            "next": [t for t in all_active if t.get("section") == "next"],
+            "today": [
+                t
+                for t in all_active
+                if t.get("section") == "today" and t.get("type", "task") != "note"
+            ],
+            "inbox": [
+                t
+                for t in all_active
+                if t.get("section") == "inbox" and t.get("type", "task") != "note"
+            ],
+            "next": [
+                t
+                for t in all_active
+                if t.get("section") == "next" and t.get("type", "task") != "note"
+            ],
+            "notes": notes,
             "all": all_active,
             "done": done,
         }
@@ -1072,15 +1129,17 @@ class FullWindow(QMainWindow):
             tasks = self._sort_tasks(tasks) if key != "done" else tasks
             self.tab_lists[key].load_tasks(tasks)
 
-        # Hide empty tabs (suggested always visible)
+        # Hide empty tabs (suggested and notes always visible)
         for i, key in enumerate(self._tab_keys):
             count = self.tab_lists[key].count()
-            self.tabs.setTabVisible(i, count > 0 or key == "suggested")
+            self.tabs.setTabVisible(i, count > 0 or key in ("suggested", "notes"))
 
         # Status bar — derive summary from already-fetched data
         s = self.db.get_summary(all_active)
+        task_count = sum(1 for t in all_active if t.get("type", "task") == "task")
+        note_count = len(notes)
         done_count = len(done)
-        msg = f"Active: {s['total']} | Done: {done_count} | Overdue: {s['overdue']}"
+        msg = f"Tasks: {task_count} | Notes: {note_count} | Done: {done_count} | Overdue: {s['overdue']}"
         if self._search_text:
             msg += f" | Filter: '{self._search_text}'"
         self.status.showMessage(msg)

@@ -39,7 +39,7 @@ def _get_tasks() -> tuple[list[dict], set[str]]:
         cur.execute(
             """
             SELECT id, title, status, priority, section, due_date,
-                   project, parent_id, notes, created_at, updated_at
+                   project, parent_id, notes, type, created_at, updated_at
             FROM tasks
             WHERE status NOT IN ('archived', 'cancelled')
             ORDER BY created_at
@@ -56,7 +56,6 @@ def _get_tasks() -> tuple[list[dict], set[str]]:
         return tasks, parent_ids
 
 
-
 def _html_escape(text: str) -> str:
     if not text:
         return ""
@@ -67,7 +66,6 @@ def _html_escape(text: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&#x27;")
     )
-
 
 
 def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
@@ -96,6 +94,9 @@ def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
 
     if has_children:
         badges_html += ' <span class="badge badge--subtask">SUBTASKS</span>'
+
+    if (task.get("type") or "task") == "note":
+        badges_html += ' <span class="badge badge--note">NOTE</span>'
 
     due_html = ""
     if due_date:
@@ -380,6 +381,12 @@ def _build_html(tasks: list[dict], parent_ids: set[str]) -> str:
       background: #f0fff4;
       color: #276749;
       border: 1px solid #9ae6b4;
+    }}
+
+    .badge--note {{
+      background: #f0f4ff;
+      color: #3b5998;
+      border: 1px solid #a3bffa;
     }}
 
     /* ── Empty state ── */

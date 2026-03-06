@@ -30,6 +30,7 @@ BRIDGE_REPO = os.environ.get(
 TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting")
 TASK_PRIORITIES = ("low", "medium", "high", "critical")  # ascending rank
 TASK_STATUSES = ("not_started", "in_progress", "done", "archived", "cancelled")
+TASK_TYPES = ("task", "note")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
 TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 
@@ -54,6 +55,9 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
         "parent_id",
         "notes",
         "recurring",
+        "type",
+        "assignee",
+        "shared_by",
         "updated_at",
     }
 )
