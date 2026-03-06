@@ -293,6 +293,42 @@ def create_tray_icon_pixmap(overdue_count=0):
     return pm
 
 
+# ── Dark Theme Colors (centralized) ──────────────────────────────────
+
+_CLR_DONE = QColor("#38a169")
+_CLR_NOTE_BG = QColor("#1e2d3d")
+_CLR_OVERDUE_BG = QColor("#3b1c1c")
+_CLR_OVERDUE_FG = QColor("#fc8181")
+_CLR_HEADER_BG = QColor("#1e2836")
+_CLR_HEADER_FG = QColor("#a0aec0")
+_CLR_OVERDUE_HDR_BG = QColor("#3b1c1c")
+_CLR_OVERDUE_HDR_FG = QColor("#fc8181")
+_CLR_URGENT_HDR_BG = QColor("#3b2c1c")
+_CLR_URGENT_HDR_FG = QColor("#f6ad55")
+
+
+def _format_task_text(task, include_project=True, prefix=""):
+    """Build display text: [N] [PRIORITY] title | Due: date | project — preview."""
+    type_prefix = "[N] " if task.get("type") == "note" else ""
+    priority = (task.get("priority") or "medium").upper()
+    due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
+    proj = f" | {task['project']}" if include_project and task.get("project") else ""
+    desc = task.get("description") or ""
+    preview = f" — {desc[:50]}..." if len(desc) > 50 else (f" — {desc}" if desc else "")
+    return f"{prefix}{type_prefix}[{priority}] {task['title']}{due}{proj}{preview}"
+
+
+def _apply_task_item_colors(item, task):
+    """Apply state-based colors to a QListWidgetItem (done, note, overdue)."""
+    if task["status"] == "done":
+        item.setForeground(_CLR_DONE)
+    if task.get("type") == "note":
+        item.setBackground(_CLR_NOTE_BG)
+    if is_overdue(task.get("due_date")) and task["status"] != "done":
+        item.setBackground(_CLR_OVERDUE_BG)
+        item.setForeground(_CLR_OVERDUE_FG)
+
+
 def _smart_group(tasks):
     """Group tasks intelligently: Overdue → Critical/High → By Project (due soon) → Rest.
 
@@ -302,34 +338,15 @@ def _smart_group(tasks):
     urgent = []
     by_project: dict[str, list] = {}
     rest = []
-    seen = set()
 
     for t in tasks:
-        tid = t["id"]
         if is_overdue(t.get("due_date")) and t["status"] != "done":
             overdue.append(t)
-            seen.add(tid)
-
-    for t in tasks:
-        tid = t["id"]
-        if tid in seen:
-            continue
-        pri = t.get("priority", "medium")
-        if pri in ("critical", "high"):
+        elif t.get("priority", "medium") in ("critical", "high"):
             urgent.append(t)
-            seen.add(tid)
-
-    for t in tasks:
-        tid = t["id"]
-        if tid in seen:
-            continue
-        proj = t.get("project")
-        if proj:
-            by_project.setdefault(proj, []).append(t)
-            seen.add(tid)
-
-    for t in tasks:
-        if t["id"] not in seen:
+        elif t.get("project"):
+            by_project.setdefault(t["project"], []).append(t)
+        else:
             rest.append(t)
 
     groups = []
@@ -971,28 +988,11 @@ class TaskListWidget(QListWidget):
                 if task["status"] == "done"
                 else Qt.CheckState.Unchecked
             )
-            priority = (task.get("priority") or "medium").upper()
-            due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
-            proj = f" | {task['project']}" if task.get("project") else ""
-            desc = task.get("description") or ""
-            preview = (
-                f" — {desc[:50]}..."
-                if len(desc) > 50
-                else (f" — {desc}" if desc else "")
-            )
-            type_prefix = "[N] " if task.get("type") == "note" else ""
-            item.setText(
-                f"{type_prefix}[{priority}] {task['title']}{due}{proj}{preview}"
-            )
+            item.setText(_format_task_text(task))
+            desc = task.get("description")
             if desc:
                 item.setToolTip(desc)
-            if task["status"] == "done":
-                item.setForeground(QColor("#38a169"))
-            if task.get("type") == "note":
-                item.setBackground(QColor("#1e2d3d"))
-            if is_overdue(task.get("due_date")) and task["status"] != "done":
-                item.setBackground(QColor("#3b1c1c"))
-                item.setForeground(QColor("#fc8181"))
+            _apply_task_item_colors(item, task)
             self.addItem(item)
         self.blockSignals(False)
 
@@ -1013,8 +1013,8 @@ class TaskListWidget(QListWidget):
             # Project header item (non-interactive)
             header = QListWidgetItem(f"── {proj_name} ({len(proj_tasks)}) ──")
             header.setFlags(Qt.ItemFlag.NoItemFlags)
-            header.setBackground(QColor("#1e2836"))
-            header.setForeground(QColor("#a0aec0"))
+            header.setBackground(_CLR_HEADER_BG)
+            header.setForeground(_CLR_HEADER_FG)
             font = header.font()
             font.setBold(True)
             header.setFont(font)
@@ -1030,25 +1030,13 @@ class TaskListWidget(QListWidget):
                     if task["status"] == "done"
                     else Qt.CheckState.Unchecked
                 )
-                priority = (task.get("priority") or "medium").upper()
-                due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
-                desc = task.get("description") or ""
-                preview = (
-                    f" — {desc[:50]}..."
-                    if len(desc) > 50
-                    else (f" — {desc}" if desc else "")
-                )
-                type_prefix = "[N] " if task.get("type") == "note" else ""
                 item.setText(
-                    f"  {type_prefix}[{priority}] {task['title']}{due}{preview}"
+                    _format_task_text(task, include_project=False, prefix="  ")
                 )
+                desc = task.get("description")
                 if desc:
                     item.setToolTip(desc)
-                if task["status"] == "done":
-                    item.setForeground(QColor("#38a169"))
-                if is_overdue(task.get("due_date")) and task["status"] != "done":
-                    item.setBackground(QColor("#3b1c1c"))
-                    item.setForeground(QColor("#fc8181"))
+                _apply_task_item_colors(item, task)
                 self.addItem(item)
 
         self.blockSignals(False)
@@ -1064,17 +1052,17 @@ class TaskListWidget(QListWidget):
                 continue
             header = QListWidgetItem(f"── {group_label} ({len(group_tasks)}) ──")
             header.setFlags(Qt.ItemFlag.NoItemFlags)
-            header.setBackground(QColor("#1e2836"))
-            header.setForeground(QColor("#a0aec0"))
+            header.setBackground(_CLR_HEADER_BG)
+            header.setForeground(_CLR_HEADER_FG)
             font = header.font()
             font.setBold(True)
             header.setFont(font)
             if group_label == "⚠ Overdue":
-                header.setBackground(QColor("#3b1c1c"))
-                header.setForeground(QColor("#fc8181"))
+                header.setBackground(_CLR_OVERDUE_HDR_BG)
+                header.setForeground(_CLR_OVERDUE_HDR_FG)
             elif group_label == "Urgent":
-                header.setBackground(QColor("#3b2c1c"))
-                header.setForeground(QColor("#f6ad55"))
+                header.setBackground(_CLR_URGENT_HDR_BG)
+                header.setForeground(_CLR_URGENT_HDR_FG)
             self.addItem(header)
             for task in group_tasks:
                 item = QListWidgetItem()
@@ -1085,26 +1073,11 @@ class TaskListWidget(QListWidget):
                     if task["status"] == "done"
                     else Qt.CheckState.Unchecked
                 )
-                priority = (task.get("priority") or "medium").upper()
-                due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
-                proj = f" | {task['project']}" if task.get("project") else ""
-                desc = task.get("description") or ""
-                preview = (
-                    f" — {desc[:50]}..."
-                    if len(desc) > 50
-                    else (f" — {desc}" if desc else "")
-                )
-                type_prefix = "[N] " if task.get("type") == "note" else ""
-                item.setText(
-                    f"  {type_prefix}[{priority}] {task['title']}{due}{proj}{preview}"
-                )
+                item.setText(_format_task_text(task, prefix="  "))
+                desc = task.get("description")
                 if desc:
                     item.setToolTip(desc)
-                if task["status"] == "done":
-                    item.setForeground(QColor("#38a169"))
-                if is_overdue(task.get("due_date")) and task["status"] != "done":
-                    item.setBackground(QColor("#3b1c1c"))
-                    item.setForeground(QColor("#fc8181"))
+                _apply_task_item_colors(item, task)
                 self.addItem(item)
         self.blockSignals(False)
 
