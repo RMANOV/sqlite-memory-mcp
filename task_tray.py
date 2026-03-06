@@ -89,6 +89,17 @@ class TaskDB:
     def close(self):
         self._conn.close()
 
+    def promote_due_today(self):
+        """Auto-move tasks with due_date <= today from inbox/next to today."""
+        cur = self._conn.execute(
+            "UPDATE tasks SET section = 'today' "
+            "WHERE due_date <= date('now') AND section IN ('inbox', 'next') "
+            "AND status <> 'done' AND type = 'task'"
+        )
+        if cur.rowcount:
+            self._conn.commit()
+        return cur.rowcount
+
     def get_all_active(self):
         """Return all active tasks (excludes done, archived, cancelled)."""
         rows = self._conn.execute(
@@ -492,6 +503,7 @@ class TrayPopup(QWidget):
 
     def refresh(self):
         """Reload tasks from DB and rebuild list."""
+        self.db.promote_due_today()
         while self.task_layout.count():
             item = self.task_layout.takeAt(0)
             if item.widget():
@@ -1517,6 +1529,8 @@ class FullWindow(QMainWindow):
         ]
 
     def refresh(self):
+        # Auto-promote tasks whose due date has arrived
+        self.db.promote_due_today()
         # Single query for all active tasks, then filter by section in Python
         all_active = self.db.get_all_active()
         done = self.db.get_done_tasks()
