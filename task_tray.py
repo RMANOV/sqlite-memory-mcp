@@ -214,7 +214,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
-from PyQt6.QtCore import QSettings, Qt, QTimer, QPoint
+from PyQt6.QtCore import QEvent, QSettings, Qt, QTimer, QPoint
 
 
 def create_tray_icon_pixmap(overdue_count=0):
@@ -256,7 +256,10 @@ class TrayPopup(QWidget):
 
     def __init__(self, db, on_open_full, parent=None):
         super().__init__(
-            parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+            parent,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
         )
         self.db = db
         self.on_open_full = on_open_full
@@ -497,6 +500,12 @@ class TrayPopup(QWidget):
         self.move(QPoint(x, y))
         self.show()
         self.activateWindow()
+
+    def changeEvent(self, event):
+        # Dismiss on deactivation (replaces Popup auto-dismiss behavior)
+        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            self.hide()
+        super().changeEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)

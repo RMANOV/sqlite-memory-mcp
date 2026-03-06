@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Task Tray
+Comment=SQLite Memory Task Tray
+Exec=python3 /home/rmanov/sqlite-memory-mcp/task_tray.py
+Icon=preferences-system-notifications
+Type=Application
+Terminal=false
+Categories=Utility;
+StartupNotify=false
