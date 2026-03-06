@@ -48,7 +48,7 @@ class TaskDB:
         self._ensure_table()
 
     def _ensure_table(self):
-        """Create tasks table if it doesn't exist (for test DBs)."""
+        """Create tasks table if missing; migrate existing table to v0.5.0 schema."""
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -69,6 +69,21 @@ class TaskDB:
                 updated_at TEXT
             )
         """)
+        # Migrate existing DBs: add columns that v0.5.0 requires
+        existing = {
+            r[1] for r in self._conn.execute("PRAGMA table_info('tasks')").fetchall()
+        }
+        for col, sql in [
+            ("type", "ALTER TABLE tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'task'"),
+            ("assignee", "ALTER TABLE tasks ADD COLUMN assignee TEXT DEFAULT NULL"),
+            ("shared_by", "ALTER TABLE tasks ADD COLUMN shared_by TEXT DEFAULT NULL"),
+            (
+                "description",
+                "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
+            ),
+        ]:
+            if col not in existing:
+                self._conn.execute(sql)
         self._conn.commit()
 
     def close(self):
@@ -231,6 +246,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QComboBox,
     QDialogButtonBox,
+    QProgressBar,
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import QEvent, QSettings, Qt, QTimer, QPoint, pyqtSignal
@@ -878,6 +894,7 @@ class FullWindow(QMainWindow):
     """Full task manager window with tabs, search, sort, and suggested view."""
 
     _bridge_done = pyqtSignal(str)
+    _bridge_progress = pyqtSignal(int, str)  # (percent, step_label)
 
     # Sort modes cycle: priority → due → created → priority ...
     _SORT_MODES = ("priority", "due", "created")
@@ -982,8 +999,17 @@ class FullWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # Bridge sync signal (thread-safe → main thread)
-        self._bridge_done.connect(lambda msg: self.status.showMessage(msg, 5000))
+        # Bridge sync progress bar (hidden by default)
+        self._sync_bar = QProgressBar()
+        self._sync_bar.setFixedWidth(220)
+        self._sync_bar.setTextVisible(True)
+        self._sync_bar.setFormat("%v%  %s")
+        self._sync_bar.hide()
+        self.status.addPermanentWidget(self._sync_bar)
+
+        # Bridge sync signals (thread-safe → main thread)
+        self._bridge_progress.connect(self._on_sync_progress)
+        self._bridge_done.connect(self._on_sync_done)
 
         # Auto-refresh every 30s
         self._refresh_timer = QTimer(self)
@@ -1009,45 +1035,193 @@ class FullWindow(QMainWindow):
         self.refresh()
         self._sync_bridge()
 
+    # Suppress console windows on Windows
+    _SP_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    def _on_sync_progress(self, pct, label):
+        self._sync_bar.setValue(pct)
+        self._sync_bar.setFormat(f"{pct}%  {label}")
+        self._sync_bar.show()
+
+    def _on_sync_done(self, msg):
+        self._sync_bar.setValue(100)
+        self._sync_bar.setFormat(f"100%  {msg}")
+        QTimer.singleShot(3000, self._sync_bar.hide)
+        self.status.showMessage(msg, 5000)
+
     def _sync_bridge(self):
-        """Git add/commit/push the memory bridge in a background thread."""
+        """Export full memory (entities+relations+tasks) → shared.json, then git push."""
         if not os.path.isdir(self._BRIDGE_DIR):
             self.status.showMessage("Bridge dir not found", 3000)
             return
 
-        self.status.showMessage("Syncing bridge to GitHub...")
-
-        def _do_sync():
-            try:
-                subprocess.run(
-                    ["git", "add", "-A"],
-                    cwd=self._BRIDGE_DIR,
-                    capture_output=True,
-                    timeout=10,
-                )
-                result = subprocess.run(
-                    ["git", "commit", "-m", "bridge: sync from task tray"],
-                    cwd=self._BRIDGE_DIR,
-                    capture_output=True,
-                    timeout=10,
-                )
-                if result.returncode == 0:
-                    subprocess.run(
-                        ["git", "push"],
-                        cwd=self._BRIDGE_DIR,
-                        capture_output=True,
-                        timeout=30,
-                    )
-                    return "Bridge synced to GitHub"
-                return "Bridge: nothing to sync"
-            except Exception as exc:
-                return f"Bridge sync error: {exc}"
-
         def _run():
-            msg = _do_sync()
-            self._bridge_done.emit(msg)
+            try:
+                git_kw = dict(
+                    cwd=self._BRIDGE_DIR,
+                    capture_output=True,
+                    text=True,
+                    creationflags=self._SP_FLAGS,
+                )
+
+                # 0. Pull remote changes + import new entities
+                self._bridge_progress.emit(5, "git pull...")
+                subprocess.run(["git", "pull", "--rebase"], timeout=30, **git_kw)
+                shared_path = Path(self._BRIDGE_DIR) / "shared.json"
+                if shared_path.exists():
+                    try:
+                        remote_data = json.loads(
+                            shared_path.read_text(encoding="utf-8")
+                        )
+                        self._import_remote_entities(remote_data.get("entities", []))
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                # 1. Export entities + observations
+                self._bridge_progress.emit(15, "Exporting entities...")
+                conn = self.db._conn
+                ent_rows = conn.execute(
+                    "SELECT id, name, entity_type, project, created_at, updated_at "
+                    "FROM entities WHERE project LIKE 'shared%' ORDER BY name"
+                ).fetchall()
+                entities_out, entity_ids = [], set()
+                for e in ent_rows:
+                    entity_ids.add(e["id"])
+                    obs = conn.execute(
+                        "SELECT content, created_at FROM observations "
+                        "WHERE entity_id = ? ORDER BY id",
+                        (e["id"],),
+                    ).fetchall()
+                    entities_out.append(
+                        {
+                            "name": e["name"],
+                            "entityType": e["entity_type"],
+                            "project": e["project"],
+                            "observations": [
+                                {"content": o["content"], "createdAt": o["created_at"]}
+                                for o in obs
+                            ],
+                            "createdAt": e["created_at"],
+                            "updatedAt": e["updated_at"],
+                        }
+                    )
+
+                # 2. Export relations between shared entities
+                self._bridge_progress.emit(25, "Exporting relations...")
+                relations_out = []
+                if entity_ids:
+                    ph = ",".join("?" * len(entity_ids))
+                    ids = list(entity_ids)
+                    rel_rows = conn.execute(
+                        f"SELECT ef.name AS from_name, et.name AS to_name, "
+                        f"r.relation_type, r.created_at FROM relations r "
+                        f"JOIN entities ef ON r.from_id = ef.id "
+                        f"JOIN entities et ON r.to_id = et.id "
+                        f"WHERE r.from_id IN ({ph}) AND r.to_id IN ({ph})",
+                        ids + ids,
+                    ).fetchall()
+                    relations_out = [
+                        {
+                            "from": r["from_name"],
+                            "to": r["to_name"],
+                            "relationType": r["relation_type"],
+                            "createdAt": r["created_at"],
+                        }
+                        for r in rel_rows
+                    ]
+
+                # 3. Export all non-archived tasks
+                self._bridge_progress.emit(40, "Exporting tasks...")
+                task_rows = conn.execute(
+                    "SELECT id, title, description, status, priority, section, "
+                    "due_date, project, parent_id, notes, recurring, type, "
+                    "assignee, shared_by, created_at, updated_at "
+                    "FROM tasks WHERE status != 'archived' ORDER BY created_at"
+                ).fetchall()
+
+                # 4. Build payload (preserve extra keys from remote)
+                payload = {
+                    "version": 2,
+                    "pushed_at": now_iso(),
+                    "machine_id": socket.gethostname(),
+                    "entities": entities_out,
+                    "relations": relations_out,
+                    "tasks": [dict(r) for r in task_rows],
+                }
+                if shared_path.exists():
+                    try:
+                        existing = json.loads(shared_path.read_text(encoding="utf-8"))
+                        known = {
+                            "version",
+                            "pushed_at",
+                            "machine_id",
+                            "entities",
+                            "relations",
+                            "tasks",
+                            "shared_tasks",
+                        }
+                        for k, v in existing.items():
+                            if k not in known and isinstance(v, list):
+                                payload[k] = v
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                self._bridge_progress.emit(55, "Writing shared.json...")
+                shared_path.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+
+                # 5. Git add + commit + push
+                self._bridge_progress.emit(65, "git add...")
+                subprocess.run(["git", "add", "shared.json"], timeout=10, **git_kw)
+
+                self._bridge_progress.emit(80, "git commit...")
+                n_ent = len(entities_out)
+                n_tasks = len(payload["tasks"])
+                msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {socket.gethostname()}"
+                result = subprocess.run(
+                    ["git", "commit", "-m", msg], timeout=10, **git_kw
+                )
+                if result.returncode != 0:
+                    self._bridge_done.emit("Nothing to sync")
+                    return
+
+                self._bridge_progress.emit(90, "git push...")
+                subprocess.run(["git", "push"], timeout=30, **git_kw)
+                self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
+            except Exception as exc:
+                self._bridge_done.emit(f"Sync error: {exc}")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _import_remote_entities(self, remote_entities):
+        """Import entities from remote shared.json that don't exist locally."""
+        conn = self.db._conn
+        for e in remote_entities:
+            existing = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (e["name"],)
+            ).fetchone()
+            if existing:
+                continue
+            now = now_iso()
+            eid = conn.execute(
+                "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    e["name"],
+                    e["entityType"],
+                    e.get("project") or "shared:bridge",
+                    now,
+                    now,
+                ),
+            ).lastrowid
+            for o in e.get("observations", []):
+                conn.execute(
+                    "INSERT INTO observations (entity_id, content, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (eid, o["content"], o.get("createdAt", now)),
+                )
+        conn.commit()
 
     def _sort_tasks(self, tasks):
         """Sort tasks by current sort mode."""
