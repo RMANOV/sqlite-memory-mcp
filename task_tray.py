@@ -271,6 +271,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import QDate, QEvent, QSettings, Qt, QTimer, QPoint, pyqtSignal
+from pathlib import Path
 
 
 def create_tray_icon_pixmap(overdue_count=0):
