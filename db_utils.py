@@ -72,14 +72,14 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
 _PRAGMAS = (
     "PRAGMA journal_mode=WAL;",
     "PRAGMA foreign_keys=ON;",
-    "PRAGMA busy_timeout=5000;",
+    "PRAGMA busy_timeout=10000;",
 )
 
 
 @contextmanager
 def get_conn(db_path: str | None = None):
     """Yield a SQLite connection with PRAGMAs set, auto-commit/rollback."""
-    conn = sqlite3.connect(db_path or DB_PATH, timeout=10)
+    conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=10)
     conn.row_factory = sqlite3.Row
     for pragma in _PRAGMAS:
         conn.execute(pragma)

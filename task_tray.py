@@ -43,10 +43,10 @@ class TaskDB:
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
         self.on_change = None
-        self._conn = sqlite3.connect(self.db_path, timeout=10)
+        self._conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA busy_timeout=10000")
         self._ensure_table()
 
     def _ensure_table(self):
@@ -1322,9 +1322,11 @@ class FullWindow(QMainWindow):
                 )
 
                 # Thread-safe: fresh connection for background thread
-                conn = sqlite3.connect(self.db.db_path, timeout=10)
+                conn = sqlite3.connect(
+                    self.db.db_path, isolation_level=None, timeout=10
+                )
                 conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA busy_timeout=10000")
 
                 # 0. Pull remote changes + import new entities
                 self._bridge_progress.emit(5, "git pull...")
@@ -1462,6 +1464,7 @@ class FullWindow(QMainWindow):
     def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""
         conn = conn or self.db._conn
+        conn.execute("BEGIN")
         for e in remote_entities:
             existing = conn.execute(
                 "SELECT id FROM entities WHERE name = ?", (e["name"],)

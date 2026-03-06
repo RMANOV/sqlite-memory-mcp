@@ -221,7 +221,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 @contextmanager
 def _get_conn():
     """Yield a SQLite connection with all PRAGMAs set, auto-commit/rollback."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
     for pragma in _PRAGMAS:
         conn.execute(pragma)
