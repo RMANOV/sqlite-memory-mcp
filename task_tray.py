@@ -5,7 +5,10 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
 import html as _html
+import os
 import sqlite3
+import subprocess
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -214,7 +217,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
-from PyQt6.QtCore import QEvent, QSettings, Qt, QTimer, QPoint
+from PyQt6.QtCore import QEvent, QSettings, Qt, QTimer, QPoint, pyqtSignal
 
 
 def create_tray_icon_pixmap(overdue_count=0):
@@ -838,6 +841,8 @@ _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
 class FullWindow(QMainWindow):
     """Full task manager window with tabs, search, sort, and suggested view."""
 
+    _bridge_done = pyqtSignal(str)
+
     # Sort modes cycle: priority → due → created → priority ...
     _SORT_MODES = ("priority", "due", "created")
     _SORT_LABELS = {
@@ -915,8 +920,8 @@ class FullWindow(QMainWindow):
         add_action = QAction("+ Add Task", self)
         add_action.triggered.connect(self._add_task)
         toolbar.addAction(add_action)
-        refresh_action = QAction("Refresh", self)
-        refresh_action.triggered.connect(self.refresh)
+        refresh_action = QAction("Refresh + Sync", self)
+        refresh_action.triggered.connect(self._refresh_and_sync)
         toolbar.addAction(refresh_action)
         toolbar.addSeparator()
 
@@ -940,6 +945,9 @@ class FullWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
+        # Bridge sync signal (thread-safe → main thread)
+        self._bridge_done.connect(lambda msg: self.status.showMessage(msg, 5000))
+
         # Auto-refresh every 30s
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
@@ -954,6 +962,49 @@ class FullWindow(QMainWindow):
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
+
+    # ── Bridge sync ────────────────────────────────────────────────────
+
+    _BRIDGE_DIR = os.path.expanduser("~/.claude/memory/bridge")
+
+    def _refresh_and_sync(self):
+        """Refresh task list then sync memory bridge to GitHub."""
+        self.refresh()
+        self._sync_bridge()
+
+    def _sync_bridge(self):
+        """Git add/commit/push the memory bridge in a background thread."""
+        if not os.path.isdir(self._BRIDGE_DIR):
+            self.status.showMessage("Bridge dir not found", 3000)
+            return
+
+        self.status.showMessage("Syncing bridge to GitHub...")
+
+        def _do_sync():
+            try:
+                subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=self._BRIDGE_DIR, capture_output=True, timeout=10,
+                )
+                result = subprocess.run(
+                    ["git", "commit", "-m", "bridge: sync from task tray"],
+                    cwd=self._BRIDGE_DIR, capture_output=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    subprocess.run(
+                        ["git", "push"],
+                        cwd=self._BRIDGE_DIR, capture_output=True, timeout=30,
+                    )
+                    return "Bridge synced to GitHub"
+                return "Bridge: nothing to sync"
+            except Exception as exc:
+                return f"Bridge sync error: {exc}"
+
+        def _run():
+            msg = _do_sync()
+            self._bridge_done.emit(msg)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _sort_tasks(self, tasks):
         """Sort tasks by current sort mode."""
