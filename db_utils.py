@@ -34,6 +34,11 @@ TASK_TYPES = ("task", "note")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
 TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 
+# Collaboration constants
+TRUST_LEVELS = ("read_only", "read_write")
+SHARE_TYPES = ("entity", "relation", "all")
+ENTITY_ORIGINS = ("local",)  # "shared:{username}" added dynamically
+
 PRIORITY_RANK = {p: i for i, p in enumerate(TASK_PRIORITIES)}
 
 PRIORITY_COLORS = {

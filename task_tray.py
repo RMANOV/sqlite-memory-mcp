@@ -849,6 +849,10 @@ class TaskListWidget(QListWidget):
                 item.setForeground(QColor("#1a5632"))
             if task.get("type") == "note":
                 item.setBackground(QColor("#f0f4ff"))
+            if is_overdue(task.get("due_date")) and task["status"] != "done":
+                item.setBackground(QColor("#fff5f5"))
+                item.setForeground(QColor("#c53030"))
+                item.setText(f"⚠ {item.text()}")
             self.addItem(item)
         self.blockSignals(False)
 
@@ -1300,7 +1304,9 @@ class FullWindow(QMainWindow):
         # Apply filter + sort, load into widgets
         for key in self._tab_keys:
             tasks = self._filter(raw[key])
-            tasks = self._sort_tasks(tasks) if key != "done" else tasks
+            tasks = (
+                self._sort_tasks(tasks) if key not in ("done", "suggested") else tasks
+            )
             self.tab_lists[key].load_tasks(tasks)
 
         # Hide empty tabs (suggested and notes always visible)

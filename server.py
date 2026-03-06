@@ -6,7 +6,8 @@ FTS5 BM25-ranked search, session tracking, cross-machine bridge sync,
 and structured task management.
 
 Drop-in compatible with @modelcontextprotocol/server-memory (tools 1-9)
-plus extended tools: session (10-12), task management (13-18), bridge (19-21).
+plus extended tools: session (10-12), task management (13-18), bridge (19-21),
+multi-account knowledge collaboration (25-27).
 """
 
 from __future__ import annotations
@@ -83,6 +84,8 @@ CREATE TABLE IF NOT EXISTS entities (
     name        TEXT    UNIQUE NOT NULL,
     entity_type TEXT    NOT NULL,
     project     TEXT    DEFAULT NULL,
+    shared_by   TEXT    DEFAULT NULL,
+    origin      TEXT    DEFAULT 'local',
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -165,6 +168,48 @@ CREATE TABLE IF NOT EXISTS pending_shared_tasks (
     received_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS collaborators (
+    github_user   TEXT PRIMARY KEY,
+    display_name  TEXT DEFAULT NULL,
+    trust_level   TEXT NOT NULL DEFAULT 'read_write',
+    added_at      TEXT NOT NULL,
+    last_sync_at  TEXT DEFAULT NULL,
+    notes         TEXT DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_shared_entities (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,
+    entity_type   TEXT NOT NULL,
+    project       TEXT DEFAULT NULL,
+    observations  TEXT NOT NULL,
+    priority      TEXT NOT NULL DEFAULT 'medium',
+    shared_by     TEXT NOT NULL,
+    source_hash   TEXT NOT NULL,
+    received_at   TEXT NOT NULL,
+    UNIQUE(source_hash, shared_by)
+);
+
+CREATE TABLE IF NOT EXISTS pending_shared_relations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_entity     TEXT NOT NULL,
+    to_entity       TEXT NOT NULL,
+    relation_type   TEXT NOT NULL,
+    shared_by       TEXT NOT NULL,
+    received_at     TEXT NOT NULL,
+    UNIQUE(from_entity, to_entity, relation_type, shared_by)
+);
+
+CREATE TABLE IF NOT EXISTS sharing_rules (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_name   TEXT NOT NULL,
+    target_user   TEXT NOT NULL,
+    share_type    TEXT NOT NULL DEFAULT 'entity',
+    priority      TEXT NOT NULL DEFAULT 'medium',
+    created_at    TEXT NOT NULL,
+    UNIQUE(entity_name, target_user, share_type)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
     tokenize = "unicode61 remove_diacritics 2"
@@ -239,6 +284,58 @@ _MIGRATIONS = [
         "assignee TEXT, shared_by TEXT, created_at TEXT NOT NULL, "
         "updated_at TEXT NOT NULL, received_at TEXT NOT NULL)",
         "pending_shared_tasks staging table",
+    ),
+    # v0.6.0: collaborators address book
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='collaborators'",
+        "CREATE TABLE collaborators ("
+        "github_user TEXT PRIMARY KEY, display_name TEXT, "
+        "trust_level TEXT NOT NULL DEFAULT 'read_write', "
+        "added_at TEXT NOT NULL, last_sync_at TEXT, notes TEXT)",
+        "collaborators table",
+    ),
+    # v0.6.0: pending_shared_entities staging
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_shared_entities'",
+        "CREATE TABLE pending_shared_entities ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+        "entity_type TEXT NOT NULL, project TEXT, observations TEXT NOT NULL, "
+        "priority TEXT NOT NULL DEFAULT 'medium', "
+        "shared_by TEXT NOT NULL, source_hash TEXT NOT NULL, received_at TEXT NOT NULL, "
+        "UNIQUE(source_hash, shared_by))",
+        "pending_shared_entities staging table",
+    ),
+    # v0.6.0: pending_shared_relations staging
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_shared_relations'",
+        "CREATE TABLE pending_shared_relations ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, from_entity TEXT NOT NULL, "
+        "to_entity TEXT NOT NULL, relation_type TEXT NOT NULL, "
+        "shared_by TEXT NOT NULL, received_at TEXT NOT NULL, "
+        "UNIQUE(from_entity, to_entity, relation_type, shared_by))",
+        "pending_shared_relations staging table",
+    ),
+    # v0.6.0: sharing_rules
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sharing_rules'",
+        "CREATE TABLE sharing_rules ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT NOT NULL, "
+        "target_user TEXT NOT NULL, share_type TEXT NOT NULL DEFAULT 'entity', "
+        "priority TEXT NOT NULL DEFAULT 'medium', "
+        "created_at TEXT NOT NULL, UNIQUE(entity_name, target_user, share_type))",
+        "sharing_rules table",
+    ),
+    # v0.6.0: entities.shared_by column
+    (
+        "SELECT 1 FROM pragma_table_info('entities') WHERE name='shared_by'",
+        "ALTER TABLE entities ADD COLUMN shared_by TEXT DEFAULT NULL",
+        "entities.shared_by column",
+    ),
+    # v0.6.0: entities.origin column
+    (
+        "SELECT 1 FROM pragma_table_info('entities') WHERE name='origin'",
+        "ALTER TABLE entities ADD COLUMN origin TEXT DEFAULT 'local'",
+        "entities.origin column",
     ),
 ]
 
@@ -1480,6 +1577,405 @@ def review_shared_tasks(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Tools 25-27: Multi-Account Knowledge Collaboration (v0.6.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _source_hash(name: str, entity_type: str, observations: list) -> str:
+    """SHA256 hash for deduplication of shared entities."""
+    raw = json.dumps({"n": name, "t": entity_type, "o": observations}, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+@mcp.tool()
+def manage_collaborators(
+    action: str,
+    github_user: str | None = None,
+    display_name: str | None = None,
+    trust_level: str | None = None,
+    notes: str | None = None,
+) -> str:
+    """Manage the collaborator address book for P2P knowledge sharing.
+
+    Each collaborator is a GitHub user whose memory-bridge repo you can
+    push knowledge to and pull knowledge from.
+
+    Args:
+        action: add | remove | list | update.
+        github_user: GitHub username (required for add/remove/update).
+        display_name: Human-friendly name.
+        trust_level: read_only (you push, they can't push back) | read_write (bidirectional).
+        notes: Free-text notes about this collaborator.
+    """
+    if action not in ("add", "remove", "list", "update"):
+        return json.dumps({"error": "action must be: add, remove, list, update"})
+
+    with _get_conn() as conn:
+        if action == "list":
+            rows = conn.execute(
+                "SELECT * FROM collaborators ORDER BY added_at"
+            ).fetchall()
+            items = [dict(r) for r in rows]
+            return json.dumps({"collaborators": items, "count": len(items)})
+
+        if not github_user:
+            return json.dumps({"error": "github_user required for add/remove/update"})
+
+        if action == "add":
+            tl = trust_level or "read_write"
+            if tl not in _TRUST_LEVELS:
+                return json.dumps(
+                    {"error": f"trust_level must be one of: {', '.join(_TRUST_LEVELS)}"}
+                )
+            now = _now()
+            conn.execute(
+                "INSERT OR REPLACE INTO collaborators "
+                "(github_user, display_name, trust_level, added_at, notes) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (github_user, display_name, tl, now, notes),
+            )
+            logger.info("manage_collaborators: added %s (trust=%s)", github_user, tl)
+            return json.dumps(
+                {"added": github_user, "trust_level": tl, "display_name": display_name}
+            )
+
+        if action == "remove":
+            cur = conn.execute(
+                "DELETE FROM collaborators WHERE github_user = ?", (github_user,)
+            )
+            # Also clean up sharing rules targeting this user
+            conn.execute(
+                "DELETE FROM sharing_rules WHERE target_user = ?", (github_user,)
+            )
+            if cur.rowcount == 0:
+                return json.dumps({"error": f"Collaborator '{github_user}' not found"})
+            logger.info("manage_collaborators: removed %s", github_user)
+            return json.dumps({"removed": github_user})
+
+        # action == "update"
+        existing = conn.execute(
+            "SELECT * FROM collaborators WHERE github_user = ?", (github_user,)
+        ).fetchone()
+        if not existing:
+            return json.dumps({"error": f"Collaborator '{github_user}' not found"})
+
+        updates = {}
+        if display_name is not None:
+            updates["display_name"] = display_name
+        if trust_level is not None:
+            if trust_level not in _TRUST_LEVELS:
+                return json.dumps(
+                    {"error": f"trust_level must be one of: {', '.join(_TRUST_LEVELS)}"}
+                )
+            updates["trust_level"] = trust_level
+        if notes is not None:
+            updates["notes"] = notes
+        if not updates:
+            return json.dumps({"error": "Nothing to update"})
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            f"UPDATE collaborators SET {set_clause} WHERE github_user = ?",
+            list(updates.values()) + [github_user],
+        )
+        logger.info("manage_collaborators: updated %s (%s)", github_user, list(updates))
+        return json.dumps({"updated": github_user, "fields": list(updates.keys())})
+
+
+@mcp.tool()
+def share_knowledge(
+    entity_names: list[str],
+    target_users: list[str] | None = None,
+    include_relations: bool = True,
+    priority: str = "medium",
+) -> str:
+    """Queue entities for sharing with collaborators on next bridge_push.
+
+    Creates sharing rules — does NOT push immediately.
+    P2P priority signals how urgently the recipient should adopt this knowledge.
+
+    Args:
+        entity_names: Entity names to share (or ['*'] for all shared-tagged).
+        target_users: GitHub usernames (or ['*'] for all collaborators). Defaults to all.
+        include_relations: Also share inter-relations between the named entities.
+        priority: critical | high | medium | low — urgency signal for recipients.
+    """
+    if priority not in _TASK_PRIORITIES:
+        return json.dumps(
+            {"error": f"priority must be one of: {', '.join(_TASK_PRIORITIES)}"}
+        )
+
+    with _get_conn() as conn:
+        # Resolve target users
+        if not target_users or target_users == ["*"]:
+            collab_rows = conn.execute(
+                "SELECT github_user FROM collaborators"
+            ).fetchall()
+            targets = [r["github_user"] for r in collab_rows]
+        else:
+            targets = target_users
+
+        if not targets:
+            return json.dumps(
+                {
+                    "error": "No collaborators found. Use manage_collaborators(action='add') first."
+                }
+            )
+
+        # Validate entities exist (unless wildcard)
+        if entity_names != ["*"]:
+            for name in entity_names:
+                row = conn.execute(
+                    "SELECT 1 FROM entities WHERE name = ?", (name,)
+                ).fetchone()
+                if not row:
+                    return json.dumps({"error": f"Entity '{name}' not found"})
+
+        share_types = ["entity"]
+        if include_relations:
+            share_types.append("relation")
+
+        created = 0
+        now = _now()
+        for ename in entity_names:
+            for tuser in targets:
+                for stype in share_types:
+                    cur = conn.execute(
+                        "INSERT OR REPLACE INTO sharing_rules "
+                        "(entity_name, target_user, share_type, priority, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (ename, tuser, stype, priority, now),
+                    )
+                    created += cur.rowcount
+
+        logger.info(
+            "share_knowledge: %d rules created for %d entities → %d users (priority=%s)",
+            created,
+            len(entity_names),
+            len(targets),
+            priority,
+        )
+        return json.dumps(
+            {
+                "rules_created": created,
+                "entities": entity_names,
+                "targets": targets,
+                "include_relations": include_relations,
+                "priority": priority,
+                "message": f"Queued for next bridge_push. {len(targets)} recipient(s).",
+            }
+        )
+
+
+@mcp.tool()
+def review_shared_knowledge(
+    action: str = "list",
+    item_ids: list[int] | None = None,
+) -> str:
+    """Review incoming shared knowledge from collaborators.
+
+    All cross-account entities enter staging first — never auto-imported.
+    P2P priority (critical/high/medium/low) indicates sender's urgency signal.
+
+    Args:
+        action: list | approve | reject | diff.
+        item_ids: IDs from pending_shared_entities to act on. If None, applies to ALL.
+    """
+    if action not in ("list", "approve", "reject", "diff"):
+        return json.dumps({"error": "action must be: list, approve, reject, diff"})
+
+    with _get_conn() as conn:
+        if action == "list":
+            ent_rows = conn.execute(
+                "SELECT id, name, entity_type, project, priority, shared_by, received_at "
+                "FROM pending_shared_entities ORDER BY "
+                "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, received_at DESC"
+            ).fetchall()
+            rel_rows = conn.execute(
+                "SELECT id, from_entity, to_entity, relation_type, shared_by, received_at "
+                "FROM pending_shared_relations ORDER BY received_at DESC"
+            ).fetchall()
+            return json.dumps(
+                {
+                    "pending_entities": [dict(r) for r in ent_rows],
+                    "pending_relations": [dict(r) for r in rel_rows],
+                    "entity_count": len(ent_rows),
+                    "relation_count": len(rel_rows),
+                }
+            )
+
+        if action == "diff":
+            if not item_ids:
+                return json.dumps({"error": "item_ids required for diff"})
+            diffs = []
+            for iid in item_ids:
+                pending = conn.execute(
+                    "SELECT * FROM pending_shared_entities WHERE id = ?", (iid,)
+                ).fetchone()
+                if not pending:
+                    diffs.append({"id": iid, "error": "not found"})
+                    continue
+                p = dict(pending)
+                pending_obs = json.loads(p["observations"])
+                local = conn.execute(
+                    "SELECT id FROM entities WHERE name = ?", (p["name"],)
+                ).fetchone()
+                if not local:
+                    diffs.append(
+                        {
+                            "id": iid,
+                            "name": p["name"],
+                            "status": "new_entity",
+                            "remote_type": p["entity_type"],
+                            "remote_observations": len(pending_obs),
+                            "priority": p["priority"],
+                        }
+                    )
+                else:
+                    local_obs = conn.execute(
+                        "SELECT content FROM observations WHERE entity_id = ?",
+                        (local["id"],),
+                    ).fetchall()
+                    local_contents = {r["content"] for r in local_obs}
+                    remote_contents = {o["content"] for o in pending_obs}
+                    local_etype = conn.execute(
+                        "SELECT entity_type FROM entities WHERE id = ?", (local["id"],)
+                    ).fetchone()["entity_type"]
+                    diffs.append(
+                        {
+                            "id": iid,
+                            "name": p["name"],
+                            "status": "type_conflict"
+                            if local_etype != p["entity_type"]
+                            else "merge",
+                            "local_type": local_etype,
+                            "remote_type": p["entity_type"],
+                            "new_observations": list(remote_contents - local_contents),
+                            "already_have": len(local_contents & remote_contents),
+                            "priority": p["priority"],
+                        }
+                    )
+            return json.dumps({"diffs": diffs})
+
+        # Build WHERE for specific IDs or all
+        if item_ids:
+            ph = ",".join("?" * len(item_ids))
+            ent_where = f"id IN ({ph})"
+            ent_params: list = list(item_ids)
+        else:
+            ent_where = "1=1"
+            ent_params = []
+
+        if action == "approve":
+            rows = conn.execute(
+                f"SELECT * FROM pending_shared_entities WHERE {ent_where}", ent_params
+            ).fetchall()
+            imported_entities = 0
+            imported_obs = 0
+            now = _now()
+            for row in rows:
+                p = dict(row)
+                pending_obs = json.loads(p["observations"])
+                origin = f"shared:{p['shared_by']}"
+
+                # Upsert entity (additive — never overwrites local)
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO entities "
+                    "(name, entity_type, project, shared_by, origin, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        p["name"],
+                        p["entity_type"],
+                        p.get("project"),
+                        p["shared_by"],
+                        origin,
+                        now,
+                        now,
+                    ),
+                )
+                imported_entities += cur.rowcount
+
+                eid_row = conn.execute(
+                    "SELECT id FROM entities WHERE name = ?", (p["name"],)
+                ).fetchone()
+                if eid_row:
+                    eid = eid_row["id"]
+                    for obs in pending_obs:
+                        content = obs["content"] if isinstance(obs, dict) else obs
+                        created = (
+                            obs.get("createdAt", now) if isinstance(obs, dict) else now
+                        )
+                        cur2 = conn.execute(
+                            "INSERT OR IGNORE INTO observations "
+                            "(entity_id, content, created_at) VALUES (?, ?, ?)",
+                            (eid, content, created),
+                        )
+                        imported_obs += cur2.rowcount
+                    _fts_sync(conn, eid)
+
+                conn.execute(
+                    "DELETE FROM pending_shared_entities WHERE id = ?", (p["id"],)
+                )
+
+            # Also approve matching pending relations
+            rel_rows = conn.execute("SELECT * FROM pending_shared_relations").fetchall()
+            imported_rels = 0
+            for rel in rel_rows:
+                r = dict(rel)
+                from_row = conn.execute(
+                    "SELECT id FROM entities WHERE name = ?", (r["from_entity"],)
+                ).fetchone()
+                to_row = conn.execute(
+                    "SELECT id FROM entities WHERE name = ?", (r["to_entity"],)
+                ).fetchone()
+                if from_row and to_row:
+                    cur3 = conn.execute(
+                        "INSERT OR IGNORE INTO relations "
+                        "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
+                        (from_row["id"], to_row["id"], r["relation_type"], now),
+                    )
+                    imported_rels += cur3.rowcount
+                    conn.execute(
+                        "DELETE FROM pending_shared_relations WHERE id = ?", (r["id"],)
+                    )
+
+            logger.info(
+                "review_shared_knowledge: approved %d entities, %d obs, %d relations",
+                imported_entities,
+                imported_obs,
+                imported_rels,
+            )
+            return json.dumps(
+                {
+                    "approved_entities": imported_entities,
+                    "new_observations": imported_obs,
+                    "approved_relations": imported_rels,
+                }
+            )
+
+        # action == "reject"
+        cur_e = conn.execute(
+            f"DELETE FROM pending_shared_entities WHERE {ent_where}", ent_params
+        )
+        # If no specific IDs, also clear all pending relations
+        if not item_ids:
+            cur_r = conn.execute("DELETE FROM pending_shared_relations")
+            rejected_rels = cur_r.rowcount
+        else:
+            rejected_rels = 0
+        rejected = cur_e.rowcount
+        logger.info(
+            "review_shared_knowledge: rejected %d entities, %d relations",
+            rejected,
+            rejected_rels,
+        )
+        return json.dumps(
+            {"rejected_entities": rejected, "rejected_relations": rejected_rels}
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Bridge helper
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1568,6 +2064,157 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
                 )
 
 
+def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
+    """Push shared knowledge (entities + relations) to a collaborator's repo."""
+    import tempfile
+
+    # Gather entities to share based on sharing_rules
+    rules = conn.execute(
+        "SELECT entity_name, share_type, priority FROM sharing_rules WHERE target_user IN (?, '*')",
+        (target_user,),
+    ).fetchall()
+    if not rules:
+        return 0
+
+    entity_names: set[str] = set()
+    include_relations = False
+    priorities: dict[str, str] = {}  # entity_name → priority
+    for r in rules:
+        if r["share_type"] in ("entity", "all"):
+            if r["entity_name"] == "*":
+                # All shared-tagged entities
+                rows = conn.execute(
+                    "SELECT name FROM entities WHERE project LIKE 'shared%'"
+                ).fetchall()
+                for row in rows:
+                    entity_names.add(row["name"])
+                    priorities[row["name"]] = r["priority"]
+            else:
+                entity_names.add(r["entity_name"])
+                priorities[r["entity_name"]] = r["priority"]
+        if r["share_type"] in ("relation", "all"):
+            include_relations = True
+
+    if not entity_names:
+        return 0
+
+    # Build knowledge payload
+    knowledge_out = []
+    entity_ids = set()
+    for ename in entity_names:
+        erow = conn.execute(
+            "SELECT id, name, entity_type, project FROM entities WHERE name = ?",
+            (ename,),
+        ).fetchone()
+        if not erow:
+            continue
+        entity_ids.add(erow["id"])
+        obs = conn.execute(
+            "SELECT content, created_at FROM observations WHERE entity_id = ? ORDER BY id",
+            (erow["id"],),
+        ).fetchall()
+        obs_list = [
+            {"content": o["content"], "createdAt": o["created_at"]} for o in obs
+        ]
+        entry = {
+            "name": erow["name"],
+            "entityType": erow["entity_type"],
+            "project": erow["project"],
+            "observations": obs_list,
+            "priority": priorities.get(ename, "medium"),
+            "sharedBy": os.environ.get("GITHUB_USER", socket.gethostname()),
+            "sharedAt": _now(),
+            "sourceHash": _source_hash(erow["name"], erow["entity_type"], obs_list),
+        }
+        # Attach relations if requested
+        if include_relations:
+            rels = conn.execute(
+                "SELECT et.name AS to_name, r.relation_type "
+                "FROM relations r JOIN entities et ON r.to_id = et.id "
+                "WHERE r.from_id = ?",
+                (erow["id"],),
+            ).fetchall()
+            entry["relations"] = [
+                {"to": r["to_name"], "relationType": r["relation_type"]}
+                for r in rels
+                if r["to_name"] in entity_names
+            ]
+        knowledge_out.append(entry)
+
+    if not knowledge_out:
+        return 0
+
+    # Clone target repo, merge knowledge, push
+    repo_url = f"https://github.com/{target_user}/memory-bridge.git"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clone = subprocess.run(
+            ["git", "clone", "--depth=1", repo_url, tmpdir],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if clone.returncode != 0:
+            logger.warning(
+                "_push_knowledge_to: clone failed for %s: %s",
+                target_user,
+                clone.stderr.strip(),
+            )
+            return 0
+
+        shared_path = Path(tmpdir) / "shared.json"
+        existing: dict = {}
+        if shared_path.exists():
+            try:
+                existing = json.loads(shared_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Merge into shared_knowledge (dedup by sourceHash)
+        current = {e["sourceHash"]: e for e in existing.get("shared_knowledge", [])}
+        for entry in knowledge_out:
+            current[entry["sourceHash"]] = entry
+        existing["shared_knowledge"] = list(current.values())
+
+        shared_path.write_text(
+            json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        subprocess.run(
+            ["git", "-C", tmpdir, "add", "shared.json"],
+            capture_output=True,
+            timeout=10,
+        )
+        hostname = socket.gethostname()
+        msg = f"bridge: shared {len(knowledge_out)} entities from {hostname} to {target_user}"
+        commit = subprocess.run(
+            ["git", "-C", tmpdir, "commit", "-m", msg],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if commit.returncode == 0:
+            push = subprocess.run(
+                ["git", "-C", tmpdir, "push"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if push.returncode == 0:
+                logger.info(
+                    "_push_knowledge_to: pushed %d entities to %s",
+                    len(knowledge_out),
+                    target_user,
+                )
+                return len(knowledge_out)
+            else:
+                logger.warning(
+                    "_push_knowledge_to: push failed for %s: %s",
+                    target_user,
+                    push.stderr.strip(),
+                )
+        return 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Tools 13-15: Cross-Machine Bridge Sync
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1651,17 +2298,30 @@ def bridge_push(tag: str = "shared") -> str:
         tasks_out = [dict(r) for r in task_rows]
 
     hostname = socket.gethostname()
+
+    # Build team_manifest from collaborators
+    with _get_conn() as conn:
+        collab_rows = conn.execute(
+            "SELECT github_user FROM collaborators ORDER BY added_at"
+        ).fetchall()
+        collaborator_list = [r["github_user"] for r in collab_rows]
+
+    owner = os.environ.get("GITHUB_USER", hostname)
     payload = {
-        "version": 2,
+        "version": 3,
         "pushed_at": _now(),
         "machine_id": hostname,
+        "owner": owner,
         "entities": entities_out,
         "relations": relations_out,
         "tasks": tasks_out,
+        "team_manifest": {
+            "collaborators": collaborator_list,
+            "display_name": owner,
+        },
     }
 
-    # Preserve extra *_tasks keys from remote (e.g. reading_tasks from Fedora)
-    # until they are absorbed into the unified tasks table via bridge_pull
+    # Preserve extra keys from remote (e.g. reading_tasks, shared_knowledge)
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     if shared_path.exists():
         try:
@@ -1670,10 +2330,13 @@ def bridge_push(tag: str = "shared") -> str:
                 "version",
                 "pushed_at",
                 "machine_id",
+                "owner",
                 "entities",
                 "relations",
                 "tasks",
                 "shared_tasks",
+                "shared_knowledge",
+                "team_manifest",
             }
             for key, val in existing.items():
                 if key not in known_keys and isinstance(val, list):
@@ -1702,6 +2365,34 @@ def bridge_push(tag: str = "shared") -> str:
         except Exception as exc:
             logger.warning("bridge_push: failed to push to %s: %s", target_user, exc)
 
+    # Cross-account knowledge push: sharing_rules → collaborator repos
+    knowledge_pushed = 0
+    with _get_conn() as conn:
+        rules = conn.execute(
+            "SELECT DISTINCT target_user FROM sharing_rules"
+        ).fetchall()
+        for rule_row in rules:
+            target = rule_row["target_user"]
+            # Check trust level
+            collab = conn.execute(
+                "SELECT trust_level FROM collaborators WHERE github_user = ?",
+                (target,),
+            ).fetchone()
+            if not collab:
+                continue
+            try:
+                pushed_n = _push_knowledge_to(conn, target)
+                knowledge_pushed += pushed_n
+                # Update last_sync_at
+                conn.execute(
+                    "UPDATE collaborators SET last_sync_at = ? WHERE github_user = ?",
+                    (_now(), target),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "bridge_push: knowledge push to %s failed: %s", target, exc
+                )
+
     n_obs = sum(len(e["observations"]) for e in entities_out)
     msg = (
         f"bridge: push {len(entities_out)} entities, "
@@ -1725,16 +2416,17 @@ def bridge_push(tag: str = "shared") -> str:
         len(tasks_out),
         pushed,
     )
-    return json.dumps(
-        {
-            "entities": len(entities_out),
-            "observations": n_obs,
-            "relations": len(relations_out),
-            "tasks": len(tasks_out),
-            "pushed_to_remote": pushed,
-            "message": msg,
-        }
-    )
+    result = {
+        "entities": len(entities_out),
+        "observations": n_obs,
+        "relations": len(relations_out),
+        "tasks": len(tasks_out),
+        "pushed_to_remote": pushed,
+        "message": msg,
+    }
+    if knowledge_pushed:
+        result["knowledge_shared"] = knowledge_pushed
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -1945,8 +2637,67 @@ def bridge_pull() -> str:
             )
             staged_count += 1
 
+        # Stage shared_knowledge for review (v0.6.0 P2P knowledge collaboration)
+        shared_knowledge = payload.get("shared_knowledge", [])
+        staged_knowledge = 0
+        staged_relations = 0
+        for sk in shared_knowledge:
+            sname = sk.get("name")
+            if not sname:
+                continue
+            obs_json = json.dumps(sk.get("observations", []), ensure_ascii=False)
+            shash = sk.get("sourceHash") or _source_hash(
+                sname, sk.get("entityType", ""), sk.get("observations", [])
+            )
+            sender = sk.get("sharedBy", "unknown")
+
+            # Check trust: only accept from known read_write collaborators
+            collab = conn.execute(
+                "SELECT trust_level FROM collaborators WHERE github_user = ?",
+                (sender,),
+            ).fetchone()
+            if not collab or collab["trust_level"] != "read_write":
+                logger.info(
+                    "bridge_pull: skipping knowledge from untrusted sender %s", sender
+                )
+                continue
+
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_shared_entities "
+                "(name, entity_type, project, observations, priority, "
+                "shared_by, source_hash, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sname,
+                    sk.get("entityType", "unknown"),
+                    sk.get("project"),
+                    obs_json,
+                    sk.get("priority", "medium"),
+                    sender,
+                    shash,
+                    now,
+                ),
+            )
+            staged_knowledge += 1
+
+            # Stage relations if included
+            for rel in sk.get("relations", []):
+                conn.execute(
+                    "INSERT OR IGNORE INTO pending_shared_relations "
+                    "(from_entity, to_entity, relation_type, shared_by, received_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (sname, rel["to"], rel["relationType"], sender, now),
+                )
+                staged_relations += 1
+
     if staged_count:
         logger.info("bridge_pull: staged %d shared tasks for review", staged_count)
+    if staged_knowledge:
+        logger.info(
+            "bridge_pull: staged %d shared entities, %d relations for knowledge review",
+            staged_knowledge,
+            staged_relations,
+        )
 
     logger.info(
         "bridge_pull: %d new entities, %d new observations, %d new relations, "
@@ -1973,6 +2724,14 @@ def bridge_pull() -> str:
             f"{staged_count} shared task(s) pending review. "
             "Use review_shared_tasks() to approve or reject."
         )
+    if staged_knowledge:
+        result["staged_shared_knowledge"] = staged_knowledge
+        result["staged_shared_relations"] = staged_relations
+        msg = f"{staged_knowledge} shared entit(ies) pending review"
+        if staged_relations:
+            msg += f" + {staged_relations} relation(s)"
+        msg += ". Use review_shared_knowledge() to approve or reject."
+        result["knowledge_review_required"] = msg
     return json.dumps(result)
 
 
@@ -1989,6 +2748,21 @@ def bridge_status() -> str:
         local_task_count = conn.execute(
             "SELECT COUNT(*) as cnt FROM tasks WHERE status != 'archived'"
         ).fetchone()["cnt"]
+
+        # v0.6.0: collaboration stats
+        collab_rows = conn.execute(
+            "SELECT github_user, display_name, trust_level, last_sync_at "
+            "FROM collaborators ORDER BY added_at"
+        ).fetchall()
+        pending_knowledge = conn.execute(
+            "SELECT COUNT(*) as cnt FROM pending_shared_entities"
+        ).fetchone()["cnt"]
+        pending_rels = conn.execute(
+            "SELECT COUNT(*) as cnt FROM pending_shared_relations"
+        ).fetchone()["cnt"]
+        sharing_rule_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM sharing_rules"
+        ).fetchone()["cnt"]
     local_names = {r["name"] for r in local_rows}
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
@@ -2004,6 +2778,7 @@ def bridge_status() -> str:
                 "pushed_at": payload.get("pushed_at"),
                 "machine_id": payload.get("machine_id"),
                 "version": payload.get("version"),
+                "owner": payload.get("owner"),
             }
         except (json.JSONDecodeError, OSError):
             pass
@@ -2027,6 +2802,11 @@ def bridge_status() -> str:
             "remote_tasks": remote_task_count,
             "last_commit": last_commit,
             "repo_meta": repo_meta,
+            "collaborators": [dict(r) for r in collab_rows],
+            "collaborator_count": len(collab_rows),
+            "pending_shared_knowledge": pending_knowledge,
+            "pending_shared_relations": pending_rels,
+            "sharing_rules": sharing_rule_count,
         }
     )
 
