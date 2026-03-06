@@ -293,6 +293,57 @@ def create_tray_icon_pixmap(overdue_count=0):
     return pm
 
 
+def _smart_group(tasks):
+    """Group tasks intelligently: Overdue → Critical/High → By Project (due soon) → Rest.
+
+    Returns list of (label, task_list) tuples. Each task appears in exactly one group.
+    """
+    overdue = []
+    urgent = []
+    by_project: dict[str, list] = {}
+    rest = []
+    seen = set()
+
+    for t in tasks:
+        tid = t["id"]
+        if is_overdue(t.get("due_date")) and t["status"] != "done":
+            overdue.append(t)
+            seen.add(tid)
+
+    for t in tasks:
+        tid = t["id"]
+        if tid in seen:
+            continue
+        pri = t.get("priority", "medium")
+        if pri in ("critical", "high"):
+            urgent.append(t)
+            seen.add(tid)
+
+    for t in tasks:
+        tid = t["id"]
+        if tid in seen:
+            continue
+        proj = t.get("project")
+        if proj:
+            by_project.setdefault(proj, []).append(t)
+            seen.add(tid)
+
+    for t in tasks:
+        if t["id"] not in seen:
+            rest.append(t)
+
+    groups = []
+    if overdue:
+        groups.append(("⚠ Overdue", overdue))
+    if urgent:
+        groups.append(("Urgent", urgent))
+    for proj_name in sorted(by_project):
+        groups.append((proj_name, by_project[proj_name]))
+    if rest:
+        groups.append(("Other", rest))
+    return groups
+
+
 # ── TrayPopup ───────────────────────────────────────────────────────
 
 
@@ -446,12 +497,15 @@ class TrayPopup(QWidget):
             ]
 
         if tasks:
-            label = f"Suggested ({len(tasks)})"
-            lbl = QLabel(label)
-            lbl.setObjectName("section-header")
-            self.task_layout.addWidget(lbl)
-            for task in tasks:
-                self.task_layout.addWidget(self._make_task_row(task))
+            groups = _smart_group(tasks)
+            for group_label, group_tasks in groups:
+                if not group_tasks:
+                    continue
+                lbl = QLabel(f"{group_label} ({len(group_tasks)})")
+                lbl.setObjectName("section-header")
+                self.task_layout.addWidget(lbl)
+                for task in group_tasks:
+                    self.task_layout.addWidget(self._make_task_row(task))
         else:
             msg = "No matches" if q else "All clear!"
             lbl = QLabel(msg)
@@ -919,6 +973,7 @@ class TaskListWidget(QListWidget):
             )
             priority = (task.get("priority") or "medium").upper()
             due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
+            proj = f" | {task['project']}" if task.get("project") else ""
             desc = task.get("description") or ""
             preview = (
                 f" — {desc[:50]}..."
@@ -926,7 +981,9 @@ class TaskListWidget(QListWidget):
                 else (f" — {desc}" if desc else "")
             )
             type_prefix = "[N] " if task.get("type") == "note" else ""
-            item.setText(f"{type_prefix}[{priority}] {task['title']}{due}{preview}")
+            item.setText(
+                f"{type_prefix}[{priority}] {task['title']}{due}{proj}{preview}"
+            )
             if desc:
                 item.setToolTip(desc)
             if task["status"] == "done":
@@ -934,9 +991,8 @@ class TaskListWidget(QListWidget):
             if task.get("type") == "note":
                 item.setBackground(QColor("#f0f4ff"))
             if is_overdue(task.get("due_date")) and task["status"] != "done":
-                item.setBackground(QColor("#fff5f5"))
-                item.setForeground(QColor("#c53030"))
-                item.setText(f"⚠ {item.text()}")
+                item.setBackground(QColor("#fce4e4"))
+                item.setForeground(QColor("#9b1c1c"))
             self.addItem(item)
         self.blockSignals(False)
 
@@ -981,11 +1037,55 @@ class TaskListWidget(QListWidget):
                 if task["status"] == "done":
                     item.setForeground(QColor("#1a5632"))
                 if is_overdue(task.get("due_date")) and task["status"] != "done":
-                    item.setBackground(QColor("#fff5f5"))
-                    item.setForeground(QColor("#c53030"))
-                    item.setText(f"  ⚠ {item.text().strip()}")
+                    item.setBackground(QColor("#fce4e4"))
+                    item.setForeground(QColor("#9b1c1c"))
                 self.addItem(item)
 
+        self.blockSignals(False)
+
+    def load_smart_grouped(self, tasks):
+        """Load tasks with smart grouping: Overdue → Urgent → By Project → Rest."""
+        self._tasks = tasks
+        self.blockSignals(True)
+        self.clear()
+        groups = _smart_group(tasks)
+        for group_label, group_tasks in groups:
+            if not group_tasks:
+                continue
+            header = QListWidgetItem(f"── {group_label} ({len(group_tasks)}) ──")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            header.setBackground(QColor("#edf2f7"))
+            header.setForeground(QColor("#1a2332"))
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            if group_label == "⚠ Overdue":
+                header.setBackground(QColor("#fff5f5"))
+                header.setForeground(QColor("#c53030"))
+            elif group_label == "Urgent":
+                header.setBackground(QColor("#fffaf0"))
+                header.setForeground(QColor("#c05621"))
+            self.addItem(header)
+            for task in group_tasks:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, task["id"])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if task["status"] == "done"
+                    else Qt.CheckState.Unchecked
+                )
+                priority = (task.get("priority") or "medium").upper()
+                due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
+                proj = f" | {task['project']}" if task.get("project") else ""
+                type_prefix = "[N] " if task.get("type") == "note" else ""
+                item.setText(f"  {type_prefix}[{priority}] {task['title']}{due}{proj}")
+                if task["status"] == "done":
+                    item.setForeground(QColor("#1a5632"))
+                if is_overdue(task.get("due_date")) and task["status"] != "done":
+                    item.setBackground(QColor("#fce4e4"))
+                    item.setForeground(QColor("#9b1c1c"))
+                self.addItem(item)
         self.blockSignals(False)
 
     def _open_reader(self, task_id):
@@ -1459,8 +1559,9 @@ class FullWindow(QMainWindow):
             tasks = (
                 self._sort_tasks(tasks) if key not in ("done", "suggested") else tasks
             )
-            if key == "projects":
-                # Group by project with headers
+            if key == "suggested":
+                self.tab_lists[key].load_smart_grouped(tasks)
+            elif key == "projects":
                 proj_sorted = sorted(
                     tasks,
                     key=lambda t: (
