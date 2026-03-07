@@ -1004,6 +1004,18 @@ def search_by_project(query: str, project: str) -> str:
 # _TASK_STATUSES, _TASK_PRIORITIES, _TASK_SECTIONS imported from db_utils
 
 
+def _sanitize_task_enums(task: dict) -> None:
+    """Clamp task enum fields to valid values in-place."""
+    if task.get("status") not in _TASK_STATUSES:
+        task["status"] = "not_started"
+    if task.get("priority") not in _TASK_PRIORITIES:
+        task["priority"] = "medium"
+    if task.get("section") not in _TASK_SECTIONS:
+        task["section"] = "inbox"
+    if task.get("type") not in _TASK_TYPES:
+        task["type"] = "task"
+
+
 @mcp.tool()
 def create_task(
     title: str,
@@ -1509,6 +1521,7 @@ def review_shared_tasks(
             imported = 0
             for row in rows:
                 t = dict(row)
+                _sanitize_task_enums(t)
                 tid = t["id"]
                 existing = conn.execute(
                     "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
@@ -2321,11 +2334,53 @@ def bridge_push(tag: str = "shared") -> str:
         },
     }
 
-    # Preserve extra keys from remote (e.g. reading_tasks, shared_knowledge)
+    # Merge remote tasks + preserve extra keys from remote
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     if shared_path.exists():
         try:
             existing = json.loads(shared_path.read_text(encoding="utf-8"))
+
+            # Merge: keep remote tasks that don't exist locally (by title)
+            local_titles = {t["title"] for t in tasks_out}
+            remote_tasks = existing.get("tasks", [])
+            merged_count = 0
+            for rt in remote_tasks:
+                if rt.get("title") and rt["title"] not in local_titles:
+                    tasks_out.append(rt)
+                    local_titles.add(rt["title"])
+                    merged_count += 1
+            if merged_count:
+                payload["tasks"] = tasks_out
+                logger.info(
+                    "bridge_push: merged %d remote-only tasks into payload",
+                    merged_count,
+                )
+
+            # Update existing tasks where remote has newer updated_at
+            local_by_title = {t["title"]: t for t in tasks_out}
+            updated_count = 0
+            for rt in remote_tasks:
+                title = rt.get("title")
+                if not title or title not in local_by_title:
+                    continue
+                lt = local_by_title[title]
+                r_upd = rt.get("updated_at", "")
+                l_upd = lt.get("updated_at", "")
+                if r_upd > l_upd:
+                    _sanitize_task_enums(rt)
+                    for field in ("status", "section", "priority", "due_date",
+                                  "notes", "description", "type"):
+                        if rt.get(field) is not None:
+                            lt[field] = rt[field]
+                    lt["updated_at"] = r_upd
+                    updated_count += 1
+            if updated_count:
+                logger.info(
+                    "bridge_push: updated %d tasks from newer remote data",
+                    updated_count,
+                )
+
+            # Preserve extra keys (e.g. reading_tasks, shared_knowledge)
             known_keys = {
                 "version",
                 "pushed_at",
@@ -2539,15 +2594,7 @@ def bridge_pull() -> str:
             tid = task.get("id")
             if not tid:
                 continue
-            # Validate imported enum fields
-            if task.get("status") not in _TASK_STATUSES:
-                task["status"] = "not_started"
-            if task.get("priority") not in _TASK_PRIORITIES:
-                task["priority"] = "medium"
-            if task.get("section") not in _TASK_SECTIONS:
-                task["section"] = "inbox"
-            if task.get("type") not in _TASK_TYPES:
-                task["type"] = "task"
+            _sanitize_task_enums(task)
             existing = conn.execute(
                 "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
@@ -2609,6 +2656,7 @@ def bridge_pull() -> str:
             sid = st.get("id")
             if not sid:
                 continue
+            _sanitize_task_enums(st)
             conn.execute(
                 "INSERT OR REPLACE INTO pending_shared_tasks "
                 "(id, title, description, status, priority, section, due_date, "

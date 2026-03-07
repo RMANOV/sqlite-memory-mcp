@@ -21,6 +21,8 @@ from db_utils import (
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
+    TASK_STATUSES,
+    TASK_TYPES,
     build_priority_order_sql,
     is_overdue,
     now_iso,
@@ -1404,18 +1406,53 @@ class FullWindow(QMainWindow):
                     "FROM tasks WHERE status != 'archived' ORDER BY created_at"
                 ).fetchall()
 
-                # 4. Build payload (preserve extra keys from remote)
+                # 4. Build payload (merge remote tasks + preserve extra keys)
+                tasks_out = [dict(r) for r in task_rows]
                 payload = {
                     "version": 2,
                     "pushed_at": now_iso(),
                     "machine_id": socket.gethostname(),
                     "entities": entities_out,
                     "relations": relations_out,
-                    "tasks": [dict(r) for r in task_rows],
+                    "tasks": tasks_out,
                 }
                 if shared_path.exists():
                     try:
                         existing = json.loads(shared_path.read_text(encoding="utf-8"))
+
+                        # Merge: keep remote tasks missing locally (by title)
+                        local_titles = {t["title"] for t in tasks_out}
+                        remote_tasks = existing.get("tasks", [])
+                        for rt in remote_tasks:
+                            if rt.get("title") and rt["title"] not in local_titles:
+                                tasks_out.append(rt)
+                                local_titles.add(rt["title"])
+
+                        # Update existing tasks where remote has newer updated_at
+                        local_by_title = {t["title"]: t for t in tasks_out}
+                        for rt in remote_tasks:
+                            title = rt.get("title")
+                            if not title or title not in local_by_title:
+                                continue
+                            lt = local_by_title[title]
+                            r_upd = rt.get("updated_at", "")
+                            l_upd = lt.get("updated_at", "")
+                            if r_upd > l_upd:
+                                if rt.get("status") not in TASK_STATUSES:
+                                    rt["status"] = "not_started"
+                                if rt.get("priority") not in TASK_PRIORITIES:
+                                    rt["priority"] = "medium"
+                                if rt.get("section") not in SECTIONS:
+                                    rt["section"] = "inbox"
+                                if rt.get("type") not in TASK_TYPES:
+                                    rt["type"] = "task"
+                                for field in ("status", "section", "priority",
+                                              "due_date", "notes", "description",
+                                              "type"):
+                                    if rt.get(field) is not None:
+                                        lt[field] = rt[field]
+                                lt["updated_at"] = r_upd
+
                         known = {
                             "version",
                             "pushed_at",
