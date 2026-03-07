@@ -1647,9 +1647,10 @@ class FullWindow(QMainWindow):
         self._clear_btn = QToolButton()
         self._clear_btn.setText("Clear")
         self._clear_btn.setStyleSheet(
-            "QToolButton { border: 1px solid #4a5568; background: #2d3748; color: #a0aec0; "
-            "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600; }"
+            "QToolButton { border: 1px solid #4a5568; background: #2d3748; color: #e2e8f0; "
+            "padding: 4px 12px; font-size: 11px; font-weight: bold; }"
             "QToolButton:hover { background: #e53e3e; color: #fff; border-color: #e53e3e; }"
+            "QToolButton:disabled { color: #4a5568; }"
         )
         self._clear_btn.clicked.connect(self._clear_all_filters)
         self._filter_bar.addWidget(self._clear_btn)
@@ -1684,7 +1685,7 @@ class FullWindow(QMainWindow):
             self._clear_btn.setEnabled(active)
 
     @staticmethod
-    def _matches_due_filter(task, due_filters, today, week_end):
+    def _matches_due_filter(task, due_filters, today, week_start, week_end):
         """Check if task matches any active due filter (OR within)."""
         due = parse_iso_date(task.get("due_date"))
         if due is None:
@@ -1694,7 +1695,7 @@ class FullWindow(QMainWindow):
                 return True
             if f == "today" and due == today:
                 return True
-            if f == "week" and today <= due <= week_end:
+            if f == "week" and week_start <= due <= week_end:
                 return True
         return False
 
@@ -1720,8 +1721,9 @@ class FullWindow(QMainWindow):
         # Due filter (OR within)
         if self._active_filters["due"]:
             today = date.today()
-            week_end = today + timedelta(days=7)
-            tasks = [t for t in tasks if self._matches_due_filter(t, self._active_filters["due"], today, week_end)]
+            week_start = today - timedelta(days=today.weekday())
+            week_end = week_start + timedelta(days=6)
+            tasks = [t for t in tasks if self._matches_due_filter(t, self._active_filters["due"], today, week_start, week_end)]
 
         # Project filter (OR within)
         if self._active_filters["project"]:
