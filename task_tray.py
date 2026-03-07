@@ -4,6 +4,7 @@ System tray widget with dual mode: compact popup + full window.
 Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
+import base64
 import html as _html
 import json
 import os
@@ -277,7 +278,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QCompleter,
 )
-from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
+from PyQt6.QtGui import QIcon, QAction, QActionGroup, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import QDate, QEvent, QObject, QSettings, Qt, QTimer, QPoint, pyqtSignal
 from pathlib import Path
 
@@ -1378,6 +1379,22 @@ class FullWindow(QMainWindow):
         _bold = self._settings.value("bold", "false") == "true"
         _update_theme_colors()
 
+        # Restore sort/tab/filter state from QSettings
+        self._sort_mode = self._settings.value("sort_mode", "priority")
+        if self._sort_mode not in self._SORT_MODES:
+            self._sort_mode = "priority"
+        self._saved_active_tab = int(self._settings.value("active_tab", 0))
+        try:
+            raw = self._settings.value("active_filters", "{}")
+            parsed = json.loads(raw) if isinstance(raw, str) else {}
+            self._active_filters = {k: set(parsed.get(k, [])) for k in ("priority", "due", "project")}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass  # defaults already set above
+
+        # First-run recovery: if QSettings has no sort_mode, try bridge profile
+        if self._settings.value("sort_mode") is None:
+            self._restore_profile_from_bridge()
+
         self.setStyleSheet(_build_main_style())
 
         # Central widget with tabs
@@ -1412,6 +1429,11 @@ class FullWindow(QMainWindow):
             self.tab_lists[key] = lw
             self.tabs.addTab(lw, self._tab_labels[key])
 
+        # Restore saved active tab
+        if hasattr(self, "_saved_active_tab"):
+            self.tabs.setCurrentIndex(min(self._saved_active_tab, len(self._tab_keys) - 1))
+        self.tabs.currentChanged.connect(lambda idx: self._save_ui_state())
+
         # Toolbar: actions + search + sort
         toolbar = QToolBar()
         toolbar.setMovable(False)
@@ -1421,12 +1443,6 @@ class FullWindow(QMainWindow):
         refresh_action = QAction("Refresh + Sync", self)
         refresh_action.triggered.connect(self._refresh_and_sync)
         toolbar.addAction(refresh_action)
-        toolbar.addSeparator()
-
-        # Sort button (click to cycle modes)
-        self._sort_action = QAction(self._SORT_LABELS[self._sort_mode], self)
-        self._sort_action.triggered.connect(self._cycle_sort)
-        toolbar.addAction(self._sort_action)
         toolbar.addSeparator()
 
         # Instant search bar
@@ -1439,47 +1455,74 @@ class FullWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Font size controls
-        self._font_down_btn = QToolButton()
-        self._font_down_btn.setText("A\u2212")
-        self._font_down_btn.setToolTip("Decrease font size")
-        self._font_down_btn.clicked.connect(self._font_down)
-        toolbar.addWidget(self._font_down_btn)
-
-        self._font_up_btn = QToolButton()
-        self._font_up_btn.setText("A+")
-        self._font_up_btn.setToolTip("Increase font size")
-        self._font_up_btn.clicked.connect(self._font_up)
-        toolbar.addWidget(self._font_up_btn)
-
-        # Bold toggle
-        self._bold_btn = QToolButton()
-        self._bold_btn.setText("B")
-        self._bold_btn.setToolTip("Toggle bold text")
-        self._bold_btn.setCheckable(True)
-        self._bold_btn.setChecked(_bold)
-        self._bold_btn.clicked.connect(self._toggle_bold)
-        toolbar.addWidget(self._bold_btn)
+        # Sort ▾ mega-button
+        self._sort_btn = QToolButton()
+        self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
+        self._sort_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        sort_menu = QMenu(self)
+        self._sort_action_group = QActionGroup(self)
+        self._sort_action_group.setExclusive(True)
+        self._sort_actions = {}
+        for mode in self._SORT_MODES:
+            act = QAction(self._SORT_LABELS[mode].replace("Sort: ", ""), self)
+            act.setCheckable(True)
+            act.setChecked(mode == self._sort_mode)
+            act.triggered.connect(lambda checked, m=mode: self._set_sort(m))
+            self._sort_action_group.addAction(act)
+            sort_menu.addAction(act)
+            self._sort_actions[mode] = act
+        sort_menu.addSeparator()
+        reset_sort_act = QAction("Reset Sort && Filters", self)
+        reset_sort_act.triggered.connect(self._reset_sort_filters)
+        sort_menu.addAction(reset_sort_act)
+        self._sort_btn.setMenu(sort_menu)
+        toolbar.addWidget(self._sort_btn)
 
         toolbar.addSeparator()
 
-        # Theme selector (mutually exclusive)
-        self._theme_group = QButtonGroup(self)
-        self._theme_group.setExclusive(True)
-        theme_btns = [
-            ("\u25fc", "black", "True Black"),
-            ("\u25c6", "blue", "Blue (default)"),
-            ("\u25fb", "light", "Light"),
+        # View ▾ mega-button
+        self._view_btn = QToolButton()
+        self._view_btn.setText("View \u25be")
+        self._view_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        view_menu = QMenu(self)
+
+        # Theme sub-section
+        self._theme_action_group = QActionGroup(self)
+        self._theme_action_group.setExclusive(True)
+        self._theme_actions = {}
+        theme_items = [
+            ("blue", "\u25c6 Blue (default)"),
+            ("black", "\u25fc True Black"),
+            ("light", "\u25fb Light"),
         ]
-        for symbol, name, tip in theme_btns:
-            btn = QToolButton()
-            btn.setText(symbol)
-            btn.setToolTip(tip)
-            btn.setCheckable(True)
-            btn.setChecked(name == _theme_name)
-            btn.clicked.connect(lambda checked, n=name: self._set_theme(n))
-            self._theme_group.addButton(btn)
-            toolbar.addWidget(btn)
+        for name, label in theme_items:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(name == _theme_name)
+            act.triggered.connect(lambda checked, n=name: self._set_theme(n))
+            self._theme_action_group.addAction(act)
+            view_menu.addAction(act)
+            self._theme_actions[name] = act
+        view_menu.addSeparator()
+
+        font_down_act = QAction("A\u2212  Smaller Font", self)
+        font_down_act.triggered.connect(self._font_down)
+        view_menu.addAction(font_down_act)
+        font_up_act = QAction("A+  Larger Font", self)
+        font_up_act.triggered.connect(self._font_up)
+        view_menu.addAction(font_up_act)
+        self._bold_action = QAction("Bold", self)
+        self._bold_action.setCheckable(True)
+        self._bold_action.setChecked(_bold)
+        self._bold_action.triggered.connect(self._toggle_bold)
+        view_menu.addAction(self._bold_action)
+        view_menu.addSeparator()
+
+        reset_view_act = QAction("Reset View", self)
+        reset_view_act.triggered.connect(self._reset_view)
+        view_menu.addAction(reset_view_act)
+        self._view_btn.setMenu(view_menu)
+        toolbar.addWidget(self._view_btn)
 
         self.addToolBar(toolbar)
 
@@ -1535,7 +1578,50 @@ class FullWindow(QMainWindow):
         self._settings.setValue("font_size", _font_size)
         self._settings.setValue("bold", "true" if _bold else "false")
         self._build_filter_chips()
+        self._save_ui_state()
         self.refresh()
+
+    def _save_ui_state(self):
+        """Persist all UI state to QSettings."""
+        self._settings.setValue("sort_mode", self._sort_mode)
+        self._settings.setValue("active_tab", self.tabs.currentIndex())
+        self._settings.setValue("active_filters",
+            json.dumps({k: list(v) for k, v in self._active_filters.items()}))
+
+    def _restore_profile_from_bridge(self):
+        """First-run recovery: load UI state from bridge shared.json profile."""
+        shared_path = Path(self._BRIDGE_DIR) / "shared.json"
+        if not shared_path.exists():
+            return
+        try:
+            data = json.loads(shared_path.read_text(encoding="utf-8"))
+            profiles = data.get("ui_profiles", {})
+            profile = profiles.get(socket.gethostname())
+            if not profile:
+                return
+            global _theme_name, _font_size, _bold
+            if profile.get("theme") in _THEMES:
+                _theme_name = profile["theme"]
+            if isinstance(profile.get("font_size"), int) and 10 <= profile["font_size"] <= 20:
+                _font_size = profile["font_size"]
+            _bold = bool(profile.get("bold", False))
+            if profile.get("sort_mode") in self._SORT_MODES:
+                self._sort_mode = profile["sort_mode"]
+            if isinstance(profile.get("active_tab"), int):
+                self._saved_active_tab = profile["active_tab"]
+            if isinstance(profile.get("active_filters"), dict):
+                self._active_filters = {
+                    k: set(profile["active_filters"].get(k, []))
+                    for k in ("priority", "due", "project")
+                }
+            geo_b64 = profile.get("geometry_b64")
+            if geo_b64:
+                from PyQt6.QtCore import QByteArray
+                self.restoreGeometry(QByteArray(base64.b64decode(geo_b64)))
+            _update_theme_colors()
+            self._save_ui_state()
+        except (json.JSONDecodeError, OSError, KeyError, ValueError):
+            pass
 
     def _font_down(self):
         global _font_size
@@ -1552,11 +1638,48 @@ class FullWindow(QMainWindow):
     def _toggle_bold(self, checked):
         global _bold
         _bold = checked
+        if hasattr(self, "_bold_action"):
+            self._bold_action.setChecked(_bold)
         self._apply_appearance()
 
     def _set_theme(self, name):
         global _theme_name
         _theme_name = name
+        if hasattr(self, "_theme_actions") and name in self._theme_actions:
+            self._theme_actions[name].setChecked(True)
+        self._apply_appearance()
+
+    def _set_sort(self, mode):
+        """Set sort mode from mega-button menu."""
+        self._sort_mode = mode
+        self._sort_btn.setText(f"{self._SORT_LABELS[mode]} \u25be")
+        self._save_ui_state()
+        self.refresh()
+
+    def _reset_sort_filters(self):
+        """Reset sort to priority and clear all filter chips."""
+        self._sort_mode = "priority"
+        self._sort_btn.setText(f"{self._SORT_LABELS['priority']} \u25be")
+        if hasattr(self, "_sort_actions") and "priority" in self._sort_actions:
+            self._sort_actions["priority"].setChecked(True)
+        for s in self._active_filters.values():
+            s.clear()
+        for btn in self._filter_chips.values():
+            btn.setChecked(False)
+        self._update_clear_btn()
+        self._save_ui_state()
+        self.refresh()
+
+    def _reset_view(self):
+        """Reset theme=blue, font=13, bold=off."""
+        global _theme_name, _font_size, _bold
+        _theme_name = "blue"
+        _font_size = 13
+        _bold = False
+        if hasattr(self, "_theme_actions") and "blue" in self._theme_actions:
+            self._theme_actions["blue"].setChecked(True)
+        if hasattr(self, "_bold_action"):
+            self._bold_action.setChecked(False)
         self._apply_appearance()
 
     # ── Bridge sync ────────────────────────────────────────────────────
@@ -1685,7 +1808,7 @@ class FullWindow(QMainWindow):
                 # 4. Build payload (merge remote tasks + preserve extra keys)
                 tasks_out = [dict(r) for r in task_rows]
                 payload = {
-                    "version": 2,
+                    "version": 3,
                     "pushed_at": now_iso(),
                     "machine_id": socket.gethostname(),
                     "entities": entities_out,
@@ -1737,12 +1860,40 @@ class FullWindow(QMainWindow):
                             "relations",
                             "tasks",
                             "shared_tasks",
+                            "owner",
+                            "team_manifest",
+                            "ui_profiles",
                         }
                         for k, v in existing.items():
-                            if k not in known and isinstance(v, list):
+                            if k not in known and isinstance(v, (list, dict)):
                                 payload[k] = v
+
+                        # Build own UI profile + merge with remote profiles
+                        remote_profiles = existing.get("ui_profiles", {})
                     except (json.JSONDecodeError, OSError):
-                        pass
+                        remote_profiles = {}
+                else:
+                    remote_profiles = {}
+
+                hostname = socket.gethostname()
+                own_profile = {
+                    "theme": _theme_name,
+                    "font_size": _font_size,
+                    "bold": _bold,
+                    "sort_mode": self._settings.value("sort_mode", "priority"),
+                    "active_tab": int(self._settings.value("active_tab", 0)),
+                    "active_filters": json.loads(
+                        self._settings.value("active_filters", "{}")
+                    ),
+                    "updated_at": now_iso(),
+                }
+                geo = self._settings.value("geometry")
+                if geo:
+                    own_profile["geometry_b64"] = base64.b64encode(
+                        bytes(geo)
+                    ).decode("ascii")
+                remote_profiles[hostname] = own_profile
+                payload["ui_profiles"] = remote_profiles
 
                 self._bridge_progress.emit(55, "Writing shared.json...")
                 shared_path.write_text(
@@ -1833,7 +1984,10 @@ class FullWindow(QMainWindow):
         """Cycle to next sort mode and refresh."""
         idx = self._SORT_MODES.index(self._sort_mode)
         self._sort_mode = self._SORT_MODES[(idx + 1) % len(self._SORT_MODES)]
-        self._sort_action.setText(self._SORT_LABELS[self._sort_mode])
+        self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
+        if hasattr(self, "_sort_actions") and self._sort_mode in self._sort_actions:
+            self._sort_actions[self._sort_mode].setChecked(True)
+        self._save_ui_state()
         self.refresh()
 
     def _on_search(self, text):
@@ -1926,6 +2080,7 @@ class FullWindow(QMainWindow):
         if chip:
             chip.setChecked(value in s)
         self._update_clear_btn()
+        self._save_ui_state()
         self.refresh()
 
     def _clear_all_filters(self):
@@ -1935,6 +2090,7 @@ class FullWindow(QMainWindow):
         for btn in self._filter_chips.values():
             btn.setChecked(False)
         self._update_clear_btn()
+        self._save_ui_state()
         self.refresh()
 
     def _update_clear_btn(self):
@@ -2091,6 +2247,7 @@ class FullWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
+        self._save_ui_state()
         self._refresh_timer.stop()
         event.ignore()
         self.hide()
