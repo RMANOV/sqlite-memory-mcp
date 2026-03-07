@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
+import calendar as _cal_mod
 from datetime import date, datetime, timedelta, timezone
 
 from db_utils import (
@@ -273,10 +274,11 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QProgressBar,
     QDateEdit,
+    QButtonGroup,
     QCompleter,
 )
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QFont
-from PyQt6.QtCore import QDate, QEvent, QSettings, Qt, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import QDate, QEvent, QObject, QSettings, Qt, QTimer, QPoint, pyqtSignal
 from pathlib import Path
 
 
@@ -311,18 +313,231 @@ def create_tray_icon_pixmap(overdue_count=0):
     return pm
 
 
-# ── Dark Theme Colors (centralized) ──────────────────────────────────
+# ── Theme System ─────────────────────────────────────────────────────
 
-_CLR_DONE = QColor("#38a169")
-_CLR_NOTE_BG = QColor("#1e2d3d")
-_CLR_OVERDUE_BG = QColor("#3b1c1c")
-_CLR_OVERDUE_FG = QColor("#fc8181")
-_CLR_HEADER_BG = QColor("#1e2836")
-_CLR_HEADER_FG = QColor("#a0aec0")
-_CLR_OVERDUE_HDR_BG = QColor("#3b1c1c")
-_CLR_OVERDUE_HDR_FG = QColor("#fc8181")
-_CLR_URGENT_HDR_BG = QColor("#3b2c1c")
-_CLR_URGENT_HDR_FG = QColor("#f6ad55")
+_THEMES = {
+    "black": {
+        "bg": "#000000", "bg2": "#0a0a0a", "bg3": "#1a1a1a",
+        "text": "#e2e8f0", "text2": "#a0aec0",
+        "border": "#2d2d2d", "accent": "#3182ce", "accent_hover": "#4299e1",
+        "danger": "#e53e3e", "done": "#38a169",
+        "note_bg": "#0d1a0d", "overdue_bg": "#1a0000", "overdue_fg": "#fc8181",
+        "header_bg": "#111111", "urgent_bg": "#2d1a00", "urgent_fg": "#f6ad55",
+    },
+    "blue": {
+        "bg": "#0f1923", "bg2": "#1a2332", "bg3": "#2d3748",
+        "text": "#e2e8f0", "text2": "#a0aec0",
+        "border": "#4a5568", "accent": "#3182ce", "accent_hover": "#4299e1",
+        "danger": "#e53e3e", "done": "#38a169",
+        "note_bg": "#1e2d3d", "overdue_bg": "#3b1c1c", "overdue_fg": "#fc8181",
+        "header_bg": "#1e2836", "urgent_bg": "#3b2c1c", "urgent_fg": "#f6ad55",
+    },
+    "light": {
+        "bg": "#f7fafc", "bg2": "#edf2f7", "bg3": "#e2e8f0",
+        "text": "#1a202c", "text2": "#4a5568",
+        "border": "#cbd5e0", "accent": "#3182ce", "accent_hover": "#2b6cb0",
+        "danger": "#e53e3e", "done": "#38a169",
+        "note_bg": "#ebf8ff", "overdue_bg": "#fff5f5", "overdue_fg": "#c53030",
+        "header_bg": "#e2e8f0", "urgent_bg": "#fffbeb", "urgent_fg": "#c05621",
+    },
+}
+
+_theme_name = "blue"
+_font_size = 13
+_bold = False
+
+
+def _T():
+    """Current theme palette."""
+    return _THEMES[_theme_name]
+
+
+def _fw():
+    """Current font-weight CSS value."""
+    return "bold" if _bold else "normal"
+
+
+def _update_theme_colors():
+    """Refresh module-level QColor variables from current theme."""
+    global _CLR_DONE, _CLR_NOTE_BG, _CLR_OVERDUE_BG, _CLR_OVERDUE_FG
+    global _CLR_HEADER_BG, _CLR_HEADER_FG, _CLR_OVERDUE_HDR_BG, _CLR_OVERDUE_HDR_FG
+    global _CLR_URGENT_HDR_BG, _CLR_URGENT_HDR_FG
+    t = _T()
+    _CLR_DONE = QColor(t["done"])
+    _CLR_NOTE_BG = QColor(t["note_bg"])
+    _CLR_OVERDUE_BG = QColor(t["overdue_bg"])
+    _CLR_OVERDUE_FG = QColor(t["overdue_fg"])
+    _CLR_HEADER_BG = QColor(t["header_bg"])
+    _CLR_HEADER_FG = QColor(t["text2"])
+    _CLR_OVERDUE_HDR_BG = QColor(t["overdue_bg"])
+    _CLR_OVERDUE_HDR_FG = QColor(t["overdue_fg"])
+    _CLR_URGENT_HDR_BG = QColor(t["urgent_bg"])
+    _CLR_URGENT_HDR_FG = QColor(t["urgent_fg"])
+
+
+# Initialize with default theme
+_t = _T()
+_CLR_DONE = QColor(_t["done"])
+_CLR_NOTE_BG = QColor(_t["note_bg"])
+_CLR_OVERDUE_BG = QColor(_t["overdue_bg"])
+_CLR_OVERDUE_FG = QColor(_t["overdue_fg"])
+_CLR_HEADER_BG = QColor(_t["header_bg"])
+_CLR_HEADER_FG = QColor(_t["text2"])
+_CLR_OVERDUE_HDR_BG = QColor(_t["overdue_bg"])
+_CLR_OVERDUE_HDR_FG = QColor(_t["overdue_fg"])
+_CLR_URGENT_HDR_BG = QColor(_t["urgent_bg"])
+_CLR_URGENT_HDR_FG = QColor(_t["urgent_fg"])
+del _t
+
+
+# ── Stylesheet builders ─────────────────────────────────────────────
+
+def _build_main_style():
+    """Build FullWindow stylesheet from current theme."""
+    t, fs = _T(), _font_size
+    return f"""
+        QMainWindow {{ background: {t['bg']}; color: {t['text']}; }}
+        QTabWidget::pane {{ border: none; background: {t['bg']}; }}
+        QTabBar {{ background: {t['bg2']}; }}
+        QTabBar::tab {{ padding: 8px 20px; font-weight: bold; font-size: {fs}px;
+                       background: {t['bg2']}; color: {t['text2']};
+                       border: 1px solid {t['bg3']}; border-bottom: none;
+                       margin-right: 2px; }}
+        QTabBar::tab:selected {{ background: {t['accent']}; color: #ffffff; }}
+        QTabBar::tab:hover:!selected {{ background: {t['bg3']}; color: {t['text']}; }}
+        QToolBar {{ background: {t['bg2']}; border-bottom: 1px solid {t['bg3']}; spacing: 4px; }}
+        QToolBar QToolButton {{ background: {t['bg3']}; color: {t['text']}; border: 1px solid {t['border']};
+                               padding: 4px 12px; font-weight: bold; font-size: {fs}px; }}
+        QToolBar QToolButton:hover {{ background: {t['accent']}; color: #ffffff; }}
+        QToolBar QToolButton:checked {{ background: {t['accent']}; color: #ffffff; }}
+        QStatusBar {{ background: {t['bg2']}; color: {t['text2']}; font-weight: bold;
+                     border-top: 1px solid {t['bg3']}; padding: 2px 8px; font-size: {fs - 1}px; }}
+        QMenu {{ background: {t['bg2']}; color: {t['text']}; border: 1px solid {t['border']}; }}
+        QMenu::item:selected {{ background: {t['accent']}; color: #ffffff; }}
+        QLineEdit#search {{ background: {t['bg3']}; color: {t['text']}; border: 2px solid {t['border']};
+                           border-radius: 4px; padding: 4px 8px; min-width: 200px; font-size: {fs}px; }}
+        QLineEdit#search:focus {{ border-color: {t['accent']}; }}
+    """
+
+
+def _build_filter_style():
+    """Build filter bar stylesheet from current theme."""
+    t, fs = _T(), _font_size
+    return f"""
+        QToolBar {{ background: {t['bg']}; border-bottom: 1px solid {t['bg3']}; spacing: 3px; padding: 2px 4px; }}
+        QToolButton {{ border-radius: 10px; padding: 2px 8px; font-size: {fs - 2}px; font-weight: 600;
+                      border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text2']}; }}
+        QToolButton:hover {{ background: {t['bg3']}; color: {t['text']}; }}
+        QToolButton:checked {{ background: {t['accent']}; color: #fff; border-color: {t['accent']}; }}
+    """
+
+
+def _build_list_style():
+    """Build TaskListWidget stylesheet from current theme."""
+    t, fs, fw = _T(), _font_size, _fw()
+    return f"""
+        QListWidget {{ background: {t['bg']}; color: {t['text']}; border: none;
+                      font-size: {fs}px; font-weight: {fw}; }}
+        QListWidget::item {{ padding: 8px 12px; border-bottom: 1px solid {t['bg3']};
+                            color: {t['text']}; background: {t['bg']}; }}
+        QListWidget::item:selected {{ background: {t['bg3']}; color: #ffffff; }}
+        QListWidget::item:hover {{ background: {t['bg2']}; }}
+        QListWidget::indicator {{ width: 18px; height: 18px; }}
+        QListWidget::indicator:unchecked {{ border: 2px solid {t['border']};
+                                           background: {t['bg2']}; border-radius: 3px; }}
+        QListWidget::indicator:checked {{ border: 2px solid {t['accent']};
+                                         background: {t['accent']}; border-radius: 3px; }}
+    """
+
+
+def _build_popup_style():
+    """Build TrayPopup stylesheet from current theme."""
+    t, fs, fw = _T(), _font_size, _fw()
+    return f"""
+        QWidget {{ background: {t['bg2']}; color: {t['text']}; font-family: 'Segoe UI'; font-weight: {fw}; }}
+        QLabel#header {{ font-size: {fs + 2}px; font-weight: bold; padding: 10px 0 10px 14px; }}
+        QLabel#section-header {{ font-size: {fs - 2}px; color: {t['text2']}; padding: 6px 14px 2px;
+                                text-transform: uppercase; letter-spacing: 1px; }}
+        QCheckBox {{ font-size: {fs}px; padding: 6px 14px; }}
+        QCheckBox::indicator {{ width: 16px; height: 16px; }}
+        QLabel#priority {{ font-size: {fs - 3}px; font-weight: bold; padding: 2px 6px;
+                          border-radius: 3px; }}
+        QLineEdit {{ background: {t['bg3']}; border: 1px solid {t['border']}; border-radius: 4px;
+                    color: {t['text']}; padding: 6px 10px; margin: 2px 14px; }}
+        QTextEdit {{ background: {t['bg3']}; border: 1px solid {t['border']}; border-radius: 4px;
+                    color: {t['text']}; padding: 6px 10px; margin: 2px 14px; font-family: 'Segoe UI';
+                    font-size: {fs}px; }}
+        QComboBox {{ background: {t['bg3']}; border: 1px solid {t['border']}; border-radius: 4px;
+                    color: {t['text']}; padding: 4px 8px; margin: 2px 14px; }}
+        QComboBox QAbstractItemView {{ background: {t['bg3']}; color: {t['text']};
+                                      selection-background-color: {t['border']}; }}
+        QPushButton#add-btn {{ background: transparent; border: none; color: {t['text2']};
+                              font-size: {fs + 5}px; font-weight: bold; padding: 4px 10px; }}
+        QPushButton#add-btn:hover {{ color: #ffffff; }}
+        QPushButton#submit-btn {{ background: {t['bg3']}; border: 1px solid {t['border']};
+                                 border-radius: 4px; color: {t['text']}; padding: 6px;
+                                 margin: 2px 14px; font-weight: bold; }}
+        QPushButton#submit-btn:hover {{ background: {t['border']}; }}
+        QPushButton#open-full {{ background: {t['bg3']}; border: none; color: {t['text2']};
+                                padding: 8px; font-size: {fs - 1}px; }}
+        QPushButton#open-full:hover {{ background: {t['border']}; color: #ffffff; }}
+    """
+
+
+def _build_dialog_style():
+    """Build EditTaskDialog stylesheet from current theme."""
+    t, fs, fw = _T(), _font_size, _fw()
+    return f"""
+        QDialog {{ background: {t['bg']}; color: {t['text']}; font-weight: {fw}; }}
+        QLabel {{ color: {t['text2']}; font-weight: bold; }}
+        QLineEdit {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+                    border-radius: 4px; padding: 6px; font-size: {fs}px; }}
+        QLineEdit:focus {{ border-color: {t['accent']}; }}
+        QTextEdit {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+                    border-radius: 4px; padding: 6px; font-size: {fs}px; }}
+        QComboBox {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+                    border-radius: 4px; padding: 6px; font-size: {fs}px; }}
+        QComboBox QAbstractItemView {{ background: {t['bg2']}; color: {t['text']};
+                                      selection-background-color: {t['border']}; }}
+        QDateEdit {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+                    border-radius: 4px; padding: 6px; font-size: {fs}px; }}
+        QDateEdit::drop-down {{ border: none; }}
+        QPushButton {{ background: {t['bg3']}; color: {t['text']}; border: 1px solid {t['border']};
+                      border-radius: 4px; padding: 6px 16px; font-weight: bold; font-size: {fs}px; }}
+        QPushButton:hover {{ background: {t['accent']}; color: #ffffff; }}
+        QMenu {{ background: {t['bg2']}; color: {t['text']}; border: 1px solid {t['border']}; }}
+        QMenu::item:selected {{ background: {t['accent']}; color: #ffffff; }}
+    """
+
+
+def _build_reader_style():
+    """Build TaskReaderDialog stylesheet from current theme."""
+    t, fs, fw = _T(), _font_size, _fw()
+    return f"""
+        QDialog {{ background: {t['bg']}; font-weight: {fw}; }}
+        QLabel#reader-title {{ color: {t['text']}; font-size: {fs + 5}px; font-weight: bold;
+                              padding: 12px 16px 4px; }}
+        QLabel#reader-meta {{ color: {t['text2']}; font-size: {fs - 1}px; padding: 2px 6px; }}
+        QLabel#reader-priority {{ font-size: {fs - 2}px; font-weight: bold; padding: 2px 8px;
+                                 border-radius: 3px; }}
+        QScrollArea {{ background: {t['bg']}; border: none; }}
+        QLabel#reader-body {{ color: {t['text']}; font-size: {fs}px; padding: 16px;
+                             background: {t['bg']}; }}
+        QFrame#reader-header {{ background: {t['bg2']}; border-bottom: 1px solid {t['bg3']}; }}
+        QPushButton {{ background: {t['bg3']}; color: {t['text']}; border: 1px solid {t['border']};
+                      border-radius: 4px; padding: 8px 20px; font-weight: bold;
+                      font-size: {fs}px; }}
+        QPushButton:hover {{ background: {t['accent']}; color: #ffffff; }}
+    """
+
+
+def _build_menu_style():
+    """Build context menu stylesheet from current theme."""
+    t = _T()
+    return (
+        f"QMenu {{ background: {t['bg2']}; color: {t['text']}; border: 1px solid {t['border']}; }}"
+        f"QMenu::item:selected {{ background: {t['accent']}; color: #ffffff; }}"
+    )
 
 
 def _format_task_text(task, include_project=True, prefix=""):
@@ -404,35 +619,7 @@ class TrayPopup(QWidget):
         self._refresh_timer.timeout.connect(self.refresh)
 
     def _stylesheet(self):
-        return """
-            QWidget { background: #1a2332; color: #f7fafc; font-family: 'Segoe UI'; }
-            QLabel#header { font-size: 15px; font-weight: bold; padding: 10px 0 10px 14px; }
-            QLabel#section-header { font-size: 11px; color: #a0aec0; padding: 6px 14px 2px;
-                                    text-transform: uppercase; letter-spacing: 1px; }
-            QCheckBox { font-size: 13px; padding: 6px 14px; }
-            QCheckBox::indicator { width: 16px; height: 16px; }
-            QLabel#priority { font-size: 10px; font-weight: bold; padding: 2px 6px;
-                              border-radius: 3px; }
-            QLineEdit { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
-                        color: #f7fafc; padding: 6px 10px; margin: 2px 14px; }
-            QTextEdit { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
-                        color: #f7fafc; padding: 6px 10px; margin: 2px 14px; font-family: 'Segoe UI';
-                        font-size: 13px; }
-            QComboBox { background: #2d3748; border: 1px solid #4a5568; border-radius: 4px;
-                        color: #f7fafc; padding: 4px 8px; margin: 2px 14px; }
-            QComboBox QAbstractItemView { background: #2d3748; color: #f7fafc;
-                                          selection-background-color: #4a5568; }
-            QPushButton#add-btn { background: transparent; border: none; color: #a0aec0;
-                                  font-size: 18px; font-weight: bold; padding: 4px 10px; }
-            QPushButton#add-btn:hover { color: #ffffff; }
-            QPushButton#submit-btn { background: #2d3748; border: 1px solid #4a5568;
-                                     border-radius: 4px; color: #f7fafc; padding: 6px;
-                                     margin: 2px 14px; font-weight: bold; }
-            QPushButton#submit-btn:hover { background: #4a5568; }
-            QPushButton#open-full { background: #2d3748; border: none; color: #a0aec0;
-                                    padding: 8px; font-size: 12px; }
-            QPushButton#open-full:hover { background: #4a5568; color: #ffffff; }
-        """
+        return _build_popup_style()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -555,8 +742,9 @@ class TrayPopup(QWidget):
         overdue = is_overdue(task.get("due_date")) and task["status"] != "done"
         row = QWidget()
         if overdue:
+            t = _T()
             row.setStyleSheet(
-                "border-left: 3px solid #e53e3e; background: rgba(229,62,62,0.12);"
+                f"border-left: 3px solid {t['danger']}; background: rgba(229,62,62,0.12);"
             )
         hl = QHBoxLayout(row)
         hl.setContentsMargins(14, 2, 14, 2)
@@ -564,7 +752,7 @@ class TrayPopup(QWidget):
         cb = QCheckBox(task["title"])
         cb.setChecked(task["status"] == "done")
         if task["status"] == "done":
-            cb.setStyleSheet("color: #38a169; text-decoration: line-through;")
+            cb.setStyleSheet(f"color: {_T()['done']}; text-decoration: line-through;")
         task_id = task["id"]
         cb.toggled.connect(lambda checked, tid=task_id: self._on_toggle(tid, checked))
         hl.addWidget(cb, 1)
@@ -659,6 +847,21 @@ class TrayPopup(QWidget):
 # ── FullWindow ──────────────────────────────────────────────────────
 
 
+class _CalendarShowFilter(QObject):
+    """Open calendar at today's page when no date is set."""
+
+    def __init__(self, due_edit, parent=None):
+        super().__init__(parent)
+        self._due_edit = due_edit
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Show:
+            if self._due_edit.date() == self._due_edit.minimumDate():
+                today = QDate.currentDate()
+                obj.setCurrentPage(today.year(), today.month())
+        return False
+
+
 class EditTaskDialog(QDialog):
     """Dialog for editing task fields with smart defaults."""
 
@@ -676,30 +879,7 @@ class EditTaskDialog(QDialog):
         self._db = db
         self.setWindowTitle("Edit Task")
         self.setMinimumWidth(380)
-        self.setStyleSheet("""
-            QDialog { background: #0f1923; color: #e2e8f0; }
-            QLabel { color: #a0aec0; font-weight: bold; }
-            QLineEdit { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
-                        border-radius: 4px; padding: 6px; }
-            QLineEdit:focus { border-color: #3182ce; }
-            QTextEdit { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
-                        border-radius: 4px; padding: 6px; font-family: 'Segoe UI'; font-size: 13px; }
-            QTextEdit:focus { border-color: #3182ce; }
-            QComboBox { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
-                        border-radius: 4px; padding: 4px 8px; }
-            QComboBox:focus { border-color: #3182ce; }
-            QComboBox QAbstractItemView { background: #1a2332; color: #e2e8f0;
-                                          selection-background-color: #3182ce;
-                                          selection-color: #ffffff; }
-            QDateEdit { background: #1a2332; color: #e2e8f0; border: 2px solid #4a5568;
-                        border-radius: 4px; padding: 6px; }
-            QDateEdit:focus { border-color: #3182ce; }
-            QDateEdit::drop-down { subcontrol-origin: padding; subcontrol-position: right center;
-                                   width: 20px; border-left: 1px solid #4a5568; }
-            QPushButton { background: #2d3748; color: #e2e8f0; border: 1px solid #4a5568;
-                          border-radius: 4px; padding: 6px 16px; font-weight: bold; }
-            QPushButton:hover { background: #3182ce; color: #ffffff; }
-        """)
+        self.setStyleSheet(_build_dialog_style())
         layout = QFormLayout(self)
 
         self.type_combo = QComboBox()
@@ -751,6 +931,51 @@ class EditTaskDialog(QDialog):
         self.due_clear_btn.clicked.connect(self._clear_due)
         due_row.addWidget(self.due_clear_btn)
         layout.addRow("Due Date:", due_row)
+
+        # Calendar: open at today, block past dates, dropdown month/year nav
+        cal = self.due_edit.calendarWidget()
+        if cal:
+            self._cal_filter = _CalendarShowFilter(self.due_edit, self)
+            cal.installEventFilter(self._cal_filter)
+
+            def _on_cal_clicked(qdate):
+                if qdate < QDate.currentDate():
+                    def _snap():
+                        self.due_edit.setDate(self.due_edit.minimumDate())
+                        self._due_cleared = True
+                    QTimer.singleShot(0, _snap)
+
+            cal.clicked.connect(_on_cal_clicked)
+
+            # Dropdown menus for month/year navigation buttons
+            month_names = [_cal_mod.month_name[i] for i in range(1, 13)]
+            for btn in cal.findChildren(QToolButton):
+                txt = btn.text().strip()
+                if not txt:
+                    continue
+                if txt.isdigit() and len(txt) == 4:
+                    menu = QMenu(btn)
+                    cur_year = QDate.currentDate().year()
+                    for y in range(cur_year, cur_year + 3):
+                        act = menu.addAction(str(y))
+                        act.triggered.connect(
+                            lambda checked, yr=y: cal.setCurrentPage(
+                                yr, cal.monthShown()
+                            )
+                        )
+                    btn.setMenu(menu)
+                    btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+                elif len(txt) > 2:
+                    menu = QMenu(btn)
+                    for i, name in enumerate(month_names, 1):
+                        act = menu.addAction(name)
+                        act.triggered.connect(
+                            lambda checked, m=i: cal.setCurrentPage(
+                                cal.yearShown(), m
+                            )
+                        )
+                    btn.setMenu(menu)
+                    btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
 
         # Project — editable combo with autocomplete from existing projects
         self.project_combo = QComboBox()
@@ -834,22 +1059,7 @@ class TaskReaderDialog(QDialog):
         title_text = (task.get("title") or "")[:60]
         self.setWindowTitle(title_text)
 
-        self.setStyleSheet("""
-            QDialog { background: #0f1923; }
-            QLabel#reader-title { color: #e2e8f0; font-size: 18px; font-weight: bold;
-                                  padding: 12px 16px 4px; }
-            QLabel#reader-meta { color: #a0aec0; font-size: 12px; padding: 2px 6px; }
-            QLabel#reader-priority { font-size: 11px; font-weight: bold; padding: 2px 8px;
-                                     border-radius: 3px; }
-            QScrollArea { background: #0f1923; border: none; }
-            QLabel#reader-body { color: #e2e8f0; font-size: 13px; padding: 16px;
-                                 background: #0f1923; }
-            QFrame#reader-header { background: #1a2332; border-bottom: 1px solid #2d3748; }
-            QPushButton { background: #2d3748; color: #e2e8f0; border: 1px solid #4a5568;
-                          border-radius: 4px; padding: 8px 20px; font-weight: bold;
-                          font-size: 13px; }
-            QPushButton:hover { background: #3182ce; color: #ffffff; }
-        """)
+        self.setStyleSheet(_build_reader_style())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -924,7 +1134,7 @@ class TaskReaderDialog(QDialog):
         plbl.setObjectName("reader-priority")
         color = _PRIORITY_COLORS_UPPER.get(priority, "#718096")
         plbl.setStyleSheet(
-            f"color: #ffffff; background: {color}; font-size: 11px; "
+            f"color: #ffffff; background: {color}; font-size: {_font_size - 2}px; "
             f"font-weight: bold; padding: 2px 8px; border-radius: 3px;"
         )
         self._meta_layout.addWidget(plbl)
@@ -976,19 +1186,7 @@ class TaskListWidget(QListWidget):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setStyleSheet("""
-            QListWidget { background: #0f1923; color: #e2e8f0; border: none;
-                          font-size: 13px; }
-            QListWidget::item { padding: 8px 12px; border-bottom: 1px solid #2d3748;
-                                color: #e2e8f0; background: #0f1923; }
-            QListWidget::item:selected { background: #2d3748; color: #ffffff; }
-            QListWidget::item:hover { background: #1a2332; }
-            QListWidget::indicator { width: 18px; height: 18px; }
-            QListWidget::indicator:unchecked { border: 2px solid #4a5568;
-                                               background: #1a2332; border-radius: 3px; }
-            QListWidget::indicator:checked { border: 2px solid #3182ce;
-                                             background: #3182ce; border-radius: 3px; }
-        """)
+        self.setStyleSheet(_build_list_style())
         self.itemDoubleClicked.connect(self._on_double_click)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
@@ -1115,10 +1313,7 @@ class TaskListWidget(QListWidget):
             return
         task_id = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu { background: #1a2332; color: #e2e8f0; border: 1px solid #4a5568; }"
-            "QMenu::item:selected { background: #3182ce; color: #ffffff; }"
-        )
+        menu.setStyleSheet(_build_menu_style())
         view_action = menu.addAction("View")
         task = next((t for t in self._tasks if t["id"] == task_id), None)
         current_type = task.get("type", "task") if task else "task"
@@ -1174,29 +1369,16 @@ class FullWindow(QMainWindow):
         if geometry:
             self.restoreGeometry(geometry)
 
-        self.setStyleSheet("""
-            QMainWindow { background: #0f1923; color: #e2e8f0; }
-            QTabWidget::pane { border: none; background: #0f1923; }
-            QTabBar { background: #1a2332; }
-            QTabBar::tab { padding: 8px 20px; font-weight: bold;
-                           background: #1a2332; color: #a0aec0;
-                           border: 1px solid #2d3748; border-bottom: none;
-                           margin-right: 2px; }
-            QTabBar::tab:selected { background: #3182ce; color: #ffffff; }
-            QTabBar::tab:hover:!selected { background: #2d3748; color: #e2e8f0; }
-            QToolBar { background: #1a2332; border-bottom: 1px solid #2d3748; spacing: 4px; }
-            QToolBar QToolButton { background: #2d3748; color: #e2e8f0; border: 1px solid #4a5568;
-                                   padding: 4px 12px; font-weight: bold; }
-            QToolBar QToolButton:hover { background: #3182ce; color: #ffffff; }
-            QToolBar QToolButton:checked { background: #3182ce; color: #ffffff; }
-            QStatusBar { background: #1a2332; color: #a0aec0; font-weight: bold;
-                         border-top: 1px solid #2d3748; padding: 2px 8px; }
-            QMenu { background: #1a2332; color: #e2e8f0; border: 1px solid #4a5568; }
-            QMenu::item:selected { background: #3182ce; color: #ffffff; }
-            QLineEdit#search { background: #2d3748; color: #e2e8f0; border: 2px solid #4a5568;
-                               border-radius: 4px; padding: 4px 8px; min-width: 200px; }
-            QLineEdit#search:focus { border-color: #3182ce; }
-        """)
+        # Restore appearance settings
+        global _theme_name, _font_size, _bold
+        _theme_name = self._settings.value("theme", "blue")
+        if _theme_name not in _THEMES:
+            _theme_name = "blue"
+        _font_size = int(self._settings.value("font_size", 13))
+        _bold = self._settings.value("bold", "false") == "true"
+        _update_theme_colors()
+
+        self.setStyleSheet(_build_main_style())
 
         # Central widget with tabs
         self.tabs = QTabWidget()
@@ -1255,18 +1437,56 @@ class FullWindow(QMainWindow):
         self._search_input.textChanged.connect(self._on_search)
         toolbar.addWidget(self._search_input)
 
+        toolbar.addSeparator()
+
+        # Font size controls
+        self._font_down_btn = QToolButton()
+        self._font_down_btn.setText("A\u2212")
+        self._font_down_btn.setToolTip("Decrease font size")
+        self._font_down_btn.clicked.connect(self._font_down)
+        toolbar.addWidget(self._font_down_btn)
+
+        self._font_up_btn = QToolButton()
+        self._font_up_btn.setText("A+")
+        self._font_up_btn.setToolTip("Increase font size")
+        self._font_up_btn.clicked.connect(self._font_up)
+        toolbar.addWidget(self._font_up_btn)
+
+        # Bold toggle
+        self._bold_btn = QToolButton()
+        self._bold_btn.setText("B")
+        self._bold_btn.setToolTip("Toggle bold text")
+        self._bold_btn.setCheckable(True)
+        self._bold_btn.setChecked(_bold)
+        self._bold_btn.clicked.connect(self._toggle_bold)
+        toolbar.addWidget(self._bold_btn)
+
+        toolbar.addSeparator()
+
+        # Theme selector (mutually exclusive)
+        self._theme_group = QButtonGroup(self)
+        self._theme_group.setExclusive(True)
+        theme_btns = [
+            ("\u25fc", "black", "True Black"),
+            ("\u25c6", "blue", "Blue (default)"),
+            ("\u25fb", "light", "Light"),
+        ]
+        for symbol, name, tip in theme_btns:
+            btn = QToolButton()
+            btn.setText(symbol)
+            btn.setToolTip(tip)
+            btn.setCheckable(True)
+            btn.setChecked(name == _theme_name)
+            btn.clicked.connect(lambda checked, n=name: self._set_theme(n))
+            self._theme_group.addButton(btn)
+            toolbar.addWidget(btn)
+
         self.addToolBar(toolbar)
 
         # Filter chip bar
         self._filter_bar = QToolBar("Filters")
         self._filter_bar.setMovable(False)
-        self._filter_bar.setStyleSheet("""
-            QToolBar { background: #0f1923; border-bottom: 1px solid #2d3748; spacing: 3px; padding: 2px 4px; }
-            QToolButton { border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;
-                          border: 1px solid #4a5568; background: #2d3748; color: #a0aec0; }
-            QToolButton:hover { background: #3d4a5c; color: #e2e8f0; }
-            QToolButton:checked { background: #3182ce; color: #fff; border-color: #3182ce; }
-        """)
+        self._filter_bar.setStyleSheet(_build_filter_style())
         self._build_filter_chips()
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._filter_bar)
 
@@ -1300,6 +1520,44 @@ class FullWindow(QMainWindow):
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
+
+    # ── Appearance ─────────────────────────────────────────────────────
+
+    def _apply_appearance(self):
+        """Rebuild all stylesheets from current theme/font/bold state."""
+        _update_theme_colors()
+        self.setStyleSheet(_build_main_style())
+        self._filter_bar.setStyleSheet(_build_filter_style())
+        for lw in self.tab_lists.values():
+            lw.setStyleSheet(_build_list_style())
+            lw.viewport().update()
+        self._settings.setValue("theme", _theme_name)
+        self._settings.setValue("font_size", _font_size)
+        self._settings.setValue("bold", "true" if _bold else "false")
+        self._build_filter_chips()
+        self.refresh()
+
+    def _font_down(self):
+        global _font_size
+        if _font_size > 10:
+            _font_size -= 1
+            self._apply_appearance()
+
+    def _font_up(self):
+        global _font_size
+        if _font_size < 20:
+            _font_size += 1
+            self._apply_appearance()
+
+    def _toggle_bold(self, checked):
+        global _bold
+        _bold = checked
+        self._apply_appearance()
+
+    def _set_theme(self, name):
+        global _theme_name
+        _theme_name = name
+        self._apply_appearance()
 
     # ── Bridge sync ────────────────────────────────────────────────────
 
@@ -1607,9 +1865,9 @@ class FullWindow(QMainWindow):
 
         # Due chips
         due_chips = [
-            ("overdue", "Overdue", "#e53e3e"),
-            ("today", "Today", "#3182ce"),
-            ("week", "This Week", "#3182ce"),
+            ("overdue", "Overdue", _T()["danger"]),
+            ("today", "Today", _T()["accent"]),
+            ("week", "This Week", _T()["accent"]),
         ]
         for value, label, color in due_chips:
             btn = QToolButton()
@@ -1635,7 +1893,7 @@ class FullWindow(QMainWindow):
             btn.setChecked(proj in self._active_filters["project"])
             btn.setStyleSheet(
                 btn.styleSheet()
-                + "QToolButton:checked { background: #3182ce; border-color: #3182ce; color: #fff; }"
+                + f"QToolButton:checked {{ background: {_T()['accent']}; border-color: {_T()['accent']}; color: #fff; }}"
             )
             btn.clicked.connect(lambda checked, p=proj: self._toggle_filter("project", p))
             self._filter_bar.addWidget(btn)
@@ -1646,11 +1904,12 @@ class FullWindow(QMainWindow):
         # Clear all button
         self._clear_btn = QToolButton()
         self._clear_btn.setText("Clear")
+        t = _T()
         self._clear_btn.setStyleSheet(
-            "QToolButton { border: 1px solid #4a5568; background: #2d3748; color: #e2e8f0; "
-            "padding: 4px 12px; font-size: 11px; font-weight: bold; }"
-            "QToolButton:hover { background: #e53e3e; color: #fff; border-color: #e53e3e; }"
-            "QToolButton:disabled { color: #4a5568; }"
+            f"QToolButton {{ border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text']}; "
+            f"padding: 4px 12px; font-size: {_font_size - 2}px; font-weight: bold; }}"
+            f"QToolButton:hover {{ background: {t['danger']}; color: #fff; border-color: {t['danger']}; }}"
+            f"QToolButton:disabled {{ color: {t['border']}; }}"
         )
         self._clear_btn.clicked.connect(self._clear_all_filters)
         self._filter_bar.addWidget(self._clear_btn)
