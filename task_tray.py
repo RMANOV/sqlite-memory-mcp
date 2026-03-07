@@ -12,7 +12,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from db_utils import (
     DB_PATH,
@@ -26,6 +26,7 @@ from db_utils import (
     build_priority_order_sql,
     is_overdue,
     now_iso,
+    parse_iso_date,
     priority_sort_key,
 )
 
@@ -264,6 +265,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QToolBar,
+    QToolButton,
     QStatusBar,
     QDialog,
     QFormLayout,
@@ -1156,6 +1158,9 @@ class FullWindow(QMainWindow):
         self.db = db
         self._sort_mode = "priority"
         self._search_text = ""
+        self._active_filters = {"priority": set(), "due": set(), "project": set()}
+        self._filter_chips = {}
+        self._last_projects = None
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
 
@@ -1251,6 +1256,19 @@ class FullWindow(QMainWindow):
         toolbar.addWidget(self._search_input)
 
         self.addToolBar(toolbar)
+
+        # Filter chip bar
+        self._filter_bar = QToolBar("Filters")
+        self._filter_bar.setMovable(False)
+        self._filter_bar.setStyleSheet("""
+            QToolBar { background: #0f1923; border-bottom: 1px solid #2d3748; spacing: 3px; padding: 2px 4px; }
+            QToolButton { border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;
+                          border: 1px solid #4a5568; background: #2d3748; color: #a0aec0; }
+            QToolButton:hover { background: #3d4a5c; color: #e2e8f0; }
+            QToolButton:checked { background: #3182ce; color: #fff; border-color: #3182ce; }
+        """)
+        self._build_filter_chips()
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._filter_bar)
 
         # Status bar
         self.status = QStatusBar()
@@ -1565,25 +1583,162 @@ class FullWindow(QMainWindow):
         self._search_text = text.strip().lower()
         self.refresh()
 
-    def _filter(self, tasks):
-        """Apply search filter to task list."""
-        q = self._search_text
-        if not q:
-            return tasks
-        return [
-            t
-            for t in tasks
-            if q
-            in (
-                f"{t.get('title', '')} {t.get('description', '')} "
-                f"{t.get('priority', '')} {t.get('project', '')} "
-                f"{t.get('due_date', '')} {t.get('section', '')} {t.get('status', '')}"
-            ).lower()
+    def _build_filter_chips(self):
+        """Populate the filter bar with priority, due, and project chips."""
+        self._filter_bar.clear()
+        self._filter_chips.clear()
+
+        # Priority chips
+        for pri in PRIORITIES:
+            btn = QToolButton()
+            btn.setText(pri.capitalize())
+            btn.setCheckable(True)
+            btn.setChecked(pri in self._active_filters["priority"])
+            color = PRIORITY_COLORS.get(pri, "#3182ce")
+            btn.setStyleSheet(
+                btn.styleSheet()
+                + f"QToolButton:checked {{ background: {color}; border-color: {color}; color: #fff; }}"
+            )
+            btn.clicked.connect(lambda checked, p=pri: self._toggle_filter("priority", p))
+            self._filter_bar.addWidget(btn)
+            self._filter_chips[("priority", pri)] = btn
+
+        self._filter_bar.addSeparator()
+
+        # Due chips
+        due_chips = [
+            ("overdue", "Overdue", "#e53e3e"),
+            ("today", "Today", "#3182ce"),
+            ("week", "This Week", "#3182ce"),
         ]
+        for value, label, color in due_chips:
+            btn = QToolButton()
+            btn.setText(label)
+            btn.setCheckable(True)
+            btn.setChecked(value in self._active_filters["due"])
+            btn.setStyleSheet(
+                btn.styleSheet()
+                + f"QToolButton:checked {{ background: {color}; border-color: {color}; color: #fff; }}"
+            )
+            btn.clicked.connect(lambda checked, v=value: self._toggle_filter("due", v))
+            self._filter_bar.addWidget(btn)
+            self._filter_chips[("due", value)] = btn
+
+        self._filter_bar.addSeparator()
+
+        # Project chips (dynamic)
+        projects = self.db.get_project_names()
+        for proj in projects:
+            btn = QToolButton()
+            btn.setText(proj)
+            btn.setCheckable(True)
+            btn.setChecked(proj in self._active_filters["project"])
+            btn.setStyleSheet(
+                btn.styleSheet()
+                + "QToolButton:checked { background: #3182ce; border-color: #3182ce; color: #fff; }"
+            )
+            btn.clicked.connect(lambda checked, p=proj: self._toggle_filter("project", p))
+            self._filter_bar.addWidget(btn)
+            self._filter_chips[("project", proj)] = btn
+
+        self._filter_bar.addSeparator()
+
+        # Clear all button
+        self._clear_btn = QToolButton()
+        self._clear_btn.setText("Clear")
+        self._clear_btn.setStyleSheet(
+            "QToolButton { border: 1px solid #4a5568; background: #2d3748; color: #a0aec0; "
+            "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600; }"
+            "QToolButton:hover { background: #e53e3e; color: #fff; border-color: #e53e3e; }"
+        )
+        self._clear_btn.clicked.connect(self._clear_all_filters)
+        self._filter_bar.addWidget(self._clear_btn)
+        self._update_clear_btn()
+
+    def _toggle_filter(self, dimension, value):
+        """Add or remove a filter value, then refresh."""
+        s = self._active_filters[dimension]
+        if value in s:
+            s.discard(value)
+        else:
+            s.add(value)
+        chip = self._filter_chips.get((dimension, value))
+        if chip:
+            chip.setChecked(value in s)
+        self._update_clear_btn()
+        self.refresh()
+
+    def _clear_all_filters(self):
+        """Remove all active chip filters."""
+        for s in self._active_filters.values():
+            s.clear()
+        for btn in self._filter_chips.values():
+            btn.setChecked(False)
+        self._update_clear_btn()
+        self.refresh()
+
+    def _update_clear_btn(self):
+        """Dim the Clear button when no filters are active."""
+        active = any(self._active_filters.values())
+        if hasattr(self, "_clear_btn"):
+            self._clear_btn.setEnabled(active)
+
+    @staticmethod
+    def _matches_due_filter(task, due_filters, today, week_end):
+        """Check if task matches any active due filter (OR within)."""
+        due = parse_iso_date(task.get("due_date"))
+        if due is None:
+            return False
+        for f in due_filters:
+            if f == "overdue" and due < today:
+                return True
+            if f == "today" and due == today:
+                return True
+            if f == "week" and today <= due <= week_end:
+                return True
+        return False
+
+    def _filter(self, tasks):
+        """Apply search + chip filters to task list."""
+        q = self._search_text
+        if q:
+            tasks = [
+                t
+                for t in tasks
+                if q
+                in (
+                    f"{t.get('title', '')} {t.get('description', '')} "
+                    f"{t.get('priority', '')} {t.get('project', '')} "
+                    f"{t.get('due_date', '')} {t.get('section', '')} {t.get('status', '')}"
+                ).lower()
+            ]
+
+        # Priority filter (OR within)
+        if self._active_filters["priority"]:
+            tasks = [t for t in tasks if t.get("priority", "medium") in self._active_filters["priority"]]
+
+        # Due filter (OR within)
+        if self._active_filters["due"]:
+            today = date.today()
+            week_end = today + timedelta(days=7)
+            tasks = [t for t in tasks if self._matches_due_filter(t, self._active_filters["due"], today, week_end)]
+
+        # Project filter (OR within)
+        if self._active_filters["project"]:
+            tasks = [t for t in tasks if t.get("project") in self._active_filters["project"]]
+
+        return tasks
 
     def refresh(self):
         # Auto-promote tasks whose due date has arrived
         self.db.promote_due_today()
+
+        # Rebuild project chips if the project list changed
+        projects = self.db.get_project_names()
+        if self._last_projects != projects:
+            self._last_projects = projects
+            self._build_filter_chips()
+
         # Single query for all active tasks, then filter by section in Python
         all_active = self.db.get_all_active()
         done = self.db.get_done_tasks()
@@ -1616,18 +1771,13 @@ class FullWindow(QMainWindow):
         # Apply filter + sort, load into widgets
         for key in self._tab_keys:
             tasks = self._filter(raw[key])
-            tasks = (
-                self._sort_tasks(tasks) if key not in ("done", "suggested") else tasks
-            )
+            tasks = self._sort_tasks(tasks)
             if key == "suggested":
                 self.tab_lists[key].load_smart_grouped(tasks)
             elif key == "projects":
                 proj_sorted = sorted(
                     tasks,
-                    key=lambda t: (
-                        t.get("project") or "zzz_none",
-                        priority_sort_key(t),
-                    ),
+                    key=lambda t: t.get("project") or "zzz_none",
                 )
                 self.tab_lists[key].load_grouped_by_project(proj_sorted)
             else:
@@ -1647,6 +1797,9 @@ class FullWindow(QMainWindow):
         msg = f"Tasks: {task_count} | Notes: {note_count} | Done: {done_count} | Overdue: {s['overdue']}"
         if self._search_text:
             msg += f" | Filter: '{self._search_text}'"
+        active_count = sum(len(v) for v in self._active_filters.values())
+        if active_count:
+            msg += f" | Filters: {active_count} active"
         self.status.showMessage(msg)
 
     def _on_item_changed(self, item):
