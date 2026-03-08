@@ -14,6 +14,7 @@ import subprocess
 import threading
 import uuid
 import calendar as _cal_mod
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from db_utils import (
@@ -41,6 +42,12 @@ _PRIORITY_COLORS_UPPER = {k.upper(): v for k, v in PRIORITY_COLORS.items()}
 # SQL fragment for active-task exclusion (reused across queries)
 _ACTIVE_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
 _ACTIVE_PARAMS = list(TASK_ACTIVE_EXCLUSIONS)
+
+# Columns needed by UI rendering (excludes parent_id, notes, assignee, shared_by, publish_requested_at)
+_UI_COLS = "id, title, description, status, section, priority, due_date, project, type, recurring, visibility, updated_at, created_at"
+
+# Page size cap for "All" and "Done" tabs to keep QListWidget responsive
+_TAB_PAGE_SIZE = 200
 
 
 class TaskDB:
@@ -102,6 +109,13 @@ class TaskDB:
         for r in nulls:
             self._conn.execute("UPDATE tasks SET id=? WHERE rowid=?", (str(uuid.uuid4()), r[0]))
         self._conn.commit()
+        # Composite indices for common UI query patterns
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status_type ON tasks(status, type)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status_due ON tasks(status, due_date)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status)",
+        ):
+            self._conn.execute(idx_sql)
 
     def close(self):
         self._conn.close()
@@ -120,7 +134,7 @@ class TaskDB:
     def get_all_active(self):
         """Return all active tasks (excludes done, archived, cancelled)."""
         rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
+            f"SELECT {_UI_COLS} FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
             "ORDER BY created_at",
             _ACTIVE_PARAMS,
         ).fetchall()
@@ -129,7 +143,7 @@ class TaskDB:
     def get_done_tasks(self):
         """Return completed tasks, newest first."""
         rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE status = 'done' ORDER BY updated_at DESC"
+            f"SELECT {_UI_COLS} FROM tasks WHERE status = 'done' ORDER BY updated_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -576,31 +590,44 @@ def _get_truth_score_badge(task, db_path=None):
     """Query TruthScore for public entities and return a color-coded badge string."""
     if task.get("visibility") != "public" or not task.get("title"):
         return ""
+    cache = _batch_truth_scores(db_path)
+    return cache.get(task["title"], "\u2b1c ")  # gray square = unrated
+
+
+# Module-level TruthScore cache (refreshed every 30s)
+_ts_cache: dict[str, str] = {}
+_ts_cache_time: float = 0.0
+
+
+def _batch_truth_scores(db_path=None):
+    """Single query for all TruthScore badges. Cached for 30s."""
+    global _ts_cache, _ts_cache_time
+    now = time.monotonic()
+    if now - _ts_cache_time < 30:
+        return _ts_cache
     try:
         conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=5)
         conn.row_factory = sqlite3.Row
-        count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM knowledge_ratings WHERE entity_name = ?",
-            (task["title"],),
-        ).fetchone()["cnt"]
-        if count == 0:
-            conn.close()
-            return "\u2b1c "  # gray square = unrated
-        avg = conn.execute(
-            "SELECT AVG(specificity * 0.35 + falsifiability * 0.25 + "
+        rows = conn.execute(
+            "SELECT entity_name, AVG(specificity * 0.35 + falsifiability * 0.25 + "
             "internal_consistency * 0.25 + novelty * 0.15) as iq "
-            "FROM knowledge_ratings WHERE entity_name = ?",
-            (task["title"],),
-        ).fetchone()["iq"] or 0.0
+            "FROM knowledge_ratings GROUP BY entity_name"
+        ).fetchall()
         conn.close()
-        if avg > 0.7:
-            return "\U0001f7e2 "  # green
-        elif avg >= 0.4:
-            return "\U0001f7e1 "  # yellow
-        else:
-            return "\U0001f534 "  # red
+        result = {}
+        for r in rows:
+            avg = r["iq"] or 0.0
+            if avg > 0.7:
+                result[r["entity_name"]] = "\U0001f7e2 "  # green
+            elif avg >= 0.4:
+                result[r["entity_name"]] = "\U0001f7e1 "  # yellow
+            else:
+                result[r["entity_name"]] = "\U0001f534 "  # red
+        _ts_cache = result
+        _ts_cache_time = now
+        return result
     except Exception:
-        return ""
+        return _ts_cache  # return stale cache on error
 
 
 def _format_task_text(task, include_project=True, prefix=""):
@@ -627,6 +654,18 @@ def _apply_task_item_colors(item, task):
     if is_overdue(task.get("due_date")) and task["status"] != "done":
         item.setBackground(_CLR_OVERDUE_BG)
         item.setForeground(_CLR_OVERDUE_FG)
+
+
+def _suggested_sort_key(t):
+    """Python sort key replicating get_suggested_tasks() SQL ordering."""
+    dd = t.get("due_date")
+    today_str = date.today().isoformat()
+    return (
+        0 if (dd and dd < today_str) else 1,           # overdue first
+        priority_sort_key(t)[0],                        # priority (critical first)
+        0 if dd else 1,                                 # has due date first
+        dd or "9999-99-99",                             # due date ascending
+    )
 
 
 def _smart_group(tasks):
@@ -707,6 +746,12 @@ class TrayPopup(QWidget):
         # Auto-refresh timer (only ticks when visible)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
+
+        # Search debounce (300ms)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self.refresh)
 
     def _stylesheet(self):
         return _build_popup_style()
@@ -890,7 +935,7 @@ class TrayPopup(QWidget):
 
     def _on_search(self, text):
         self._search_text = text.strip().lower()
-        self.refresh()
+        self._search_timer.start()  # debounce: resets 300ms countdown
 
     def show_near_tray(self, tray_geometry):
         """Position popup near the tray icon."""
@@ -1279,6 +1324,7 @@ class TaskListWidget(QListWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
         self._tasks = []
+        self._last_fp = None  # fingerprint for skip-if-unchanged
 
     @staticmethod
     def _build_tooltip(task):
@@ -1291,7 +1337,15 @@ class TaskListWidget(QListWidget):
             parts.append(desc)
         return "\n".join(parts) if parts else None
 
+    @staticmethod
+    def _fingerprint(tasks):
+        return tuple((t["id"], t.get("updated_at", "")) for t in tasks)
+
     def load_tasks(self, tasks):
+        fp = self._fingerprint(tasks)
+        if fp == self._last_fp:
+            return
+        self._last_fp = fp
         self._tasks = tasks
         self.blockSignals(True)
         self.clear()
@@ -1316,6 +1370,10 @@ class TaskListWidget(QListWidget):
         """Load tasks grouped by project with section headers."""
         from collections import OrderedDict
 
+        fp = self._fingerprint(tasks)
+        if fp == self._last_fp:
+            return
+        self._last_fp = fp
         self._tasks = tasks
         self.blockSignals(True)
         self.clear()
@@ -1359,6 +1417,10 @@ class TaskListWidget(QListWidget):
 
     def load_smart_grouped(self, tasks):
         """Load tasks with smart grouping: Overdue → Urgent → By Project → Rest."""
+        fp = self._fingerprint(tasks)
+        if fp == self._last_fp:
+            return
+        self._last_fp = fp
         self._tasks = tasks
         self.blockSignals(True)
         self.clear()
@@ -1606,6 +1668,8 @@ class FullWindow(QMainWindow):
         self._active_filters = {"priority": set(), "due": set(), "project": set()}
         self._filter_chips = {}
         self._last_projects = None
+        self._project_cache_time: float = 0.0  # monotonic time of last project query
+        self._filtered_cache: dict[str, list] = {}  # lazy tab rendering cache
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
 
@@ -1681,7 +1745,7 @@ class FullWindow(QMainWindow):
         # Restore saved active tab
         if hasattr(self, "_saved_active_tab"):
             self.tabs.setCurrentIndex(min(self._saved_active_tab, len(self._tab_keys) - 1))
-        self.tabs.currentChanged.connect(lambda idx: self._save_ui_state())
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Toolbar: actions + search + sort
         toolbar = QToolBar()
@@ -1694,13 +1758,17 @@ class FullWindow(QMainWindow):
         toolbar.addAction(refresh_action)
         toolbar.addSeparator()
 
-        # Instant search bar
+        # Instant search bar (debounced 300ms)
         self._search_input = QLineEdit()
         self._search_input.setObjectName("search")
         self._search_input.setPlaceholderText("Search tasks...")
         self._search_input.setClearButtonEnabled(True)
         self._search_input.textChanged.connect(self._on_search)
         toolbar.addWidget(self._search_input)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self.refresh)
 
         toolbar.addSeparator()
 
@@ -2346,9 +2414,9 @@ class FullWindow(QMainWindow):
         self.refresh()
 
     def _on_search(self, text):
-        """Instant search filter."""
+        """Debounced search filter (300ms)."""
         self._search_text = text.strip().lower()
-        self.refresh()
+        self._search_timer.start()  # resets 300ms countdown
 
     def _build_filter_chips(self):
         """Populate the filter bar with priority, due, and project chips."""
@@ -2500,18 +2568,25 @@ class FullWindow(QMainWindow):
         # Auto-promote tasks whose due date has arrived
         self.db.promote_due_today()
 
-        # Rebuild project chips if the project list changed
-        projects = self.db.get_project_names()
-        if self._last_projects != projects:
-            self._last_projects = projects
-            self._build_filter_chips()
+        # Rebuild project chips (cached 60s)
+        now_mono = time.monotonic()
+        if now_mono - self._project_cache_time >= 60:
+            self._project_cache_time = now_mono
+            projects = self.db.get_project_names()
+            if self._last_projects != projects:
+                self._last_projects = projects
+                self._build_filter_chips()
 
-        # Single query for all active tasks, then filter by section in Python
+        # 2 DB queries instead of 4: derive suggested & notes in Python
         all_active = self.db.get_all_active()
         done = self.db.get_done_tasks()
-        suggested = self.db.get_suggested_tasks()
 
-        notes = self.db.get_all_notes()
+        suggested = sorted(all_active, key=_suggested_sort_key)[:20]
+        notes = (
+            [t for t in all_active if t.get("type") == "note"]
+            + [t for t in done if t.get("type") == "note"]
+        )
+
         raw = {
             "suggested": suggested,
             "today": [
@@ -2535,26 +2610,21 @@ class FullWindow(QMainWindow):
             "done": done,
         }
 
-        # Apply filter + sort, load into widgets
+        # Pre-compute filtered+sorted data for all tabs (cheap Python ops)
+        self._filtered_cache = {}
         for key in self._tab_keys:
-            tasks = self._filter(raw[key])
-            tasks = self._sort_tasks(tasks)
-            if key == "suggested":
-                self.tab_lists[key].load_smart_grouped(tasks)
-            elif key == "projects":
-                proj_sorted = sorted(
-                    tasks,
-                    key=lambda t: t.get("project") or "zzz_none",
-                )
-                self.tab_lists[key].load_grouped_by_project(proj_sorted)
-            else:
-                self.tab_lists[key].load_tasks(tasks)
+            self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
 
-        # Hide empty tabs (suggested, notes, projects always visible)
+        # Update tab visibility (suggested, notes, projects always visible)
         always_visible = ("suggested", "notes", "projects")
         for i, key in enumerate(self._tab_keys):
-            count = self.tab_lists[key].count()
+            count = len(self._filtered_cache[key])
             self.tabs.setTabVisible(i, count > 0 or key in always_visible)
+
+        # Lazy rendering: only load the currently active tab
+        current_idx = self.tabs.currentIndex()
+        if 0 <= current_idx < len(self._tab_keys):
+            self._load_tab(self._tab_keys[current_idx])
 
         # Status bar — derive summary from already-fetched data
         s = self.db.get_summary(all_active)
@@ -2568,6 +2638,37 @@ class FullWindow(QMainWindow):
         if active_count:
             msg += f" | Filters: {active_count} active"
         self.status.showMessage(msg)
+
+    def _on_tab_changed(self, idx):
+        """Handle tab switch: save state + lazy-load the newly visible tab."""
+        self._save_ui_state()
+        if idx < len(self._tab_keys):
+            self._load_tab(self._tab_keys[idx])
+
+    def _load_tab(self, key):
+        """Render a single tab from cached data. Caps All/Done at 200 items."""
+        tasks = self._filtered_cache.get(key)
+        if tasks is None:
+            return
+        cap_msg = ""
+        if key in ("all", "done") and len(tasks) > _TAB_PAGE_SIZE:
+            cap_msg = f"── {len(tasks) - _TAB_PAGE_SIZE} more items... ──"
+            tasks = tasks[:_TAB_PAGE_SIZE]
+
+        lw = self.tab_lists[key]
+        if key == "suggested":
+            lw.load_smart_grouped(tasks)
+        elif key == "projects":
+            proj_sorted = sorted(tasks, key=lambda t: t.get("project") or "zzz_none")
+            lw.load_grouped_by_project(proj_sorted)
+        else:
+            lw.load_tasks(tasks)
+
+        if cap_msg:
+            sentinel = QListWidgetItem(cap_msg)
+            sentinel.setFlags(Qt.ItemFlag.NoItemFlags)
+            sentinel.setForeground(QColor("#888"))
+            lw.addItem(sentinel)
 
     def _on_item_changed(self, item):
         task_id = item.data(Qt.ItemDataRole.UserRole)
