@@ -37,6 +37,40 @@ from db_utils import (
 # Pre-built SQL fragment for active-task exclusion filter
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 
+# ── Recurring task validation ─────────────────────────────────────────
+_RECURRING_EVERY = ("day", "week", "month")
+_RECURRING_WEEKDAYS = frozenset(
+    ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+)
+
+
+def _validate_recurring(raw: str) -> str | None:
+    """Validate recurring JSON config. Returns error message or None if valid."""
+    try:
+        config = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return f"Invalid JSON: {raw!r}"
+    if not isinstance(config, dict):
+        return "Recurring config must be a JSON object"
+    every = config.get("every", "").lower()
+    if every not in _RECURRING_EVERY:
+        return f"Invalid 'every': {every}. Use: {_RECURRING_EVERY}"
+    if every == "week":
+        day = config.get("day", "").lower()
+        if day not in _RECURRING_WEEKDAYS:
+            return f"Weekly recurrence requires 'day' (weekday name). Got: {day!r}"
+    if every == "month":
+        day = config.get("day")
+        if day is None:
+            return "Monthly recurrence requires 'day' (1-31)"
+        try:
+            d = int(day)
+            if not 1 <= d <= 31:
+                return f"Monthly 'day' must be 1-31. Got: {d}"
+        except (ValueError, TypeError):
+            return f"Monthly 'day' must be an integer. Got: {day!r}"
+    return None
+
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
 LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1063,6 +1097,10 @@ def create_task(
             return json.dumps(
                 {"error": f"Invalid due_date: {due_date}. Use YYYY-MM-DD format"}
             )
+    if recurring:
+        err = _validate_recurring(recurring)
+        if err:
+            return json.dumps({"error": f"Invalid recurring config: {err}"})
 
     with _get_conn() as conn:
         if parent_id:
@@ -1177,6 +1215,10 @@ def update_task(
             return json.dumps(
                 {"error": f"Invalid due_date: {updates['due_date']}. Use YYYY-MM-DD"}
             )
+    if "recurring" in updates and updates["recurring"] is not None:
+        err = _validate_recurring(updates["recurring"])
+        if err:
+            return json.dumps({"error": f"Invalid recurring config: {err}"})
 
     updates["updated_at"] = _now()
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -1432,6 +1474,35 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
 
     logger.info("bump_overdue_priority: %d tasks bumped to %s", bumped, target_priority)
     return json.dumps({"bumped": bumped, "target_priority": target_priority})
+
+
+@mcp.tool()
+def process_recurring_tasks(dry_run: bool = False) -> str:
+    """Process recurring tasks: recreate done recurring tasks if schedule matches today.
+
+    Finds tasks with status='done' and a recurring JSON config, checks if today
+    matches the schedule, and creates a new not_started copy (idempotent — skips
+    if an active task with the same title already exists).
+
+    Args:
+        dry_run: If True, show what would be created without inserting.
+    """
+    from recurring_tasks import process_recurring
+
+    with _get_conn() as conn:
+        created = process_recurring(conn, dry_run=dry_run)
+
+    if not created:
+        return json.dumps({"message": "No recurring tasks to process today.", "created": 0})
+
+    titles = [t["title"] for t in created]
+    prefix = "[dry-run] Would create" if dry_run else "Created"
+    logger.info("process_recurring_tasks: %s %d task(s)", prefix.lower(), len(created))
+    return json.dumps({
+        "message": f"{prefix} {len(created)} recurring task(s)",
+        "created": len(created),
+        "tasks": titles,
+    })
 
 
 @mcp.tool()

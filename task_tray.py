@@ -541,15 +541,34 @@ def _build_menu_style():
     )
 
 
+def _recurring_label(raw: str | None) -> str:
+    """Human-readable label for recurring config JSON."""
+    if not raw:
+        return ""
+    try:
+        cfg = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    every = cfg.get("every", "").lower()
+    if every == "day":
+        return "Daily"
+    if every == "week":
+        return f"Weekly ({cfg.get('day', '?').title()})"
+    if every == "month":
+        return f"Monthly (day {cfg.get('day', '?')})"
+    return ""
+
+
 def _format_task_text(task, include_project=True, prefix=""):
-    """Build display text: [N] [PRIORITY] title | Due: date | project — preview."""
+    """Build display text: [N] [🔄] [PRIORITY] title | Due: date | project — preview."""
     type_prefix = "[N] " if task.get("type") == "note" else ""
+    recur = "\U0001f504 " if task.get("recurring") else ""
     priority = (task.get("priority") or "medium").upper()
     due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
     proj = f" | {task['project']}" if include_project and task.get("project") else ""
     desc = task.get("description") or ""
     preview = f" — {desc[:50]}..." if len(desc) > 50 else (f" — {desc}" if desc else "")
-    return f"{prefix}{type_prefix}[{priority}] {task['title']}{due}{proj}{preview}"
+    return f"{prefix}{type_prefix}{recur}[{priority}] {task['title']}{due}{proj}{preview}"
 
 
 def _apply_task_item_colors(item, task):
@@ -1152,6 +1171,12 @@ class TaskReaderDialog(QDialog):
                 mlbl.setObjectName("reader-meta")
                 self._meta_layout.addWidget(mlbl)
 
+        rl = _recurring_label(self.task.get("recurring"))
+        if rl:
+            rlbl = QLabel(f"\U0001f504 {rl}")
+            rlbl.setObjectName("reader-meta")
+            self._meta_layout.addWidget(rlbl)
+
         self._meta_layout.addStretch()
 
         # Body
@@ -1193,6 +1218,17 @@ class TaskListWidget(QListWidget):
         self.customContextMenuRequested.connect(self._context_menu)
         self._tasks = []
 
+    @staticmethod
+    def _build_tooltip(task):
+        parts = []
+        rl = _recurring_label(task.get("recurring"))
+        if rl:
+            parts.append(f"\U0001f504 {rl}")
+        desc = task.get("description")
+        if desc:
+            parts.append(desc)
+        return "\n".join(parts) if parts else None
+
     def load_tasks(self, tasks):
         self._tasks = tasks
         self.blockSignals(True)
@@ -1207,9 +1243,9 @@ class TaskListWidget(QListWidget):
                 else Qt.CheckState.Unchecked
             )
             item.setText(_format_task_text(task))
-            desc = task.get("description")
-            if desc:
-                item.setToolTip(desc)
+            tip = self._build_tooltip(task)
+            if tip:
+                item.setToolTip(tip)
             _apply_task_item_colors(item, task)
             self.addItem(item)
         self.blockSignals(False)
@@ -1251,9 +1287,9 @@ class TaskListWidget(QListWidget):
                 item.setText(
                     _format_task_text(task, include_project=False, prefix="  ")
                 )
-                desc = task.get("description")
-                if desc:
-                    item.setToolTip(desc)
+                tip = self._build_tooltip(task)
+                if tip:
+                    item.setToolTip(tip)
                 _apply_task_item_colors(item, task)
                 self.addItem(item)
 
@@ -1292,9 +1328,9 @@ class TaskListWidget(QListWidget):
                     else Qt.CheckState.Unchecked
                 )
                 item.setText(_format_task_text(task, prefix="  "))
-                desc = task.get("description")
-                if desc:
-                    item.setToolTip(desc)
+                tip = self._build_tooltip(task)
+                if tip:
+                    item.setToolTip(tip)
                 _apply_task_item_colors(item, task)
                 self.addItem(item)
         self.blockSignals(False)
@@ -1320,14 +1356,107 @@ class TaskListWidget(QListWidget):
         current_type = task.get("type", "task") if task else "task"
         target_type = "note" if current_type == "task" else "task"
         convert_action = menu.addAction(f"Convert to {target_type.title()}")
+        has_recurring = bool(task.get("recurring")) if task else False
+        recurring_label = "Edit Recurring..." if has_recurring else "Set Recurring..."
+        recurring_action = menu.addAction(recurring_label)
+        if has_recurring:
+            clear_recurring_action = menu.addAction("Clear Recurring")
+        else:
+            clear_recurring_action = None
+        menu.addSeparator()
         delete_action = menu.addAction("Delete")
         action = menu.exec(self.mapToGlobal(pos))
         if action == view_action:
             self._open_reader(task_id)
         elif action == convert_action:
             self.db.update_task(task_id, type=target_type)
+        elif action == recurring_action:
+            self._show_recurring_dialog(task_id, task)
+        elif action == clear_recurring_action:
+            self.db.update_task(task_id, recurring=None)
         elif action == delete_action:
             self.db.delete_task(task_id)
+
+    def _show_recurring_dialog(self, task_id, task):
+        """Show dialog to set/edit recurring schedule."""
+        dlg = RecurringDialog(task, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            config = dlg.get_config()
+            self.db.update_task(task_id, recurring=config)
+
+
+class RecurringDialog(QDialog):
+    """Dialog to configure recurring schedule for a task."""
+
+    _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Recurring Schedule")
+        self.setMinimumWidth(300)
+        self.setStyleSheet(_build_dialog_style())
+        layout = QFormLayout(self)
+
+        self.every_combo = QComboBox()
+        self.every_combo.addItems(["Daily", "Weekly", "Monthly"])
+        self.every_combo.currentTextChanged.connect(self._on_every_changed)
+        layout.addRow("Repeat:", self.every_combo)
+
+        self.day_of_week = QComboBox()
+        self.day_of_week.addItems(self._WEEKDAYS)
+        self._dow_label = QLabel("Day:")
+        layout.addRow(self._dow_label, self.day_of_week)
+
+        self.day_of_month = QSpinBox()
+        self.day_of_month.setRange(1, 31)
+        self._dom_label = QLabel("Day of month:")
+        layout.addRow(self._dom_label, self.day_of_month)
+
+        # Restore from existing config
+        raw = task.get("recurring") if task else None
+        if raw:
+            try:
+                cfg = json.loads(raw)
+                every = cfg.get("every", "day").lower()
+                if every == "week":
+                    self.every_combo.setCurrentText("Weekly")
+                    day_name = cfg.get("day", "monday").title()
+                    if day_name in self._WEEKDAYS:
+                        self.day_of_week.setCurrentText(day_name)
+                elif every == "month":
+                    self.every_combo.setCurrentText("Monthly")
+                    self.day_of_month.setValue(int(cfg.get("day", 1)))
+                else:
+                    self.every_combo.setCurrentText("Daily")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        self._on_every_changed(self.every_combo.currentText())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _on_every_changed(self, text):
+        is_weekly = text == "Weekly"
+        is_monthly = text == "Monthly"
+        self.day_of_week.setVisible(is_weekly)
+        self._dow_label.setVisible(is_weekly)
+        self.day_of_month.setVisible(is_monthly)
+        self._dom_label.setVisible(is_monthly)
+
+    def get_config(self) -> str:
+        """Return recurring config as JSON string."""
+        every = self.every_combo.currentText()
+        if every == "Daily":
+            return json.dumps({"every": "day"})
+        elif every == "Weekly":
+            return json.dumps({"every": "week", "day": self.day_of_week.currentText().lower()})
+        else:
+            return json.dumps({"every": "month", "day": self.day_of_month.value()})
 
 
 _REFRESH_INTERVAL_MS = 30_000
@@ -1559,10 +1688,24 @@ class FullWindow(QMainWindow):
         self._purge_timer.timeout.connect(self._run_purge)
         self._purge_timer.start(_PURGE_INTERVAL_MS)
 
+        # Process recurring tasks at startup
+        self._process_recurring()
+
         self.refresh()
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
+
+    def _process_recurring(self):
+        """Process recurring tasks silently (idempotent)."""
+        try:
+            from recurring_tasks import process_recurring
+            with get_conn() as conn:
+                created = process_recurring(conn, dry_run=False)
+            if created:
+                self.refresh()
+        except Exception:
+            pass  # silent — never break startup/sync
 
     # ── Appearance ─────────────────────────────────────────────────────
 
@@ -1706,6 +1849,9 @@ class FullWindow(QMainWindow):
         hide_ms = 15000 if is_error else 4000
         QTimer.singleShot(hide_ms, self._sync_bar.hide)
         self.status.showMessage(msg, hide_ms)
+        if not is_error:
+            self._process_recurring()
+            self.refresh()
 
     def _sync_bridge(self):
         """Export full memory (entities+relations+tasks) → shared.json, then git push."""

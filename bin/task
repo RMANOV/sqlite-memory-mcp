@@ -27,31 +27,43 @@ add|note)
     export TASK_PROJECT=""
     export TASK_DESC=""
     export TASK_TYPE="task"
+    export TASK_RECURRING=""
     [[ "$cmd" == "note" ]] && export TASK_TYPE="note"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --priority) export TASK_PRIORITY="$2"; shift 2;;
-            --section)  export TASK_SECTION="$2";  shift 2;;
-            --due)      export TASK_DUE="$2";      shift 2;;
-            --project)  export TASK_PROJECT="$2";  shift 2;;
-            --desc)     export TASK_DESC="$2";     shift 2;;
-            --content)  export TASK_DESC="$2";     shift 2;;
+            --priority)  export TASK_PRIORITY="$2";  shift 2;;
+            --section)   export TASK_SECTION="$2";   shift 2;;
+            --due)       export TASK_DUE="$2";       shift 2;;
+            --project)   export TASK_PROJECT="$2";   shift 2;;
+            --desc)      export TASK_DESC="$2";      shift 2;;
+            --content)   export TASK_DESC="$2";      shift 2;;
+            --recurring) export TASK_RECURRING="$2"; shift 2;;
             *) echo "Unknown flag: $1"; exit 1;;
         esac
     done
     $PY -c "
-import sqlite3, uuid, datetime, os
+import sqlite3, uuid, datetime, json, os
 c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
 c.execute('PRAGMA busy_timeout=10000')
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 t, s, p = os.environ['TASK_TITLE'], os.environ['TASK_SECTION'], os.environ['TASK_PRIORITY']
+recur = os.environ['TASK_RECURRING'] or None
+if recur:
+    try:
+        cfg = json.loads(recur)
+        valid_every = ('day', 'week', 'month')
+        if cfg.get('every', '').lower() not in valid_every:
+            raise ValueError(f'every must be one of {valid_every}')
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f'Invalid --recurring JSON: {e}'); import sys; sys.exit(1)
 c.execute(
-    'INSERT INTO tasks (id,title,description,status,section,priority,due_date,project,type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    'INSERT INTO tasks (id,title,description,status,section,priority,due_date,project,type,recurring,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
     (str(uuid.uuid4()), t, os.environ['TASK_DESC'] or None, 'not_started', s, p,
      os.environ['TASK_DUE'] or None, os.environ['TASK_PROJECT'] or None,
-     os.environ['TASK_TYPE'], now, now))
+     os.environ['TASK_TYPE'], recur, now, now))
 c.close()
-print(f'Created {os.environ[\"TASK_TYPE\"]}: {t} [{s}/{p}]')
+suffix = f' (recurring: {recur})' if recur else ''
+print(f'Created {os.environ[\"TASK_TYPE\"]}: {t} [{s}/{p}]{suffix}')
 "
     touch "$REFRESH"
     ;;
@@ -113,9 +125,11 @@ else:
 help|*)
     echo "task -- CLI for SQLite Memory tasks"
     echo ""
-    echo "  task add \"title\" [--priority high] [--section today] [--due DATE] [--project X] [--desc \"...\"]"
+    echo "  task add \"title\" [--priority high] [--section today] [--due DATE] [--project X] [--desc \"...\"] [--recurring '{\"every\":\"week\",\"day\":\"monday\"}']"
     echo "  task note \"title\" [--content \"...\"] [--priority high] [--project X]"
     echo "  task done \"title\""
     echo "  task ls [--section today] [--status done] [--project X]"
+    echo ""
+    echo "Recurring formats: {\"every\":\"day\"} | {\"every\":\"week\",\"day\":\"monday\"} | {\"every\":\"month\",\"day\":15}"
     ;;
 esac
