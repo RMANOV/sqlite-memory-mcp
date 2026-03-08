@@ -1766,7 +1766,14 @@ class FullWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # Bridge sync progress bar (hidden by default)
+        # Last sync timestamp label (permanent, right corner)
+        self._sync_label = QLabel("")
+        self._sync_label.setStyleSheet(
+            f"color: {_T()['text2']}; font-size: {_font_size - 2}px; padding-right: 8px;"
+        )
+        self.status.addPermanentWidget(self._sync_label)
+
+        # Bridge sync progress bar (hidden by default, replaces label visually)
         self._sync_bar = QProgressBar()
         self._sync_bar.setFixedWidth(280)
         self._sync_bar.setTextVisible(True)
@@ -1940,6 +1947,7 @@ class FullWindow(QMainWindow):
     def _on_sync_progress(self, pct, label):
         self._sync_bar.setValue(pct)
         self._sync_bar.setFormat(f"{pct}%  {label}")
+        self._sync_label.hide()
         self._sync_bar.show()
 
     def _on_sync_done(self, msg):
@@ -1947,11 +1955,21 @@ class FullWindow(QMainWindow):
         self._sync_bar.setValue(100)
         self._sync_bar.setFormat(msg[:50])
         hide_ms = 15000 if is_error else 4000
-        QTimer.singleShot(hide_ms, self._sync_bar.hide)
+        QTimer.singleShot(hide_ms, self._show_last_sync_time)
         self.status.showMessage(msg, hide_ms)
         if not is_error:
+            from datetime import datetime
+
+            self._last_sync_at = datetime.now()
             self._process_recurring()
             self.refresh()
+
+    def _show_last_sync_time(self):
+        self._sync_bar.hide()
+        if hasattr(self, "_last_sync_at") and self._last_sync_at:
+            ts = self._last_sync_at.strftime("%d.%m %H:%M")
+            self._sync_label.setText(f"Synced: {ts}")
+        self._sync_label.show()
 
     def _sync_bridge(self):
         """Export full memory (entities+relations+tasks) → shared.json, then git push."""
