@@ -165,10 +165,11 @@ class TaskDB:
         return [dict(r) for r in rows]
 
     def get_project_names(self):
-        """Return sorted list of distinct non-null project names."""
+        """Return project names sorted by active task count (most first)."""
         rows = self._conn.execute(
-            "SELECT DISTINCT project FROM tasks WHERE project IS NOT NULL "
-            "ORDER BY project"
+            "SELECT project, COUNT(*) as cnt FROM tasks "
+            "WHERE project IS NOT NULL AND status NOT IN ('archived','cancelled') "
+            "GROUP BY project ORDER BY cnt DESC"
         ).fetchall()
         return [r["project"] for r in rows]
 
@@ -648,7 +649,7 @@ def _smart_group(tasks):
         groups.append(("⚠ Overdue", overdue))
     if urgent:
         groups.append(("Urgent", urgent))
-    for proj_name in sorted(by_project):
+    for proj_name in sorted(by_project, key=lambda p: len(by_project[p]), reverse=True):
         groups.append((proj_name, by_project[proj_name]))
     if rest:
         groups.append(("Other", rest))
@@ -2351,7 +2352,23 @@ class FullWindow(QMainWindow):
 
         self._filter_bar.addSeparator()
 
-        # Project chips (dynamic)
+        # Clear all button (before project chips for quick access)
+        self._clear_btn = QToolButton()
+        self._clear_btn.setText("Clear")
+        t = _T()
+        self._clear_btn.setStyleSheet(
+            f"QToolButton {{ border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text']}; "
+            f"padding: 4px 12px; font-size: {_font_size - 2}px; font-weight: bold; }}"
+            f"QToolButton:hover {{ background: {t['danger']}; color: #fff; border-color: {t['danger']}; }}"
+            f"QToolButton:disabled {{ color: {t['border']}; }}"
+        )
+        self._clear_btn.clicked.connect(self._clear_all_filters)
+        self._filter_bar.addWidget(self._clear_btn)
+        self._update_clear_btn()
+
+        self._filter_bar.addSeparator()
+
+        # Project chips (dynamic, sorted by task count descending)
         projects = self.db.get_project_names()
         for proj in projects:
             btn = QToolButton()
@@ -2365,22 +2382,6 @@ class FullWindow(QMainWindow):
             btn.clicked.connect(lambda checked, p=proj: self._toggle_filter("project", p))
             self._filter_bar.addWidget(btn)
             self._filter_chips[("project", proj)] = btn
-
-        self._filter_bar.addSeparator()
-
-        # Clear all button
-        self._clear_btn = QToolButton()
-        self._clear_btn.setText("Clear")
-        t = _T()
-        self._clear_btn.setStyleSheet(
-            f"QToolButton {{ border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text']}; "
-            f"padding: 4px 12px; font-size: {_font_size - 2}px; font-weight: bold; }}"
-            f"QToolButton:hover {{ background: {t['danger']}; color: #fff; border-color: {t['danger']}; }}"
-            f"QToolButton:disabled {{ color: {t['border']}; }}"
-        )
-        self._clear_btn.clicked.connect(self._clear_all_filters)
-        self._filter_bar.addWidget(self._clear_btn)
-        self._update_clear_btn()
 
     def _toggle_filter(self, dimension, value):
         """Add or remove a filter value, then refresh."""
