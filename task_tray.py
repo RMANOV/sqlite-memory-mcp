@@ -96,6 +96,11 @@ class TaskDB:
         ]:
             if col not in existing:
                 self._conn.execute(sql)
+        # Backfill null IDs
+        import uuid
+        nulls = self._conn.execute("SELECT rowid FROM tasks WHERE id IS NULL").fetchall()
+        for r in nulls:
+            self._conn.execute("UPDATE tasks SET id=? WHERE rowid=?", (str(uuid.uuid4()), r[0]))
         self._conn.commit()
 
     def close(self):
@@ -656,6 +661,29 @@ def _smart_group(tasks):
     return groups
 
 
+def _score_task(task, query):
+    """Score task relevance. 0 = no match."""
+    q = query.lower()
+    title = (task.get("title") or "").lower()
+    combined = (
+        f"{title} {(task.get('description') or '').lower()} "
+        f"{task.get('priority', '')} {task.get('project', '')} "
+        f"{task.get('due_date', '')} {task.get('section', '')} {task.get('status', '')}"
+    )
+    if q in title:
+        return 100
+    if q in combined:
+        return 50
+    words = q.split()
+    if len(words) > 1:
+        matched = sum(1 for w in words if w in combined)
+        if matched == len(words):
+            return 30
+        if matched > 0:
+            return 10 * matched
+    return 0
+
+
 # ── TrayPopup ───────────────────────────────────────────────────────
 
 
@@ -770,16 +798,8 @@ class TrayPopup(QWidget):
         # Apply search filter if active
         q = self._search_text
         if q:
-            tasks = [
-                t
-                for t in tasks
-                if q
-                in (
-                    f"{t.get('title', '')} {t.get('description', '')} "
-                    f"{t.get('priority', '')} "
-                    f"{t.get('project', '')} {t.get('due_date', '')}"
-                ).lower()
-            ]
+            scored = [(t, _score_task(t, q)) for t in tasks]
+            tasks = [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0]
 
         if tasks:
             groups = _smart_group(tasks)
@@ -1967,7 +1987,10 @@ class FullWindow(QMainWindow):
     def _show_last_sync_time(self):
         self._sync_bar.hide()
         if hasattr(self, "_last_sync_at") and self._last_sync_at:
-            ts = self._last_sync_at.strftime("%d.%m %H:%M")
+            if self._last_sync_at.date() == date.today():
+                ts = self._last_sync_at.strftime("%H:%M:%S")
+            else:
+                ts = self._last_sync_at.strftime("%a %d.%m, %H:%M:%S")
             self._sync_label.setText(f"Synced: {ts}")
         self._sync_label.show()
 
@@ -2435,12 +2458,13 @@ class FullWindow(QMainWindow):
     def _matches_due_filter(task, due_filters, today, week_start, week_end):
         """Check if task matches any active due filter (OR within)."""
         due = parse_iso_date(task.get("due_date"))
-        if due is None:
-            return False
         for f in due_filters:
-            if f == "overdue" and due < today:
+            # "today" matches by due_date OR by section (user intent = "work today")
+            if f == "today" and (due == today or task.get("section") == "today"):
                 return True
-            if f == "today" and due == today:
+            if due is None:
+                continue
+            if f == "overdue" and due < today:
                 return True
             if f == "week" and week_start <= due <= week_end:
                 return True
@@ -2450,17 +2474,9 @@ class FullWindow(QMainWindow):
         """Apply search OR chip filters. Search bypasses chip filters."""
         q = self._search_text
         if q:
-            # Search ignores chip filters — return all matches
-            return [
-                t
-                for t in tasks
-                if q
-                in (
-                    f"{t.get('title', '')} {t.get('description', '')} "
-                    f"{t.get('priority', '')} {t.get('project', '')} "
-                    f"{t.get('due_date', '')} {t.get('section', '')} {t.get('status', '')}"
-                ).lower()
-            ]
+            # Search ignores chip filters — score + sort by relevance
+            scored = [(t, _score_task(t, q)) for t in tasks]
+            return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0]
 
         # Chip filters only when not searching
         # Priority filter (OR within)
