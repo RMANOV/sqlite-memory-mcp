@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from db_utils import (
     DB_PATH,
     PRIORITY_COLORS,
+    PUBLISH_STANDBY_MINUTES,
     TASK_ACTIVE_EXCLUSIONS,
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
     TASK_PRIORITIES,
@@ -72,6 +73,8 @@ class TaskDB:
                 type TEXT NOT NULL DEFAULT 'task',
                 assignee TEXT,
                 shared_by TEXT,
+                visibility TEXT DEFAULT 'private',
+                publish_requested_at TEXT,
                 created_at TEXT,
                 updated_at TEXT
             )
@@ -88,6 +91,8 @@ class TaskDB:
                 "description",
                 "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
             ),
+            ("visibility", "ALTER TABLE tasks ADD COLUMN visibility TEXT DEFAULT 'private'"),
+            ("publish_requested_at", "ALTER TABLE tasks ADD COLUMN publish_requested_at TEXT DEFAULT NULL"),
         ]:
             if col not in existing:
                 self._conn.execute(sql)
@@ -277,6 +282,8 @@ from PyQt6.QtWidgets import (
     QDateEdit,
     QButtonGroup,
     QCompleter,
+    QMessageBox,
+    QSpinBox,
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import QDate, QEvent, QObject, QSettings, Qt, QTimer, QPoint, pyqtSignal
@@ -560,15 +567,17 @@ def _recurring_label(raw: str | None) -> str:
 
 
 def _format_task_text(task, include_project=True, prefix=""):
-    """Build display text: [N] [🔄] [PRIORITY] title | Due: date | project — preview."""
+    """Build display text: [N] [🔄] [⏳/🌐] [PRIORITY] title | Due: date | project — preview."""
     type_prefix = "[N] " if task.get("type") == "note" else ""
     recur = "\U0001f504 " if task.get("recurring") else ""
+    vis = task.get("visibility", "private")
+    vis_badge = "\u23f3 " if vis == "pending_public" else ("\U0001f310 " if vis == "public" else "")
     priority = (task.get("priority") or "medium").upper()
     due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
     proj = f" | {task['project']}" if include_project and task.get("project") else ""
     desc = task.get("description") or ""
     preview = f" — {desc[:50]}..." if len(desc) > 50 else (f" — {desc}" if desc else "")
-    return f"{prefix}{type_prefix}{recur}[{priority}] {task['title']}{due}{proj}{preview}"
+    return f"{prefix}{type_prefix}{recur}{vis_badge}[{priority}] {task['title']}{due}{proj}{preview}"
 
 
 def _apply_task_item_colors(item, task):
@@ -1364,6 +1373,16 @@ class TaskListWidget(QListWidget):
         else:
             clear_recurring_action = None
         menu.addSeparator()
+        # v0.7.0: Publish / Unpublish
+        task_vis = task.get("visibility", "private") if task else "private"
+        publish_action = unpublish_action = None
+        if task_vis == "public":
+            unpublish_action = menu.addAction("\U0001f310 Unpublish")
+        elif task_vis == "pending_public":
+            unpublish_action = menu.addAction("\u23f3 Cancel Publish")
+        else:
+            publish_action = menu.addAction("Publish...")
+        menu.addSeparator()
         delete_action = menu.addAction("Delete")
         action = menu.exec(self.mapToGlobal(pos))
         if action == view_action:
@@ -1374,8 +1393,56 @@ class TaskListWidget(QListWidget):
             self._show_recurring_dialog(task_id, task)
         elif action == clear_recurring_action:
             self.db.update_task(task_id, recurring=None)
+        elif publish_action and action == publish_action:
+            self._publish_task(task_id)
+        elif unpublish_action and action == unpublish_action:
+            self._cancel_publish_task(task_id)
         elif action == delete_action:
             self.db.delete_task(task_id)
+
+    def _publish_task(self, task_id):
+        """Two-warning gate before setting task to pending_public."""
+        # Warning 1: visibility scope
+        msg1 = QMessageBox(self)
+        msg1.setWindowTitle("Publish Task")
+        msg1.setText(
+            "Are you sure you want to publish this content?\n"
+            "It will be visible to ALL Claude instances."
+        )
+        btn_no = msg1.addButton("Don't Publish", QMessageBox.ButtonRole.RejectRole)
+        btn_yes = msg1.addButton("Publish", QMessageBox.ButtonRole.AcceptRole)
+        msg1.setDefaultButton(btn_no)
+        msg1.exec()
+        if msg1.clickedButton() != btn_yes:
+            return
+
+        # Warning 2: harm/safety check
+        msg2 = QMessageBox(self)
+        msg2.setWindowTitle("Safety Check")
+        msg2.setText(
+            "Are you sure the content will NOT harm,\n"
+            "endanger, or compromise the safety of any person?"
+        )
+        btn_cancel = msg2.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        btn_confirm = msg2.addButton("Confirm Safe", QMessageBox.ButtonRole.AcceptRole)
+        msg2.setDefaultButton(btn_cancel)
+        msg2.exec()
+        if msg2.clickedButton() != btn_confirm:
+            return
+
+        self.db.update_task(
+            task_id,
+            visibility="pending_public",
+            publish_requested_at=now_iso(),
+        )
+
+    def _cancel_publish_task(self, task_id):
+        """Revert pending_public or public → private."""
+        self.db.update_task(
+            task_id,
+            visibility="private",
+            publish_requested_at=None,
+        )
 
     def _show_recurring_dialog(self, task_id, task):
         """Show dialog to set/edit recurring schedule."""
@@ -1875,6 +1942,23 @@ class FullWindow(QMainWindow):
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA busy_timeout=10000")
 
+                # v0.7.0: Promote pending_public → public if standby elapsed
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
+                ).isoformat()
+                conn.execute(
+                    "UPDATE entities SET visibility='public' "
+                    "WHERE visibility='pending_public' AND publish_requested_at <= ?",
+                    (cutoff,),
+                )
+                conn.execute(
+                    "UPDATE tasks SET visibility='public' "
+                    "WHERE visibility='pending_public' AND publish_requested_at <= ?",
+                    (cutoff,),
+                )
+                conn.commit()
+
                 # 0. Pull remote changes + import new entities
                 self._bridge_progress.emit(5, "git pull...")
                 subprocess.run(["git", "pull", "--rebase"], timeout=30, **git_kw)
@@ -1951,6 +2035,37 @@ class FullWindow(QMainWindow):
                     "FROM tasks WHERE status != 'archived' ORDER BY created_at"
                 ).fetchall()
 
+                # 3b. v0.7.0: Export public knowledge
+                self._bridge_progress.emit(45, "Exporting public knowledge...")
+                pub_ent_rows = conn.execute(
+                    "SELECT id, name, entity_type, project, created_at, updated_at "
+                    "FROM entities WHERE visibility='public' ORDER BY name"
+                ).fetchall()
+                public_entities_out = []
+                for pe in pub_ent_rows:
+                    obs = conn.execute(
+                        "SELECT content, created_at FROM observations "
+                        "WHERE entity_id = ? ORDER BY id",
+                        (pe["id"],),
+                    ).fetchall()
+                    public_entities_out.append({
+                        "name": pe["name"],
+                        "entityType": pe["entity_type"],
+                        "project": pe["project"],
+                        "observations": [
+                            {"content": o["content"], "createdAt": o["created_at"]}
+                            for o in obs
+                        ],
+                        "createdAt": pe["created_at"],
+                        "updatedAt": pe["updated_at"],
+                    })
+                pub_task_rows = conn.execute(
+                    "SELECT id, title, description, status, priority, section, "
+                    "due_date, project, created_at, updated_at "
+                    "FROM tasks WHERE visibility='public' ORDER BY created_at"
+                ).fetchall()
+                public_tasks_out = [dict(r) for r in pub_task_rows]
+
                 # 4. Build payload (merge remote tasks + preserve extra keys)
                 tasks_out = [dict(r) for r in task_rows]
                 payload = {
@@ -1961,6 +2076,11 @@ class FullWindow(QMainWindow):
                     "relations": relations_out,
                     "tasks": tasks_out,
                 }
+                if public_entities_out or public_tasks_out:
+                    payload["public_knowledge"] = {
+                        "entities": public_entities_out,
+                        "tasks": public_tasks_out,
+                    }
                 if shared_path.exists():
                     try:
                         existing = json.loads(shared_path.read_text(encoding="utf-8"))
@@ -2006,6 +2126,7 @@ class FullWindow(QMainWindow):
                             "relations",
                             "tasks",
                             "shared_tasks",
+                            "public_knowledge",
                             "owner",
                             "team_manifest",
                             "ui_profiles",

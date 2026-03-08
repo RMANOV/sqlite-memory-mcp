@@ -34,6 +34,10 @@ TASK_TYPES = ("task", "note")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
 TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 
+# v0.7.0: Public knowledge visibility
+VISIBILITY_LEVELS = ("private", "pending_public", "public")
+PUBLISH_STANDBY_MINUTES = 15
+
 # Collaboration constants
 TRUST_LEVELS = ("read_only", "read_write")
 SHARE_TYPES = ("entity", "relation", "all")
@@ -64,6 +68,8 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
         "assignee",
         "shared_by",
         "updated_at",
+        "visibility",
+        "publish_requested_at",
     }
 )
 

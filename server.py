@@ -20,7 +20,7 @@ import sqlite3
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from db_utils import (
     TASK_PRIORITIES as _TASK_PRIORITIES,
     TASK_STATUSES as _TASK_STATUSES,
     TASK_TYPES as _TASK_TYPES,
+    VISIBILITY_LEVELS as _VISIBILITY_LEVELS,
+    PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
     build_priority_order_sql,
     now_iso as _now,
 )
@@ -120,6 +122,8 @@ CREATE TABLE IF NOT EXISTS entities (
     project     TEXT    DEFAULT NULL,
     shared_by   TEXT    DEFAULT NULL,
     origin      TEXT    DEFAULT 'local',
+    visibility           TEXT DEFAULT 'private',
+    publish_requested_at TEXT DEFAULT NULL,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -166,6 +170,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     type        TEXT NOT NULL DEFAULT 'task',
     assignee    TEXT DEFAULT NULL,
     shared_by   TEXT DEFAULT NULL,
+    visibility           TEXT DEFAULT 'private',
+    publish_requested_at TEXT DEFAULT NULL,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -371,6 +377,38 @@ _MIGRATIONS = [
         "ALTER TABLE entities ADD COLUMN origin TEXT DEFAULT 'local'",
         "entities.origin column",
     ),
+    # v0.7.0: public knowledge — visibility columns
+    (
+        "SELECT 1 FROM pragma_table_info('entities') WHERE name='visibility'",
+        "ALTER TABLE entities ADD COLUMN visibility TEXT DEFAULT 'private'",
+        "entities.visibility column",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('entities') WHERE name='publish_requested_at'",
+        "ALTER TABLE entities ADD COLUMN publish_requested_at TEXT DEFAULT NULL",
+        "entities.publish_requested_at column",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='visibility'",
+        "ALTER TABLE tasks ADD COLUMN visibility TEXT DEFAULT 'private'",
+        "tasks.visibility column",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='publish_requested_at'",
+        "ALTER TABLE tasks ADD COLUMN publish_requested_at TEXT DEFAULT NULL",
+        "tasks.publish_requested_at column",
+    ),
+    # v0.7.0: visibility indexes
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_entities_visibility'",
+        "CREATE INDEX idx_entities_visibility ON entities(visibility)",
+        "idx_entities_visibility index",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_visibility'",
+        "CREATE INDEX idx_tasks_visibility ON tasks(visibility)",
+        "idx_tasks_visibility index",
+    ),
 ]
 
 
@@ -534,12 +572,16 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
             etype = ent["entityType"]
             project = ent.get("project")
             observations = ent.get("observations", [])
+            # v0.7.0: visibility only 'private' at creation (no bypass)
+            vis = ent.get("visibility", "private")
+            if vis not in _VISIBILITY_LEVELS or vis != "private":
+                vis = "private"
 
             cur = conn.execute(
                 "INSERT OR IGNORE INTO entities "
-                "(name, entity_type, project, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, etype, project, now, now),
+                "(name, entity_type, project, visibility, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, etype, project, vis, now, now),
             )
             if cur.rowcount > 0:
                 created += 1
@@ -2060,6 +2102,201 @@ def review_shared_knowledge(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Tools 28-30: Public Knowledge (v0.7.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def request_publish(
+    entity_names: list[str] | None = None,
+    task_ids: list[str] | None = None,
+    safety_confirmed: bool = False,
+) -> str:
+    """Request to publish entities/tasks as public knowledge.
+
+    ⚠️ WARNING 1: Publishing makes content visible to ALL instances.
+    Default action is to NOT publish. You must explicitly set safety_confirmed=True.
+
+    ⚠️ WARNING 2: Before confirming, verify the content will not harm,
+    endanger, or compromise the safety of any person.
+
+    After confirmation, content enters a standby period (default 15 min)
+    before becoming truly public on next bridge_push.
+    """
+    if not entity_names and not task_ids:
+        return json.dumps({"error": "Provide entity_names and/or task_ids"})
+
+    if not safety_confirmed:
+        return json.dumps({
+            "status": "confirmation_required",
+            "warning_1": (
+                "⚠️ You are about to make content PUBLIC and visible to "
+                "ALL Claude instances. Default: DO NOT publish."
+            ),
+            "warning_2": (
+                "⚠️ Are you sure the content will NOT harm, endanger, "
+                "or compromise the safety of any person?"
+            ),
+            "action": "Call request_publish again with safety_confirmed=True to proceed.",
+            "standby_minutes": _PUBLISH_STANDBY_MINUTES,
+        })
+
+    now = _now()
+    updated_entities = 0
+    updated_tasks = 0
+    not_found: list[str] = []
+
+    with _get_conn() as conn:
+        for name in (entity_names or []):
+            cur = conn.execute(
+                "UPDATE entities SET visibility='pending_public', "
+                "publish_requested_at=?, updated_at=? "
+                "WHERE name=? AND visibility='private'",
+                (now, now, name),
+            )
+            if cur.rowcount:
+                updated_entities += cur.rowcount
+            else:
+                # Check if it exists at all
+                row = conn.execute(
+                    "SELECT visibility FROM entities WHERE name=?", (name,)
+                ).fetchone()
+                if not row:
+                    not_found.append(f"entity:{name}")
+                # else already pending/public — skip silently
+
+        for tid in (task_ids or []):
+            cur = conn.execute(
+                "UPDATE tasks SET visibility='pending_public', "
+                "publish_requested_at=?, updated_at=? "
+                "WHERE id=? AND visibility='private'",
+                (now, now, tid),
+            )
+            if cur.rowcount:
+                updated_tasks += cur.rowcount
+            else:
+                row = conn.execute(
+                    "SELECT visibility FROM tasks WHERE id=?", (tid,)
+                ).fetchone()
+                if not row:
+                    not_found.append(f"task:{tid}")
+
+    logger.info(
+        "request_publish: %d entities, %d tasks set to pending_public",
+        updated_entities, updated_tasks,
+    )
+    result: dict[str, Any] = {
+        "status": "pending_public",
+        "entities_updated": updated_entities,
+        "tasks_updated": updated_tasks,
+        "standby_minutes": _PUBLISH_STANDBY_MINUTES,
+        "message": (
+            f"Content will become public after {_PUBLISH_STANDBY_MINUTES} min "
+            "standby on next bridge_push."
+        ),
+    }
+    if not_found:
+        result["not_found"] = not_found
+    return json.dumps(result)
+
+
+@mcp.tool()
+def cancel_publish(
+    entity_names: list[str] | None = None,
+    task_ids: list[str] | None = None,
+) -> str:
+    """Cancel a pending publish request. Reverts pending_public → private.
+
+    Only works during the standby period (before content becomes truly public).
+    """
+    if not entity_names and not task_ids:
+        return json.dumps({"error": "Provide entity_names and/or task_ids"})
+
+    now = _now()
+    reverted_entities = 0
+    reverted_tasks = 0
+
+    with _get_conn() as conn:
+        for name in (entity_names or []):
+            cur = conn.execute(
+                "UPDATE entities SET visibility='private', "
+                "publish_requested_at=NULL, updated_at=? "
+                "WHERE name=? AND visibility='pending_public'",
+                (now, name),
+            )
+            reverted_entities += cur.rowcount
+
+        for tid in (task_ids or []):
+            cur = conn.execute(
+                "UPDATE tasks SET visibility='private', "
+                "publish_requested_at=NULL, updated_at=? "
+                "WHERE id=? AND visibility='pending_public'",
+                (now, tid),
+            )
+            reverted_tasks += cur.rowcount
+
+    logger.info(
+        "cancel_publish: reverted %d entities, %d tasks to private",
+        reverted_entities, reverted_tasks,
+    )
+    return json.dumps({
+        "reverted_entities": reverted_entities,
+        "reverted_tasks": reverted_tasks,
+    })
+
+
+@mcp.tool()
+def search_public_knowledge(
+    query: str,
+    entity_type: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Search published public knowledge using FTS5 BM25-ranked search.
+
+    Only returns entities with visibility='public'.
+    """
+    fts_q = _fts_query(query)
+    with _get_conn() as conn:
+        if entity_type:
+            rows = conn.execute(
+                "SELECT memory_fts.rowid, memory_fts.name, memory_fts.entity_type, "
+                "memory_fts.observations_text, memory_fts.rank "
+                "FROM memory_fts "
+                "JOIN entities ON entities.id = memory_fts.rowid "
+                "WHERE memory_fts MATCH ? AND entities.visibility = 'public' "
+                "AND entities.entity_type = ? "
+                "ORDER BY memory_fts.rank LIMIT ?",
+                (fts_q, entity_type, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT memory_fts.rowid, memory_fts.name, memory_fts.entity_type, "
+                "memory_fts.observations_text, memory_fts.rank "
+                "FROM memory_fts "
+                "JOIN entities ON entities.id = memory_fts.rowid "
+                "WHERE memory_fts MATCH ? AND entities.visibility = 'public' "
+                "ORDER BY memory_fts.rank LIMIT ?",
+                (fts_q, limit),
+            ).fetchall()
+
+        results = []
+        for r in rows:
+            eid = r["rowid"]
+            obs = conn.execute(
+                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+                (eid,),
+            ).fetchall()
+            results.append({
+                "name": r["name"],
+                "entityType": r["entity_type"],
+                "observations": [o["content"] for o in obs],
+            })
+
+    logger.info("search_public_knowledge: query=%r matched=%d", query, len(results))
+    return json.dumps({"entities": results, "query": query, "count": len(results)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Bridge helper
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2320,6 +2557,26 @@ def bridge_push(tag: str = "shared") -> str:
         )
 
     with _get_conn() as conn:
+        # v0.7.0: Promote pending_public → public if standby elapsed
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=_PUBLISH_STANDBY_MINUTES)
+        ).isoformat()
+        promoted_ent = conn.execute(
+            "UPDATE entities SET visibility='public' "
+            "WHERE visibility='pending_public' AND publish_requested_at <= ?",
+            (cutoff,),
+        ).rowcount
+        promoted_tasks = conn.execute(
+            "UPDATE tasks SET visibility='public' "
+            "WHERE visibility='pending_public' AND publish_requested_at <= ?",
+            (cutoff,),
+        ).rowcount
+        if promoted_ent or promoted_tasks:
+            logger.info(
+                "bridge_push: promoted %d entities, %d tasks to public",
+                promoted_ent, promoted_tasks,
+            )
+
         ent_rows = conn.execute(
             "SELECT id, name, entity_type, project, created_at, updated_at "
             "FROM entities WHERE project LIKE ? ORDER BY name",
@@ -2381,6 +2638,36 @@ def bridge_push(tag: str = "shared") -> str:
         ).fetchall()
         tasks_out = [dict(r) for r in task_rows]
 
+        # v0.7.0: Export public entities + tasks as public_knowledge
+        pub_ent_rows = conn.execute(
+            "SELECT id, name, entity_type, project, created_at, updated_at "
+            "FROM entities WHERE visibility='public' ORDER BY name"
+        ).fetchall()
+        public_entities_out = []
+        for pe in pub_ent_rows:
+            obs = conn.execute(
+                "SELECT content, created_at FROM observations "
+                "WHERE entity_id = ? ORDER BY id",
+                (pe["id"],),
+            ).fetchall()
+            public_entities_out.append({
+                "name": pe["name"],
+                "entityType": pe["entity_type"],
+                "project": pe["project"],
+                "observations": [
+                    {"content": o["content"], "createdAt": o["created_at"]}
+                    for o in obs
+                ],
+                "createdAt": pe["created_at"],
+                "updatedAt": pe["updated_at"],
+            })
+        pub_task_rows = conn.execute(
+            "SELECT id, title, description, status, priority, section, "
+            "due_date, project, created_at, updated_at "
+            "FROM tasks WHERE visibility='public' ORDER BY created_at"
+        ).fetchall()
+        public_tasks_out = [dict(r) for r in pub_task_rows]
+
     hostname = socket.gethostname()
 
     # Build team_manifest from collaborators
@@ -2404,6 +2691,13 @@ def bridge_push(tag: str = "shared") -> str:
             "display_name": owner,
         },
     }
+
+    # v0.7.0: Add public_knowledge to payload
+    if public_entities_out or public_tasks_out:
+        payload["public_knowledge"] = {
+            "entities": public_entities_out,
+            "tasks": public_tasks_out,
+        }
 
     # Merge remote tasks + preserve extra keys from remote
     shared_path = Path(BRIDGE_REPO) / "shared.json"
@@ -2462,6 +2756,7 @@ def bridge_push(tag: str = "shared") -> str:
                 "tasks",
                 "shared_tasks",
                 "shared_knowledge",
+                "public_knowledge",
                 "team_manifest",
             }
             for key, val in existing.items():
@@ -2542,7 +2837,7 @@ def bridge_push(tag: str = "shared") -> str:
         len(tasks_out),
         pushed,
     )
-    result = {
+    result: dict[str, Any] = {
         "entities": len(entities_out),
         "observations": n_obs,
         "relations": len(relations_out),
@@ -2552,6 +2847,52 @@ def bridge_push(tag: str = "shared") -> str:
     }
     if knowledge_pushed:
         result["knowledge_shared"] = knowledge_pushed
+    if promoted_ent or promoted_tasks:
+        result["promoted_to_public"] = {
+            "entities": promoted_ent,
+            "tasks": promoted_tasks,
+        }
+
+    # v0.7.0: Create GitHub release when public_knowledge is pushed
+    has_public = bool(public_entities_out or public_tasks_out)
+    if pushed and has_public:
+        n_pub_ent = len(public_entities_out)
+        n_pub_tasks = len(public_tasks_out)
+        tag_name = f"public-v{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        release_title = f"Public Knowledge: {n_pub_ent} entities, {n_pub_tasks} tasks"
+        release_notes = (
+            f"## Public Knowledge Release\n\n"
+            f"- **{n_pub_ent}** public entities\n"
+            f"- **{n_pub_tasks}** public tasks\n\n"
+            f"Published from `{hostname}` at {_now()}"
+        )
+        try:
+            rel_result = subprocess.run(
+                [
+                    "gh", "release", "create", tag_name,
+                    "--repo", "RMANOV/sqlite-memory-mcp",
+                    "--title", release_title,
+                    "--notes", release_notes,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if rel_result.returncode == 0:
+                result["github_release"] = tag_name
+                logger.info("bridge_push: created GitHub release %s", tag_name)
+            else:
+                logger.warning(
+                    "bridge_push: GitHub release failed: %s", rel_result.stderr.strip()
+                )
+        except Exception as exc:
+            logger.warning("bridge_push: GitHub release error: %s", exc)
+
+    if has_public:
+        result["public_knowledge"] = {
+            "entities": len(public_entities_out),
+            "tasks": len(public_tasks_out),
+        }
     return json.dumps(result)
 
 
@@ -2809,6 +3150,46 @@ def bridge_pull() -> str:
                 )
                 staged_relations += 1
 
+        # v0.7.0: Stage incoming public_knowledge from collaborators
+        staged_public = 0
+        public_knowledge = payload.get("public_knowledge", {})
+        pk_entities = (
+            public_knowledge.get("entities", [])
+            if isinstance(public_knowledge, dict)
+            else []
+        )
+        source_owner = payload.get("owner", "unknown")
+        for pk in pk_entities:
+            pname = pk.get("name")
+            if not pname:
+                continue
+            obs_json = json.dumps(pk.get("observations", []), ensure_ascii=False)
+            phash = _source_hash(
+                pname, pk.get("entityType", ""), pk.get("observations", [])
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_shared_entities "
+                "(name, entity_type, project, observations, priority, "
+                "shared_by, source_hash, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pname,
+                    pk.get("entityType", "unknown"),
+                    pk.get("project"),
+                    obs_json,
+                    "medium",
+                    f"public:{source_owner}",
+                    phash,
+                    now,
+                ),
+            )
+            staged_public += 1
+        if staged_public:
+            logger.info(
+                "bridge_pull: staged %d public knowledge entities for review",
+                staged_public,
+            )
+
     if staged_count:
         logger.info("bridge_pull: staged %d shared tasks for review", staged_count)
     if staged_knowledge:
@@ -2851,6 +3232,8 @@ def bridge_pull() -> str:
             msg += f" + {staged_relations} relation(s)"
         msg += ". Use review_shared_knowledge() to approve or reject."
         result["knowledge_review_required"] = msg
+    if staged_public:
+        result["staged_public_knowledge"] = staged_public
     return json.dumps(result)
 
 
@@ -2881,6 +3264,20 @@ def bridge_status() -> str:
         ).fetchone()["cnt"]
         sharing_rule_count = conn.execute(
             "SELECT COUNT(*) as cnt FROM sharing_rules"
+        ).fetchone()["cnt"]
+
+        # v0.7.0: public knowledge counts
+        public_ent_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM entities WHERE visibility='public'"
+        ).fetchone()["cnt"]
+        pending_pub_ent_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM entities WHERE visibility='pending_public'"
+        ).fetchone()["cnt"]
+        public_task_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE visibility='public'"
+        ).fetchone()["cnt"]
+        pending_pub_task_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE visibility='pending_public'"
         ).fetchone()["cnt"]
     local_names = {r["name"] for r in local_rows}
 
@@ -2926,6 +3323,10 @@ def bridge_status() -> str:
             "pending_shared_knowledge": pending_knowledge,
             "pending_shared_relations": pending_rels,
             "sharing_rules": sharing_rule_count,
+            "public_entities": public_ent_count,
+            "pending_public_entities": pending_pub_ent_count,
+            "public_tasks": public_task_count,
+            "pending_public_tasks": pending_pub_task_count,
         }
     )
 
