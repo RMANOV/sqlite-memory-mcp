@@ -143,7 +143,7 @@ class TaskDB:
         """Return prioritized mix: overdue + high/critical + nearest due."""
         pri_sql = build_priority_order_sql()
         rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE (status NOT IN ({_ACTIVE_PH}) OR (type = 'note' AND status = 'done' AND due_date IS NULL)) "
+            f"SELECT * FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
             "ORDER BY "
             "CASE WHEN due_date IS NOT NULL AND due_date < date('now') THEN 0 ELSE 1 END, "
             f"{pri_sql}, "
