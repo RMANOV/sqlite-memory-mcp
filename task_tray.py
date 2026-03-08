@@ -2447,10 +2447,11 @@ class FullWindow(QMainWindow):
         return False
 
     def _filter(self, tasks):
-        """Apply search + chip filters to task list."""
+        """Apply search OR chip filters. Search bypasses chip filters."""
         q = self._search_text
         if q:
-            tasks = [
+            # Search ignores chip filters — return all matches
+            return [
                 t
                 for t in tasks
                 if q
@@ -2461,6 +2462,7 @@ class FullWindow(QMainWindow):
                 ).lower()
             ]
 
+        # Chip filters only when not searching
         # Priority filter (OR within)
         if self._active_filters["priority"]:
             tasks = [t for t in tasks if t.get("priority", "medium") in self._active_filters["priority"]]
