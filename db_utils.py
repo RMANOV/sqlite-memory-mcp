@@ -43,6 +43,18 @@ TRUST_LEVELS = ("read_only", "read_write")
 SHARE_TYPES = ("entity", "relation", "all")
 ENTITY_ORIGINS = ("local",)  # "shared:{username}" added dynamically
 
+# v0.9.0: Quality rating constants (HARDCODED — not configurable to prevent gaming)
+VERIFICATION_OUTCOMES = ("confirmed", "contradicted", "inconclusive")
+VERIFICATION_WEIGHTS = {"confirmed": 1.0, "inconclusive": 0.5, "contradicted": 0.0}
+
+# Composite score weights (sealed)
+IQ_WEIGHTS = {"specificity": 0.35, "falsifiability": 0.25, "internal_consistency": 0.25, "novelty": 0.15}
+TIER_WEIGHTS = {"iq": 0.40, "verification": 0.35, "cross_validation": 0.25}
+
+# Anomaly detection
+RATING_BURST_THRESHOLD = 5
+RATING_BURST_WINDOW_HOURS = 24
+
 PRIORITY_RANK = {p: i for i, p in enumerate(TASK_PRIORITIES)}
 
 PRIORITY_COLORS = {

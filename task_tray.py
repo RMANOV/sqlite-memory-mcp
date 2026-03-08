@@ -566,18 +566,50 @@ def _recurring_label(raw: str | None) -> str:
     return ""
 
 
+def _get_truth_score_badge(task, db_path=None):
+    """Query TruthScore for public entities and return a color-coded badge string."""
+    if task.get("visibility") != "public" or not task.get("title"):
+        return ""
+    try:
+        conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=5)
+        conn.row_factory = sqlite3.Row
+        count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM knowledge_ratings WHERE entity_name = ?",
+            (task["title"],),
+        ).fetchone()["cnt"]
+        if count == 0:
+            conn.close()
+            return "\u2b1c "  # gray square = unrated
+        avg = conn.execute(
+            "SELECT AVG(specificity * 0.35 + falsifiability * 0.25 + "
+            "internal_consistency * 0.25 + novelty * 0.15) as iq "
+            "FROM knowledge_ratings WHERE entity_name = ?",
+            (task["title"],),
+        ).fetchone()["iq"] or 0.0
+        conn.close()
+        if avg > 0.7:
+            return "\U0001f7e2 "  # green
+        elif avg >= 0.4:
+            return "\U0001f7e1 "  # yellow
+        else:
+            return "\U0001f534 "  # red
+    except Exception:
+        return ""
+
+
 def _format_task_text(task, include_project=True, prefix=""):
-    """Build display text: [N] [🔄] [⏳/🌐] [PRIORITY] title | Due: date | project — preview."""
+    """Build display text: [N] [🔄] [⏳/🌐] [TS] [PRIORITY] title | Due: date | project — preview."""
     type_prefix = "[N] " if task.get("type") == "note" else ""
     recur = "\U0001f504 " if task.get("recurring") else ""
     vis = task.get("visibility", "private")
     vis_badge = "\u23f3 " if vis == "pending_public" else ("\U0001f310 " if vis == "public" else "")
+    ts_badge = _get_truth_score_badge(task) if vis == "public" else ""
     priority = (task.get("priority") or "medium").upper()
     due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
     proj = f" | {task['project']}" if include_project and task.get("project") else ""
     desc = task.get("description") or ""
     preview = f" — {desc[:50]}..." if len(desc) > 50 else (f" — {desc}" if desc else "")
-    return f"{prefix}{type_prefix}{recur}{vis_badge}[{priority}] {task['title']}{due}{proj}{preview}"
+    return f"{prefix}{type_prefix}{recur}{vis_badge}{ts_badge}[{priority}] {task['title']}{due}{proj}{preview}"
 
 
 def _apply_task_item_colors(item, task):
@@ -2081,6 +2113,19 @@ class FullWindow(QMainWindow):
                         "entities": public_entities_out,
                         "tasks": public_tasks_out,
                     }
+
+                # v0.9.0: Export knowledge ratings
+                try:
+                    kr_rows = conn.execute(
+                        "SELECT entity_name, rater_id, content_hash, specificity, "
+                        "falsifiability, internal_consistency, novelty, "
+                        "verification_outcome, usefulness, verification_context, "
+                        "rated_at FROM knowledge_ratings ORDER BY rated_at"
+                    ).fetchall()
+                    if kr_rows:
+                        payload["knowledge_ratings"] = [dict(r) for r in kr_rows]
+                except Exception:
+                    pass  # table may not exist yet
                 if shared_path.exists():
                     try:
                         existing = json.loads(shared_path.read_text(encoding="utf-8"))
@@ -2127,6 +2172,7 @@ class FullWindow(QMainWindow):
                             "tasks",
                             "shared_tasks",
                             "public_knowledge",
+                            "knowledge_ratings",
                             "owner",
                             "team_manifest",
                             "ui_profiles",

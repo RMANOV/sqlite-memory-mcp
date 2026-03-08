@@ -12,8 +12,10 @@ multi-account knowledge collaboration (25-27).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -32,6 +34,12 @@ from db_utils import (
     TASK_TYPES as _TASK_TYPES,
     VISIBILITY_LEVELS as _VISIBILITY_LEVELS,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
+    IQ_WEIGHTS as _IQ_WEIGHTS,
+    TIER_WEIGHTS as _TIER_WEIGHTS,
+    VERIFICATION_OUTCOMES as _VERIFICATION_OUTCOMES,
+    VERIFICATION_WEIGHTS as _VERIFICATION_WEIGHTS,
+    RATING_BURST_THRESHOLD as _RATING_BURST_THRESHOLD,
+    RATING_BURST_WINDOW_HOURS as _RATING_BURST_WINDOW_HOURS,
     build_priority_order_sql,
     now_iso as _now,
 )
@@ -250,6 +258,34 @@ CREATE TABLE IF NOT EXISTS sharing_rules (
     UNIQUE(entity_name, target_user, share_type)
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_ratings (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_name          TEXT NOT NULL,
+    rater_id             TEXT NOT NULL,
+    content_hash         TEXT NOT NULL,
+    specificity          REAL NOT NULL CHECK(specificity BETWEEN 0.0 AND 1.0),
+    falsifiability       REAL NOT NULL CHECK(falsifiability BETWEEN 0.0 AND 1.0),
+    internal_consistency REAL NOT NULL CHECK(internal_consistency BETWEEN 0.0 AND 1.0),
+    novelty              REAL NOT NULL CHECK(novelty BETWEEN 0.0 AND 1.0),
+    verification_outcome TEXT DEFAULT NULL CHECK(
+        verification_outcome IS NULL
+        OR verification_outcome IN ('confirmed', 'contradicted', 'inconclusive')
+    ),
+    usefulness           REAL DEFAULT NULL CHECK(usefulness IS NULL OR usefulness BETWEEN 0.0 AND 1.0),
+    verification_context TEXT DEFAULT NULL,
+    rated_at             TEXT NOT NULL,
+    UNIQUE(entity_name, rater_id, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS rating_anomalies (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_name   TEXT NOT NULL,
+    anomaly_type  TEXT NOT NULL,
+    details       TEXT NOT NULL,
+    detected_at   TEXT NOT NULL,
+    resolved      INTEGER DEFAULT 0
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
     tokenize = "unicode61 remove_diacritics 2"
@@ -408,6 +444,54 @@ _MIGRATIONS = [
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_visibility'",
         "CREATE INDEX idx_tasks_visibility ON tasks(visibility)",
         "idx_tasks_visibility index",
+    ),
+    # v0.9.0: knowledge_ratings table
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_ratings'",
+        "CREATE TABLE knowledge_ratings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "entity_name TEXT NOT NULL, rater_id TEXT NOT NULL, content_hash TEXT NOT NULL, "
+        "specificity REAL NOT NULL CHECK(specificity BETWEEN 0.0 AND 1.0), "
+        "falsifiability REAL NOT NULL CHECK(falsifiability BETWEEN 0.0 AND 1.0), "
+        "internal_consistency REAL NOT NULL CHECK(internal_consistency BETWEEN 0.0 AND 1.0), "
+        "novelty REAL NOT NULL CHECK(novelty BETWEEN 0.0 AND 1.0), "
+        "verification_outcome TEXT DEFAULT NULL CHECK("
+        "verification_outcome IS NULL OR verification_outcome IN "
+        "('confirmed','contradicted','inconclusive')), "
+        "usefulness REAL DEFAULT NULL CHECK(usefulness IS NULL OR usefulness BETWEEN 0.0 AND 1.0), "
+        "verification_context TEXT DEFAULT NULL, rated_at TEXT NOT NULL, "
+        "UNIQUE(entity_name, rater_id, content_hash))",
+        "knowledge_ratings table (v0.9.0)",
+    ),
+    # v0.9.0: rating_anomalies table
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rating_anomalies'",
+        "CREATE TABLE rating_anomalies ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT NOT NULL, "
+        "anomaly_type TEXT NOT NULL, details TEXT NOT NULL, "
+        "detected_at TEXT NOT NULL, resolved INTEGER DEFAULT 0)",
+        "rating_anomalies table (v0.9.0)",
+    ),
+    # v0.9.0: knowledge_ratings indexes
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_kr_entity'",
+        "CREATE INDEX idx_kr_entity ON knowledge_ratings(entity_name)",
+        "idx_kr_entity index (v0.9.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_kr_hash'",
+        "CREATE INDEX idx_kr_hash ON knowledge_ratings(content_hash)",
+        "idx_kr_hash index (v0.9.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_kr_rater'",
+        "CREATE INDEX idx_kr_rater ON knowledge_ratings(rater_id)",
+        "idx_kr_rater index (v0.9.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_anomaly_ent'",
+        "CREATE INDEX idx_anomaly_ent ON rating_anomalies(entity_name)",
+        "idx_anomaly_ent index (v0.9.0)",
     ),
 ]
 
@@ -1713,6 +1797,152 @@ def _source_hash(name: str, entity_type: str, observations: list) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _content_hash(entity_name: str, observations: list[str]) -> str:
+    """Deterministic SHA256 bound to exact content version (order-independent)."""
+    raw = json.dumps({"name": entity_name, "obs": sorted(observations)}, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _get_publisher_id(conn, entity_name: str) -> str:
+    """Extract publisher identity for an entity."""
+    row = conn.execute(
+        "SELECT origin, shared_by FROM entities WHERE name = ?", (entity_name,)
+    ).fetchone()
+    if not row:
+        return ""
+    origin = row["origin"] or "local"
+    if origin.startswith("shared:"):
+        return origin.split(":", 1)[1]
+    if row["shared_by"]:
+        return row["shared_by"]
+    return os.environ.get("GITHUB_USER", socket.gethostname())
+
+
+def _compute_truth_score(entity_name: str, conn) -> dict[str, Any]:
+    """Compute composite TruthScore for a public entity.
+
+    Three tiers: IQ (content quality), Verification, Cross-validation.
+    Returns dict with truth_score, confidence, rating_count, content_hash, dimensions.
+    """
+    # Get current content hash
+    obs_rows = conn.execute(
+        "SELECT o.content FROM observations o "
+        "JOIN entities e ON o.entity_id = e.id "
+        "WHERE e.name = ? ORDER BY o.id",
+        (entity_name,),
+    ).fetchall()
+    observations = [r["content"] for r in obs_rows]
+    c_hash = _content_hash(entity_name, observations)
+
+    # Get ratings for current content version
+    ratings = conn.execute(
+        "SELECT specificity, falsifiability, internal_consistency, novelty, "
+        "verification_outcome, usefulness FROM knowledge_ratings "
+        "WHERE entity_name = ? AND content_hash = ?",
+        (entity_name, c_hash),
+    ).fetchall()
+
+    if not ratings:
+        return {
+            "truth_score": 0.0,
+            "confidence": 0.0,
+            "rating_count": 0,
+            "content_hash": c_hash,
+            "dimensions": {},
+        }
+
+    rater_count = len(ratings)
+
+    # Tier 1: IQ — average of dimensional scores
+    avg_spec = sum(r["specificity"] for r in ratings) / rater_count
+    avg_fals = sum(r["falsifiability"] for r in ratings) / rater_count
+    avg_cons = sum(r["internal_consistency"] for r in ratings) / rater_count
+    avg_nov = sum(r["novelty"] for r in ratings) / rater_count
+
+    iq = (
+        _IQ_WEIGHTS["specificity"] * avg_spec
+        + _IQ_WEIGHTS["falsifiability"] * avg_fals
+        + _IQ_WEIGHTS["internal_consistency"] * avg_cons
+        + _IQ_WEIGHTS["novelty"] * avg_nov
+    )
+
+    # Tier 2: Verification — avg(usefulness * weight) for verified ratings
+    verified = [r for r in ratings if r["verification_outcome"] is not None]
+    if verified:
+        v_scores = []
+        for r in verified:
+            w = _VERIFICATION_WEIGHTS.get(r["verification_outcome"], 0.5)
+            u = r["usefulness"] if r["usefulness"] is not None else 0.5
+            v_scores.append(u * w)
+        v = sum(v_scores) / len(v_scores)
+    else:
+        v = 0.5  # neutral if no verifications
+
+    # Tier 3: Cross-validation — log-diminishing returns on confirmed count
+    confirmed_count = sum(
+        1 for r in ratings if r["verification_outcome"] == "confirmed"
+    )
+    cv = min(1.0, math.log2(confirmed_count + 1) / 4.0)
+
+    # Confidence scales with rater count (log-diminishing)
+    confidence = min(1.0, 0.5 + 0.15 * math.log2(rater_count + 1))
+
+    # Adaptive weights: shift toward IQ if no verifications
+    if not verified:
+        iq_w, v_w, cv_w = 0.55, 0.20, 0.25
+    else:
+        iq_w = _TIER_WEIGHTS["iq"]
+        v_w = _TIER_WEIGHTS["verification"]
+        cv_w = _TIER_WEIGHTS["cross_validation"]
+
+    truth_score = (iq_w * iq + v_w * v + cv_w * cv) * confidence
+
+    return {
+        "truth_score": round(truth_score, 4),
+        "confidence": round(confidence, 4),
+        "rating_count": rater_count,
+        "content_hash": c_hash,
+        "dimensions": {
+            "specificity": round(avg_spec, 4),
+            "falsifiability": round(avg_fals, 4),
+            "internal_consistency": round(avg_cons, 4),
+            "novelty": round(avg_nov, 4),
+            "iq_composite": round(iq, 4),
+            "verification": round(v, 4),
+            "cross_validation": round(cv, 4),
+        },
+    }
+
+
+def _check_rating_anomalies(conn, entity_name: str) -> None:
+    """Detect rating burst anomalies (too many ratings in short window)."""
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=_RATING_BURST_WINDOW_HOURS)
+    ).isoformat()
+    count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM knowledge_ratings "
+        "WHERE entity_name = ? AND rated_at >= ?",
+        (entity_name, cutoff),
+    ).fetchone()["cnt"]
+
+    if count > _RATING_BURST_THRESHOLD:
+        conn.execute(
+            "INSERT INTO rating_anomalies (entity_name, anomaly_type, details, detected_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                entity_name,
+                "rating_burst",
+                f"{count} ratings in {_RATING_BURST_WINDOW_HOURS}h (threshold: {_RATING_BURST_THRESHOLD})",
+                _now(),
+            ),
+        )
+        logger.warning(
+            "Rating anomaly detected: %s has %d ratings in %dh",
+            entity_name, count, _RATING_BURST_WINDOW_HOURS,
+        )
+
+
 @mcp.tool()
 def manage_collaborators(
     action: str,
@@ -2249,11 +2479,17 @@ def cancel_publish(
 def search_public_knowledge(
     query: str,
     entity_type: str | None = None,
+    sort_by: str = "relevance",
+    min_truth_score: float | None = None,
     limit: int = 50,
 ) -> str:
     """Search published public knowledge using FTS5 BM25-ranked search.
 
     Only returns entities with visibility='public'.
+
+    Args:
+        sort_by: "relevance" (BM25), "truth_score", or "rating_count"
+        min_truth_score: Filter out entities below this TruthScore threshold
     """
     fts_q = _fts_query(query)
     with _get_conn() as conn:
@@ -2286,14 +2522,238 @@ def search_public_knowledge(
                 "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
                 (eid,),
             ).fetchall()
+            score_info = _compute_truth_score(r["name"], conn)
+            if min_truth_score is not None and score_info["truth_score"] < min_truth_score:
+                continue
             results.append({
                 "name": r["name"],
                 "entityType": r["entity_type"],
                 "observations": [o["content"] for o in obs],
+                "truthScore": score_info["truth_score"],
+                "ratingCount": score_info["rating_count"],
+                "confidence": score_info["confidence"],
             })
+
+        # Sort results
+        if sort_by == "truth_score":
+            results.sort(key=lambda x: x["truthScore"], reverse=True)
+        elif sort_by == "rating_count":
+            results.sort(key=lambda x: x["ratingCount"], reverse=True)
 
     logger.info("search_public_knowledge: query=%r matched=%d", query, len(results))
     return json.dumps({"entities": results, "query": query, "count": len(results)})
+
+
+@mcp.tool()
+def rate_public_knowledge(
+    entity_name: str,
+    specificity: float,
+    falsifiability: float,
+    internal_consistency: float,
+    novelty: float,
+    verification_outcome: str | None = None,
+    usefulness: float | None = None,
+    verification_context: str | None = None,
+) -> str:
+    """Rate a public knowledge entity's quality (Claude-only structured analysis).
+
+    Anti-gaming: rater_id set server-side, content_hash computed from DB,
+    self-rating blocked, UNIQUE constraint prevents re-rating same version.
+
+    Args:
+        entity_name: Name of the public entity to rate
+        specificity: How specific/precise the knowledge is (0.0-1.0)
+        falsifiability: Can claims be tested/verified? (0.0-1.0)
+        internal_consistency: Are observations consistent? (0.0-1.0)
+        novelty: Does it add new information? (0.0-1.0)
+        verification_outcome: "confirmed", "contradicted", or "inconclusive"
+        usefulness: How useful was the knowledge in practice? (0.0-1.0)
+        verification_context: Description of how verification was done
+    """
+    # Validate scores in [0.0, 1.0]
+    for name, val in [("specificity", specificity), ("falsifiability", falsifiability),
+                      ("internal_consistency", internal_consistency), ("novelty", novelty)]:
+        if not (0.0 <= val <= 1.0):
+            return json.dumps({"error": f"{name} must be between 0.0 and 1.0, got {val}"})
+
+    if verification_outcome is not None:
+        if verification_outcome not in _VERIFICATION_OUTCOMES:
+            return json.dumps({"error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"})
+        if usefulness is None:
+            return json.dumps({"error": "usefulness is required when verification_outcome is provided"})
+
+    if usefulness is not None and not (0.0 <= usefulness <= 1.0):
+        return json.dumps({"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"})
+
+    # rater_id: server-side identity (never user input)
+    rater_id = os.environ.get("GITHUB_USER", socket.gethostname())
+
+    with _get_conn() as conn:
+        # Entity must exist and be public
+        entity = conn.execute(
+            "SELECT name, visibility FROM entities WHERE name = ?", (entity_name,)
+        ).fetchone()
+        if not entity:
+            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+        if entity["visibility"] != "public":
+            return json.dumps({"error": f"Entity '{entity_name}' is not public (visibility={entity['visibility']})"})
+
+        # Anti-gaming: no self-rating
+        publisher_id = _get_publisher_id(conn, entity_name)
+        if rater_id == publisher_id:
+            return json.dumps({"error": "Cannot rate your own published knowledge"})
+
+        # Compute content hash from current DB content
+        obs_rows = conn.execute(
+            "SELECT o.content FROM observations o "
+            "JOIN entities e ON o.entity_id = e.id "
+            "WHERE e.name = ? ORDER BY o.id",
+            (entity_name,),
+        ).fetchall()
+        c_hash = _content_hash(entity_name, [r["content"] for r in obs_rows])
+
+        # Insert rating (UNIQUE constraint prevents re-rating same version)
+        try:
+            conn.execute(
+                "INSERT INTO knowledge_ratings "
+                "(entity_name, rater_id, content_hash, specificity, falsifiability, "
+                "internal_consistency, novelty, verification_outcome, usefulness, "
+                "verification_context, rated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entity_name, rater_id, c_hash, specificity, falsifiability,
+                    internal_consistency, novelty, verification_outcome, usefulness,
+                    verification_context, _now(),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return json.dumps({
+                "error": "Already rated this content version",
+                "hint": "Content must change before you can rate again",
+            })
+
+        # Anomaly detection
+        _check_rating_anomalies(conn, entity_name)
+
+        # Compute updated TruthScore
+        score_info = _compute_truth_score(entity_name, conn)
+
+    logger.info(
+        "rate_public_knowledge: %s rated by %s (score=%.4f)",
+        entity_name, rater_id, score_info["truth_score"],
+    )
+    return json.dumps({
+        "status": "rated",
+        "entity_name": entity_name,
+        "rater_id": rater_id,
+        "content_hash": c_hash,
+        **score_info,
+    })
+
+
+@mcp.tool()
+def get_knowledge_ratings(
+    entity_name: str,
+    include_individual: bool = False,
+) -> str:
+    """Get computed TruthScore and dimensional breakdown for a public entity.
+
+    Args:
+        entity_name: Name of the entity to get ratings for
+        include_individual: Include individual rating details
+    """
+    with _get_conn() as conn:
+        entity = conn.execute(
+            "SELECT name, visibility FROM entities WHERE name = ?", (entity_name,)
+        ).fetchone()
+        if not entity:
+            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+
+        score_info = _compute_truth_score(entity_name, conn)
+
+        # Anomaly status
+        anomaly_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM rating_anomalies "
+            "WHERE entity_name = ? AND resolved = 0",
+            (entity_name,),
+        ).fetchone()["cnt"]
+        score_info["unresolved_anomalies"] = anomaly_count
+
+        if include_individual:
+            ratings = conn.execute(
+                "SELECT rater_id, specificity, falsifiability, internal_consistency, "
+                "novelty, verification_outcome, usefulness, verification_context, rated_at "
+                "FROM knowledge_ratings WHERE entity_name = ? AND content_hash = ? "
+                "ORDER BY rated_at",
+                (entity_name, score_info["content_hash"]),
+            ).fetchall()
+            score_info["individual_ratings"] = [dict(r) for r in ratings]
+
+    return json.dumps(score_info)
+
+
+@mcp.tool()
+def update_verification(
+    entity_name: str,
+    verification_outcome: str,
+    usefulness: float,
+    verification_context: str | None = None,
+) -> str:
+    """Update verification fields on your existing rating for a public entity.
+
+    Use after actually testing/applying the knowledge in practice.
+
+    Args:
+        entity_name: Name of the entity
+        verification_outcome: "confirmed", "contradicted", or "inconclusive"
+        usefulness: How useful was the knowledge in practice? (0.0-1.0)
+        verification_context: Description of how verification was done
+    """
+    if verification_outcome not in _VERIFICATION_OUTCOMES:
+        return json.dumps({"error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"})
+    if not (0.0 <= usefulness <= 1.0):
+        return json.dumps({"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"})
+
+    rater_id = os.environ.get("GITHUB_USER", socket.gethostname())
+
+    with _get_conn() as conn:
+        # Get current content hash
+        obs_rows = conn.execute(
+            "SELECT o.content FROM observations o "
+            "JOIN entities e ON o.entity_id = e.id "
+            "WHERE e.name = ? ORDER BY o.id",
+            (entity_name,),
+        ).fetchall()
+        if not obs_rows:
+            return json.dumps({"error": f"Entity '{entity_name}' not found or has no observations"})
+        c_hash = _content_hash(entity_name, [r["content"] for r in obs_rows])
+
+        # Update existing rating
+        cur = conn.execute(
+            "UPDATE knowledge_ratings SET verification_outcome = ?, "
+            "usefulness = ?, verification_context = ? "
+            "WHERE entity_name = ? AND rater_id = ? AND content_hash = ?",
+            (verification_outcome, usefulness, verification_context,
+             entity_name, rater_id, c_hash),
+        )
+        if cur.rowcount == 0:
+            return json.dumps({
+                "error": "No existing rating found for this entity/version",
+                "hint": "You must rate_public_knowledge first before updating verification",
+            })
+
+        score_info = _compute_truth_score(entity_name, conn)
+
+    logger.info(
+        "update_verification: %s by %s → %s (score=%.4f)",
+        entity_name, rater_id, verification_outcome, score_info["truth_score"],
+    )
+    return json.dumps({
+        "status": "verification_updated",
+        "entity_name": entity_name,
+        "verification_outcome": verification_outcome,
+        **score_info,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2699,6 +3159,16 @@ def bridge_push(tag: str = "shared") -> str:
             "tasks": public_tasks_out,
         }
 
+    # v0.9.0: Export knowledge_ratings
+    with _get_conn() as conn:
+        rating_rows = conn.execute(
+            "SELECT entity_name, rater_id, content_hash, specificity, falsifiability, "
+            "internal_consistency, novelty, verification_outcome, usefulness, "
+            "verification_context, rated_at FROM knowledge_ratings ORDER BY rated_at"
+        ).fetchall()
+    if rating_rows:
+        payload["knowledge_ratings"] = [dict(r) for r in rating_rows]
+
     # Merge remote tasks + preserve extra keys from remote
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     if shared_path.exists():
@@ -2757,6 +3227,7 @@ def bridge_push(tag: str = "shared") -> str:
                 "shared_tasks",
                 "shared_knowledge",
                 "public_knowledge",
+                "knowledge_ratings",
                 "team_manifest",
             }
             for key, val in existing.items():
@@ -3190,6 +3661,42 @@ def bridge_pull() -> str:
                 staged_public,
             )
 
+        # v0.9.0: Import knowledge ratings with anti-gaming validation
+        imported_ratings = 0
+        local_owner = os.environ.get("GITHUB_USER", socket.gethostname())
+        for kr in payload.get("knowledge_ratings", []):
+            kr_rater = kr.get("rater_id", "")
+            kr_entity = kr.get("entity_name", "")
+            # Skip own ratings (don't import back)
+            if kr_rater == local_owner:
+                continue
+            # Skip if entity doesn't exist locally or isn't public
+            ent = conn.execute(
+                "SELECT visibility FROM entities WHERE name = ?", (kr_entity,)
+            ).fetchone()
+            if not ent or ent["visibility"] != "public":
+                continue
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO knowledge_ratings "
+                    "(entity_name, rater_id, content_hash, specificity, falsifiability, "
+                    "internal_consistency, novelty, verification_outcome, usefulness, "
+                    "verification_context, rated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        kr_entity, kr_rater, kr.get("content_hash", ""),
+                        kr.get("specificity", 0.0), kr.get("falsifiability", 0.0),
+                        kr.get("internal_consistency", 0.0), kr.get("novelty", 0.0),
+                        kr.get("verification_outcome"), kr.get("usefulness"),
+                        kr.get("verification_context"), kr.get("rated_at", now),
+                    ),
+                )
+                imported_ratings += 1
+            except (sqlite3.IntegrityError, sqlite3.OperationalError):
+                continue
+        if imported_ratings:
+            logger.info("bridge_pull: imported %d knowledge ratings", imported_ratings)
+
     if staged_count:
         logger.info("bridge_pull: staged %d shared tasks for review", staged_count)
     if staged_knowledge:
@@ -3234,6 +3741,8 @@ def bridge_pull() -> str:
         result["knowledge_review_required"] = msg
     if staged_public:
         result["staged_public_knowledge"] = staged_public
+    if imported_ratings:
+        result["imported_ratings"] = imported_ratings
     return json.dumps(result)
 
 
@@ -3278,6 +3787,17 @@ def bridge_status() -> str:
         ).fetchone()["cnt"]
         pending_pub_task_count = conn.execute(
             "SELECT COUNT(*) as cnt FROM tasks WHERE visibility='pending_public'"
+        ).fetchone()["cnt"]
+
+        # v0.9.0: rating statistics
+        total_ratings = conn.execute(
+            "SELECT COUNT(*) as cnt FROM knowledge_ratings"
+        ).fetchone()["cnt"]
+        rated_entities = conn.execute(
+            "SELECT COUNT(DISTINCT entity_name) as cnt FROM knowledge_ratings"
+        ).fetchone()["cnt"]
+        anomaly_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM rating_anomalies WHERE resolved = 0"
         ).fetchone()["cnt"]
     local_names = {r["name"] for r in local_rows}
 
@@ -3327,6 +3847,9 @@ def bridge_status() -> str:
             "pending_public_entities": pending_pub_ent_count,
             "public_tasks": public_task_count,
             "pending_public_tasks": pending_pub_task_count,
+            "total_ratings": total_ratings,
+            "rated_entities": rated_entities,
+            "anomalies": anomaly_count,
         }
     )
 
