@@ -100,16 +100,25 @@ class TaskDB:
                 "description",
                 "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
             ),
-            ("visibility", "ALTER TABLE tasks ADD COLUMN visibility TEXT DEFAULT 'private'"),
-            ("publish_requested_at", "ALTER TABLE tasks ADD COLUMN publish_requested_at TEXT DEFAULT NULL"),
+            (
+                "visibility",
+                "ALTER TABLE tasks ADD COLUMN visibility TEXT DEFAULT 'private'",
+            ),
+            (
+                "publish_requested_at",
+                "ALTER TABLE tasks ADD COLUMN publish_requested_at TEXT DEFAULT NULL",
+            ),
         ]:
             if col not in existing:
                 self._conn.execute(sql)
         # Backfill null IDs
-        import uuid
-        nulls = self._conn.execute("SELECT rowid FROM tasks WHERE id IS NULL").fetchall()
+        nulls = self._conn.execute(
+            "SELECT rowid FROM tasks WHERE id IS NULL"
+        ).fetchall()
         for r in nulls:
-            self._conn.execute("UPDATE tasks SET id=? WHERE rowid=?", (str(uuid.uuid4()), r[0]))
+            self._conn.execute(
+                "UPDATE tasks SET id=? WHERE rowid=?", (str(uuid.uuid4()), r[0])
+            )
         self._conn.commit()
         # Composite indices for common UI query patterns
         for idx_sql in (
@@ -302,13 +311,21 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QProgressBar,
     QDateEdit,
-    QButtonGroup,
     QCompleter,
     QMessageBox,
     QSpinBox,
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup, QPixmap, QPainter, QColor, QFont
-from PyQt6.QtCore import QDate, QEvent, QObject, QSettings, Qt, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import (
+    QDate,
+    QEvent,
+    QObject,
+    QSettings,
+    Qt,
+    QTimer,
+    QPoint,
+    pyqtSignal,
+)
 from pathlib import Path
 
 
@@ -347,28 +364,58 @@ def create_tray_icon_pixmap(overdue_count=0):
 
 _THEMES = {
     "black": {
-        "bg": "#000000", "bg2": "#0a0a0a", "bg3": "#1a1a1a",
-        "text": "#e2e8f0", "text2": "#a0aec0",
-        "border": "#2d2d2d", "accent": "#3182ce", "accent_hover": "#4299e1",
-        "danger": "#e53e3e", "done": "#38a169",
-        "note_bg": "#0d1a0d", "overdue_bg": "#1a0000", "overdue_fg": "#fc8181",
-        "header_bg": "#111111", "urgent_bg": "#2d1a00", "urgent_fg": "#f6ad55",
+        "bg": "#000000",
+        "bg2": "#0a0a0a",
+        "bg3": "#1a1a1a",
+        "text": "#e2e8f0",
+        "text2": "#a0aec0",
+        "border": "#2d2d2d",
+        "accent": "#3182ce",
+        "accent_hover": "#4299e1",
+        "danger": "#e53e3e",
+        "done": "#38a169",
+        "note_bg": "#0d1a0d",
+        "overdue_bg": "#1a0000",
+        "overdue_fg": "#fc8181",
+        "header_bg": "#111111",
+        "urgent_bg": "#2d1a00",
+        "urgent_fg": "#f6ad55",
     },
     "blue": {
-        "bg": "#0f1923", "bg2": "#1a2332", "bg3": "#2d3748",
-        "text": "#e2e8f0", "text2": "#a0aec0",
-        "border": "#4a5568", "accent": "#3182ce", "accent_hover": "#4299e1",
-        "danger": "#e53e3e", "done": "#38a169",
-        "note_bg": "#1e2d3d", "overdue_bg": "#3b1c1c", "overdue_fg": "#fc8181",
-        "header_bg": "#1e2836", "urgent_bg": "#3b2c1c", "urgent_fg": "#f6ad55",
+        "bg": "#0f1923",
+        "bg2": "#1a2332",
+        "bg3": "#2d3748",
+        "text": "#e2e8f0",
+        "text2": "#a0aec0",
+        "border": "#4a5568",
+        "accent": "#3182ce",
+        "accent_hover": "#4299e1",
+        "danger": "#e53e3e",
+        "done": "#38a169",
+        "note_bg": "#1e2d3d",
+        "overdue_bg": "#3b1c1c",
+        "overdue_fg": "#fc8181",
+        "header_bg": "#1e2836",
+        "urgent_bg": "#3b2c1c",
+        "urgent_fg": "#f6ad55",
     },
     "light": {
-        "bg": "#f7fafc", "bg2": "#edf2f7", "bg3": "#e2e8f0",
-        "text": "#1a202c", "text2": "#4a5568",
-        "border": "#cbd5e0", "accent": "#3182ce", "accent_hover": "#2b6cb0",
-        "danger": "#e53e3e", "done": "#38a169",
-        "note_bg": "#ebf8ff", "overdue_bg": "#fff5f5", "overdue_fg": "#c53030",
-        "header_bg": "#e2e8f0", "urgent_bg": "#fffbeb", "urgent_fg": "#c05621",
+        "bg": "#f7fafc",
+        "bg2": "#edf2f7",
+        "bg3": "#e2e8f0",
+        "text": "#1a202c",
+        "text2": "#4a5568",
+        "border": "#cbd5e0",
+        "accent": "#3182ce",
+        "accent_hover": "#2b6cb0",
+        "danger": "#e53e3e",
+        "done": "#38a169",
+        "note_bg": "#ebf8ff",
+        "overdue_bg": "#fff5f5",
+        "overdue_fg": "#c53030",
+        "header_bg": "#e2e8f0",
+        "urgent_bg": "#fffbeb",
+        "urgent_fg": "#c05621",
     },
 }
 
@@ -422,31 +469,32 @@ del _t
 
 # ── Stylesheet builders ─────────────────────────────────────────────
 
+
 def _build_main_style():
     """Build FullWindow stylesheet from current theme."""
     t, fs = _T(), _font_size
     return f"""
-        QMainWindow {{ background: {t['bg']}; color: {t['text']}; }}
-        QTabWidget::pane {{ border: none; background: {t['bg']}; }}
-        QTabBar {{ background: {t['bg2']}; }}
+        QMainWindow {{ background: {t["bg"]}; color: {t["text"]}; }}
+        QTabWidget::pane {{ border: none; background: {t["bg"]}; }}
+        QTabBar {{ background: {t["bg2"]}; }}
         QTabBar::tab {{ padding: 8px 20px; font-weight: bold; font-size: {fs}px;
-                       background: {t['bg2']}; color: {t['text2']};
-                       border: 1px solid {t['bg3']}; border-bottom: none;
+                       background: {t["bg2"]}; color: {t["text2"]};
+                       border: 1px solid {t["bg3"]}; border-bottom: none;
                        margin-right: 2px; }}
-        QTabBar::tab:selected {{ background: {t['accent']}; color: #ffffff; }}
-        QTabBar::tab:hover:!selected {{ background: {t['bg3']}; color: {t['text']}; }}
-        QToolBar {{ background: {t['bg2']}; border-bottom: 1px solid {t['bg3']}; spacing: 4px; }}
-        QToolBar QToolButton {{ background: {t['bg3']}; color: {t['text']}; border: 1px solid {t['border']};
+        QTabBar::tab:selected {{ background: {t["accent"]}; color: #ffffff; }}
+        QTabBar::tab:hover:!selected {{ background: {t["bg3"]}; color: {t["text"]}; }}
+        QToolBar {{ background: {t["bg2"]}; border-bottom: 1px solid {t["bg3"]}; spacing: 4px; }}
+        QToolBar QToolButton {{ background: {t["bg3"]}; color: {t["text"]}; border: 1px solid {t["border"]};
                                padding: 4px 12px; font-weight: bold; font-size: {fs}px; }}
-        QToolBar QToolButton:hover {{ background: {t['accent']}; color: #ffffff; }}
-        QToolBar QToolButton:checked {{ background: {t['accent']}; color: #ffffff; }}
-        QStatusBar {{ background: {t['bg2']}; color: {t['text2']}; font-weight: bold;
-                     border-top: 1px solid {t['bg3']}; padding: 2px 8px; font-size: {fs - 1}px; }}
-        QMenu {{ background: {t['bg2']}; color: {t['text']}; border: 1px solid {t['border']}; }}
-        QMenu::item:selected {{ background: {t['accent']}; color: #ffffff; }}
-        QLineEdit#search {{ background: {t['bg3']}; color: {t['text']}; border: 2px solid {t['border']};
+        QToolBar QToolButton:hover {{ background: {t["accent"]}; color: #ffffff; }}
+        QToolBar QToolButton:checked {{ background: {t["accent"]}; color: #ffffff; }}
+        QStatusBar {{ background: {t["bg2"]}; color: {t["text2"]}; font-weight: bold;
+                     border-top: 1px solid {t["bg3"]}; padding: 2px 8px; font-size: {fs - 1}px; }}
+        QMenu {{ background: {t["bg2"]}; color: {t["text"]}; border: 1px solid {t["border"]}; }}
+        QMenu::item:selected {{ background: {t["accent"]}; color: #ffffff; }}
+        QLineEdit#search {{ background: {t["bg3"]}; color: {t["text"]}; border: 2px solid {t["border"]};
                            border-radius: 4px; padding: 4px 8px; min-width: 200px; font-size: {fs}px; }}
-        QLineEdit#search:focus {{ border-color: {t['accent']}; }}
+        QLineEdit#search:focus {{ border-color: {t["accent"]}; }}
     """
 
 
@@ -454,11 +502,11 @@ def _build_filter_style():
     """Build filter bar stylesheet from current theme."""
     t, fs = _T(), _font_size
     return f"""
-        QToolBar {{ background: {t['bg']}; border-bottom: 1px solid {t['bg3']}; spacing: 3px; padding: 2px 4px; }}
+        QToolBar {{ background: {t["bg"]}; border-bottom: 1px solid {t["bg3"]}; spacing: 3px; padding: 2px 4px; }}
         QToolButton {{ border-radius: 10px; padding: 2px 8px; font-size: {fs - 2}px; font-weight: 600;
-                      border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text2']}; }}
-        QToolButton:hover {{ background: {t['bg3']}; color: {t['text']}; }}
-        QToolButton:checked {{ background: {t['accent']}; color: #fff; border-color: {t['accent']}; }}
+                      border: 1px solid {t["border"]}; background: {t["bg3"]}; color: {t["text2"]}; }}
+        QToolButton:hover {{ background: {t["bg3"]}; color: {t["text"]}; }}
+        QToolButton:checked {{ background: {t["accent"]}; color: #fff; border-color: {t["accent"]}; }}
     """
 
 
@@ -466,17 +514,17 @@ def _build_list_style():
     """Build TaskListWidget stylesheet from current theme."""
     t, fs, fw = _T(), _font_size, _fw()
     return f"""
-        QListWidget {{ background: {t['bg']}; color: {t['text']}; border: none;
+        QListWidget {{ background: {t["bg"]}; color: {t["text"]}; border: none;
                       font-size: {fs}px; font-weight: {fw}; }}
-        QListWidget::item {{ padding: 8px 12px; border-bottom: 1px solid {t['bg3']};
-                            color: {t['text']}; background: {t['bg']}; }}
-        QListWidget::item:selected {{ background: {t['bg3']}; color: #ffffff; }}
-        QListWidget::item:hover {{ background: {t['bg2']}; }}
+        QListWidget::item {{ padding: 8px 12px; border-bottom: 1px solid {t["bg3"]};
+                            color: {t["text"]}; background: {t["bg"]}; }}
+        QListWidget::item:selected {{ background: {t["bg3"]}; color: #ffffff; }}
+        QListWidget::item:hover {{ background: {t["bg2"]}; }}
         QListWidget::indicator {{ width: 18px; height: 18px; }}
-        QListWidget::indicator:unchecked {{ border: 2px solid {t['border']};
-                                           background: {t['bg2']}; border-radius: 3px; }}
-        QListWidget::indicator:checked {{ border: 2px solid {t['accent']};
-                                         background: {t['accent']}; border-radius: 3px; }}
+        QListWidget::indicator:unchecked {{ border: 2px solid {t["border"]};
+                                           background: {t["bg2"]}; border-radius: 3px; }}
+        QListWidget::indicator:checked {{ border: 2px solid {t["accent"]};
+                                         background: {t["accent"]}; border-radius: 3px; }}
     """
 
 
@@ -484,33 +532,33 @@ def _build_popup_style():
     """Build TrayPopup stylesheet from current theme."""
     t, fs, fw = _T(), _font_size, _fw()
     return f"""
-        QWidget {{ background: {t['bg2']}; color: {t['text']}; font-family: 'Segoe UI'; font-weight: {fw}; }}
+        QWidget {{ background: {t["bg2"]}; color: {t["text"]}; font-family: 'Segoe UI'; font-weight: {fw}; }}
         QLabel#header {{ font-size: {fs + 2}px; font-weight: bold; padding: 10px 0 10px 14px; }}
-        QLabel#section-header {{ font-size: {fs - 2}px; color: {t['text2']}; padding: 6px 14px 2px;
+        QLabel#section-header {{ font-size: {fs - 2}px; color: {t["text2"]}; padding: 6px 14px 2px;
                                 text-transform: uppercase; letter-spacing: 1px; }}
         QCheckBox {{ font-size: {fs}px; padding: 6px 14px; }}
         QCheckBox::indicator {{ width: 16px; height: 16px; }}
         QLabel#priority {{ font-size: {fs - 3}px; font-weight: bold; padding: 2px 6px;
                           border-radius: 3px; }}
-        QLineEdit {{ background: {t['bg3']}; border: 1px solid {t['border']}; border-radius: 4px;
-                    color: {t['text']}; padding: 6px 10px; margin: 2px 14px; }}
-        QTextEdit {{ background: {t['bg3']}; border: 1px solid {t['border']}; border-radius: 4px;
-                    color: {t['text']}; padding: 6px 10px; margin: 2px 14px; font-family: 'Segoe UI';
+        QLineEdit {{ background: {t["bg3"]}; border: 1px solid {t["border"]}; border-radius: 4px;
+                    color: {t["text"]}; padding: 6px 10px; margin: 2px 14px; }}
+        QTextEdit {{ background: {t["bg3"]}; border: 1px solid {t["border"]}; border-radius: 4px;
+                    color: {t["text"]}; padding: 6px 10px; margin: 2px 14px; font-family: 'Segoe UI';
                     font-size: {fs}px; }}
-        QComboBox {{ background: {t['bg3']}; border: 1px solid {t['border']}; border-radius: 4px;
-                    color: {t['text']}; padding: 4px 8px; margin: 2px 14px; }}
-        QComboBox QAbstractItemView {{ background: {t['bg3']}; color: {t['text']};
-                                      selection-background-color: {t['border']}; }}
-        QPushButton#add-btn {{ background: transparent; border: none; color: {t['text2']};
+        QComboBox {{ background: {t["bg3"]}; border: 1px solid {t["border"]}; border-radius: 4px;
+                    color: {t["text"]}; padding: 4px 8px; margin: 2px 14px; }}
+        QComboBox QAbstractItemView {{ background: {t["bg3"]}; color: {t["text"]};
+                                      selection-background-color: {t["border"]}; }}
+        QPushButton#add-btn {{ background: transparent; border: none; color: {t["text2"]};
                               font-size: {fs + 5}px; font-weight: bold; padding: 4px 10px; }}
         QPushButton#add-btn:hover {{ color: #ffffff; }}
-        QPushButton#submit-btn {{ background: {t['bg3']}; border: 1px solid {t['border']};
-                                 border-radius: 4px; color: {t['text']}; padding: 6px;
+        QPushButton#submit-btn {{ background: {t["bg3"]}; border: 1px solid {t["border"]};
+                                 border-radius: 4px; color: {t["text"]}; padding: 6px;
                                  margin: 2px 14px; font-weight: bold; }}
-        QPushButton#submit-btn:hover {{ background: {t['border']}; }}
-        QPushButton#open-full {{ background: {t['bg3']}; border: none; color: {t['text2']};
+        QPushButton#submit-btn:hover {{ background: {t["border"]}; }}
+        QPushButton#open-full {{ background: {t["bg3"]}; border: none; color: {t["text2"]};
                                 padding: 8px; font-size: {fs - 1}px; }}
-        QPushButton#open-full:hover {{ background: {t['border']}; color: #ffffff; }}
+        QPushButton#open-full:hover {{ background: {t["border"]}; color: #ffffff; }}
     """
 
 
@@ -518,25 +566,25 @@ def _build_dialog_style():
     """Build EditTaskDialog stylesheet from current theme."""
     t, fs, fw = _T(), _font_size, _fw()
     return f"""
-        QDialog {{ background: {t['bg']}; color: {t['text']}; font-weight: {fw}; }}
-        QLabel {{ color: {t['text2']}; font-weight: bold; }}
-        QLineEdit {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+        QDialog {{ background: {t["bg"]}; color: {t["text"]}; font-weight: {fw}; }}
+        QLabel {{ color: {t["text2"]}; font-weight: bold; }}
+        QLineEdit {{ background: {t["bg2"]}; color: {t["text"]}; border: 2px solid {t["border"]};
                     border-radius: 4px; padding: 6px; font-size: {fs}px; }}
-        QLineEdit:focus {{ border-color: {t['accent']}; }}
-        QTextEdit {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+        QLineEdit:focus {{ border-color: {t["accent"]}; }}
+        QTextEdit {{ background: {t["bg2"]}; color: {t["text"]}; border: 2px solid {t["border"]};
                     border-radius: 4px; padding: 6px; font-size: {fs}px; }}
-        QComboBox {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+        QComboBox {{ background: {t["bg2"]}; color: {t["text"]}; border: 2px solid {t["border"]};
                     border-radius: 4px; padding: 6px; font-size: {fs}px; }}
-        QComboBox QAbstractItemView {{ background: {t['bg2']}; color: {t['text']};
-                                      selection-background-color: {t['border']}; }}
-        QDateEdit {{ background: {t['bg2']}; color: {t['text']}; border: 2px solid {t['border']};
+        QComboBox QAbstractItemView {{ background: {t["bg2"]}; color: {t["text"]};
+                                      selection-background-color: {t["border"]}; }}
+        QDateEdit {{ background: {t["bg2"]}; color: {t["text"]}; border: 2px solid {t["border"]};
                     border-radius: 4px; padding: 6px; font-size: {fs}px; }}
         QDateEdit::drop-down {{ border: none; }}
-        QPushButton {{ background: {t['bg3']}; color: {t['text']}; border: 1px solid {t['border']};
+        QPushButton {{ background: {t["bg3"]}; color: {t["text"]}; border: 1px solid {t["border"]};
                       border-radius: 4px; padding: 6px 16px; font-weight: bold; font-size: {fs}px; }}
-        QPushButton:hover {{ background: {t['accent']}; color: #ffffff; }}
-        QMenu {{ background: {t['bg2']}; color: {t['text']}; border: 1px solid {t['border']}; }}
-        QMenu::item:selected {{ background: {t['accent']}; color: #ffffff; }}
+        QPushButton:hover {{ background: {t["accent"]}; color: #ffffff; }}
+        QMenu {{ background: {t["bg2"]}; color: {t["text"]}; border: 1px solid {t["border"]}; }}
+        QMenu::item:selected {{ background: {t["accent"]}; color: #ffffff; }}
     """
 
 
@@ -544,20 +592,20 @@ def _build_reader_style():
     """Build TaskReaderDialog stylesheet from current theme."""
     t, fs, fw = _T(), _font_size, _fw()
     return f"""
-        QDialog {{ background: {t['bg']}; font-weight: {fw}; }}
-        QLabel#reader-title {{ color: {t['text']}; font-size: {fs + 5}px; font-weight: bold;
+        QDialog {{ background: {t["bg"]}; font-weight: {fw}; }}
+        QLabel#reader-title {{ color: {t["text"]}; font-size: {fs + 5}px; font-weight: bold;
                               padding: 12px 16px 4px; }}
-        QLabel#reader-meta {{ color: {t['text2']}; font-size: {fs - 1}px; padding: 2px 6px; }}
+        QLabel#reader-meta {{ color: {t["text2"]}; font-size: {fs - 1}px; padding: 2px 6px; }}
         QLabel#reader-priority {{ font-size: {fs - 2}px; font-weight: bold; padding: 2px 8px;
                                  border-radius: 3px; }}
-        QScrollArea {{ background: {t['bg']}; border: none; }}
-        QLabel#reader-body {{ color: {t['text']}; font-size: {fs}px; padding: 16px;
-                             background: {t['bg']}; }}
-        QFrame#reader-header {{ background: {t['bg2']}; border-bottom: 1px solid {t['bg3']}; }}
-        QPushButton {{ background: {t['bg3']}; color: {t['text']}; border: 1px solid {t['border']};
+        QScrollArea {{ background: {t["bg"]}; border: none; }}
+        QLabel#reader-body {{ color: {t["text"]}; font-size: {fs}px; padding: 16px;
+                             background: {t["bg"]}; }}
+        QFrame#reader-header {{ background: {t["bg2"]}; border-bottom: 1px solid {t["bg3"]}; }}
+        QPushButton {{ background: {t["bg3"]}; color: {t["text"]}; border: 1px solid {t["border"]};
                       border-radius: 4px; padding: 8px 20px; font-weight: bold;
                       font-size: {fs}px; }}
-        QPushButton:hover {{ background: {t['accent']}; color: #ffffff; }}
+        QPushButton:hover {{ background: {t["accent"]}; color: #ffffff; }}
     """
 
 
@@ -637,7 +685,11 @@ def _format_task_text(task, include_project=True, prefix=""):
     type_prefix = "[N] " if task.get("type") == "note" else ""
     recur = "\U0001f504 " if task.get("recurring") else ""
     vis = task.get("visibility", "private")
-    vis_badge = "\u23f3 " if vis == "pending_public" else ("\U0001f310 " if vis == "public" else "")
+    vis_badge = (
+        "\u23f3 "
+        if vis == "pending_public"
+        else ("\U0001f310 " if vis == "public" else "")
+    )
     ts_badge = _get_truth_score_badge(task) if vis == "public" else ""
     priority = (task.get("priority") or "medium").upper()
     due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
@@ -663,10 +715,10 @@ def _suggested_sort_key(t):
     dd = t.get("due_date")
     today_str = date.today().isoformat()
     return (
-        0 if (dd and dd < today_str) else 1,           # overdue first
-        priority_sort_key(t)[0],                        # priority (critical first)
-        0 if dd else 1,                                 # has due date first
-        dd or "9999-99-99",                             # due date ascending
+        0 if (dd and dd < today_str) else 1,  # overdue first
+        priority_sort_key(t)[0],  # priority (critical first)
+        0 if dd else 1,  # has due date first
+        dd or "9999-99-99",  # due date ascending
     )
 
 
@@ -700,29 +752,6 @@ def _smart_group(tasks):
     if rest:
         groups.append(("Other", rest))
     return groups
-
-
-def _score_task(task, query):
-    """Score task relevance. 0 = no match."""
-    q = query.lower()
-    title = (task.get("title") or "").lower()
-    combined = (
-        f"{title} {(task.get('description') or '').lower()} "
-        f"{task.get('priority', '')} {task.get('project', '')} "
-        f"{task.get('due_date', '')} {task.get('section', '')} {task.get('status', '')}"
-    )
-    if q in title:
-        return 100
-    if q in combined:
-        return 50
-    words = q.split()
-    if len(words) > 1:
-        matched = sum(1 for w in words if w in combined)
-        if matched == len(words):
-            return 30
-        if matched > 0:
-            return 10 * matched
-    return 0
 
 
 # ── TrayPopup ───────────────────────────────────────────────────────
@@ -845,7 +874,7 @@ class TrayPopup(QWidget):
         # Apply search filter if active
         q = self._search_text
         if q:
-            scored = [(t, _score_task(t, q)) for t in tasks]
+            scored = [(t, score_task(t, q)) for t in tasks]
             tasks = [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0]
 
         if tasks:
@@ -1069,9 +1098,11 @@ class EditTaskDialog(QDialog):
 
             def _on_cal_clicked(qdate):
                 if qdate < QDate.currentDate():
+
                     def _snap():
                         self.due_edit.setDate(self.due_edit.minimumDate())
                         self._due_cleared = True
+
                     QTimer.singleShot(0, _snap)
 
             cal.clicked.connect(_on_cal_clicked)
@@ -1099,9 +1130,7 @@ class EditTaskDialog(QDialog):
                     for i, name in enumerate(month_names, 1):
                         act = menu.addAction(name)
                         act.triggered.connect(
-                            lambda checked, m=i: cal.setCurrentPage(
-                                cal.yearShown(), m
-                            )
+                            lambda checked, m=i: cal.setCurrentPage(cal.yearShown(), m)
                         )
                     btn.setMenu(menu)
                     btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1574,7 +1603,15 @@ class TaskListWidget(QListWidget):
 class RecurringDialog(QDialog):
     """Dialog to configure recurring schedule for a task."""
 
-    _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+    _WEEKDAYS = (
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    )
 
     def __init__(self, task, parent=None):
         super().__init__(parent)
@@ -1640,7 +1677,9 @@ class RecurringDialog(QDialog):
         if every == "Daily":
             return json.dumps({"every": "day"})
         elif every == "Weekly":
-            return json.dumps({"every": "week", "day": self.day_of_week.currentText().lower()})
+            return json.dumps(
+                {"every": "week", "day": self.day_of_week.currentText().lower()}
+            )
         else:
             return json.dumps({"every": "month", "day": self.day_of_month.value()})
 
@@ -1705,7 +1744,9 @@ class FullWindow(QMainWindow):
         try:
             raw = self._settings.value("active_filters", "{}")
             parsed = json.loads(raw) if isinstance(raw, str) else {}
-            self._active_filters = {k: set(parsed.get(k, [])) for k in ("priority", "due", "project")}
+            self._active_filters = {
+                k: set(parsed.get(k, [])) for k in ("priority", "due", "project")
+            }
         except (json.JSONDecodeError, TypeError, ValueError):
             pass  # defaults already set above
 
@@ -1750,7 +1791,9 @@ class FullWindow(QMainWindow):
 
         # Restore saved active tab
         if hasattr(self, "_saved_active_tab"):
-            self.tabs.setCurrentIndex(min(self._saved_active_tab, len(self._tab_keys) - 1))
+            self.tabs.setCurrentIndex(
+                min(self._saved_active_tab, len(self._tab_keys) - 1)
+            )
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Toolbar: actions + search + sort
@@ -1901,6 +1944,7 @@ class FullWindow(QMainWindow):
         """Process recurring tasks silently (idempotent)."""
         try:
             from recurring_tasks import process_recurring
+
             with get_conn() as conn:
                 created = process_recurring(conn, dry_run=False)
             if created:
@@ -1929,8 +1973,10 @@ class FullWindow(QMainWindow):
         """Persist all UI state to QSettings."""
         self._settings.setValue("sort_mode", self._sort_mode)
         self._settings.setValue("active_tab", self.tabs.currentIndex())
-        self._settings.setValue("active_filters",
-            json.dumps({k: list(v) for k, v in self._active_filters.items()}))
+        self._settings.setValue(
+            "active_filters",
+            json.dumps({k: list(v) for k, v in self._active_filters.items()}),
+        )
 
     def _restore_profile_from_bridge(self):
         """First-run recovery: load UI state from bridge shared.json profile."""
@@ -1946,7 +1992,10 @@ class FullWindow(QMainWindow):
             global _theme_name, _font_size, _bold
             if profile.get("theme") in _THEMES:
                 _theme_name = profile["theme"]
-            if isinstance(profile.get("font_size"), int) and 10 <= profile["font_size"] <= 20:
+            if (
+                isinstance(profile.get("font_size"), int)
+                and 10 <= profile["font_size"] <= 20
+            ):
                 _font_size = profile["font_size"]
             _bold = bool(profile.get("bold", False))
             if profile.get("sort_mode") in self._SORT_MODES:
@@ -1961,6 +2010,7 @@ class FullWindow(QMainWindow):
             geo_b64 = profile.get("geometry_b64")
             if geo_b64:
                 from PyQt6.QtCore import QByteArray
+
                 self.restoreGeometry(QByteArray(base64.b64decode(geo_b64)))
             _update_theme_colors()
             self._save_ui_state()
@@ -2196,17 +2246,19 @@ class FullWindow(QMainWindow):
                         "WHERE entity_id = ? ORDER BY id",
                         (pe["id"],),
                     ).fetchall()
-                    public_entities_out.append({
-                        "name": pe["name"],
-                        "entityType": pe["entity_type"],
-                        "project": pe["project"],
-                        "observations": [
-                            {"content": o["content"], "createdAt": o["created_at"]}
-                            for o in obs
-                        ],
-                        "createdAt": pe["created_at"],
-                        "updatedAt": pe["updated_at"],
-                    })
+                    public_entities_out.append(
+                        {
+                            "name": pe["name"],
+                            "entityType": pe["entity_type"],
+                            "project": pe["project"],
+                            "observations": [
+                                {"content": o["content"], "createdAt": o["created_at"]}
+                                for o in obs
+                            ],
+                            "createdAt": pe["created_at"],
+                            "updatedAt": pe["updated_at"],
+                        }
+                    )
                 pub_task_rows = conn.execute(
                     "SELECT id, title, description, status, priority, section, "
                     "due_date, project, created_at, updated_at "
@@ -2272,9 +2324,15 @@ class FullWindow(QMainWindow):
                                     rt["section"] = "inbox"
                                 if rt.get("type") not in TASK_TYPES:
                                     rt["type"] = "task"
-                                for field in ("status", "section", "priority",
-                                              "due_date", "notes", "description",
-                                              "type"):
+                                for field in (
+                                    "status",
+                                    "section",
+                                    "priority",
+                                    "due_date",
+                                    "notes",
+                                    "description",
+                                    "type",
+                                ):
                                     if rt.get(field) is not None:
                                         lt[field] = rt[field]
                                 lt["updated_at"] = r_upd
@@ -2318,9 +2376,9 @@ class FullWindow(QMainWindow):
                 }
                 geo = self._settings.value("geometry")
                 if geo:
-                    own_profile["geometry_b64"] = base64.b64encode(
-                        bytes(geo)
-                    ).decode("ascii")
+                    own_profile["geometry_b64"] = base64.b64encode(bytes(geo)).decode(
+                        "ascii"
+                    )
                 remote_profiles[hostname] = own_profile
                 payload["ui_profiles"] = remote_profiles
 
@@ -2440,7 +2498,9 @@ class FullWindow(QMainWindow):
                 btn.styleSheet()
                 + f"QToolButton:checked {{ background: {color}; border-color: {color}; color: #fff; }}"
             )
-            btn.clicked.connect(lambda checked, p=pri: self._toggle_filter("priority", p))
+            btn.clicked.connect(
+                lambda checked, p=pri: self._toggle_filter("priority", p)
+            )
             self._filter_bar.addWidget(btn)
             self._filter_chips[("priority", pri)] = btn
 
@@ -2494,7 +2554,9 @@ class FullWindow(QMainWindow):
                 btn.styleSheet()
                 + f"QToolButton:checked {{ background: {_T()['accent']}; border-color: {_T()['accent']}; color: #fff; }}"
             )
-            btn.clicked.connect(lambda checked, p=proj: self._toggle_filter("project", p))
+            btn.clicked.connect(
+                lambda checked, p=proj: self._toggle_filter("project", p)
+            )
             self._filter_bar.addWidget(btn)
             self._filter_chips[("project", proj)] = btn
 
@@ -2554,18 +2616,30 @@ class FullWindow(QMainWindow):
         # Chip filters only when not searching
         # Priority filter (OR within)
         if self._active_filters["priority"]:
-            tasks = [t for t in tasks if t.get("priority", "medium") in self._active_filters["priority"]]
+            tasks = [
+                t
+                for t in tasks
+                if t.get("priority", "medium") in self._active_filters["priority"]
+            ]
 
         # Due filter (OR within)
         if self._active_filters["due"]:
             today = date.today()
             week_start = today - timedelta(days=today.weekday())
             week_end = week_start + timedelta(days=6)
-            tasks = [t for t in tasks if self._matches_due_filter(t, self._active_filters["due"], today, week_start, week_end)]
+            tasks = [
+                t
+                for t in tasks
+                if self._matches_due_filter(
+                    t, self._active_filters["due"], today, week_start, week_end
+                )
+            ]
 
         # Project filter (OR within)
         if self._active_filters["project"]:
-            tasks = [t for t in tasks if t.get("project") in self._active_filters["project"]]
+            tasks = [
+                t for t in tasks if t.get("project") in self._active_filters["project"]
+            ]
 
         return tasks
 
@@ -2590,10 +2664,9 @@ class FullWindow(QMainWindow):
         self._search_engine.rebuild_index(all_active + done)
 
         suggested = sorted(all_active, key=_suggested_sort_key)[:20]
-        notes = (
-            [t for t in all_active if t.get("type") == "note"]
-            + [t for t in done if t.get("type") == "note"]
-        )
+        notes = [t for t in all_active if t.get("type") == "note"] + [
+            t for t in done if t.get("type") == "note"
+        ]
 
         raw = {
             "suggested": suggested,

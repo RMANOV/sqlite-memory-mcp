@@ -43,8 +43,8 @@ def _tokenize(text: str) -> list[str]:
     return [w.lower() for w in _WORD_RE.findall(text) if len(w) >= _MIN_WORD_LEN]
 
 
-def _score_task_fallback(task, query):
-    """Fallback substring scorer (mirrors _score_task from task_tray)."""
+def score_task(task, query):
+    """Substring scorer for task relevance. 0 = no match."""
     q = query.lower()
     title = (task.get("title") or "").lower()
     combined = (
@@ -132,13 +132,13 @@ class TaskSearchEngine:
 
         if not self._engine:
             # Fallback to substring matching
-            scored = [(t, _score_task_fallback(t, query)) for t in tasks]
+            scored = [(t, score_task(t, query)) for t in tasks]
             return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
 
         query_words = _tokenize(query)
         if not query_words:
             # Query has no indexable words — try fallback
-            scored = [(t, _score_task_fallback(t, query)) for t in tasks]
+            scored = [(t, score_task(t, query)) for t in tasks]
             return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
 
         # For each query word, fuzzy-match against trie and resolve task IDs
@@ -166,7 +166,7 @@ class TaskSearchEngine:
 
         if not task_scores:
             # SmartKey found nothing — fallback to substring
-            scored = [(t, _score_task_fallback(t, query)) for t in tasks]
+            scored = [(t, score_task(t, query)) for t in tasks]
             return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
 
         n_query_words = len(query_words)
