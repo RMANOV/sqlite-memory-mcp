@@ -1708,6 +1708,7 @@ class FullWindow(QMainWindow):
         self.db = db
         self._sort_mode = "priority"
         self._search_text = ""
+        self._pre_search_tab: int | None = None  # tab to restore after search clears
         self._active_filters = {"priority": set(), "due": set(), "project": set()}
         self._filter_chips = {}
         self._last_projects = None
@@ -2479,7 +2480,15 @@ class FullWindow(QMainWindow):
 
     def _on_search(self, text):
         """Debounced search filter (300ms)."""
-        self._search_text = text.strip().lower()
+        new_text = text.strip().lower()
+        # Save tab before first search keystroke
+        if new_text and not self._search_text:
+            self._pre_search_tab = self.tabs.currentIndex()
+        # Restore tab when search is cleared
+        if not new_text and self._search_text and self._pre_search_tab is not None:
+            self.tabs.setCurrentIndex(self._pre_search_tab)
+            self._pre_search_tab = None
+        self._search_text = new_text
         self._search_timer.start()  # resets 300ms countdown
 
     def _build_filter_chips(self):
@@ -2693,8 +2702,17 @@ class FullWindow(QMainWindow):
 
         # Pre-compute filtered+sorted data for all tabs (cheap Python ops)
         self._filtered_cache = {}
-        for key in self._tab_keys:
-            self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
+        if self._search_text:
+            # Global search: search ALL tasks, then distribute into tabs
+            all_tasks = all_active + done
+            global_results = self._search_engine.search(self._search_text, all_tasks)
+            global_ids = {id(t) for t in global_results}
+            for key in self._tab_keys:
+                matched = [t for t in raw[key] if id(t) in global_ids]
+                self._filtered_cache[key] = self._sort_tasks(matched)
+        else:
+            for key in self._tab_keys:
+                self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
 
         # Update tab visibility (suggested, notes, projects always visible)
         always_visible = ("suggested", "notes", "projects")
@@ -2702,8 +2720,20 @@ class FullWindow(QMainWindow):
             count = len(self._filtered_cache[key])
             self.tabs.setTabVisible(i, count > 0 or key in always_visible)
 
-        # Lazy rendering: only load the currently active tab
+        # Auto-switch to first tab with results when searching
         current_idx = self.tabs.currentIndex()
+        if self._search_text:
+            current_key = (
+                self._tab_keys[current_idx] if current_idx < len(self._tab_keys) else ""
+            )
+            if not self._filtered_cache.get(current_key):
+                for i, key in enumerate(self._tab_keys):
+                    if self._filtered_cache.get(key):
+                        self.tabs.setCurrentIndex(i)
+                        current_idx = i
+                        break
+
+        # Lazy rendering: only load the currently active tab
         if 0 <= current_idx < len(self._tab_keys):
             self._load_tab(self._tab_keys[current_idx])
 
