@@ -196,6 +196,18 @@ def build_priority_order_sql(prefix: str = "") -> str:
     )
 
 
+def sanitize_task_enums(task: dict) -> None:
+    """Clamp task enum fields to valid values in-place."""
+    if task.get("status") not in TASK_STATUSES:
+        task["status"] = "not_started"
+    if task.get("priority") not in TASK_PRIORITIES:
+        task["priority"] = "medium"
+    if task.get("section") not in TASK_SECTIONS:
+        task["section"] = "inbox"
+    if task.get("type") not in TASK_TYPES:
+        task["type"] = "task"
+
+
 def priority_sort_key(task: dict[str, Any]) -> tuple:
     """Python sort key: (priority_rank ascending, due_date ascending)."""
     rank = PRIORITY_RANK.get(task.get("priority", "low"), 0)

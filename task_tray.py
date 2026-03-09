@@ -2170,12 +2170,9 @@ class FullWindow(QMainWindow):
 
         def _run():
             try:
-                _hooks_dir = os.path.expanduser("~/.claude/hooks")
-                if _hooks_dir not in sys.path:
-                    sys.path.insert(0, _hooks_dir)
                 import bridge_sync_worker
 
-                bridge_sync_worker.main(
+                stats = bridge_sync_worker.main(
                     progress_callback=lambda pct, label: self._bridge_progress.emit(
                         pct, label
                     )
@@ -2184,7 +2181,9 @@ class FullWindow(QMainWindow):
                 # Patch UI profile into shared.json (tray-specific, no extra commit)
                 self._patch_ui_profile()
 
-                self._bridge_done.emit("Synced OK")
+                n_ent = stats.get("entities", 0)
+                n_tasks = stats.get("tasks", 0)
+                self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
             except Exception as exc:
                 self._bridge_done.emit(f"Sync error: {exc}")
 

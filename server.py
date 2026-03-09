@@ -52,6 +52,7 @@ from db_utils import (
     RATING_BURST_WINDOW_HOURS as _RATING_BURST_WINDOW_HOURS,
     build_priority_order_sql,
     now_iso as _now,
+    sanitize_task_enums as _sanitize_task_enums,
 )
 
 # Pre-built SQL fragment for active-task exclusion filter
@@ -1228,18 +1229,6 @@ def search_by_project(query: str, project: str) -> str:
 
 
 # _TASK_STATUSES, _TASK_PRIORITIES, _TASK_SECTIONS imported from db_utils
-
-
-def _sanitize_task_enums(task: dict) -> None:
-    """Clamp task enum fields to valid values in-place."""
-    if task.get("status") not in _TASK_STATUSES:
-        task["status"] = "not_started"
-    if task.get("priority") not in _TASK_PRIORITIES:
-        task["priority"] = "medium"
-    if task.get("section") not in _TASK_SECTIONS:
-        task["section"] = "inbox"
-    if task.get("type") not in _TASK_TYPES:
-        task["type"] = "task"
 
 
 @mcp.tool()
