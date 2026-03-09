@@ -34,11 +34,14 @@ _NOWIN: dict = (
 )
 
 from db_utils import (
+    json_dumps as _json_dumps,
+    json_loads as _json_loads,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
     TASK_STATUSES as _TASK_STATUSES,
     TASK_TYPES as _TASK_TYPES,
+    TRUST_LEVELS as _TRUST_LEVELS,
     VISIBILITY_LEVELS as _VISIBILITY_LEVELS,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
     IQ_WEIGHTS as _IQ_WEIGHTS,
@@ -93,7 +96,7 @@ def _validate_recurring(raw: str) -> str | None:
 LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-logger = logging.getLogger("sqlite-memory")
+logger = logging.getLogger("sqlite-kb")
 logger.setLevel(logging.DEBUG)
 _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -104,7 +107,7 @@ if not logger.handlers:
 from fastmcp import FastMCP
 
 mcp = FastMCP(
-    "sqlite-memory",
+    "sqlite-kb",
     instructions=(
         "SQLite-backed persistent memory with WAL concurrent safety, "
         "FTS5 search, session tracking, structured task management, "
@@ -298,6 +301,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
     tokenize = "unicode61 remove_diacritics 2"
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+    title, description, notes,
+    content='tasks', content_rowid='rowid',
+    tokenize = "unicode61 remove_diacritics 2"
+);
+
+-- Auto-sync triggers: keep tasks_fts in lockstep with tasks table
+CREATE TRIGGER IF NOT EXISTS tasks_fts_ai AFTER INSERT ON tasks BEGIN
+    INSERT INTO tasks_fts(rowid, title, description, notes)
+    VALUES (new.rowid, new.title, new.description, new.notes);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_fts_ad AFTER DELETE ON tasks BEGIN
+    INSERT INTO tasks_fts(tasks_fts, rowid, title, description, notes)
+    VALUES ('delete', old.rowid, old.title, old.description, old.notes);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_fts_au AFTER UPDATE ON tasks BEGIN
+    INSERT INTO tasks_fts(tasks_fts, rowid, title, description, notes)
+    VALUES ('delete', old.rowid, old.title, old.description, old.notes);
+    INSERT INTO tasks_fts(rowid, title, description, notes)
+    VALUES (new.rowid, new.title, new.description, new.notes);
+END;
 """
 
 
@@ -501,6 +528,12 @@ _MIGRATIONS = [
         "CREATE INDEX idx_anomaly_ent ON rating_anomalies(entity_name)",
         "idx_anomaly_ent index (v0.9.0)",
     ),
+    # v1.0.0: bridge sync metadata for incremental push
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_meta'",
+        "CREATE TABLE bridge_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        "bridge_meta table (v1.0.0)",
+    ),
 ]
 
 
@@ -515,6 +548,19 @@ def _init_db() -> None:
             if not conn.execute(check_q).fetchone():
                 conn.execute(migrate_q)
                 logger.info("Migration applied: %s", desc)
+
+    # One-time FTS rebuild for tasks if tasks_fts index is stale or empty
+    with _get_conn() as conn:
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        fts_count = conn.execute("SELECT COUNT(*) FROM tasks_fts").fetchone()[0]
+        if task_count > 0 and fts_count == 0:
+            conn.execute(
+                "INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')"
+            )
+            logger.info(
+                "tasks_fts: rebuilt FTS index for %d existing tasks", task_count
+            )
+
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -939,30 +985,42 @@ def search_nodes(query: str) -> str:
     """
     fts_q = _fts_query(query)
     with _get_conn() as conn:
+        # Single JOIN query instead of N+1 per-entity subqueries
         rows = conn.execute(
-            "SELECT rowid, name, entity_type, observations_text, rank "
-            "FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank "
-            "LIMIT 50",
+            "SELECT memory_fts.rowid AS eid, memory_fts.name, "
+            "memory_fts.entity_type, e.project, memory_fts.rank "
+            "FROM memory_fts "
+            "JOIN entities e ON e.id = memory_fts.rowid "
+            "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT 50",
             (fts_q,),
         ).fetchall()
 
+        if not rows:
+            return json.dumps({"entities": [], "query": query})
+
+        # Batch-fetch observations for all matched entities in one query
+        eids = [r["eid"] for r in rows]
+        ph = ",".join("?" * len(eids))
+        obs_rows = conn.execute(
+            f"SELECT entity_id, content FROM observations "
+            f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+            eids,
+        ).fetchall()
+
+        # Group observations by entity_id
+        obs_by_eid: dict[int, list[str]] = {}
+        for o in obs_rows:
+            obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
+
         results = []
         for r in rows:
-            eid = r["rowid"]
-            obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-                (eid,),
-            ).fetchall()
-            ent = conn.execute(
-                "SELECT project FROM entities WHERE id = ?", (eid,)
-            ).fetchone()
-            entity = {
+            entity: dict[str, Any] = {
                 "name": r["name"],
                 "entityType": r["entity_type"],
-                "observations": [o["content"] for o in obs],
+                "observations": obs_by_eid.get(r["eid"], []),
             }
-            if ent and ent["project"]:
-                entity["project"] = ent["project"]
+            if r["project"]:
+                entity["project"] = r["project"]
             results.append(entity)
 
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
@@ -1376,56 +1434,94 @@ def query_tasks(
     parent_id: str | None = None,
     type: str | None = None,
     overdue_only: bool = False,
+    search: str | None = None,
+    summary_only: bool = False,
+    offset: int = 0,
     limit: int = 50,
 ) -> str:
     """Query tasks with optional filters. Returns markdown table.
 
     Filters are combined with AND. Omit a filter to skip it.
     overdue_only=True shows only tasks past due_date that are not done/archived.
+    search: FTS5 full-text search across title, description, and notes.
+    summary_only=True omits description/notes from results (faster for large datasets).
+    offset/limit for pagination.
     """
     conditions: list[str] = []
     params: list[Any] = []
+    use_fts = bool(search and search.strip())
 
     if section:
-        conditions.append("section = ?")
+        conditions.append("t.section = ?")
         params.append(section)
     if status:
-        conditions.append("status = ?")
+        conditions.append("t.status = ?")
         params.append(status)
     if priority:
-        conditions.append("priority = ?")
+        conditions.append("t.priority = ?")
         params.append(priority)
     if project:
-        conditions.append("project = ?")
+        conditions.append("t.project = ?")
         params.append(project)
     if parent_id:
-        conditions.append("parent_id = ?")
+        conditions.append("t.parent_id = ?")
         params.append(parent_id)
     if type:
-        conditions.append("type = ?")
+        conditions.append("t.type = ?")
         params.append(type)
     if overdue_only:
-        conditions.append("due_date < date('now')")
-        conditions.append(f"status NOT IN ({_EXCL_PH})")
+        conditions.append("t.due_date < date('now')")
+        conditions.append(f"t.status NOT IN ({_EXCL_PH})")
         params.extend(_TASK_ACTIVE_EXCLUSIONS)
 
-    where = " AND ".join(conditions) if conditions else "1=1"
-    params.append(limit)
+    # Column selection based on summary_only
+    if summary_only:
+        cols = "t.id, t.title, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
+    else:
+        cols = "t.id, t.title, t.description, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
+
+    if use_fts:
+        fts_q = _fts_query(search)
+        conditions.append("tasks_fts.rowid = t.rowid")
+        conditions.append("tasks_fts MATCH ?")
+        params.append(fts_q)
+        where = " AND ".join(conditions) if conditions else "1=1"
+        # FTS snippet for search context (truncated to 64 tokens)
+        if not summary_only:
+            cols += ", snippet(tasks_fts, 1, '<b>', '</b>', '...', 64) AS match_snippet"
+        sql = (
+            f"SELECT {cols} FROM tasks t, tasks_fts "
+            f"WHERE {where} "
+            f"ORDER BY tasks_fts.rank, "
+            f"  {build_priority_order_sql('t.')}, "
+            f"  t.due_date ASC NULLS LAST, t.created_at ASC "
+            f"LIMIT ? OFFSET ?"
+        )
+    else:
+        where = " AND ".join(conditions) if conditions else "1=1"
+        sql = (
+            f"SELECT {cols} FROM tasks t WHERE {where} "
+            f"ORDER BY "
+            f"  {build_priority_order_sql('t.')}, "
+            f"  t.due_date ASC NULLS LAST, t.created_at ASC "
+            f"LIMIT ? OFFSET ?"
+        )
+
+    params.extend([limit, offset])
 
     with _get_conn() as conn:
-        rows = conn.execute(
-            f"SELECT id, title, description, status, priority, section, due_date, project, parent_id "
-            f"FROM tasks WHERE {where} "
-            f"ORDER BY "
-            f"  {build_priority_order_sql()}, "
-            f"  due_date ASC NULLS LAST, created_at ASC "
-            f"LIMIT ?",
-            params,
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
+        # Get total count for pagination info
+        count_params = params[:-2]  # exclude limit/offset
+        if use_fts:
+            count_sql = f"SELECT COUNT(*) FROM tasks t, tasks_fts WHERE {where}"
+        else:
+            count_sql = f"SELECT COUNT(*) FROM tasks t WHERE {where}"
+        total = conn.execute(count_sql, count_params).fetchone()[0]
 
     if not rows:
         return json.dumps(
-            {"tasks": [], "count": 0, "message": "No tasks match filters"}
+            {"tasks": [], "count": 0, "total": total, "message": "No tasks match filters"}
         )
 
     # Build markdown table
@@ -1437,18 +1533,23 @@ def query_tasks(
         due = r["due_date"] or "—"
         proj = r["project"] or "—"
         lines.append(
-            f"| {i} | {r['title']} | {r['status']} | {r['priority']} "
+            f"| {i + offset} | {r['title']} | {r['status']} | {r['priority']} "
             f"| {r['section']} | {due} | {proj} |"
         )
 
     tasks_json = [dict(r) for r in rows]
-    return json.dumps(
-        {
-            "tasks": tasks_json,
-            "count": len(rows),
-            "markdown": "\n".join(lines),
-        }
-    )
+    result = {
+        "tasks": tasks_json,
+        "count": len(rows),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "markdown": "\n".join(lines),
+    }
+    if total > offset + limit:
+        result["has_more"] = True
+        result["next_offset"] = offset + limit
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -3091,11 +3192,14 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
 
 
 @mcp.tool()
-def bridge_push(tag: str = "shared") -> str:
+def bridge_push(tag: str = "shared", force: bool = False) -> str:
     """Push tagged entities to the bridge git repo for cross-machine sync.
 
     Exports entities where project LIKE '{tag}%' with their observations
     and inter-relations to JSON. Git add, commit, push.
+
+    Incremental: skips full export if nothing changed since last push.
+    Set force=True to push regardless.
     """
     if not Path(BRIDGE_REPO).is_dir():
         return json.dumps(
@@ -3106,6 +3210,26 @@ def bridge_push(tag: str = "shared") -> str:
         )
 
     with _get_conn() as conn:
+        # Incremental check: skip if no changes since last push
+        if not force:
+            last_push_row = conn.execute(
+                "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+            ).fetchone()
+            if last_push_row:
+                last_push_at = last_push_row["value"]
+                row = conn.execute(
+                    "SELECT "
+                    "  (SELECT COUNT(*) FROM tasks WHERE updated_at > ?) AS changed_tasks, "
+                    "  (SELECT COUNT(*) FROM entities WHERE updated_at > ?) AS changed_ents, "
+                    "  (SELECT COUNT(*) FROM entities WHERE visibility = 'pending_public') AS pending_pub",
+                    (last_push_at, last_push_at),
+                ).fetchone()
+                if row[0] == 0 and row[1] == 0 and row[2] == 0:
+                    logger.info("bridge_push: no changes since %s, skipping", last_push_at)
+                    return json.dumps({
+                        "pushed": 0,
+                        "message": f"No changes since {last_push_at}. Use force=True to push anyway.",
+                    })
         # v0.7.0: Promote pending_public → public if standby elapsed
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=_PUBLISH_STANDBY_MINUTES)
@@ -3265,7 +3389,7 @@ def bridge_push(tag: str = "shared") -> str:
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     if shared_path.exists():
         try:
-            existing = json.loads(shared_path.read_text(encoding="utf-8"))
+            existing = _json_loads(shared_path.read_text(encoding="utf-8"))
 
             # Merge: keep remote tasks that don't exist locally (by title)
             local_titles = {t["title"] for t in tasks_out}
@@ -3340,9 +3464,7 @@ def bridge_push(tag: str = "shared") -> str:
         except (json.JSONDecodeError, OSError):
             pass
 
-    shared_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    shared_path.write_text(_json_dumps(payload), encoding="utf-8")
 
     # Cross-account push: send assigned tasks to other users' repos
     by_assignee: dict[str, list] = {}
@@ -3470,6 +3592,14 @@ def bridge_push(tag: str = "shared") -> str:
             "entities": len(public_entities_out),
             "tasks": len(public_tasks_out),
         }
+
+    # Record push timestamp for incremental sync
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
+            (_now(),),
+        )
+
     return json.dumps(result)
 
 

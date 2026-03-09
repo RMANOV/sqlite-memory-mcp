@@ -12,6 +12,25 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Any
 
+try:
+    import orjson
+
+    def json_dumps(obj: Any, **kw) -> str:
+        """Fast JSON serialize via orjson (returns str for compatibility)."""
+        return orjson.dumps(obj).decode("utf-8")
+
+    def json_loads(s: str | bytes) -> Any:
+        return orjson.loads(s)
+
+except ImportError:
+    import json
+
+    def json_dumps(obj: Any, **kw) -> str:  # type: ignore[misc]
+        return json.dumps(obj, ensure_ascii=False, **kw)
+
+    def json_loads(s: str | bytes) -> Any:  # type: ignore[misc]
+        return json.loads(s)
+
 
 # ── Paths ────────────────────────────────────────────────────────────────
 
@@ -111,6 +130,32 @@ def get_conn(db_path: str | None = None):
         conn.close()
 
 
+@contextmanager
+def bulk_conn(db_path: str | None = None):
+    """Connection optimized for bulk inserts: single transaction, relaxed sync.
+
+    Use for batch imports where throughput matters more than per-row durability.
+    WAL checkpoint runs automatically after the transaction commits.
+    """
+    conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")  # faster writes, safe with WAL
+    conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache for bulk ops
+    conn.execute("BEGIN;")
+    try:
+        yield conn
+        conn.execute("COMMIT;")
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+
 # ── Timestamp helpers ────────────────────────────────────────────────────
 
 
@@ -138,11 +183,16 @@ def is_overdue(due_date_str: str | None) -> bool:
 # ── SQL helpers ──────────────────────────────────────────────────────────
 
 
-def build_priority_order_sql() -> str:
-    """Return a CASE clause for SQL ORDER BY priority (critical first)."""
+def build_priority_order_sql(prefix: str = "") -> str:
+    """Return a CASE clause for SQL ORDER BY priority (critical first).
+
+    Args:
+        prefix: Table alias prefix, e.g. "t." for qualified column refs.
+    """
+    col = f"{prefix}priority"
     return (
-        "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-        "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END"
+        f"CASE {col} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+        f"WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END"
     )
 
 

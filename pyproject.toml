@@ -3,7 +3,7 @@ name = "sqlite-memory-mcp"
 version = "0.6.0"
 description = "SQLite-backed MCP Memory Server with WAL concurrent safety, FTS5 search, session tracking, cross-machine bridge sync, and task management"
 requires-python = ">=3.10"
-dependencies = ["fastmcp>=2.0.0"]
+dependencies = ["fastmcp>=2.0.0", "orjson>=3.9.0"]
 license = {text = "MIT"}
 authors = [{name = "rmanov"}]
 readme = "README.md"
