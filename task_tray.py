@@ -17,7 +17,7 @@ import calendar as _cal_mod
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from task_search import TaskSearchEngine
+from task_search import TaskSearchEngine, score_task
 
 from db_utils import (
     DB_PATH,
@@ -27,6 +27,7 @@ from db_utils import (
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
     build_priority_order_sql,
+    get_conn,
     is_overdue,
     now_iso,
     parse_iso_date,
@@ -2597,9 +2598,9 @@ class FullWindow(QMainWindow):
             # Global search: search ALL tasks, then distribute into tabs
             all_tasks = all_active + done
             global_results = self._search_engine.search(self._search_text, all_tasks)
-            global_ids = {id(t) for t in global_results}
+            global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
-                matched = [t for t in raw[key] if id(t) in global_ids]
+                matched = [t for t in raw[key] if t["id"] in global_ids]
                 self._filtered_cache[key] = self._sort_tasks(matched)
         else:
             for key in self._tab_keys:
