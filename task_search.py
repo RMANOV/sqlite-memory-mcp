@@ -36,6 +36,9 @@ _ENGINE_CONFIG = json.dumps(
 
 # Regex for tokenizing task titles into words
 _WORD_RE = re.compile(r"[a-zA-Z0-9\u0400-\u04FF]+")
+# Pre-compiled patterns for hyphen/underscore normalization in search
+_NORMALIZE_RE = re.compile(r"[-_]+")
+_SPLIT_RE = re.compile(r"[\s\-_]+")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -52,11 +55,17 @@ def score_task(task, query):
         f"{task.get('priority', '')} {task.get('project', '')} "
         f"{task.get('due_date', '')} {task.get('section', '')} {task.get('status', '')}"
     )
-    if q in title:
+    # Normalize hyphens/underscores to spaces for substring matching
+    q_normalized = _NORMALIZE_RE.sub(" ", q).strip()
+    if q_normalized and q_normalized in title:
         return 100
-    if q in combined:
+    if q_normalized != q and q in title:
+        return 100
+    if q_normalized and q_normalized in combined:
         return 50
-    words = q.split()
+    if q_normalized != q and q in combined:
+        return 50
+    words = [w for w in _SPLIT_RE.split(q) if w]
     if len(words) > 1:
         matched = sum(1 for w in words if w in combined)
         if matched == len(words):

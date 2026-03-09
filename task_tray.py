@@ -22,13 +22,10 @@ from task_search import TaskSearchEngine
 from db_utils import (
     DB_PATH,
     PRIORITY_COLORS,
-    PUBLISH_STANDBY_MINUTES,
     TASK_ACTIVE_EXCLUSIONS,
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
-    TASK_STATUSES,
-    TASK_TYPES,
     build_priority_order_sql,
     is_overdue,
     now_iso,
@@ -319,6 +316,7 @@ from PyQt6.QtGui import QIcon, QAction, QActionGroup, QPixmap, QPainter, QColor,
 from PyQt6.QtCore import (
     QDate,
     QEvent,
+    QFileSystemWatcher,
     QObject,
     QSettings,
     Qt,
@@ -1710,6 +1708,8 @@ class FullWindow(QMainWindow):
         self._search_text = ""
         self._pre_search_tab: int | None = None  # tab to restore after search clears
         self._active_filters = {"priority": set(), "due": set(), "project": set()}
+        self._excluded_filters = {"priority": set(), "due": set(), "project": set()}
+        self._minus_mode = False
         self._filter_chips = {}
         self._last_projects = None
         self._project_cache_time: float = 0.0  # monotonic time of last project query
@@ -1747,6 +1747,11 @@ class FullWindow(QMainWindow):
             parsed = json.loads(raw) if isinstance(raw, str) else {}
             self._active_filters = {
                 k: set(parsed.get(k, [])) for k in ("priority", "due", "project")
+            }
+            raw_ex = self._settings.value("excluded_filters", "{}")
+            parsed_ex = json.loads(raw_ex) if isinstance(raw_ex, str) else {}
+            self._excluded_filters = {
+                k: set(parsed_ex.get(k, [])) for k in ("priority", "due", "project")
             }
         except (json.JSONDecodeError, TypeError, ValueError):
             pass  # defaults already set above
@@ -1933,10 +1938,34 @@ class FullWindow(QMainWindow):
         self._purge_timer.timeout.connect(self._run_purge)
         self._purge_timer.start(_PURGE_INTERVAL_MS)
 
+        # Auto-sync: watch memory.db for changes
+        self._db_watcher = QFileSystemWatcher([str(Path(self.db.db_path))], self)
+        self._db_watcher.fileChanged.connect(self._on_db_changed)
+        self._auto_sync_timer = QTimer(self)
+        self._auto_sync_timer.setSingleShot(True)
+        self._auto_sync_timer.setInterval(60_000)  # 60s debounce
+        self._auto_sync_timer.timeout.connect(self._auto_sync_triggered)
+        self._db_refresh_debounce = QTimer(self)
+        self._db_refresh_debounce.setSingleShot(True)
+        self._db_refresh_debounce.setInterval(500)  # 500ms UI debounce
+        self._db_refresh_debounce.timeout.connect(self.refresh)
+
         # Process recurring tasks at startup
         self._process_recurring()
 
         self.refresh()
+
+    def _on_db_changed(self, path):
+        """DB file changed — start/restart debounce timers."""
+        self._auto_sync_timer.start()  # 60s bridge sync debounce
+        self._db_refresh_debounce.start()  # 500ms UI refresh debounce
+        # Re-add path (Qt removes watched files after change notification)
+        if not self._db_watcher.files():
+            self._db_watcher.addPath(path)
+
+    def _auto_sync_triggered(self):
+        """Debounce elapsed — run bridge sync."""
+        self._sync_bridge()
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
@@ -1978,6 +2007,10 @@ class FullWindow(QMainWindow):
             "active_filters",
             json.dumps({k: list(v) for k, v in self._active_filters.items()}),
         )
+        self._settings.setValue(
+            "excluded_filters",
+            json.dumps({k: list(v) for k, v in self._excluded_filters.items()}),
+        )
 
     def _restore_profile_from_bridge(self):
         """First-run recovery: load UI state from bridge shared.json profile."""
@@ -2006,6 +2039,11 @@ class FullWindow(QMainWindow):
             if isinstance(profile.get("active_filters"), dict):
                 self._active_filters = {
                     k: set(profile["active_filters"].get(k, []))
+                    for k in ("priority", "due", "project")
+                }
+            if isinstance(profile.get("excluded_filters"), dict):
+                self._excluded_filters = {
+                    k: set(profile["excluded_filters"].get(k, []))
                     for k in ("priority", "due", "project")
                 }
             geo_b64 = profile.get("geometry_b64")
@@ -2059,6 +2097,11 @@ class FullWindow(QMainWindow):
             self._sort_actions["priority"].setChecked(True)
         for s in self._active_filters.values():
             s.clear()
+        for s in self._excluded_filters.values():
+            s.clear()
+        if hasattr(self, "_minus_btn"):
+            self._minus_btn.setChecked(False)
+        self._minus_mode = False
         for btn in self._filter_chips.values():
             btn.setChecked(False)
         self._update_clear_btn()
@@ -2120,298 +2163,63 @@ class FullWindow(QMainWindow):
         self._sync_label.show()
 
     def _sync_bridge(self):
-        """Export full memory (entities+relations+tasks) → shared.json, then git push."""
+        """Sync memory bridge via bridge_sync_worker (pull + push + shared.js)."""
         if not os.path.isdir(self._BRIDGE_DIR):
             self.status.showMessage("Bridge dir not found", 3000)
             return
 
         def _run():
             try:
-                git_kw = dict(
-                    cwd=self._BRIDGE_DIR,
-                    capture_output=True,
-                    text=True,
-                    creationflags=self._SP_FLAGS,
-                )
+                _hooks_dir = os.path.expanduser("~/.claude/hooks")
+                if _hooks_dir not in sys.path:
+                    sys.path.insert(0, _hooks_dir)
+                import bridge_sync_worker
 
-                # Thread-safe: fresh connection for background thread
-                conn = sqlite3.connect(
-                    self.db.db_path, isolation_level=None, timeout=10
-                )
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout=10000")
-
-                # v0.7.0: Promote pending_public → public if standby elapsed
-                cutoff = (
-                    datetime.now(timezone.utc)
-                    - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
-                ).isoformat()
-                conn.execute(
-                    "UPDATE entities SET visibility='public' "
-                    "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-                    (cutoff,),
-                )
-                conn.execute(
-                    "UPDATE tasks SET visibility='public' "
-                    "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-                    (cutoff,),
-                )
-                conn.commit()
-
-                # 0. Pull remote changes + import new entities
-                self._bridge_progress.emit(5, "git pull...")
-                subprocess.run(["git", "pull", "--rebase"], timeout=30, **git_kw)
-                shared_path = Path(self._BRIDGE_DIR) / "shared.json"
-                if shared_path.exists():
-                    try:
-                        remote_data = json.loads(
-                            shared_path.read_text(encoding="utf-8")
-                        )
-                        self._import_remote_entities(
-                            remote_data.get("entities", []), conn
-                        )
-                    except (json.JSONDecodeError, OSError):
-                        pass
-
-                # 1. Export entities + observations
-                self._bridge_progress.emit(15, "Exporting entities...")
-                ent_rows = conn.execute(
-                    "SELECT id, name, entity_type, project, created_at, updated_at "
-                    "FROM entities WHERE project LIKE 'shared%' ORDER BY name"
-                ).fetchall()
-                entities_out, entity_ids = [], set()
-                for e in ent_rows:
-                    entity_ids.add(e["id"])
-                    obs = conn.execute(
-                        "SELECT content, created_at FROM observations "
-                        "WHERE entity_id = ? ORDER BY id",
-                        (e["id"],),
-                    ).fetchall()
-                    entities_out.append(
-                        {
-                            "name": e["name"],
-                            "entityType": e["entity_type"],
-                            "project": e["project"],
-                            "observations": [
-                                {"content": o["content"], "createdAt": o["created_at"]}
-                                for o in obs
-                            ],
-                            "createdAt": e["created_at"],
-                            "updatedAt": e["updated_at"],
-                        }
+                bridge_sync_worker.main(
+                    progress_callback=lambda pct, label: self._bridge_progress.emit(
+                        pct, label
                     )
-
-                # 2. Export relations between shared entities
-                self._bridge_progress.emit(25, "Exporting relations...")
-                relations_out = []
-                if entity_ids:
-                    ph = ",".join("?" * len(entity_ids))
-                    ids = list(entity_ids)
-                    rel_rows = conn.execute(
-                        f"SELECT ef.name AS from_name, et.name AS to_name, "
-                        f"r.relation_type, r.created_at FROM relations r "
-                        f"JOIN entities ef ON r.from_id = ef.id "
-                        f"JOIN entities et ON r.to_id = et.id "
-                        f"WHERE r.from_id IN ({ph}) AND r.to_id IN ({ph})",
-                        ids + ids,
-                    ).fetchall()
-                    relations_out = [
-                        {
-                            "from": r["from_name"],
-                            "to": r["to_name"],
-                            "relationType": r["relation_type"],
-                            "createdAt": r["created_at"],
-                        }
-                        for r in rel_rows
-                    ]
-
-                # 3. Export all non-archived tasks
-                self._bridge_progress.emit(40, "Exporting tasks...")
-                task_rows = conn.execute(
-                    "SELECT id, title, description, status, priority, section, "
-                    "due_date, project, parent_id, notes, recurring, type, "
-                    "assignee, shared_by, created_at, updated_at "
-                    "FROM tasks WHERE status != 'archived' ORDER BY created_at"
-                ).fetchall()
-
-                # 3b. v0.7.0: Export public knowledge
-                self._bridge_progress.emit(45, "Exporting public knowledge...")
-                pub_ent_rows = conn.execute(
-                    "SELECT id, name, entity_type, project, created_at, updated_at "
-                    "FROM entities WHERE visibility='public' ORDER BY name"
-                ).fetchall()
-                public_entities_out = []
-                for pe in pub_ent_rows:
-                    obs = conn.execute(
-                        "SELECT content, created_at FROM observations "
-                        "WHERE entity_id = ? ORDER BY id",
-                        (pe["id"],),
-                    ).fetchall()
-                    public_entities_out.append(
-                        {
-                            "name": pe["name"],
-                            "entityType": pe["entity_type"],
-                            "project": pe["project"],
-                            "observations": [
-                                {"content": o["content"], "createdAt": o["created_at"]}
-                                for o in obs
-                            ],
-                            "createdAt": pe["created_at"],
-                            "updatedAt": pe["updated_at"],
-                        }
-                    )
-                pub_task_rows = conn.execute(
-                    "SELECT id, title, description, status, priority, section, "
-                    "due_date, project, created_at, updated_at "
-                    "FROM tasks WHERE visibility='public' ORDER BY created_at"
-                ).fetchall()
-                public_tasks_out = [dict(r) for r in pub_task_rows]
-
-                # 4. Build payload (merge remote tasks + preserve extra keys)
-                tasks_out = [dict(r) for r in task_rows]
-                payload = {
-                    "version": 3,
-                    "pushed_at": now_iso(),
-                    "machine_id": socket.gethostname(),
-                    "entities": entities_out,
-                    "relations": relations_out,
-                    "tasks": tasks_out,
-                }
-                if public_entities_out or public_tasks_out:
-                    payload["public_knowledge"] = {
-                        "entities": public_entities_out,
-                        "tasks": public_tasks_out,
-                    }
-
-                # v0.9.0: Export knowledge ratings
-                try:
-                    kr_rows = conn.execute(
-                        "SELECT entity_name, rater_id, content_hash, specificity, "
-                        "falsifiability, internal_consistency, novelty, "
-                        "verification_outcome, usefulness, verification_context, "
-                        "rated_at FROM knowledge_ratings ORDER BY rated_at"
-                    ).fetchall()
-                    if kr_rows:
-                        payload["knowledge_ratings"] = [dict(r) for r in kr_rows]
-                except Exception:
-                    pass  # table may not exist yet
-                if shared_path.exists():
-                    try:
-                        existing = json.loads(shared_path.read_text(encoding="utf-8"))
-
-                        # Merge: keep remote tasks missing locally (by title)
-                        local_titles = {t["title"] for t in tasks_out}
-                        remote_tasks = existing.get("tasks", [])
-                        for rt in remote_tasks:
-                            if rt.get("title") and rt["title"] not in local_titles:
-                                tasks_out.append(rt)
-                                local_titles.add(rt["title"])
-
-                        # Update existing tasks where remote has newer updated_at
-                        local_by_title = {t["title"]: t for t in tasks_out}
-                        for rt in remote_tasks:
-                            title = rt.get("title")
-                            if not title or title not in local_by_title:
-                                continue
-                            lt = local_by_title[title]
-                            r_upd = rt.get("updated_at", "")
-                            l_upd = lt.get("updated_at", "")
-                            if r_upd > l_upd:
-                                if rt.get("status") not in TASK_STATUSES:
-                                    rt["status"] = "not_started"
-                                if rt.get("priority") not in TASK_PRIORITIES:
-                                    rt["priority"] = "medium"
-                                if rt.get("section") not in SECTIONS:
-                                    rt["section"] = "inbox"
-                                if rt.get("type") not in TASK_TYPES:
-                                    rt["type"] = "task"
-                                for field in (
-                                    "status",
-                                    "section",
-                                    "priority",
-                                    "due_date",
-                                    "notes",
-                                    "description",
-                                    "type",
-                                ):
-                                    if rt.get(field) is not None:
-                                        lt[field] = rt[field]
-                                lt["updated_at"] = r_upd
-
-                        known = {
-                            "version",
-                            "pushed_at",
-                            "machine_id",
-                            "entities",
-                            "relations",
-                            "tasks",
-                            "shared_tasks",
-                            "public_knowledge",
-                            "knowledge_ratings",
-                            "owner",
-                            "team_manifest",
-                            "ui_profiles",
-                        }
-                        for k, v in existing.items():
-                            if k not in known and isinstance(v, (list, dict)):
-                                payload[k] = v
-
-                        # Build own UI profile + merge with remote profiles
-                        remote_profiles = existing.get("ui_profiles", {})
-                    except (json.JSONDecodeError, OSError):
-                        remote_profiles = {}
-                else:
-                    remote_profiles = {}
-
-                hostname = socket.gethostname()
-                own_profile = {
-                    "theme": _theme_name,
-                    "font_size": _font_size,
-                    "bold": _bold,
-                    "sort_mode": self._settings.value("sort_mode", "priority"),
-                    "active_tab": int(self._settings.value("active_tab", 0)),
-                    "active_filters": json.loads(
-                        self._settings.value("active_filters", "{}")
-                    ),
-                    "updated_at": now_iso(),
-                }
-                geo = self._settings.value("geometry")
-                if geo:
-                    own_profile["geometry_b64"] = base64.b64encode(bytes(geo)).decode(
-                        "ascii"
-                    )
-                remote_profiles[hostname] = own_profile
-                payload["ui_profiles"] = remote_profiles
-
-                self._bridge_progress.emit(55, "Writing shared.json...")
-                shared_path.write_text(
-                    json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
 
-                # 5. Git add + commit + push
-                self._bridge_progress.emit(65, "git add...")
-                subprocess.run(["git", "add", "shared.json"], timeout=10, **git_kw)
+                # Patch UI profile into shared.json (tray-specific, no extra commit)
+                self._patch_ui_profile()
 
-                self._bridge_progress.emit(80, "git commit...")
-                n_ent = len(entities_out)
-                n_tasks = len(payload["tasks"])
-                msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {socket.gethostname()}"
-                result = subprocess.run(
-                    ["git", "commit", "-m", msg], timeout=10, **git_kw
-                )
-                if result.returncode != 0:
-                    self._bridge_done.emit("Nothing to sync")
-                    return
-
-                self._bridge_progress.emit(90, "git push...")
-                subprocess.run(["git", "push"], timeout=30, **git_kw)
-                self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
+                self._bridge_done.emit("Synced OK")
             except Exception as exc:
                 self._bridge_done.emit(f"Sync error: {exc}")
-            finally:
-                conn.close()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _patch_ui_profile(self):
+        """Write own UI profile into shared.json (persisted on next sync cycle)."""
+        shared_path = Path(self._BRIDGE_DIR) / "shared.json"
+        if not shared_path.exists():
+            return
+        try:
+            data = json.loads(shared_path.read_text(encoding="utf-8"))
+            profiles = data.get("ui_profiles", {})
+            profiles[socket.gethostname()] = {
+                "theme": _theme_name,
+                "font_size": _font_size,
+                "bold": _bold,
+                "sort_mode": self._settings.value("sort_mode", "priority"),
+                "active_tab": int(self._settings.value("active_tab", 0)),
+                "active_filters": json.loads(
+                    self._settings.value("active_filters", "{}")
+                ),
+                "updated_at": now_iso(),
+            }
+            geo = self._settings.value("geometry")
+            if geo:
+                profiles[socket.gethostname()]["geometry_b64"] = base64.b64encode(
+                    bytes(geo)
+                ).decode("ascii")
+            data["ui_profiles"] = profiles
+            shared_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except (json.JSONDecodeError, OSError):
+            pass  # non-critical — UI profiles sync on next cycle
 
     def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""
@@ -2495,17 +2303,35 @@ class FullWindow(QMainWindow):
         """Populate the filter bar with priority, due, and project chips."""
         self._filter_bar.clear()
         self._filter_chips.clear()
+        t = _T()
+
+        # Minus (exclude) mode toggle
+        self._minus_btn = QToolButton()
+        self._minus_btn.setText("\u2212")  # Unicode minus sign
+        self._minus_btn.setCheckable(True)
+        self._minus_btn.setChecked(self._minus_mode)
+        self._minus_btn.setToolTip("Exclude mode: click chips to exclude them")
+        self._minus_btn.setStyleSheet(
+            f"QToolButton {{ font-size: {_font_size}px; font-weight: 900; padding: 2px 6px; "
+            f"border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text2']}; border-radius: 10px; }}"
+            f"QToolButton:checked {{ background: {t['danger']}; border-color: {t['danger']}; color: #fff; }}"
+        )
+        self._minus_btn.toggled.connect(self._on_minus_toggled)
+        self._filter_bar.addWidget(self._minus_btn)
+        self._filter_bar.addSeparator()
 
         # Priority chips
         for pri in PRIORITIES:
             btn = QToolButton()
             btn.setText(pri.capitalize())
             btn.setCheckable(True)
-            btn.setChecked(pri in self._active_filters["priority"])
             color = PRIORITY_COLORS.get(pri, "#3182ce")
+            excluded = pri in self._excluded_filters["priority"]
+            btn.setChecked(excluded or pri in self._active_filters["priority"])
+            used_color = t["danger"] if excluded else color
             btn.setStyleSheet(
                 btn.styleSheet()
-                + f"QToolButton:checked {{ background: {color}; border-color: {color}; color: #fff; }}"
+                + f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
             )
             btn.clicked.connect(
                 lambda checked, p=pri: self._toggle_filter("priority", p)
@@ -2517,18 +2343,20 @@ class FullWindow(QMainWindow):
 
         # Due chips
         due_chips = [
-            ("overdue", "Overdue", _T()["danger"]),
-            ("today", "Today", _T()["accent"]),
-            ("week", "This Week", _T()["accent"]),
+            ("overdue", "Overdue", t["danger"]),
+            ("today", "Today", t["accent"]),
+            ("week", "This Week", t["accent"]),
         ]
         for value, label, color in due_chips:
             btn = QToolButton()
             btn.setText(label)
             btn.setCheckable(True)
-            btn.setChecked(value in self._active_filters["due"])
+            excluded = value in self._excluded_filters["due"]
+            btn.setChecked(excluded or value in self._active_filters["due"])
+            used_color = t["danger"] if excluded else color
             btn.setStyleSheet(
                 btn.styleSheet()
-                + f"QToolButton:checked {{ background: {color}; border-color: {color}; color: #fff; }}"
+                + f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
             )
             btn.clicked.connect(lambda checked, v=value: self._toggle_filter("due", v))
             self._filter_bar.addWidget(btn)
@@ -2539,7 +2367,6 @@ class FullWindow(QMainWindow):
         # Clear all button (before project chips for quick access)
         self._clear_btn = QToolButton()
         self._clear_btn.setText("Clear")
-        t = _T()
         self._clear_btn.setStyleSheet(
             f"QToolButton {{ border: 1px solid {t['border']}; background: {t['bg3']}; color: {t['text']}; "
             f"padding: 4px 12px; font-size: {_font_size - 2}px; font-weight: bold; }}"
@@ -2558,10 +2385,12 @@ class FullWindow(QMainWindow):
             btn = QToolButton()
             btn.setText(proj)
             btn.setCheckable(True)
-            btn.setChecked(proj in self._active_filters["project"])
+            excluded = proj in self._excluded_filters["project"]
+            btn.setChecked(excluded or proj in self._active_filters["project"])
+            used_color = t["danger"] if excluded else t["accent"]
             btn.setStyleSheet(
                 btn.styleSheet()
-                + f"QToolButton:checked {{ background: {_T()['accent']}; border-color: {_T()['accent']}; color: #fff; }}"
+                + f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
             )
             btn.clicked.connect(
                 lambda checked, p=proj: self._toggle_filter("project", p)
@@ -2569,33 +2398,75 @@ class FullWindow(QMainWindow):
             self._filter_bar.addWidget(btn)
             self._filter_chips[("project", proj)] = btn
 
+    def _on_minus_toggled(self, checked):
+        """Toggle exclude mode on/off."""
+        self._minus_mode = checked
+
     def _toggle_filter(self, dimension, value):
-        """Add or remove a filter value, then refresh."""
-        s = self._active_filters[dimension]
-        if value in s:
-            s.discard(value)
+        """Cycle chip state: off/include/exclude based on minus mode."""
+        inc = self._active_filters[dimension]
+        exc = self._excluded_filters[dimension]
+
+        if self._minus_mode:
+            if value in exc:
+                exc.discard(value)  # exclude → off
+            else:
+                inc.discard(value)  # remove include if any
+                exc.add(value)  # → exclude
         else:
-            s.add(value)
+            if value in exc:
+                exc.discard(value)  # exclude → off (normal click clears)
+            elif value in inc:
+                inc.discard(value)  # include → off
+            else:
+                inc.add(value)  # off → include
+
+        # Update chip visual
         chip = self._filter_chips.get((dimension, value))
         if chip:
-            chip.setChecked(value in s)
+            is_active = value in inc or value in exc
+            chip.setChecked(is_active)
+            t = _T()
+            if value in exc:
+                color = t["danger"]
+            elif dimension == "priority":
+                color = PRIORITY_COLORS.get(value, "#3182ce")
+            elif dimension == "due":
+                color = {
+                    "overdue": t["danger"],
+                    "today": t["accent"],
+                    "week": t["accent"],
+                }.get(value, t["accent"])
+            else:
+                color = t["accent"]
+            chip.setStyleSheet(
+                f"QToolButton:checked {{ background: {color}; border-color: {color}; color: #fff; }}"
+            )
+
         self._update_clear_btn()
         self._save_ui_state()
         self.refresh()
 
     def _clear_all_filters(self):
-        """Remove all active chip filters."""
+        """Remove all active and excluded chip filters."""
         for s in self._active_filters.values():
+            s.clear()
+        for s in self._excluded_filters.values():
             s.clear()
         for btn in self._filter_chips.values():
             btn.setChecked(False)
+        if hasattr(self, "_minus_btn"):
+            self._minus_btn.setChecked(False)
+        self._minus_mode = False
         self._update_clear_btn()
         self._save_ui_state()
         self.refresh()
 
     def _update_clear_btn(self):
         """Dim the Clear button when no filters are active."""
-        active = any(self._active_filters.values())
+        active = any(self._active_filters.values()) or any(
+            self._excluded_filters.values()
+        )
         if hasattr(self, "_clear_btn"):
             self._clear_btn.setEnabled(active)
 
@@ -2622,8 +2493,7 @@ class FullWindow(QMainWindow):
             # SmartKey fuzzy search (falls back to substring if unavailable)
             return self._search_engine.search(q, tasks)
 
-        # Chip filters only when not searching
-        # Priority filter (OR within)
+        # ── Include filters (AND between dims, OR within dim) ──
         if self._active_filters["priority"]:
             tasks = [
                 t
@@ -2631,23 +2501,45 @@ class FullWindow(QMainWindow):
                 if t.get("priority", "medium") in self._active_filters["priority"]
             ]
 
-        # Due filter (OR within)
-        if self._active_filters["due"]:
+        due_inc = self._active_filters["due"]
+        due_exc = self._excluded_filters["due"]
+        if due_inc or due_exc:
             today = date.today()
             week_start = today - timedelta(days=today.weekday())
             week_end = week_start + timedelta(days=6)
-            tasks = [
-                t
-                for t in tasks
-                if self._matches_due_filter(
-                    t, self._active_filters["due"], today, week_start, week_end
-                )
-            ]
+            if due_inc:
+                tasks = [
+                    t
+                    for t in tasks
+                    if self._matches_due_filter(t, due_inc, today, week_start, week_end)
+                ]
+            if due_exc:
+                tasks = [
+                    t
+                    for t in tasks
+                    if not self._matches_due_filter(
+                        t, due_exc, today, week_start, week_end
+                    )
+                ]
 
-        # Project filter (OR within)
         if self._active_filters["project"]:
             tasks = [
                 t for t in tasks if t.get("project") in self._active_filters["project"]
+            ]
+
+        # ── Exclude filters (remove matching) ──
+        if self._excluded_filters["priority"]:
+            tasks = [
+                t
+                for t in tasks
+                if t.get("priority", "medium") not in self._excluded_filters["priority"]
+            ]
+
+        if self._excluded_filters["project"]:
+            tasks = [
+                t
+                for t in tasks
+                if t.get("project") not in self._excluded_filters["project"]
             ]
 
         return tasks
@@ -2745,9 +2637,15 @@ class FullWindow(QMainWindow):
         msg = f"Tasks: {task_count} | Notes: {note_count} | Done: {done_count} | Overdue: {s['overdue']}"
         if self._search_text:
             msg += f" | Filter: '{self._search_text}'"
-        active_count = sum(len(v) for v in self._active_filters.values())
-        if active_count:
-            msg += f" | Filters: {active_count} active"
+        inc_count = sum(len(v) for v in self._active_filters.values())
+        exc_count = sum(len(v) for v in self._excluded_filters.values())
+        if inc_count or exc_count:
+            parts = []
+            if inc_count:
+                parts.append(f"{inc_count} include")
+            if exc_count:
+                parts.append(f"{exc_count} exclude")
+            msg += f" | Filters: {', '.join(parts)}"
         self.status.showMessage(msg)
 
     def _on_tab_changed(self, idx):

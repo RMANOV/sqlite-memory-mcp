@@ -26,6 +26,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Suppress console windows on Windows when spawning git/gh from GUI
+import sys as _sys
+
+_NOWIN: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if _sys.platform == "win32" else {}
+)
+
 from db_utils import (
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_SECTIONS as _TASK_SECTIONS,
@@ -80,6 +87,7 @@ def _validate_recurring(raw: str) -> str | None:
         except (ValueError, TypeError):
             return f"Monthly 'day' must be an integer. Got: {day!r}"
     return None
+
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
 LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
@@ -1619,16 +1627,20 @@ def process_recurring_tasks(dry_run: bool = False) -> str:
         created = process_recurring(conn, dry_run=dry_run)
 
     if not created:
-        return json.dumps({"message": "No recurring tasks to process today.", "created": 0})
+        return json.dumps(
+            {"message": "No recurring tasks to process today.", "created": 0}
+        )
 
     titles = [t["title"] for t in created]
     prefix = "[dry-run] Would create" if dry_run else "Created"
     logger.info("process_recurring_tasks: %s %d task(s)", prefix.lower(), len(created))
-    return json.dumps({
-        "message": f"{prefix} {len(created)} recurring task(s)",
-        "created": len(created),
-        "tasks": titles,
-    })
+    return json.dumps(
+        {
+            "message": f"{prefix} {len(created)} recurring task(s)",
+            "created": len(created),
+            "tasks": titles,
+        }
+    )
 
 
 @mcp.tool()
@@ -1655,6 +1667,7 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    **_NOWIN,
                 )
                 shared_by = result.stdout.strip() or None
             except (subprocess.TimeoutExpired, OSError):
@@ -1917,8 +1930,7 @@ def _compute_truth_score(entity_name: str, conn) -> dict[str, Any]:
 def _check_rating_anomalies(conn, entity_name: str) -> None:
     """Detect rating burst anomalies (too many ratings in short window)."""
     cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(hours=_RATING_BURST_WINDOW_HOURS)
+        datetime.now(timezone.utc) - timedelta(hours=_RATING_BURST_WINDOW_HOURS)
     ).isoformat()
     count = conn.execute(
         "SELECT COUNT(*) as cnt FROM knowledge_ratings "
@@ -1939,7 +1951,9 @@ def _check_rating_anomalies(conn, entity_name: str) -> None:
         )
         logger.warning(
             "Rating anomaly detected: %s has %d ratings in %dh",
-            entity_name, count, _RATING_BURST_WINDOW_HOURS,
+            entity_name,
+            count,
+            _RATING_BURST_WINDOW_HOURS,
         )
 
 
@@ -2357,19 +2371,21 @@ def request_publish(
         return json.dumps({"error": "Provide entity_names and/or task_ids"})
 
     if not safety_confirmed:
-        return json.dumps({
-            "status": "confirmation_required",
-            "warning_1": (
-                "⚠️ You are about to make content PUBLIC and visible to "
-                "ALL Claude instances. Default: DO NOT publish."
-            ),
-            "warning_2": (
-                "⚠️ Are you sure the content will NOT harm, endanger, "
-                "or compromise the safety of any person?"
-            ),
-            "action": "Call request_publish again with safety_confirmed=True to proceed.",
-            "standby_minutes": _PUBLISH_STANDBY_MINUTES,
-        })
+        return json.dumps(
+            {
+                "status": "confirmation_required",
+                "warning_1": (
+                    "⚠️ You are about to make content PUBLIC and visible to "
+                    "ALL Claude instances. Default: DO NOT publish."
+                ),
+                "warning_2": (
+                    "⚠️ Are you sure the content will NOT harm, endanger, "
+                    "or compromise the safety of any person?"
+                ),
+                "action": "Call request_publish again with safety_confirmed=True to proceed.",
+                "standby_minutes": _PUBLISH_STANDBY_MINUTES,
+            }
+        )
 
     now = _now()
     updated_entities = 0
@@ -2377,7 +2393,7 @@ def request_publish(
     not_found: list[str] = []
 
     with _get_conn() as conn:
-        for name in (entity_names or []):
+        for name in entity_names or []:
             cur = conn.execute(
                 "UPDATE entities SET visibility='pending_public', "
                 "publish_requested_at=?, updated_at=? "
@@ -2395,7 +2411,7 @@ def request_publish(
                     not_found.append(f"entity:{name}")
                 # else already pending/public — skip silently
 
-        for tid in (task_ids or []):
+        for tid in task_ids or []:
             cur = conn.execute(
                 "UPDATE tasks SET visibility='pending_public', "
                 "publish_requested_at=?, updated_at=? "
@@ -2413,7 +2429,8 @@ def request_publish(
 
     logger.info(
         "request_publish: %d entities, %d tasks set to pending_public",
-        updated_entities, updated_tasks,
+        updated_entities,
+        updated_tasks,
     )
     result: dict[str, Any] = {
         "status": "pending_public",
@@ -2447,7 +2464,7 @@ def cancel_publish(
     reverted_tasks = 0
 
     with _get_conn() as conn:
-        for name in (entity_names or []):
+        for name in entity_names or []:
             cur = conn.execute(
                 "UPDATE entities SET visibility='private', "
                 "publish_requested_at=NULL, updated_at=? "
@@ -2456,7 +2473,7 @@ def cancel_publish(
             )
             reverted_entities += cur.rowcount
 
-        for tid in (task_ids or []):
+        for tid in task_ids or []:
             cur = conn.execute(
                 "UPDATE tasks SET visibility='private', "
                 "publish_requested_at=NULL, updated_at=? "
@@ -2467,12 +2484,15 @@ def cancel_publish(
 
     logger.info(
         "cancel_publish: reverted %d entities, %d tasks to private",
-        reverted_entities, reverted_tasks,
+        reverted_entities,
+        reverted_tasks,
     )
-    return json.dumps({
-        "reverted_entities": reverted_entities,
-        "reverted_tasks": reverted_tasks,
-    })
+    return json.dumps(
+        {
+            "reverted_entities": reverted_entities,
+            "reverted_tasks": reverted_tasks,
+        }
+    )
 
 
 @mcp.tool()
@@ -2523,16 +2543,21 @@ def search_public_knowledge(
                 (eid,),
             ).fetchall()
             score_info = _compute_truth_score(r["name"], conn)
-            if min_truth_score is not None and score_info["truth_score"] < min_truth_score:
+            if (
+                min_truth_score is not None
+                and score_info["truth_score"] < min_truth_score
+            ):
                 continue
-            results.append({
-                "name": r["name"],
-                "entityType": r["entity_type"],
-                "observations": [o["content"] for o in obs],
-                "truthScore": score_info["truth_score"],
-                "ratingCount": score_info["rating_count"],
-                "confidence": score_info["confidence"],
-            })
+            results.append(
+                {
+                    "name": r["name"],
+                    "entityType": r["entity_type"],
+                    "observations": [o["content"] for o in obs],
+                    "truthScore": score_info["truth_score"],
+                    "ratingCount": score_info["rating_count"],
+                    "confidence": score_info["confidence"],
+                }
+            )
 
         # Sort results
         if sort_by == "truth_score":
@@ -2571,19 +2596,35 @@ def rate_public_knowledge(
         verification_context: Description of how verification was done
     """
     # Validate scores in [0.0, 1.0]
-    for name, val in [("specificity", specificity), ("falsifiability", falsifiability),
-                      ("internal_consistency", internal_consistency), ("novelty", novelty)]:
+    for name, val in [
+        ("specificity", specificity),
+        ("falsifiability", falsifiability),
+        ("internal_consistency", internal_consistency),
+        ("novelty", novelty),
+    ]:
         if not (0.0 <= val <= 1.0):
-            return json.dumps({"error": f"{name} must be between 0.0 and 1.0, got {val}"})
+            return json.dumps(
+                {"error": f"{name} must be between 0.0 and 1.0, got {val}"}
+            )
 
     if verification_outcome is not None:
         if verification_outcome not in _VERIFICATION_OUTCOMES:
-            return json.dumps({"error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"})
+            return json.dumps(
+                {
+                    "error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"
+                }
+            )
         if usefulness is None:
-            return json.dumps({"error": "usefulness is required when verification_outcome is provided"})
+            return json.dumps(
+                {
+                    "error": "usefulness is required when verification_outcome is provided"
+                }
+            )
 
     if usefulness is not None and not (0.0 <= usefulness <= 1.0):
-        return json.dumps({"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"})
+        return json.dumps(
+            {"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"}
+        )
 
     # rater_id: server-side identity (never user input)
     rater_id = os.environ.get("GITHUB_USER", socket.gethostname())
@@ -2596,7 +2637,11 @@ def rate_public_knowledge(
         if not entity:
             return json.dumps({"error": f"Entity '{entity_name}' not found"})
         if entity["visibility"] != "public":
-            return json.dumps({"error": f"Entity '{entity_name}' is not public (visibility={entity['visibility']})"})
+            return json.dumps(
+                {
+                    "error": f"Entity '{entity_name}' is not public (visibility={entity['visibility']})"
+                }
+            )
 
         # Anti-gaming: no self-rating
         publisher_id = _get_publisher_id(conn, entity_name)
@@ -2621,16 +2666,26 @@ def rate_public_knowledge(
                 "verification_context, rated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    entity_name, rater_id, c_hash, specificity, falsifiability,
-                    internal_consistency, novelty, verification_outcome, usefulness,
-                    verification_context, _now(),
+                    entity_name,
+                    rater_id,
+                    c_hash,
+                    specificity,
+                    falsifiability,
+                    internal_consistency,
+                    novelty,
+                    verification_outcome,
+                    usefulness,
+                    verification_context,
+                    _now(),
                 ),
             )
         except sqlite3.IntegrityError:
-            return json.dumps({
-                "error": "Already rated this content version",
-                "hint": "Content must change before you can rate again",
-            })
+            return json.dumps(
+                {
+                    "error": "Already rated this content version",
+                    "hint": "Content must change before you can rate again",
+                }
+            )
 
         # Anomaly detection
         _check_rating_anomalies(conn, entity_name)
@@ -2640,15 +2695,19 @@ def rate_public_knowledge(
 
     logger.info(
         "rate_public_knowledge: %s rated by %s (score=%.4f)",
-        entity_name, rater_id, score_info["truth_score"],
+        entity_name,
+        rater_id,
+        score_info["truth_score"],
     )
-    return json.dumps({
-        "status": "rated",
-        "entity_name": entity_name,
-        "rater_id": rater_id,
-        "content_hash": c_hash,
-        **score_info,
-    })
+    return json.dumps(
+        {
+            "status": "rated",
+            "entity_name": entity_name,
+            "rater_id": rater_id,
+            "content_hash": c_hash,
+            **score_info,
+        }
+    )
 
 
 @mcp.tool()
@@ -2710,9 +2769,13 @@ def update_verification(
         verification_context: Description of how verification was done
     """
     if verification_outcome not in _VERIFICATION_OUTCOMES:
-        return json.dumps({"error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"})
+        return json.dumps(
+            {"error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"}
+        )
     if not (0.0 <= usefulness <= 1.0):
-        return json.dumps({"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"})
+        return json.dumps(
+            {"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"}
+        )
 
     rater_id = os.environ.get("GITHUB_USER", socket.gethostname())
 
@@ -2725,7 +2788,9 @@ def update_verification(
             (entity_name,),
         ).fetchall()
         if not obs_rows:
-            return json.dumps({"error": f"Entity '{entity_name}' not found or has no observations"})
+            return json.dumps(
+                {"error": f"Entity '{entity_name}' not found or has no observations"}
+            )
         c_hash = _content_hash(entity_name, [r["content"] for r in obs_rows])
 
         # Update existing rating
@@ -2733,27 +2798,40 @@ def update_verification(
             "UPDATE knowledge_ratings SET verification_outcome = ?, "
             "usefulness = ?, verification_context = ? "
             "WHERE entity_name = ? AND rater_id = ? AND content_hash = ?",
-            (verification_outcome, usefulness, verification_context,
-             entity_name, rater_id, c_hash),
+            (
+                verification_outcome,
+                usefulness,
+                verification_context,
+                entity_name,
+                rater_id,
+                c_hash,
+            ),
         )
         if cur.rowcount == 0:
-            return json.dumps({
-                "error": "No existing rating found for this entity/version",
-                "hint": "You must rate_public_knowledge first before updating verification",
-            })
+            return json.dumps(
+                {
+                    "error": "No existing rating found for this entity/version",
+                    "hint": "You must rate_public_knowledge first before updating verification",
+                }
+            )
 
         score_info = _compute_truth_score(entity_name, conn)
 
     logger.info(
         "update_verification: %s by %s → %s (score=%.4f)",
-        entity_name, rater_id, verification_outcome, score_info["truth_score"],
+        entity_name,
+        rater_id,
+        verification_outcome,
+        score_info["truth_score"],
     )
-    return json.dumps({
-        "status": "verification_updated",
-        "entity_name": entity_name,
-        "verification_outcome": verification_outcome,
-        **score_info,
-    })
+    return json.dumps(
+        {
+            "status": "verification_updated",
+            "entity_name": entity_name,
+            "verification_outcome": verification_outcome,
+            **score_info,
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2768,6 +2846,7 @@ def _git(*args: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=30,
+        **_NOWIN,
     )
     if result.returncode != 0:
         logger.warning("git %s failed: %s", " ".join(args), result.stderr.strip())
@@ -2785,6 +2864,7 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
             capture_output=True,
             text=True,
             timeout=30,
+            **_NOWIN,
         )
         if clone.returncode != 0:
             logger.warning(
@@ -2816,7 +2896,10 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
         )
 
         subprocess.run(
-            ["git", "-C", tmpdir, "add", "shared.json"], capture_output=True, timeout=10
+            ["git", "-C", tmpdir, "add", "shared.json"],
+            capture_output=True,
+            timeout=10,
+            **_NOWIN,
         )
         hostname = socket.gethostname()
         msg = f"bridge: shared {len(tasks)} tasks from {hostname} to {assignee}"
@@ -2825,6 +2908,7 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
             capture_output=True,
             text=True,
             timeout=10,
+            **_NOWIN,
         )
         if commit.returncode == 0:
             push = subprocess.run(
@@ -2832,6 +2916,7 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                **_NOWIN,
             )
             if push.returncode == 0:
                 logger.info(
@@ -2933,6 +3018,7 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
             capture_output=True,
             text=True,
             timeout=30,
+            **_NOWIN,
         )
         if clone.returncode != 0:
             logger.warning(
@@ -2964,6 +3050,7 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
             ["git", "-C", tmpdir, "add", "shared.json"],
             capture_output=True,
             timeout=10,
+            **_NOWIN,
         )
         hostname = socket.gethostname()
         msg = f"bridge: shared {len(knowledge_out)} entities from {hostname} to {target_user}"
@@ -2972,6 +3059,7 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
             capture_output=True,
             text=True,
             timeout=10,
+            **_NOWIN,
         )
         if commit.returncode == 0:
             push = subprocess.run(
@@ -2979,6 +3067,7 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                **_NOWIN,
             )
             if push.returncode == 0:
                 logger.info(
@@ -3034,7 +3123,8 @@ def bridge_push(tag: str = "shared") -> str:
         if promoted_ent or promoted_tasks:
             logger.info(
                 "bridge_push: promoted %d entities, %d tasks to public",
-                promoted_ent, promoted_tasks,
+                promoted_ent,
+                promoted_tasks,
             )
 
         ent_rows = conn.execute(
@@ -3110,17 +3200,19 @@ def bridge_push(tag: str = "shared") -> str:
                 "WHERE entity_id = ? ORDER BY id",
                 (pe["id"],),
             ).fetchall()
-            public_entities_out.append({
-                "name": pe["name"],
-                "entityType": pe["entity_type"],
-                "project": pe["project"],
-                "observations": [
-                    {"content": o["content"], "createdAt": o["created_at"]}
-                    for o in obs
-                ],
-                "createdAt": pe["created_at"],
-                "updatedAt": pe["updated_at"],
-            })
+            public_entities_out.append(
+                {
+                    "name": pe["name"],
+                    "entityType": pe["entity_type"],
+                    "project": pe["project"],
+                    "observations": [
+                        {"content": o["content"], "createdAt": o["created_at"]}
+                        for o in obs
+                    ],
+                    "createdAt": pe["created_at"],
+                    "updatedAt": pe["updated_at"],
+                }
+            )
         pub_task_rows = conn.execute(
             "SELECT id, title, description, status, priority, section, "
             "due_date, project, created_at, updated_at "
@@ -3203,8 +3295,15 @@ def bridge_push(tag: str = "shared") -> str:
                 l_upd = lt.get("updated_at", "")
                 if r_upd > l_upd:
                     _sanitize_task_enums(rt)
-                    for field in ("status", "section", "priority", "due_date",
-                                  "notes", "description", "type"):
+                    for field in (
+                        "status",
+                        "section",
+                        "priority",
+                        "due_date",
+                        "notes",
+                        "description",
+                        "type",
+                    ):
                         if rt.get(field) is not None:
                             lt[field] = rt[field]
                     lt["updated_at"] = r_upd
@@ -3340,14 +3439,21 @@ def bridge_push(tag: str = "shared") -> str:
         try:
             rel_result = subprocess.run(
                 [
-                    "gh", "release", "create", tag_name,
-                    "--repo", "RMANOV/sqlite-memory-mcp",
-                    "--title", release_title,
-                    "--notes", release_notes,
+                    "gh",
+                    "release",
+                    "create",
+                    tag_name,
+                    "--repo",
+                    "RMANOV/sqlite-memory-mcp",
+                    "--title",
+                    release_title,
+                    "--notes",
+                    release_notes,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=30,
+                **_NOWIN,
             )
             if rel_result.returncode == 0:
                 result["github_release"] = tag_name
@@ -3684,11 +3790,17 @@ def bridge_pull() -> str:
                     "verification_context, rated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        kr_entity, kr_rater, kr.get("content_hash", ""),
-                        kr.get("specificity", 0.0), kr.get("falsifiability", 0.0),
-                        kr.get("internal_consistency", 0.0), kr.get("novelty", 0.0),
-                        kr.get("verification_outcome"), kr.get("usefulness"),
-                        kr.get("verification_context"), kr.get("rated_at", now),
+                        kr_entity,
+                        kr_rater,
+                        kr.get("content_hash", ""),
+                        kr.get("specificity", 0.0),
+                        kr.get("falsifiability", 0.0),
+                        kr.get("internal_consistency", 0.0),
+                        kr.get("novelty", 0.0),
+                        kr.get("verification_outcome"),
+                        kr.get("usefulness"),
+                        kr.get("verification_context"),
+                        kr.get("rated_at", now),
                     ),
                 )
                 imported_ratings += 1
