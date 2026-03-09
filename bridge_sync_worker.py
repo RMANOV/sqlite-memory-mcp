@@ -14,6 +14,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -79,6 +80,95 @@ def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
             )
         imported += 1
     return imported
+
+
+def _import_remote_tasks(conn: sqlite3.Connection, remote_tasks: list) -> tuple[int, int]:
+    """Import/update local tasks from remote shared.json. Returns (new, updated)."""
+    now = now_iso()
+    new_count = 0
+    updated_count = 0
+
+    # Sort parents before children to avoid FK violations
+    tasks_sorted = sorted(
+        remote_tasks,
+        key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")),
+    )
+
+    for task in tasks_sorted:
+        sanitize_task_enums(task)
+        tid = task.get("id")
+        title = task.get("title")
+        if not title:
+            continue
+
+        # Match by id first, then by title as fallback
+        existing = None
+        if tid:
+            existing = conn.execute(
+                "SELECT id, updated_at FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        if not existing:
+            existing = conn.execute(
+                "SELECT id, updated_at FROM tasks WHERE title = ?", (title,)
+            ).fetchone()
+
+        if existing:
+            # Only overwrite if remote is newer
+            if task.get("updated_at", "") > (existing["updated_at"] or ""):
+                conn.execute(
+                    "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
+                    "section=?, due_date=?, project=?, parent_id=?, notes=?, "
+                    "recurring=?, type=?, assignee=?, shared_by=?, updated_at=? WHERE id=?",
+                    (
+                        title,
+                        task.get("description"),
+                        task.get("status", "not_started"),
+                        task.get("priority", "medium"),
+                        task.get("section", "inbox"),
+                        task.get("due_date"),
+                        task.get("project"),
+                        task.get("parent_id"),
+                        task.get("notes"),
+                        task.get("recurring"),
+                        task.get("type", "task"),
+                        task.get("assignee"),
+                        task.get("shared_by"),
+                        task["updated_at"],
+                        existing["id"],
+                    ),
+                )
+                updated_count += 1
+        else:
+            # Insert new task — generate UUID if missing
+            if not tid:
+                tid = str(uuid.uuid4())
+            conn.execute(
+                "INSERT OR IGNORE INTO tasks (id, title, description, status, priority, "
+                "section, due_date, project, parent_id, notes, recurring, "
+                "type, assignee, shared_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tid,
+                    title,
+                    task.get("description"),
+                    task.get("status", "not_started"),
+                    task.get("priority", "medium"),
+                    task.get("section", "inbox"),
+                    task.get("due_date"),
+                    task.get("project"),
+                    task.get("parent_id"),
+                    task.get("notes"),
+                    task.get("recurring"),
+                    task.get("type", "task"),
+                    task.get("assignee"),
+                    task.get("shared_by"),
+                    task.get("created_at", now),
+                    task.get("updated_at", now),
+                ),
+            )
+            new_count += 1
+
+    return new_count, updated_count
 
 
 def _export_entities(conn: sqlite3.Connection) -> tuple[list, set]:
@@ -269,15 +359,18 @@ def main(
         _progress(progress_callback, 5, "git pull...")
         _git("pull", "--rebase", bridge_dir=bridge_dir)
 
-        # 2. Import remote entities
-        _progress(progress_callback, 10, "Importing remote entities...")
+        # 2. Import remote data (entities + tasks)
+        _progress(progress_callback, 10, "Importing remote data...")
         shared_path = Path(bridge_dir) / "shared.json"
+        new_t, upd_t = 0, 0
         if shared_path.exists():
             try:
                 remote_data = json.loads(shared_path.read_text(encoding="utf-8"))
                 conn.execute("BEGIN")
                 _import_remote_entities(conn, remote_data.get("entities", []))
+                new_t, upd_t = _import_remote_tasks(conn, remote_data.get("tasks", []))
                 conn.commit()
+                log.info("Imported %d new tasks, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -362,7 +455,13 @@ def main(
             _git("push", bridge_dir=bridge_dir)
 
         _progress(progress_callback, 100, "Done")
-        return {"entities": n_ent, "tasks": n_tasks, "pushed": pushed}
+        return {
+            "entities": n_ent,
+            "tasks": n_tasks,
+            "pushed": pushed,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+        }
 
     finally:
         conn.close()
