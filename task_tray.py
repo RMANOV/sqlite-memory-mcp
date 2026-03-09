@@ -17,6 +17,8 @@ import calendar as _cal_mod
 import time
 from datetime import date, datetime, timedelta, timezone
 
+from task_search import TaskSearchEngine
+
 from db_utils import (
     DB_PATH,
     PRIORITY_COLORS,
@@ -1462,6 +1464,8 @@ class TaskListWidget(QListWidget):
     def _open_reader(self, task_id):
         task = next((t for t in self._tasks if t["id"] == task_id), None)
         if task:
+            if hasattr(self, "_search_engine"):
+                self._search_engine.record_open(task)
             dlg = TaskReaderDialog(task, self.db, self)
             dlg.exec()
 
@@ -1670,6 +1674,7 @@ class FullWindow(QMainWindow):
         self._last_projects = None
         self._project_cache_time: float = 0.0  # monotonic time of last project query
         self._filtered_cache: dict[str, list] = {}  # lazy tab rendering cache
+        self._search_engine = TaskSearchEngine()
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
 
@@ -1738,6 +1743,7 @@ class FullWindow(QMainWindow):
         self.tab_lists = {}
         for key in self._tab_keys:
             lw = TaskListWidget(self.db)
+            lw._search_engine = self._search_engine
             lw.itemChanged.connect(lambda item, k=key: self._on_item_changed(item))
             self.tab_lists[key] = lw
             self.tabs.addTab(lw, self._tab_labels[key])
@@ -2542,9 +2548,8 @@ class FullWindow(QMainWindow):
         """Apply search OR chip filters. Search bypasses chip filters."""
         q = self._search_text
         if q:
-            # Search ignores chip filters — score + sort by relevance
-            scored = [(t, _score_task(t, q)) for t in tasks]
-            return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0]
+            # SmartKey fuzzy search (falls back to substring if unavailable)
+            return self._search_engine.search(q, tasks)
 
         # Chip filters only when not searching
         # Priority filter (OR within)
@@ -2580,6 +2585,9 @@ class FullWindow(QMainWindow):
         # 2 DB queries instead of 4: derive suggested & notes in Python
         all_active = self.db.get_all_active()
         done = self.db.get_done_tasks()
+
+        # Rebuild SmartKey search index (skips if fingerprint unchanged)
+        self._search_engine.rebuild_index(all_active + done)
 
         suggested = sorted(all_active, key=_suggested_sort_key)[:20]
         notes = (
@@ -2699,6 +2707,7 @@ class FullWindow(QMainWindow):
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
         self._save_ui_state()
+        self._search_engine.save()
         self._refresh_timer.stop()
         event.ignore()
         self.hide()
