@@ -2505,6 +2505,16 @@ def request_publish(
         return json.dumps(
             {
                 "status": "confirmation_required",
+                "recommendation": (
+                    "P2P Knowledge Sharing targets SPECIFIC technical "
+                    "information useful to other machines/agents in the "
+                    "network — not generic knowledge, but hard-won lessons. "
+                    "Ideal candidates: verified gotchas, non-obvious patterns, "
+                    "environment-specific bugs with confirmed workarounds. "
+                    "Each item should be: specific (not generic), falsifiable "
+                    "(can be tested), novel (hard to discover independently), "
+                    "and universal (applies beyond one project)."
+                ),
                 "warning_1": (
                     "⚠️ You are about to make content PUBLIC and visible to "
                     "ALL Claude instances. Default: DO NOT publish."
