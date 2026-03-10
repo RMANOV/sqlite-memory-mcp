@@ -292,6 +292,65 @@ class TaskDB:
         if self.on_change:
             self.on_change()
 
+    # ── Entity Link helpers (v2.2.0) ─────────────────────────────────
+
+    def search_entities(self, query: str, limit: int = 10) -> list[dict]:
+        """FTS5 search for entities (for autocomplete in link dialog)."""
+        if not query or len(query.strip()) < 2:
+            return []
+        words = query.strip().split()
+        fts_q = " OR ".join(f'"{w}"' for w in words if w)
+        if not fts_q:
+            return []
+        rows = self._conn.execute(
+            "SELECT rowid, name, entity_type, "
+            "(SELECT COUNT(*) FROM observations WHERE entity_id = memory_fts.rowid) AS obs_count "
+            "FROM memory_fts WHERE memory_fts MATCH ? LIMIT ?",
+            (fts_q, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def link_task_entity(
+        self, task_id: str, entity_id: int, link_type: str = "manual"
+    ) -> bool:
+        """Create a manual link between a task and an entity."""
+        now = now_iso()
+        try:
+            self._conn.execute(
+                "INSERT INTO task_entity_links (task_id, entity_id, link_type, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(task_id, entity_id) DO UPDATE SET link_type = ?, created_at = ?",
+                (task_id, entity_id, link_type, now, link_type, now),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def get_task_links(self, task_id: str) -> list[dict]:
+        """Get all entities linked to a task."""
+        try:
+            rows = self._conn.execute(
+                "SELECT e.id AS entity_id, e.name AS entity_name, e.entity_type, "
+                "tel.link_type, tel.score, tel.created_at "
+                "FROM task_entity_links tel "
+                "JOIN entities e ON e.id = tel.entity_id "
+                "WHERE tel.task_id = ?",
+                (task_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def unlink_task_entity(self, task_id: str, entity_id: int) -> bool:
+        """Remove a link between a task and an entity."""
+        cursor = self._conn.execute(
+            "DELETE FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
+            (task_id, entity_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
 
 # ── UI Layer ────────────────────────────────────────────────────────
 
@@ -1235,6 +1294,176 @@ class EditTaskDialog(QDialog):
         return vals
 
 
+class EntityLinkDialog(QDialog):
+    """Dialog for searching and linking knowledge graph entities to a task."""
+
+    def __init__(self, db: TaskDB, task_id: str, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.task_id = task_id
+        self._debounce_timer: int | None = None
+        self._pending_query = ""
+        self.setWindowTitle("Link to Entity")
+        self.setMinimumSize(500, 450)
+        self.setModal(True)
+        self._build_ui()
+        self._load_current_links()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # Current links section
+        layout.addWidget(QLabel("<b>Current Links:</b>"))
+        self._current_list = QListWidget()
+        self._current_list.setMaximumHeight(120)
+        self._current_list.setStyleSheet(
+            "QListWidget { border: 1px solid #555; border-radius: 4px; }"
+            "QListWidget::item { padding: 4px 8px; }"
+        )
+        layout.addWidget(self._current_list)
+
+        self._unlink_btn = QPushButton("Unlink Selected")
+        self._unlink_btn.setEnabled(False)
+        self._unlink_btn.clicked.connect(self._on_unlink)
+        self._current_list.itemSelectionChanged.connect(
+            lambda: self._unlink_btn.setEnabled(
+                bool(self._current_list.selectedItems())
+            )
+        )
+        layout.addWidget(self._unlink_btn)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #555;")
+        layout.addWidget(sep)
+
+        # Search section
+        layout.addWidget(QLabel("<b>Search Entities:</b>"))
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Type to search entities...")
+        self._search_input.setStyleSheet(
+            "QLineEdit { padding: 6px 10px; border: 1px solid #666; "
+            "border-radius: 4px; font-size: 13px; }"
+        )
+        self._search_input.textChanged.connect(self._on_search_changed)
+        layout.addWidget(self._search_input)
+
+        self._results_list = QListWidget()
+        self._results_list.setStyleSheet(
+            "QListWidget { border: 1px solid #555; border-radius: 4px; }"
+            "QListWidget::item { padding: 6px 8px; }"
+            "QListWidget::item:selected { background: #1a3a5c; color: white; }"
+        )
+        layout.addWidget(self._results_list)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self._link_btn = QPushButton("Link Selected")
+        self._link_btn.setEnabled(False)
+        self._link_btn.setStyleSheet(
+            "QPushButton { background: #1a3a5c; color: white; padding: 8px 20px; "
+            "border-radius: 4px; font-weight: bold; }"
+            "QPushButton:hover { background: #254d73; }"
+            "QPushButton:disabled { background: #555; }"
+        )
+        self._link_btn.clicked.connect(self._on_link)
+        self._results_list.itemSelectionChanged.connect(
+            lambda: self._link_btn.setEnabled(bool(self._results_list.selectedItems()))
+        )
+
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(
+            "QPushButton { padding: 8px 20px; border: 1px solid #666; "
+            "border-radius: 4px; }"
+            "QPushButton:hover { background: #333; }"
+        )
+        close_btn.clicked.connect(self.accept)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self._link_btn)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def _load_current_links(self):
+        self._current_list.clear()
+        links = self.db.get_task_links(self.task_id)
+        for link in links:
+            text = f"{link['entity_name']}  ({link['entity_type']})"
+            if link.get("link_type") == "auto":
+                text += "  [auto]"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, link["entity_id"])
+            self._current_list.addItem(item)
+
+        if not links:
+            item = QListWidgetItem("No linked entities")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(QColor("#999"))
+            self._current_list.addItem(item)
+
+    def _on_search_changed(self, text: str):
+        """Debounced search — 300ms delay."""
+        if self._debounce_timer is not None:
+            self.killTimer(self._debounce_timer)
+        self._debounce_timer = self.startTimer(300)
+        self._pending_query = text
+
+    def timerEvent(self, event):
+        if event.timerId() == self._debounce_timer:
+            self.killTimer(self._debounce_timer)
+            self._debounce_timer = None
+            self._do_search(self._pending_query)
+
+    def _do_search(self, query: str):
+        self._results_list.clear()
+        if len(query.strip()) < 2:
+            return
+
+        results = self.db.search_entities(query)
+        current_ids: set[int] = set()
+        for i in range(self._current_list.count()):
+            eid = self._current_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if eid is not None:
+                current_ids.add(eid)
+
+        for r in results:
+            if r["rowid"] in current_ids:
+                continue
+            text = f"{r['name']}  ({r['entity_type']})  — {r['obs_count']} obs"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, r["rowid"])
+            self._results_list.addItem(item)
+
+        if self._results_list.count() == 0:
+            item = QListWidgetItem("No matching entities found")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(QColor("#999"))
+            self._results_list.addItem(item)
+
+    def _on_link(self):
+        items = self._results_list.selectedItems()
+        if not items:
+            return
+        entity_id = items[0].data(Qt.ItemDataRole.UserRole)
+        if entity_id is None:
+            return
+        if self.db.link_task_entity(self.task_id, entity_id):
+            self._load_current_links()
+            self._do_search(self._search_input.text())
+
+    def _on_unlink(self):
+        items = self._current_list.selectedItems()
+        if not items:
+            return
+        entity_id = items[0].data(Qt.ItemDataRole.UserRole)
+        if entity_id is None:
+            return
+        if self.db.unlink_task_entity(self.task_id, entity_id):
+            self._load_current_links()
+
+
 class TaskReaderDialog(QDialog):
     """Read-only view for task descriptions with comfortable reading layout."""
 
@@ -1362,18 +1591,49 @@ class TaskReaderDialog(QDialog):
         if desc:
             escaped = _html.escape(desc)
             paragraphs = escaped.split("\n\n")
-            body_html = "".join(
-                f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs
-            )
-            self._body_label.setText(
+            inner = "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs)
+            body_html = (
                 f'<div style="font-family: Segoe UI; font-size: 13px; '
-                f'line-height: 160%; color: #e2e8f0;">{body_html}</div>'
+                f'line-height: 160%; color: #e2e8f0;">{inner}</div>'
             )
         else:
-            self._body_label.setText(
+            body_html = (
                 '<div style="font-family: Segoe UI; font-size: 13px; '
                 'color: #4a5568; font-style: italic;">No description</div>'
             )
+
+        # Linked entities section
+        links = self.db.get_task_links(self.task.get("id", ""))
+        if links:
+            _type_colors = {
+                "concept": "#1a3a5c",
+                "tool": "#2d6a2e",
+                "person": "#8b4513",
+                "project": "#4a148c",
+                "technology": "#00695c",
+            }
+            badges = []
+            for lk in links:
+                c = _type_colors.get((lk.get("entity_type") or "").lower(), "#555")
+                b = (
+                    f'<span style="display:inline-block; background:{c}; color:white; '
+                    f"padding:3px 10px; border-radius:12px; font-size:11px; "
+                    f'margin:2px 4px 2px 0;">{_html.escape(lk["entity_name"])}'
+                )
+                if lk.get("entity_type"):
+                    b += f' <span style="opacity:0.7;">({_html.escape(lk["entity_type"])})</span>'
+                if lk.get("link_type") == "auto":
+                    b += ' <span style="opacity:0.5;">[auto]</span>'
+                b += "</span>"
+                badges.append(b)
+            body_html += (
+                '<div style="margin-top:16px; padding-top:12px; border-top:1px solid #444;">'
+                '<div style="font-weight:bold; color:#a0aec0; margin-bottom:8px; '
+                'font-size:12px;">Linked Entities</div>'
+                f"<div>{''.join(badges)}</div></div>"
+            )
+
+        self._body_label.setText(body_html)
 
     def _on_edit(self):
         dlg = EditTaskDialog(self.task, self, db=self.db)
@@ -1579,6 +1839,13 @@ class TaskListWidget(QListWidget):
         else:
             publish_action = menu.addAction("Publish...")
         menu.addSeparator()
+        # v2.2.0: Entity links
+        task_links = self.db.get_task_links(task_id)
+        if task_links:
+            link_action = menu.addAction(f"Manage Links ({len(task_links)})...")
+        else:
+            link_action = menu.addAction("Link to Entity...")
+        menu.addSeparator()
         delete_action = menu.addAction("Delete")
         action = menu.exec(self.mapToGlobal(pos))
         if action == view_action:
@@ -1597,6 +1864,8 @@ class TaskListWidget(QListWidget):
             self._publish_task(task_id)
         elif unpublish_action and action == unpublish_action:
             self._cancel_publish_task(task_id)
+        elif action == link_action:
+            EntityLinkDialog(self.db, task_id, self).exec()
         elif action == delete_action:
             self.db.delete_task(task_id)
 

@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import re  # used by _tokenize() for Jaccard similarity
 import socket
 import sqlite3
 import subprocess
@@ -324,6 +325,16 @@ CREATE TABLE IF NOT EXISTS rating_anomalies (
     resolved      INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS task_entity_links (
+    task_id    TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    entity_id  INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    link_type  TEXT    NOT NULL DEFAULT 'manual',
+    score      REAL    DEFAULT NULL,
+    created_at TEXT    NOT NULL,
+    PRIMARY KEY (task_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tel_entity ON task_entity_links(entity_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
     tokenize = "unicode61 remove_diacritics 2"
@@ -593,6 +604,23 @@ _MIGRATIONS = [
         "INSERT OR IGNORE INTO task_field_versions (task_id, field_name, updated_at, updated_by) "
         "SELECT id, 'reminder_at', updated_at, '' FROM tasks",
         "seed task_field_versions.reminder_at for existing tasks (v2.1.0)",
+    ),
+    # v2.2.0: task_entity_links table
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_entity_links'",
+        "CREATE TABLE task_entity_links ("
+        "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
+        "entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, "
+        "link_type TEXT NOT NULL DEFAULT 'manual', "
+        "score REAL DEFAULT NULL, "
+        "created_at TEXT NOT NULL, "
+        "PRIMARY KEY (task_id, entity_id))",
+        "task_entity_links table (v2.2.0 — entity↔task links)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tel_entity'",
+        "CREATE INDEX idx_tel_entity ON task_entity_links(entity_id)",
+        "idx_tel_entity index (v2.2.0)",
     ),
 ]
 
@@ -1035,6 +1063,21 @@ def _fts_query(raw: str) -> str:
         return '""'
     escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
     return " OR ".join(escaped)
+
+
+_STOPWORDS = frozenset(
+    "the a an is are was were be been being have has had do does did "
+    "will would shall should may might can could and or but if then "
+    "else for of in on at to from by with".split()
+)
+
+
+def _tokenize(text: str) -> set[str]:
+    """Extract meaningful tokens from text for Jaccard similarity."""
+    if not text:
+        return set()
+    words = re.findall(r"\w+", text.lower())
+    return {w for w in words if len(w) >= 3 and w not in _STOPWORDS}
 
 
 @mcp.tool()
@@ -4309,6 +4352,428 @@ def bridge_status() -> str:
             "anomalies": anomaly_count,
         }
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tools 34-40: Entity↔Task Links + Cross-Entity Insights (v2.2.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def link_task_entity(task_id: str, entity_name: str) -> str:
+    """Link a task to a knowledge graph entity.
+
+    Creates a manual link between a task and an entity. If an auto-discovered
+    link already exists, it upgrades to manual (manual always wins).
+    """
+    with _get_conn() as conn:
+        task = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return json.dumps({"error": f"Task {task_id} not found"})
+
+        entity = conn.execute(
+            "SELECT id FROM entities WHERE name = ?", (entity_name,)
+        ).fetchone()
+        if not entity:
+            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+
+        entity_id = entity["id"]
+        now = datetime.now(timezone.utc).isoformat()
+
+        conn.execute(
+            "INSERT INTO task_entity_links (task_id, entity_id, link_type, created_at) "
+            "VALUES (?, ?, 'manual', ?) "
+            "ON CONFLICT(task_id, entity_id) DO UPDATE SET link_type = 'manual', created_at = ?",
+            (task_id, entity_id, now, now),
+        )
+
+        return json.dumps(
+            {
+                "task_id": task_id,
+                "entity_name": entity_name,
+                "entity_id": entity_id,
+                "link_type": "manual",
+                "created_at": now,
+            }
+        )
+
+
+@mcp.tool()
+def unlink_task_entity(task_id: str, entity_name: str) -> str:
+    """Remove a link between a task and a knowledge graph entity."""
+    with _get_conn() as conn:
+        entity = conn.execute(
+            "SELECT id FROM entities WHERE name = ?", (entity_name,)
+        ).fetchone()
+        if not entity:
+            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+
+        cursor = conn.execute(
+            "DELETE FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
+            (task_id, entity["id"]),
+        )
+
+        return json.dumps({"removed": cursor.rowcount > 0})
+
+
+@mcp.tool()
+def get_task_links(task_id: str) -> str:
+    """Get all knowledge graph entities linked to a task."""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT e.name AS entity_name, e.entity_type, "
+            "tel.link_type, tel.score, tel.created_at "
+            "FROM task_entity_links tel "
+            "JOIN entities e ON e.id = tel.entity_id "
+            "WHERE tel.task_id = ?",
+            (task_id,),
+        ).fetchall()
+
+        return json.dumps({"task_id": task_id, "links": [dict(r) for r in rows]})
+
+
+@mcp.tool()
+def get_entity_tasks(entity_name: str) -> str:
+    """Get all tasks linked to a knowledge graph entity."""
+    with _get_conn() as conn:
+        entity = conn.execute(
+            "SELECT id FROM entities WHERE name = ?", (entity_name,)
+        ).fetchone()
+        if not entity:
+            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+
+        rows = conn.execute(
+            "SELECT t.id AS task_id, t.title, t.status, t.priority, "
+            "tel.link_type, tel.score "
+            "FROM task_entity_links tel "
+            "JOIN tasks t ON t.id = tel.task_id "
+            "WHERE tel.entity_id = ?",
+            (entity["id"],),
+        ).fetchall()
+
+        return json.dumps(
+            {
+                "entity_name": entity_name,
+                "tasks": [dict(r) for r in rows],
+            }
+        )
+
+
+@mcp.tool()
+def suggest_task_links(task_id: str, limit: int = 5) -> str:
+    """Suggest knowledge graph entities that may be related to a task.
+
+    Uses FTS5 for candidate retrieval + Jaccard similarity for ranking.
+    Does NOT auto-create links — returns suggestions for human/Claude review.
+    """
+    with _get_conn() as conn:
+        task = conn.execute(
+            "SELECT title, description FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            return json.dumps({"error": f"Task {task_id} not found"})
+
+        search_text = f"{task['title'] or ''} {task['description'] or ''}"
+        task_tokens = _tokenize(search_text)
+        if not task_tokens:
+            return json.dumps({"task_id": task_id, "suggestions": []})
+
+        fts_q = _fts_query(search_text)
+        if not fts_q:
+            return json.dumps({"task_id": task_id, "suggestions": []})
+
+        candidates = conn.execute(
+            "SELECT rowid, name, entity_type, rank "
+            "FROM memory_fts WHERE memory_fts MATCH ? "
+            "ORDER BY rank LIMIT 50",
+            (fts_q,),
+        ).fetchall()
+
+        linked_ids = {
+            r["entity_id"]
+            for r in conn.execute(
+                "SELECT entity_id FROM task_entity_links WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+        }
+
+        scored = []
+        for c in candidates:
+            if c["rowid"] in linked_ids:
+                continue
+
+            obs = conn.execute(
+                "SELECT content FROM observations WHERE entity_id = ?",
+                (c["rowid"],),
+            ).fetchall()
+            obs_text = " ".join(o["content"] for o in obs)
+            entity_tokens = _tokenize(f"{c['name']} {obs_text}")
+
+            if not entity_tokens:
+                continue
+
+            t_tok = set(list(task_tokens)[:500])
+            e_tok = set(list(entity_tokens)[:500])
+            intersection = t_tok & e_tok
+            union = t_tok | e_tok
+            jaccard = len(intersection) / len(union) if union else 0.0
+
+            norm_rank = min(1.0, abs(c["rank"]) / 20.0)
+            combined = 0.6 * norm_rank + 0.4 * jaccard
+
+            scored.append(
+                {
+                    "entity_name": c["name"],
+                    "entity_type": c["entity_type"],
+                    "score": round(combined, 4),
+                    "shared_keywords": sorted(intersection)[:10],
+                }
+            )
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+
+        return json.dumps({"task_id": task_id, "suggestions": scored[:limit]})
+
+
+@mcp.tool()
+def find_entity_overlaps(
+    entity_name: str | None = None,
+    min_score: float = 0.3,
+    limit: int = 20,
+) -> str:
+    """Find overlapping/duplicate entities in the knowledge graph.
+
+    Uses FTS5 + Jaccard similarity to detect entity pairs with significant
+    observation overlap. Pairs with score >= 0.8 get a merge suggestion.
+    """
+    with _get_conn() as conn:
+        if entity_name:
+            sources = conn.execute(
+                "SELECT id, name, entity_type FROM entities WHERE name = ?",
+                (entity_name,),
+            ).fetchall()
+            if not sources:
+                return json.dumps({"error": f"Entity '{entity_name}' not found"})
+        else:
+            sources = conn.execute(
+                "SELECT id, name, entity_type FROM entities"
+            ).fetchall()
+
+        seen_pairs: set[tuple[int, int]] = set()
+        overlaps = []
+
+        for src in sources:
+            src_obs = conn.execute(
+                "SELECT content FROM observations WHERE entity_id = ?",
+                (src["id"],),
+            ).fetchall()
+            src_text = " ".join(o["content"] for o in src_obs)
+            src_tokens = _tokenize(f"{src['name']} {src_text}")
+
+            if not src_tokens:
+                continue
+
+            fts_q = _fts_query(src_text or src["name"])
+            if not fts_q:
+                continue
+
+            candidates = conn.execute(
+                "SELECT rowid, name, entity_type "
+                "FROM memory_fts WHERE memory_fts MATCH ? LIMIT 50",
+                (fts_q,),
+            ).fetchall()
+
+            for cand in candidates:
+                cand_id = cand["rowid"]
+                if cand_id == src["id"]:
+                    continue
+
+                pair_key = (min(src["id"], cand_id), max(src["id"], cand_id))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                cand_obs = conn.execute(
+                    "SELECT content FROM observations WHERE entity_id = ?",
+                    (cand_id,),
+                ).fetchall()
+                cand_text = " ".join(o["content"] for o in cand_obs)
+                cand_tokens = _tokenize(f"{cand['name']} {cand_text}")
+
+                if not cand_tokens:
+                    continue
+
+                s_tok = set(list(src_tokens)[:500])
+                c_tok = set(list(cand_tokens)[:500])
+                intersection = s_tok & c_tok
+                union_set = s_tok | c_tok
+                jaccard = len(intersection) / len(union_set) if union_set else 0.0
+
+                if jaccard < min_score:
+                    continue
+
+                overlaps.append(
+                    {
+                        "entity_a": src["name"],
+                        "entity_b": cand["name"],
+                        "score": round(jaccard, 4),
+                        "shared_keywords": sorted(intersection)[:10],
+                        "suggest_merge": jaccard >= 0.8,
+                    }
+                )
+
+        overlaps.sort(key=lambda x: x["score"], reverse=True)
+
+        return json.dumps({"overlaps": overlaps[:limit]})
+
+
+@mcp.tool()
+def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> str:
+    """Merge one entity into another, combining observations, relations, and task links.
+
+    The source entity is absorbed into the target. Use dry_run=True (default) to
+    preview what will be moved before committing.
+
+    Args:
+        source_name: Entity to merge FROM (will be deleted)
+        target_name: Entity to merge INTO (will receive all data)
+        dry_run: If True, only show what would happen without making changes
+    """
+    with _get_conn() as conn:
+        source = conn.execute(
+            "SELECT id, name FROM entities WHERE name = ?", (source_name,)
+        ).fetchone()
+        if not source:
+            return json.dumps({"error": f"Source entity '{source_name}' not found"})
+
+        target = conn.execute(
+            "SELECT id, name FROM entities WHERE name = ?", (target_name,)
+        ).fetchone()
+        if not target:
+            return json.dumps({"error": f"Target entity '{target_name}' not found"})
+
+        src_id, tgt_id = source["id"], target["id"]
+
+        if src_id == tgt_id:
+            return json.dumps({"error": "Source and target are the same entity"})
+
+        # Count what will be moved
+        unique_obs = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM observations "
+            "WHERE entity_id = ? AND content NOT IN "
+            "(SELECT content FROM observations WHERE entity_id = ?)",
+            (src_id, tgt_id),
+        ).fetchone()["cnt"]
+
+        rel_from = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM relations WHERE from_id = ? AND to_id != ?",
+            (src_id, tgt_id),
+        ).fetchone()["cnt"]
+
+        rel_to = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM relations WHERE to_id = ? AND from_id != ?",
+            (src_id, tgt_id),
+        ).fetchone()["cnt"]
+
+        task_links = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM task_entity_links "
+            "WHERE entity_id = ? AND task_id NOT IN "
+            "(SELECT task_id FROM task_entity_links WHERE entity_id = ?)",
+            (src_id, tgt_id),
+        ).fetchone()["cnt"]
+
+        preview = {
+            "source": source_name,
+            "target": target_name,
+            "observations_to_move": unique_obs,
+            "relations_to_move": rel_from + rel_to,
+            "task_links_to_move": task_links,
+            "dry_run": dry_run,
+        }
+
+        if dry_run:
+            return json.dumps(preview)
+
+        # 1. Move unique observations
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) "
+            "SELECT ?, content, created_at FROM observations "
+            "WHERE entity_id = ? AND content NOT IN "
+            "(SELECT content FROM observations WHERE entity_id = ?)",
+            (tgt_id, src_id, tgt_id),
+        )
+
+        # 2. Reassign relations (from_id) — skip self-loops and dupes
+        from_rels = conn.execute(
+            "SELECT id, to_id, relation_type FROM relations "
+            "WHERE from_id = ? AND to_id != ?",
+            (src_id, tgt_id),
+        ).fetchall()
+        for rel in from_rels:
+            existing = conn.execute(
+                "SELECT 1 FROM relations "
+                "WHERE from_id = ? AND to_id = ? AND relation_type = ?",
+                (tgt_id, rel["to_id"], rel["relation_type"]),
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "UPDATE relations SET from_id = ? WHERE id = ?",
+                    (tgt_id, rel["id"]),
+                )
+
+        # Reassign relations (to_id)
+        to_rels = conn.execute(
+            "SELECT id, from_id, relation_type FROM relations "
+            "WHERE to_id = ? AND from_id != ?",
+            (src_id, tgt_id),
+        ).fetchall()
+        for rel in to_rels:
+            existing = conn.execute(
+                "SELECT 1 FROM relations "
+                "WHERE from_id = ? AND to_id = ? AND relation_type = ?",
+                (rel["from_id"], tgt_id, rel["relation_type"]),
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "UPDATE relations SET to_id = ? WHERE id = ?",
+                    (tgt_id, rel["id"]),
+                )
+
+        # 3. Reassign task links
+        src_links = conn.execute(
+            "SELECT task_id, link_type, score, created_at "
+            "FROM task_entity_links WHERE entity_id = ?",
+            (src_id,),
+        ).fetchall()
+        for link in src_links:
+            existing = conn.execute(
+                "SELECT 1 FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
+                (link["task_id"], tgt_id),
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT INTO task_entity_links "
+                    "(task_id, entity_id, link_type, score, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        link["task_id"],
+                        tgt_id,
+                        link["link_type"],
+                        link["score"],
+                        link["created_at"],
+                    ),
+                )
+
+        # 4. Delete source entity (CASCADE cleans orphan observations/relations/links)
+        conn.execute("DELETE FROM entities WHERE id = ?", (src_id,))
+
+        # 5. Rebuild FTS5 for target + clean source
+        _fts_sync(conn, tgt_id)
+        conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (src_id,))
+
+        preview["merged"] = True
+        preview["dry_run"] = False
+        return json.dumps(preview)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

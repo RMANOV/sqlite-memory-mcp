@@ -374,9 +374,29 @@ def export_task_files(
             fvr["updated_by"],
         ]
 
+    # Batch fetch task-entity links
+    link_rows = conn.execute(
+        "SELECT tel.task_id, tel.entity_id, e.name, tel.link_type, "
+        "tel.score, tel.created_at "
+        "FROM task_entity_links tel JOIN entities e ON e.id = tel.entity_id "
+        "WHERE tel.task_id IN ({})".format(ph),
+        task_ids,
+    ).fetchall()
+    link_map: dict[str, list[dict]] = {}
+    for lr in link_rows:
+        link_map.setdefault(lr["task_id"], []).append(
+            {
+                "name": lr["name"],
+                "link_type": lr["link_type"],
+                "score": lr["score"],
+                "created_at": lr["created_at"],
+            }
+        )
+
     for tid in task_ids:
         task = task_map[tid]
         task["_field_ts"] = fv_map.get(tid, {})
+        task["_links"] = link_map.get(tid, [])
         task_path = tasks_dir / f"{tid}.json"
         task_path.write_text(json_dumps(task), encoding="utf-8")
         exported.append(tid)
@@ -594,6 +614,42 @@ def merge_import_tasks(
                     (tid, field, fts, fby),
                 )
             new_count += 1
+
+    # Import task-entity links from remote tasks
+    now = datetime.now(timezone.utc).isoformat()
+    for rt in remote_tasks:
+        remote_links = rt.get("_links")
+        if not remote_links:
+            continue
+        tid = rt.get("id", "")
+        if not _SAFE_TASK_ID.match(tid):
+            continue
+        local_task = conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        if not local_task:
+            continue
+        for link in remote_links:
+            ename = link.get("name")
+            if not ename:
+                continue
+            entity = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (ename,)
+            ).fetchone()
+            if not entity:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO task_entity_links "
+                "(task_id, entity_id, link_type, score, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    tid,
+                    entity["id"],
+                    link.get("link_type", "auto"),
+                    link.get("score"),
+                    link.get("created_at", now),
+                ),
+            )
 
     return new_count, updated_fields
 
