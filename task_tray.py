@@ -1027,11 +1027,15 @@ class TrayPopup(QWidget):
         return row
 
     def _on_toggle(self, task_id, checked):
+        # Defer DB write — on_change() triggers _refresh_all() which rebuilds
+        # this popup's widgets; doing it inside the signal can crash.
+        QTimer.singleShot(0, lambda: self._apply_toggle(task_id, checked))
+
+    def _apply_toggle(self, task_id, checked):
         if checked:
             self.db.mark_done(task_id)
         else:
             self.db.update_task(task_id, status="not_started")
-        QTimer.singleShot(300, self.refresh)
 
     def _toggle_add_form(self):
         visible = not self._add_form.isVisible()
