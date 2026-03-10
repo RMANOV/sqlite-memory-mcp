@@ -34,6 +34,7 @@ from task_search import TaskSearchEngine, score_task
 
 from db_utils import (
     DB_PATH,
+    MERGEABLE_FIELDS,
     PRIORITY_COLORS,
     TASK_ACTIVE_EXCLUSIONS,
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
@@ -45,6 +46,7 @@ from db_utils import (
     now_iso,
     parse_iso_date,
     priority_sort_key,
+    upsert_field_versions,
 )
 
 PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
@@ -309,6 +311,7 @@ class TaskDB:
                 now,
             ),
         )
+        upsert_field_versions(self._conn, task_id, MERGEABLE_FIELDS, now)
         self._conn.commit()
         if self.on_change:
             self.on_change()
@@ -321,6 +324,7 @@ class TaskDB:
             "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
             (now, task_id),
         )
+        upsert_field_versions(self._conn, task_id, ("status",), now)
         self._conn.commit()
         if self.on_change:
             self.on_change()
@@ -332,10 +336,14 @@ class TaskDB:
         invalid = set(fields) - ALLOWED_FIELDS
         if invalid:
             raise ValueError(f"Unknown task fields: {invalid}")
-        fields["updated_at"] = now_iso()
+        now = now_iso()
+        changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
+        fields["updated_at"] = now
         sets = ", ".join(f"{k}=?" for k in fields)
         vals = list(fields.values()) + [task_id]
         self._conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals)
+        if changed:
+            upsert_field_versions(self._conn, task_id, changed, now)
         self._conn.commit()
         if self.on_change:
             self.on_change()
