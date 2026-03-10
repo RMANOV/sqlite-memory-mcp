@@ -535,6 +535,35 @@ _MIGRATIONS = [
         "CREATE TABLE bridge_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         "bridge_meta table (v1.0.0)",
     ),
+    # v2.0.0: per-field CRDT — task_field_versions table
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_field_versions'",
+        "CREATE TABLE task_field_versions ("
+        "task_id TEXT NOT NULL, field_name TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', "
+        "PRIMARY KEY (task_id, field_name), "
+        "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE)",
+        "task_field_versions table (v2.0.0 — per-field CRDT)",
+    ),
+    # v2.0.0: seed field versions from existing tasks
+    (
+        "SELECT 1 FROM task_field_versions LIMIT 1",
+        "INSERT OR IGNORE INTO task_field_versions (task_id, field_name, updated_at, updated_by) "
+        "SELECT id, 'title', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'status', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'priority', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'section', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'due_date', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'project', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'parent_id', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'recurring', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'type', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'assignee', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'shared_by', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'description', updated_at, '' FROM tasks "
+        "UNION ALL SELECT id, 'notes', updated_at, '' FROM tasks",
+        "seed task_field_versions from existing tasks (v2.0.0)",
+    ),
 ]
 
 
@@ -555,9 +584,7 @@ def _init_db() -> None:
         task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         fts_count = conn.execute("SELECT COUNT(*) FROM tasks_fts").fetchone()[0]
         if task_count > 0 and fts_count == 0:
-            conn.execute(
-                "INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')"
-            )
+            conn.execute("INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')")
             logger.info(
                 "tasks_fts: rebuilt FTS index for %d existing tasks", task_count
             )
@@ -1312,6 +1339,8 @@ def create_task(
                 now,
             ),
         )
+        # v2.0.0: Seed field versions for CRDT sync
+        _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now)
 
     logger.info("create_task: %s (%s)", title, task_id)
     return json.dumps(
@@ -1409,6 +1438,9 @@ def update_task(
         cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
         if cur.rowcount == 0:
             return json.dumps({"error": f"Task {task_id} not found"})
+        # v2.0.0: Track field versions for CRDT sync
+        changed = [k for k in updates if k != "updated_at"]
+        _upsert_field_versions(conn, task_id, changed, updates["updated_at"])
 
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
     return json.dumps({"updated": task_id, "fields": list(updates.keys())})
@@ -1510,7 +1542,12 @@ def query_tasks(
 
     if not rows:
         return json.dumps(
-            {"tasks": [], "count": 0, "total": total, "message": "No tasks match filters"}
+            {
+                "tasks": [],
+                "count": 0,
+                "total": total,
+                "message": "No tasks match filters",
+            }
         )
 
     # Build markdown table
@@ -3198,7 +3235,24 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             }
         )
 
+    # v2.0.0: Pull before push (prevents overwriting remote changes)
+    pull_result = _git("pull", "--rebase", "--autostash")
+    if pull_result.returncode != 0:
+        logger.warning("bridge_push: git pull failed: %s", pull_result.stderr.strip())
+
+    # v2.0.0: One-time migration shared.json → per-task files
+    _migrate_to_per_task_files(BRIDGE_REPO)
+
     with _get_conn() as conn:
+        # v2.0.0: CRDT merge remote index.json into local DB
+        _bp_index_path = Path(BRIDGE_REPO) / "index.json"
+        if _bp_index_path.exists():
+            try:
+                _remote_idx = _json_loads(_bp_index_path.read_text(encoding="utf-8"))
+                _merge_import_tasks(conn, _remote_idx.get("tasks", []))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("bridge_push: index.json merge failed: %s", exc)
+
         # Incremental check: skip if no changes since last push
         if not force:
             last_push_row = conn.execute(
@@ -3214,11 +3268,15 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                     (last_push_at, last_push_at),
                 ).fetchone()
                 if row[0] == 0 and row[1] == 0 and row[2] == 0:
-                    logger.info("bridge_push: no changes since %s, skipping", last_push_at)
-                    return json.dumps({
-                        "pushed": 0,
-                        "message": f"No changes since {last_push_at}. Use force=True to push anyway.",
-                    })
+                    logger.info(
+                        "bridge_push: no changes since %s, skipping", last_push_at
+                    )
+                    return json.dumps(
+                        {
+                            "pushed": 0,
+                            "message": f"No changes since {last_push_at}. Use force=True to push anyway.",
+                        }
+                    )
         # v0.7.0: Promote pending_public → public if standby elapsed
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=_PUBLISH_STANDBY_MINUTES)
@@ -3300,6 +3358,16 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             "FROM tasks WHERE status != 'archived' ORDER BY created_at"
         ).fetchall()
         tasks_out = [dict(r) for r in task_rows]
+
+        # v2.0.0: Export per-task files + index.json
+        last_push_at = None
+        lp_row = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+        ).fetchone()
+        if lp_row:
+            last_push_at = lp_row["value"]
+        _export_task_files(conn, BRIDGE_REPO, changed_since=last_push_at)
+        _export_index_json(conn, BRIDGE_REPO)
 
         # v0.7.0: Export public entities + tasks as public_knowledge
         pub_ent_rows = conn.execute(
@@ -3501,7 +3569,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         f"{len(tasks_out)} tasks from {hostname}"
     )
 
-    _git("add", "shared.json")
+    _git("add", "shared.json", "index.json", "tasks/")
     commit_result = _git("commit", "-m", msg)
     if commit_result.returncode != 0 and "nothing to commit" in commit_result.stdout:
         logger.info("bridge_push: no changes to commit")
@@ -3607,27 +3675,24 @@ def bridge_pull() -> str:
         logger.warning("bridge_pull: git pull failed, proceeding with local copy")
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
-    if not shared_path.exists():
-        return json.dumps({"error": "shared.json not found in bridge repo"})
+    _pull_index_path = Path(BRIDGE_REPO) / "index.json"
+    _has_index = _pull_index_path.exists()
 
-    try:
-        payload = json.loads(shared_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        return json.dumps({"error": f"Failed to read shared.json: {exc}"})
+    if not shared_path.exists() and not _has_index:
+        return json.dumps({"error": "No sync data found in bridge repo"})
+
+    # Read shared.json for entities/relations (and legacy task fallback)
+    payload: dict = {}
+    if shared_path.exists():
+        try:
+            payload = json.loads(shared_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            if not _has_index:
+                return json.dumps({"error": f"Failed to read shared.json: {exc}"})
+            logger.warning("bridge_pull: shared.json parse failed: %s", exc)
 
     entities = payload.get("entities", [])
     relations = payload.get("relations", [])
-    # Collect tasks from all *_tasks keys (tasks, reading_tasks, etc.)
-    tasks = list(payload.get("tasks", []))
-    for key, val in payload.items():
-        if (
-            key.endswith("_tasks")
-            and key != "tasks"
-            and key != "shared_tasks"
-            and isinstance(val, list)
-        ):
-            tasks.extend(val)
-            logger.info("bridge_pull: merged %d tasks from '%s'", len(val), key)
     # Stage shared_tasks for review (never auto-import from other accounts)
     shared_tasks = payload.get("shared_tasks", [])
     staged_count = 0
@@ -3692,28 +3757,77 @@ def bridge_pull() -> str:
                 )
                 new_relations += cur3.rowcount
 
-        # Import tasks (last-write-wins by updated_at)
-        # Sort parents before children to avoid FK violations
-        tasks_sorted = sorted(
-            tasks,
-            key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")),
-        )
-        for task in tasks_sorted:
-            tid = task.get("id")
-            if not tid:
-                continue
-            _sanitize_task_enums(task)
-            existing = conn.execute(
-                "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
-            ).fetchone()
-            if existing:
-                # Only overwrite if remote is newer
-                if task.get("updated_at", "") > existing["updated_at"]:
+        # v2.0.0: Import tasks via per-field CRDT merge from index.json
+        if _has_index:
+            try:
+                _idx_data = _json_loads(_pull_index_path.read_text(encoding="utf-8"))
+                new_tasks, updated_tasks = _merge_import_tasks(
+                    conn, _idx_data.get("tasks", [])
+                )
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("bridge_pull: index.json read failed: %s", exc)
+                new_tasks, updated_tasks = 0, 0
+        else:
+            # Legacy fallback: task-level LWW from shared.json
+            tasks = list(payload.get("tasks", []))
+            for key, val in payload.items():
+                if (
+                    key.endswith("_tasks")
+                    and key != "tasks"
+                    and key != "shared_tasks"
+                    and isinstance(val, list)
+                ):
+                    tasks.extend(val)
+            tasks_sorted = sorted(
+                tasks,
+                key=lambda t: (
+                    t.get("parent_id") is not None,
+                    t.get("created_at", ""),
+                ),
+            )
+            for task in tasks_sorted:
+                tid = task.get("id")
+                if not tid:
+                    continue
+                _sanitize_task_enums(task)
+                existing = conn.execute(
+                    "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                if existing:
+                    if task.get("updated_at", "") > existing["updated_at"]:
+                        conn.execute(
+                            "UPDATE tasks SET title=?, description=?, status=?, "
+                            "priority=?, section=?, due_date=?, project=?, "
+                            "parent_id=?, notes=?, recurring=?, type=?, "
+                            "assignee=?, shared_by=?, updated_at=? WHERE id=?",
+                            (
+                                task["title"],
+                                task.get("description"),
+                                task["status"],
+                                task["priority"],
+                                task["section"],
+                                task.get("due_date"),
+                                task.get("project"),
+                                task.get("parent_id"),
+                                task.get("notes"),
+                                task.get("recurring"),
+                                task.get("type", "task"),
+                                task.get("assignee"),
+                                task.get("shared_by"),
+                                task["updated_at"],
+                                tid,
+                            ),
+                        )
+                        updated_tasks += 1
+                else:
                     conn.execute(
-                        "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
-                        "section=?, due_date=?, project=?, parent_id=?, notes=?, "
-                        "recurring=?, type=?, assignee=?, shared_by=?, updated_at=? WHERE id=?",
+                        "INSERT INTO tasks (id, title, description, status, "
+                        "priority, section, due_date, project, parent_id, "
+                        "notes, recurring, type, assignee, shared_by, "
+                        "created_at, updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
+                            tid,
                             task["title"],
                             task.get("description"),
                             task["status"],
@@ -3727,37 +3841,11 @@ def bridge_pull() -> str:
                             task.get("type", "task"),
                             task.get("assignee"),
                             task.get("shared_by"),
-                            task["updated_at"],
-                            tid,
+                            task.get("created_at", now),
+                            task.get("updated_at", now),
                         ),
                     )
-                    updated_tasks += 1
-            else:
-                conn.execute(
-                    "INSERT INTO tasks (id, title, description, status, priority, "
-                    "section, due_date, project, parent_id, notes, recurring, "
-                    "type, assignee, shared_by, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        tid,
-                        task["title"],
-                        task.get("description"),
-                        task["status"],
-                        task["priority"],
-                        task["section"],
-                        task.get("due_date"),
-                        task.get("project"),
-                        task.get("parent_id"),
-                        task.get("notes"),
-                        task.get("recurring"),
-                        task.get("type", "task"),
-                        task.get("assignee"),
-                        task.get("shared_by"),
-                        task.get("created_at", now),
-                        task.get("updated_at", now),
-                    ),
-                )
-                new_tasks += 1
+                    new_tasks += 1
 
         # Stage shared_tasks for manual review (security: never auto-import)
         for st in shared_tasks:

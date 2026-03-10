@@ -1,7 +1,8 @@
 """Bridge sync worker — standalone module for memory bridge sync.
 
 Exports full memory (entities + relations + tasks + public knowledge) to
-shared.json, then git push.  Called from task_tray.py's Sync button.
+shared.json + per-task files + index.json, then git push.
+Called from task_tray.py's Sync button.
 
 No FastMCP / server.py dependency — only db_utils for DB access.
 """
@@ -14,7 +15,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -25,6 +25,12 @@ from db_utils import (
     PUBLISH_STANDBY_MINUTES,
     now_iso,
     sanitize_task_enums,
+    # v2.0.0: Bridge Sync v2 — per-field CRDT
+    json_loads as _json_loads,
+    export_task_files,
+    export_index_json,
+    merge_import_tasks,
+    migrate_to_per_task_files,
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -82,95 +88,6 @@ def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
     return imported
 
 
-def _import_remote_tasks(conn: sqlite3.Connection, remote_tasks: list) -> tuple[int, int]:
-    """Import/update local tasks from remote shared.json. Returns (new, updated)."""
-    now = now_iso()
-    new_count = 0
-    updated_count = 0
-
-    # Sort parents before children to avoid FK violations
-    tasks_sorted = sorted(
-        remote_tasks,
-        key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")),
-    )
-
-    for task in tasks_sorted:
-        sanitize_task_enums(task)
-        tid = task.get("id")
-        title = task.get("title")
-        if not title:
-            continue
-
-        # Match by id first, then by title as fallback
-        existing = None
-        if tid:
-            existing = conn.execute(
-                "SELECT id, updated_at FROM tasks WHERE id = ?", (tid,)
-            ).fetchone()
-        if not existing:
-            existing = conn.execute(
-                "SELECT id, updated_at FROM tasks WHERE title = ?", (title,)
-            ).fetchone()
-
-        if existing:
-            # Only overwrite if remote is newer
-            if task.get("updated_at", "") > (existing["updated_at"] or ""):
-                conn.execute(
-                    "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
-                    "section=?, due_date=?, project=?, parent_id=?, notes=?, "
-                    "recurring=?, type=?, assignee=?, shared_by=?, updated_at=? WHERE id=?",
-                    (
-                        title,
-                        task.get("description"),
-                        task.get("status", "not_started"),
-                        task.get("priority", "medium"),
-                        task.get("section", "inbox"),
-                        task.get("due_date"),
-                        task.get("project"),
-                        task.get("parent_id"),
-                        task.get("notes"),
-                        task.get("recurring"),
-                        task.get("type", "task"),
-                        task.get("assignee"),
-                        task.get("shared_by"),
-                        task["updated_at"],
-                        existing["id"],
-                    ),
-                )
-                updated_count += 1
-        else:
-            # Insert new task — generate UUID if missing
-            if not tid:
-                tid = str(uuid.uuid4())
-            conn.execute(
-                "INSERT OR IGNORE INTO tasks (id, title, description, status, priority, "
-                "section, due_date, project, parent_id, notes, recurring, "
-                "type, assignee, shared_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    tid,
-                    title,
-                    task.get("description"),
-                    task.get("status", "not_started"),
-                    task.get("priority", "medium"),
-                    task.get("section", "inbox"),
-                    task.get("due_date"),
-                    task.get("project"),
-                    task.get("parent_id"),
-                    task.get("notes"),
-                    task.get("recurring"),
-                    task.get("type", "task"),
-                    task.get("assignee"),
-                    task.get("shared_by"),
-                    task.get("created_at", now),
-                    task.get("updated_at", now),
-                ),
-            )
-            new_count += 1
-
-    return new_count, updated_count
-
-
 def _export_entities(conn: sqlite3.Connection) -> tuple[list, set]:
     """Export shared entities + observations. Returns (entities_list, entity_ids)."""
     rows = conn.execute(
@@ -191,8 +108,7 @@ def _export_entities(conn: sqlite3.Connection) -> tuple[list, set]:
                 "entityType": e["entity_type"],
                 "project": e["project"],
                 "observations": [
-                    {"content": o["content"], "createdAt": o["created_at"]}
-                    for o in obs
+                    {"content": o["content"], "createdAt": o["created_at"]} for o in obs
                 ],
                 "createdAt": e["created_at"],
                 "updatedAt": e["updated_at"],
@@ -256,8 +172,7 @@ def _export_public_knowledge(conn: sqlite3.Connection) -> tuple[list, list]:
                 "entityType": pe["entity_type"],
                 "project": pe["project"],
                 "observations": [
-                    {"content": o["content"], "createdAt": o["created_at"]}
-                    for o in obs
+                    {"content": o["content"], "createdAt": o["created_at"]} for o in obs
                 ],
                 "createdAt": pe["created_at"],
                 "updatedAt": pe["updated_at"],
@@ -309,8 +224,13 @@ def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict
         if r_upd > l_upd:
             sanitize_task_enums(rt)
             for field in (
-                "status", "section", "priority", "due_date",
-                "notes", "description", "type",
+                "status",
+                "section",
+                "priority",
+                "due_date",
+                "notes",
+                "description",
+                "type",
             ):
                 if rt.get(field) is not None:
                     lt[field] = rt[field]
@@ -327,7 +247,7 @@ def main(
     db_path: str | None = None,
     bridge_repo: str | None = None,
 ) -> dict:
-    """Run full bridge sync: pull → export → merge → push.
+    """Run full bridge sync: pull → CRDT merge → export → push.
 
     Returns {"entities": N, "tasks": N, "pushed": bool}.
     """
@@ -340,8 +260,7 @@ def main(
     try:
         # Promote pending_public → public if standby elapsed
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
+            datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
         ).isoformat()
         conn.execute(
             "UPDATE entities SET visibility='public' "
@@ -357,44 +276,78 @@ def main(
 
         # 1. Pull remote changes
         _progress(progress_callback, 5, "git pull...")
-        _git("pull", "--rebase", bridge_dir=bridge_dir)
+        _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
 
-        # 2. Import remote data (entities + tasks)
+        # 2. One-time migration: shared.json → per-task files
+        migrate_to_per_task_files(bridge_dir)
+
+        # 3. Import remote data (entities from shared.json, tasks via CRDT)
         _progress(progress_callback, 10, "Importing remote data...")
         shared_path = Path(bridge_dir) / "shared.json"
+        index_path = Path(bridge_dir) / "index.json"
         new_t, upd_t = 0, 0
+
+        # Import entities from shared.json
         if shared_path.exists():
             try:
-                remote_data = json.loads(shared_path.read_text(encoding="utf-8"))
+                remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
                 conn.execute("BEGIN")
                 _import_remote_entities(conn, remote_data.get("entities", []))
-                new_t, upd_t = _import_remote_tasks(conn, remote_data.get("tasks", []))
+                conn.commit()
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # v2.0.0: CRDT merge tasks from index.json (preferred)
+        if index_path.exists():
+            try:
+                idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
+                conn.execute("BEGIN")
+                new_t, upd_t = merge_import_tasks(conn, idx_data.get("tasks", []))
+                conn.commit()
+                log.info(
+                    "CRDT merged %d new tasks, %d field updates from index.json",
+                    new_t,
+                    upd_t,
+                )
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("index.json merge failed: %s", exc)
+        elif shared_path.exists():
+            # Legacy fallback: task-level LWW from shared.json
+            try:
+                remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
+                conn.execute("BEGIN")
+                new_t, upd_t = merge_import_tasks(conn, remote_data.get("tasks", []))
                 conn.commit()
                 log.info("Imported %d new tasks, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # 3. Export entities + observations
+        # 4. Export entities + observations
         _progress(progress_callback, 20, "Exporting entities...")
         entities_out, entity_ids = _export_entities(conn)
 
-        # 4. Export relations
+        # 5. Export relations
         _progress(progress_callback, 30, "Exporting relations...")
         relations_out = _export_relations(conn, entity_ids)
 
-        # 5. Export tasks
+        # 6. Export tasks
         _progress(progress_callback, 40, "Exporting tasks...")
         tasks_out = _export_tasks(conn)
 
-        # 6. Export public knowledge
+        # v2.0.0: Export per-task files + index.json
+        _progress(progress_callback, 45, "Exporting per-task files...")
+        export_task_files(conn, bridge_dir)
+        export_index_json(conn, bridge_dir)
+
+        # 7. Export public knowledge
         _progress(progress_callback, 50, "Exporting public knowledge...")
         pub_entities, pub_tasks = _export_public_knowledge(conn)
 
-        # 7. Export knowledge ratings
+        # 8. Export knowledge ratings
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
         kr_out = _export_knowledge_ratings(conn)
 
-        # 8. Build payload
+        # 9. Build shared.json payload (backward compat)
         _progress(progress_callback, 60, "Merging tasks...")
         payload = {
             "version": 3,
@@ -415,13 +368,22 @@ def main(
         # Merge remote tasks + preserve extra keys from existing shared.json
         if shared_path.exists():
             try:
-                existing = json.loads(shared_path.read_text(encoding="utf-8"))
+                existing = _json_loads(shared_path.read_text(encoding="utf-8"))
                 _merge_remote_tasks(tasks_out, existing)
 
                 known_keys = {
-                    "version", "pushed_at", "machine_id", "entities",
-                    "relations", "tasks", "shared_tasks", "public_knowledge",
-                    "knowledge_ratings", "owner", "team_manifest", "ui_profiles",
+                    "version",
+                    "pushed_at",
+                    "machine_id",
+                    "entities",
+                    "relations",
+                    "tasks",
+                    "shared_tasks",
+                    "public_knowledge",
+                    "knowledge_ratings",
+                    "owner",
+                    "team_manifest",
+                    "ui_profiles",
                 }
                 for k, v in existing.items():
                     if k not in known_keys and isinstance(v, (list, dict)):
@@ -433,15 +395,15 @@ def main(
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # 9. Write shared.json
+        # 10. Write shared.json (backward compat)
         _progress(progress_callback, 70, "Writing shared.json...")
         shared_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-        # 10. Git add + commit + push
+        # 11. Git add + commit + push (includes new per-task files)
         _progress(progress_callback, 80, "git add...")
-        _git("add", "shared.json", bridge_dir=bridge_dir)
+        _git("add", "shared.json", "index.json", "tasks/", bridge_dir=bridge_dir)
 
         _progress(progress_callback, 90, "git commit...")
         n_ent = len(entities_out)
