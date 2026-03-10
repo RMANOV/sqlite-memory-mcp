@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 from db_utils import (
     DB_PATH,
     bulk_conn,
+    get_conn,
     now_iso,
 )
 
@@ -162,22 +163,38 @@ def _fetch_page_blocks(page_id: str) -> list[dict]:
 
 # Map Notion property names to task fields (case-insensitive matching)
 _PRIORITY_MAP = {
-    "critical": "critical", "high": "high", "medium": "medium", "low": "low",
-    "p0": "critical", "p1": "high", "p2": "medium", "p3": "low",
+    "critical": "critical",
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+    "p0": "critical",
+    "p1": "high",
+    "p2": "medium",
+    "p3": "low",
     "urgent": "critical",
 }
 
 _STATUS_MAP = {
-    "not started": "not_started", "not_started": "not_started",
-    "in progress": "in_progress", "in_progress": "in_progress",
-    "done": "done", "complete": "done", "completed": "done",
-    "archived": "archived", "cancelled": "cancelled", "canceled": "cancelled",
+    "not started": "not_started",
+    "not_started": "not_started",
+    "in progress": "in_progress",
+    "in_progress": "in_progress",
+    "done": "done",
+    "complete": "done",
+    "completed": "done",
+    "archived": "archived",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
 }
 
 _SECTION_MAP = {
-    "inbox": "inbox", "today": "today", "next": "next",
-    "someday": "someday", "waiting": "waiting",
-    "backlog": "someday", "later": "someday",
+    "inbox": "inbox",
+    "today": "today",
+    "next": "next",
+    "someday": "someday",
+    "waiting": "waiting",
+    "backlog": "someday",
+    "later": "someday",
 }
 
 
@@ -277,9 +294,7 @@ def _map_notion_page(page: dict) -> dict:
     updated_at = page.get("last_edited_time", now_iso())
 
     # Dedup hash based on title + created_time
-    dedup_key = hashlib.sha256(
-        f"{title}:{created_at}".encode()
-    ).hexdigest()[:12]
+    dedup_key = hashlib.sha256(f"{title}:{created_at}".encode()).hexdigest()[:12]
     task_id = f"notion-{dedup_key}"
 
     return {
@@ -334,7 +349,7 @@ def import_pages(
     """
     tasks_to_insert: list[dict] = []
     content_map: dict[str, str] = {}  # task_id → description
-    notes_map: dict[str, str] = {}    # task_id → notes (from comments)
+    notes_map: dict[str, str] = {}  # task_id → notes (from comments)
     stats = {"imported": 0, "skipped": 0, "errors": 0, "total": len(pages)}
 
     # Map all pages first
@@ -371,7 +386,11 @@ def import_pages(
             desc_len = len(content_map.get(t["id"], ""))
             log.info(
                 "  [%s] %s (status=%s, priority=%s, desc=%d chars)",
-                t["id"], t["title"], t["status"], t["priority"], desc_len,
+                t["id"],
+                t["title"],
+                t["status"],
+                t["priority"],
+                desc_len,
             )
         if len(tasks_to_insert) > 10:
             log.info("  ... and %d more", len(tasks_to_insert) - 10)
@@ -424,11 +443,19 @@ def import_pages(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import Notion tasks into sqlite-memory-mcp")
+    parser = argparse.ArgumentParser(
+        description="Import Notion tasks into sqlite-memory-mcp"
+    )
     parser.add_argument("--db-id", default=DEFAULT_DB_ID, help="Notion database ID")
-    parser.add_argument("--page-size", type=int, default=100, help="Pages per API request")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without inserting")
-    parser.add_argument("--no-content", action="store_true", help="Skip fetching page content")
+    parser.add_argument(
+        "--page-size", type=int, default=100, help="Pages per API request"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Preview without inserting"
+    )
+    parser.add_argument(
+        "--no-content", action="store_true", help="Skip fetching page content"
+    )
     parser.add_argument("--db-path", default=None, help="Override SQLite DB path")
     args = parser.parse_args()
 
@@ -451,16 +478,17 @@ def main():
 
     log.info(
         "Import complete: %d imported, %d skipped (duplicates), %d errors (of %d total)",
-        stats["imported"], stats["skipped"], stats["errors"], stats["total"],
+        stats["imported"],
+        stats["skipped"],
+        stats["errors"],
+        stats["total"],
     )
 
     # Show DB stats
     if not args.dry_run:
-        import sqlite3
-        conn = sqlite3.connect(DB_PATH)
-        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with get_conn() as conn:
+            task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         db_size = Path(DB_PATH).stat().st_size / (1024 * 1024)
-        conn.close()
         log.info("DB now has %d tasks, size: %.1f MB", task_count, db_size)
 
 

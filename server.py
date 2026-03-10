@@ -21,7 +21,6 @@ import socket
 import sqlite3
 import subprocess
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +35,7 @@ _NOWIN: dict = (
 from db_utils import (
     json_dumps as _json_dumps,
     json_loads as _json_loads,
+    get_conn as _get_conn,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
@@ -50,9 +50,15 @@ from db_utils import (
     VERIFICATION_WEIGHTS as _VERIFICATION_WEIGHTS,
     RATING_BURST_THRESHOLD as _RATING_BURST_THRESHOLD,
     RATING_BURST_WINDOW_HOURS as _RATING_BURST_WINDOW_HOURS,
+    MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
     build_priority_order_sql,
     now_iso as _now,
     sanitize_task_enums as _sanitize_task_enums,
+    upsert_field_versions as _upsert_field_versions,
+    merge_import_tasks as _merge_import_tasks,
+    export_task_files as _export_task_files,
+    export_index_json as _export_index_json,
+    migrate_to_per_task_files as _migrate_to_per_task_files,
 )
 
 # Pre-built SQL fragment for active-task exclusion filter
@@ -125,13 +131,6 @@ DB_PATH = os.environ.get(
 BRIDGE_REPO = os.environ.get(
     "BRIDGE_REPO",
     os.path.expanduser("~/.claude/memory/bridge"),
-)
-
-_PRAGMAS = (
-    "PRAGMA journal_mode=WAL;",
-    "PRAGMA foreign_keys=ON;",
-    "PRAGMA busy_timeout=10000;",
-    "PRAGMA wal_autocheckpoint=100;",
 )
 
 _SCHEMA_SQL = """
@@ -329,22 +328,7 @@ END;
 """
 
 
-# ── Connection helper ────────────────────────────────────────────────────
-@contextmanager
-def _get_conn():
-    """Yield a SQLite connection with all PRAGMAs set, auto-commit/rollback."""
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    for pragma in _PRAGMAS:
-        conn.execute(pragma)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# _get_conn imported from db_utils (atomic BEGIN/COMMIT transactions)
 
 
 # ── Schema init ──────────────────────────────────────────────────────────
@@ -570,8 +554,10 @@ _MIGRATIONS = [
 def _init_db() -> None:
     """Create tables if they don't exist, run migrations, set WAL mode."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with _get_conn() as conn:
-        conn.executescript(_SCHEMA_SQL)
+    # executescript() auto-commits, incompatible with get_conn's BEGIN — use raw conn
+    raw = sqlite3.connect(DB_PATH, isolation_level=None)
+    raw.executescript(_SCHEMA_SQL)
+    raw.close()
     # Migrations in separate transaction for proper rollback
     with _get_conn() as conn:
         for check_q, migrate_q, desc in _MIGRATIONS:
@@ -1013,15 +999,22 @@ def search_nodes(query: str) -> str:
     """
     fts_q = _fts_query(query)
     with _get_conn() as conn:
-        # Single JOIN query instead of N+1 per-entity subqueries
-        rows = conn.execute(
-            "SELECT memory_fts.rowid AS eid, memory_fts.name, "
-            "memory_fts.entity_type, e.project, memory_fts.rank "
-            "FROM memory_fts "
-            "JOIN entities e ON e.id = memory_fts.rowid "
-            "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT 50",
-            (fts_q,),
-        ).fetchall()
+        # Empty query → return all entities (no FTS filter)
+        if not query.strip():
+            rows = conn.execute(
+                "SELECT e.id AS eid, e.name, e.entity_type, e.project, 0 AS rank "
+                "FROM entities e ORDER BY e.name LIMIT 50"
+            ).fetchall()
+        else:
+            # Single JOIN query instead of N+1 per-entity subqueries
+            rows = conn.execute(
+                "SELECT memory_fts.rowid AS eid, memory_fts.name, "
+                "memory_fts.entity_type, e.project, memory_fts.rank "
+                "FROM memory_fts "
+                "JOIN entities e ON e.id = memory_fts.rowid "
+                "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT 50",
+                (fts_q,),
+            ).fetchall()
 
         if not rows:
             return json.dumps({"entities": [], "query": query})
@@ -1225,21 +1218,30 @@ def search_by_project(query: str, project: str) -> str:
             (fts_q, project),
         ).fetchall()
 
-        results = []
-        for r in rows:
-            eid = r["rowid"]
-            obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-                (eid,),
+        if not rows:
+            results = []
+        else:
+            # Batch-fetch observations (avoids N+1 per-entity queries)
+            eids = [r["rowid"] for r in rows]
+            ph = ",".join("?" * len(eids))
+            obs_rows = conn.execute(
+                f"SELECT entity_id, content FROM observations "
+                f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+                eids,
             ).fetchall()
-            results.append(
+            obs_by_eid: dict[int, list[str]] = {}
+            for o in obs_rows:
+                obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
+
+            results = [
                 {
                     "name": r["name"],
                     "entityType": r["entity_type"],
                     "project": project,
-                    "observations": [o["content"] for o in obs],
+                    "observations": obs_by_eid.get(r["rowid"], []),
                 }
-            )
+                for r in rows
+            ]
 
     logger.info(
         "search_by_project: query=%r project=%r matched=%d",
@@ -1365,6 +1367,8 @@ def update_task(
 ) -> str:
     """Update a task's fields. Only provided fields are changed.
 
+    Pass empty string ("") to clear a field to NULL.
+
     Args:
         task_id: UUID of the task to update (required).
         title: New title.
@@ -1372,11 +1376,11 @@ def update_task(
         status: not_started | in_progress | done | archived | cancelled.
         priority: low | medium | high | critical.
         section: inbox | today | next | someday | waiting.
-        due_date: YYYY-MM-DD or None.
-        project: Project tag.
-        parent_id: Parent task UUID.
-        notes: Freeform notes.
-        recurring: JSON recurrence config.
+        due_date: YYYY-MM-DD or "" to clear.
+        project: Project tag or "" to clear.
+        parent_id: Parent task UUID or "" to clear.
+        notes: Freeform notes or "" to clear.
+        recurring: JSON recurrence config or "" to clear.
     """
     fields = {
         "title": title,
@@ -2662,13 +2666,23 @@ def search_public_knowledge(
                 (fts_q, limit),
             ).fetchall()
 
+        # Batch-fetch observations (avoids N+1 per-entity queries)
+        if rows:
+            eids = [r["rowid"] for r in rows]
+            ph = ",".join("?" * len(eids))
+            obs_rows = conn.execute(
+                f"SELECT entity_id, content FROM observations "
+                f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+                eids,
+            ).fetchall()
+            obs_by_eid: dict[int, list[str]] = {}
+            for o in obs_rows:
+                obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
+        else:
+            obs_by_eid = {}
+
         results = []
         for r in rows:
-            eid = r["rowid"]
-            obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-                (eid,),
-            ).fetchall()
             score_info = _compute_truth_score(r["name"], conn)
             if (
                 min_truth_score is not None
@@ -2679,7 +2693,7 @@ def search_public_knowledge(
                 {
                     "name": r["name"],
                     "entityType": r["entity_type"],
-                    "observations": [o["content"] for o in obs],
+                    "observations": obs_by_eid.get(r["rowid"], []),
                     "truthScore": score_info["truth_score"],
                     "ratingCount": score_info["rating_count"],
                     "confidence": score_info["confidence"],
@@ -3401,15 +3415,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         ).fetchall()
         public_tasks_out = [dict(r) for r in pub_task_rows]
 
-    hostname = socket.gethostname()
-
-    # Build team_manifest from collaborators
-    with _get_conn() as conn:
+        # Build team_manifest from collaborators (same connection)
         collab_rows = conn.execute(
             "SELECT github_user FROM collaborators ORDER BY added_at"
         ).fetchall()
         collaborator_list = [r["github_user"] for r in collab_rows]
 
+    hostname = socket.gethostname()
     owner = os.environ.get("GITHUB_USER", hostname)
     payload = {
         "version": 3,
@@ -3623,7 +3635,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                     "create",
                     tag_name,
                     "--repo",
-                    "RMANOV/sqlite-memory-mcp",
+                    os.environ.get("BRIDGE_GH_REPO", "RMANOV/sqlite-memory-mcp"),
                     "--title",
                     release_title,
                     "--notes",

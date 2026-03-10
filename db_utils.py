@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
 import sqlite3
 from contextlib import contextmanager
@@ -154,6 +155,9 @@ MERGEABLE_FIELDS = (
 
 _TOMBSTONE_DAYS = 30
 
+# Path traversal defense: task IDs must be UUID-safe (alphanumeric + hyphens)
+_SAFE_TASK_ID = re.compile(r"^[a-zA-Z0-9\-]+$")
+
 _log = logging.getLogger("sqlite-kb")
 
 # ── DB connection ────────────────────────────────────────────────────────
@@ -162,21 +166,27 @@ _PRAGMAS = (
     "PRAGMA journal_mode=WAL;",
     "PRAGMA foreign_keys=ON;",
     "PRAGMA busy_timeout=10000;",
+    "PRAGMA wal_autocheckpoint=100;",
 )
 
 
 @contextmanager
 def get_conn(db_path: str | None = None):
-    """Yield a SQLite connection with PRAGMAs set, auto-commit/rollback."""
+    """Yield a SQLite connection with PRAGMAs set, auto-commit/rollback.
+
+    Uses explicit BEGIN/COMMIT to ensure each context-manager block is atomic.
+    (isolation_level=None = autocommit; commit()/rollback() are no-ops without BEGIN.)
+    """
     conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=10)
     conn.row_factory = sqlite3.Row
     for pragma in _PRAGMAS:
         conn.execute(pragma)
+    conn.execute("BEGIN;")
     try:
         yield conn
-        conn.commit()
+        conn.execute("COMMIT;")
     except Exception:
-        conn.rollback()
+        conn.execute("ROLLBACK;")
         raise
     finally:
         conn.close()
@@ -331,6 +341,8 @@ def export_task_files(
     exported: list[str] = []
     for row in rows:
         tid = row["id"]
+        if not _SAFE_TASK_ID.match(tid):
+            continue
         task_row = conn.execute(
             f"SELECT {_TASK_EXPORT_COLS} FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
@@ -561,6 +573,8 @@ def merge_import_tasks(
 
 def load_task_content(task_id: str, bridge_dir: str) -> dict | None:
     """Lazy-load full task (notes/description) from bridge per-task file."""
+    if not _SAFE_TASK_ID.match(task_id):
+        return None
     task_file = Path(bridge_dir) / "tasks" / f"{task_id}.json"
     if not task_file.exists():
         return None
@@ -596,7 +610,7 @@ def migrate_to_per_task_files(bridge_dir: str) -> bool:
     count = 0
     for task in tasks:
         tid = task.get("id")
-        if not tid:
+        if not tid or not _SAFE_TASK_ID.match(tid):
             continue
         if "_field_ts" not in task:
             task["_field_ts"] = {}

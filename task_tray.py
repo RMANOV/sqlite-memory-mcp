@@ -61,6 +61,15 @@ class TaskDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._ensure_table()
+        self._wal_timer = QTimer()
+        self._wal_timer.timeout.connect(self._wal_checkpoint)
+        self._wal_timer.start(300_000)  # 5 minutes
+
+    def _wal_checkpoint(self):
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
 
     def _ensure_table(self):
         """Create tasks table if missing; migrate existing table to v0.5.0 schema."""

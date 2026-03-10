@@ -27,10 +27,12 @@ from db_utils import (
     sanitize_task_enums,
     # v2.0.0: Bridge Sync v2 — per-field CRDT
     json_loads as _json_loads,
+    json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
     export_task_files,
     export_index_json,
     merge_import_tasks,
     migrate_to_per_task_files,
+    get_conn,  # I3: managed connection — handles PRAGMAs, BEGIN/COMMIT/ROLLBACK, close
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -202,7 +204,12 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
 
 
 def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict]:
-    """Merge remote tasks: keep missing-locally, newer-wins update."""
+    """Merge remote tasks: keep missing-locally, newer-wins update.
+
+    DEPRECATED: Legacy title-based matching for shared.json backward compat only.
+    Will be removed once all machines run Bridge v2 (per-task files + index.json).
+    New code should use merge_import_tasks() from db_utils (UUID-based CRDT).
+    """
     remote_tasks = existing_data.get("tasks", [])
     local_titles = {t["title"] for t in tasks_out}
 
@@ -254,10 +261,7 @@ def main(
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
 
-    conn = sqlite3.connect(_db_path, isolation_level=None, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=10000")
-    try:
+    with get_conn(_db_path) as conn:
         # Promote pending_public → public if standby elapsed
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
@@ -272,7 +276,6 @@ def main(
             "WHERE visibility='pending_public' AND publish_requested_at <= ?",
             (cutoff,),
         )
-        conn.commit()
 
         # 1. Pull remote changes
         _progress(progress_callback, 5, "git pull...")
@@ -291,9 +294,7 @@ def main(
         if shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                conn.execute("BEGIN")
                 _import_remote_entities(conn, remote_data.get("entities", []))
-                conn.commit()
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -301,9 +302,7 @@ def main(
         if index_path.exists():
             try:
                 idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
-                conn.execute("BEGIN")
                 new_t, upd_t = merge_import_tasks(conn, idx_data.get("tasks", []))
-                conn.commit()
                 log.info(
                     "CRDT merged %d new tasks, %d field updates from index.json",
                     new_t,
@@ -315,9 +314,7 @@ def main(
             # Legacy fallback: task-level LWW from shared.json
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                conn.execute("BEGIN")
                 new_t, upd_t = merge_import_tasks(conn, remote_data.get("tasks", []))
-                conn.commit()
                 log.info("Imported %d new tasks, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
@@ -395,11 +392,9 @@ def main(
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # 10. Write shared.json (backward compat)
+        # 10. Write shared.json (backward compat)  # I5: use _json_dumps from db_utils
         _progress(progress_callback, 70, "Writing shared.json...")
-        shared_path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        shared_path.write_text(_json_dumps(payload), encoding="utf-8")
 
         # 11. Git add + commit + push (includes new per-task files)
         _progress(progress_callback, 80, "git add...")
@@ -424,6 +419,3 @@ def main(
             "imported_new": new_t,
             "imported_updated": upd_t,
         }
-
-    finally:
-        conn.close()

@@ -43,8 +43,13 @@ def next_due_date(config: dict, today: date) -> str:
     if every == "week":
         day_name = config.get("day", "").lower()
         weekday_map = {
-            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-            "friday": 4, "saturday": 5, "sunday": 6,
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
         }
         target_weekday = weekday_map.get(day_name)
         if target_weekday is None:
@@ -62,6 +67,7 @@ def next_due_date(config: dict, today: date) -> str:
         except ValueError:
             # day_num > days in this month — use last day
             import calendar
+
             last_day = calendar.monthrange(today.year, today.month)[1]
             candidate = today.replace(day=last_day)
         if candidate < today:
@@ -73,6 +79,7 @@ def next_due_date(config: dict, today: date) -> str:
                     candidate = candidate.replace(month=today.month + 1)
                 except ValueError:
                     import calendar
+
                     last_day = calendar.monthrange(today.year, today.month + 1)[1]
                     candidate = candidate.replace(
                         month=today.month + 1, day=min(day_num, last_day)
@@ -92,7 +99,10 @@ def has_active_duplicate(conn: sqlite3.Connection, title: str) -> bool:
 
 def get_recurring_done_tasks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT * FROM tasks WHERE recurring IS NOT NULL AND status = 'done'"
+        "SELECT id, title, description, status, priority, section, due_date,"
+        " project, parent_id, notes, recurring, type, assignee, shared_by,"
+        " created_at, updated_at, visibility, publish_requested_at"
+        " FROM tasks WHERE recurring IS NOT NULL AND status = 'done'"
     ).fetchall()
 
 
@@ -114,9 +124,7 @@ def build_new_task(source: sqlite3.Row, due: str, timestamp: str) -> dict:
     }
 
 
-def process_recurring(
-    conn: sqlite3.Connection, dry_run: bool
-) -> list[dict]:
+def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
     today = date.today()
     timestamp = now_iso()
 
