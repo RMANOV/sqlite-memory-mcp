@@ -151,7 +151,7 @@ def _export_tasks(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT id, title, description, status, priority, section, "
         "due_date, project, parent_id, notes, recurring, type, "
-        "assignee, shared_by, created_at, updated_at "
+        "assignee, shared_by, reminder_at, created_at, updated_at "
         "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
     ).fetchall()
     return [dict(r) for r in rows]
@@ -283,7 +283,7 @@ def main(
     _progress(progress_callback, 5, "git pull...")
     _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
 
-    # Phase 3: Import + Export (short transaction)
+    # Phase 3a: Import (write transaction)
     with get_conn(_db_path) as conn:
         migrate_to_per_task_files(bridge_dir)
 
@@ -316,7 +316,10 @@ def main(
                 log.info("Imported %d new, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
+    # Import transaction closed — DB lock released
 
+    # Phase 3b: Export (read-only, separate short transaction)
+    with get_conn(_db_path) as conn:
         _progress(progress_callback, 20, "Exporting entities...")
         entities_out, entity_ids = _export_entities(conn)
         _progress(progress_callback, 30, "Exporting relations...")
@@ -332,7 +335,7 @@ def main(
         pub_entities, pub_tasks = _export_public_knowledge(conn)
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
         kr_out = _export_knowledge_ratings(conn)
-    # Transaction closed — DB lock released
+    # Export transaction closed
 
     # Phase 4: Build payload + write files + git ops (no transaction)
     _progress(progress_callback, 60, "Merging tasks...")

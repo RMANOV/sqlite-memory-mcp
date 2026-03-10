@@ -24,9 +24,11 @@ from urllib.request import Request, urlopen
 
 from db_utils import (
     DB_PATH,
+    MERGEABLE_FIELDS,
     bulk_conn,
     get_conn,
     now_iso,
+    upsert_field_versions,
 )
 
 # ── Logging ──────────────────────────────────────────────────────────────
@@ -426,6 +428,7 @@ def import_pages(
                     ),
                 )
                 if cur.rowcount > 0:
+                    upsert_field_versions(conn, task_id, MERGEABLE_FIELDS)
                     stats["imported"] += 1
                 else:
                     stats["skipped"] += 1

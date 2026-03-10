@@ -20,12 +20,12 @@ import calendar as _cal_mod
 import time
 from datetime import date, datetime, timedelta, timezone
 
-_crash_log = open(
-    os.path.expanduser("~/.claude/mcp_servers/sqlite_memory/crash.log"), "a"
-)
+_log_dir = os.path.expanduser("~/.claude/mcp_servers/sqlite_kb")
+os.makedirs(_log_dir, exist_ok=True)
+_crash_log = open(os.path.join(_log_dir, "crash.log"), "a")
 faulthandler.enable(file=_crash_log)
 logging.basicConfig(
-    filename=os.path.expanduser("~/.claude/mcp_servers/sqlite_memory/task_tray.log"),
+    filename=os.path.join(_log_dir, "task_tray.log"),
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
 )
@@ -172,6 +172,28 @@ class TaskDB:
             "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status)",
         ):
             self._conn.execute(idx_sql)
+        # v0.6.0+: supporting tables for per-field CRDT and entity links
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS task_field_versions ("
+            "task_id TEXT NOT NULL, field_name TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', "
+            "PRIMARY KEY (task_id, field_name), "
+            "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS task_entity_links ("
+            "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
+            "entity_id INTEGER NOT NULL, "
+            "link_type TEXT NOT NULL DEFAULT 'manual', "
+            "score REAL DEFAULT NULL, "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (task_id, entity_id))"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tel_entity "
+            "ON task_entity_links(entity_id)"
+        )
+        self._conn.commit()
 
     def close(self):
         self._conn.close()
@@ -2542,8 +2564,8 @@ class FullWindow(QMainWindow):
                 created = process_recurring(conn, dry_run=False)
             if created:
                 self.refresh()
-        except Exception:
-            pass  # silent — never break startup/sync
+        except Exception as exc:
+            logging.getLogger("task_tray").warning("recurring: %s", exc)
 
     # ── Appearance ─────────────────────────────────────────────────────
 
@@ -3435,7 +3457,8 @@ class TaskTrayApp:
                 (now_str,),
             ).fetchall()
             conn.close()
-        except Exception:
+        except Exception as exc:
+            logging.getLogger("task_tray").warning("reminder check: %s", exc)
             return
 
         for row in rows:

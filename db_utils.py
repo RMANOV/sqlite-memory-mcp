@@ -695,7 +695,7 @@ def fts_sync_entity(conn: sqlite3.Connection, entity_id: int) -> None:
 
     conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (entity_id,))
     conn.execute(
-        "INSERT INTO memory_fts(rowid, name, entity_type, observations) VALUES (?, ?, ?, ?)",
+        "INSERT INTO memory_fts(rowid, name, entity_type, observations_text) VALUES (?, ?, ?, ?)",
         (row["id"], row["name"], row["entity_type"], obs_text),
     )
 

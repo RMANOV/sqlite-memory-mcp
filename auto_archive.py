@@ -36,7 +36,7 @@ def archive(conn: sqlite3.Connection, days: int) -> None:
         "AND updated_at < datetime('now', ? || ' days')",
         (iso_now, f"-{days}"),
     )
-    conn.commit()
+    # conn.commit() removed — get_conn() context manager handles commit/rollback
     print(f"Archived {cur.rowcount} tasks (older than {days} days).")
 
 

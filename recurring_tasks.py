@@ -16,7 +16,7 @@ import sys
 import uuid
 from datetime import date, timedelta
 
-from db_utils import DB_PATH, get_conn, now_iso
+from db_utils import DB_PATH, MERGEABLE_FIELDS, get_conn, now_iso, upsert_field_versions
 
 
 def matches_schedule(config: dict, today: date) -> bool:
@@ -204,6 +204,7 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
                 """,
                 new_task,
             )
+            upsert_field_versions(conn, new_task["id"], MERGEABLE_FIELDS)
             print(
                 f"  Created: title='{new_task['title']}'"
                 f"  id={new_task['id']}"
@@ -212,8 +213,7 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
 
         created.append(new_task)
 
-    if not dry_run and created:
-        conn.commit()
+    # conn.commit() removed — get_conn() context manager handles commit/rollback
 
     return created
 

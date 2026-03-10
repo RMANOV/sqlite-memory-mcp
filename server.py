@@ -60,6 +60,9 @@ from db_utils import (
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
     migrate_to_per_task_files as _migrate_to_per_task_files,
+    fts_sync_entity as _fts_sync,
+    DB_PATH,
+    BRIDGE_REPO,
 )
 
 # Pre-built SQL fragment for active-task exclusion filter
@@ -149,16 +152,7 @@ mcp = FastMCP(
     ),
 )
 
-# ── Constants + DB path ──────────────────────────────────────────────────
-DB_PATH = os.environ.get(
-    "SQLITE_MEMORY_DB",
-    os.path.expanduser("~/.claude/memory/memory.db"),
-)
-
-BRIDGE_REPO = os.environ.get(
-    "BRIDGE_REPO",
-    os.path.expanduser("~/.claude/memory/bridge"),
-)
+# DB_PATH and BRIDGE_REPO imported from db_utils (single source of truth)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -653,34 +647,7 @@ def _init_db() -> None:
 
 
 # ── FTS sync helper ──────────────────────────────────────────────────────
-def _fts_sync(conn: sqlite3.Connection, entity_id: int) -> None:
-    """Rebuild the FTS entry for a given entity.
-
-    Gathers all observations, concatenates them, and upserts into memory_fts.
-    The FTS rowid is kept in sync with entities.id.
-    """
-    row = conn.execute(
-        "SELECT id, name, entity_type FROM entities WHERE id = ?",
-        (entity_id,),
-    ).fetchone()
-    if row is None:
-        # Entity was deleted — remove from FTS
-        conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (entity_id,))
-        return
-
-    obs_rows = conn.execute(
-        "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-        (entity_id,),
-    ).fetchall()
-    obs_text = "\n".join(r["content"] for r in obs_rows)
-
-    # DELETE then INSERT to ensure idempotent upsert (FTS5 has no ON CONFLICT)
-    conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (entity_id,))
-    conn.execute(
-        "INSERT INTO memory_fts(rowid, name, entity_type, observations_text) "
-        "VALUES (?, ?, ?, ?)",
-        (row["id"], row["name"], row["entity_type"], obs_text),
-    )
+# _fts_sync is imported from db_utils.fts_sync_entity (single source of truth)
 
 
 def _fts_sync_by_name(conn: sqlite3.Connection, entity_name: str) -> None:
@@ -2085,6 +2052,22 @@ def _content_hash(entity_name: str, observations: list[str]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _entity_content_hash(
+    conn, entity_name: str
+) -> tuple[str, list[str]] | None:
+    """Fetch observations + compute content hash. Returns (hash, obs_list) or None."""
+    obs_rows = conn.execute(
+        "SELECT o.content FROM observations o "
+        "JOIN entities e ON o.entity_id = e.id "
+        "WHERE e.name = ? ORDER BY o.id",
+        (entity_name,),
+    ).fetchall()
+    if not obs_rows:
+        return None
+    obs = [r["content"] for r in obs_rows]
+    return _content_hash(entity_name, obs), obs
+
+
 def _get_publisher_id(conn, entity_name: str) -> str:
     """Extract publisher identity for an entity."""
     row = conn.execute(
@@ -2107,14 +2090,9 @@ def _compute_truth_score(entity_name: str, conn) -> dict[str, Any]:
     Returns dict with truth_score, confidence, rating_count, content_hash, dimensions.
     """
     # Get current content hash
-    obs_rows = conn.execute(
-        "SELECT o.content FROM observations o "
-        "JOIN entities e ON o.entity_id = e.id "
-        "WHERE e.name = ? ORDER BY o.id",
-        (entity_name,),
-    ).fetchall()
-    observations = [r["content"] for r in obs_rows]
-    c_hash = _content_hash(entity_name, observations)
+    result = _entity_content_hash(conn, entity_name)
+    observations = result[1] if result else []
+    c_hash = result[0] if result else _content_hash(entity_name, [])
 
     # Get ratings for current content version
     ratings = conn.execute(
@@ -2947,13 +2925,8 @@ def rate_public_knowledge(
             return json.dumps({"error": "Cannot rate your own published knowledge"})
 
         # Compute content hash from current DB content
-        obs_rows = conn.execute(
-            "SELECT o.content FROM observations o "
-            "JOIN entities e ON o.entity_id = e.id "
-            "WHERE e.name = ? ORDER BY o.id",
-            (entity_name,),
-        ).fetchall()
-        c_hash = _content_hash(entity_name, [r["content"] for r in obs_rows])
+        result = _entity_content_hash(conn, entity_name)
+        c_hash = result[0] if result else _content_hash(entity_name, [])
 
         # Insert rating (UNIQUE constraint prevents re-rating same version)
         try:
@@ -3079,17 +3052,12 @@ def update_verification(
 
     with _get_conn() as conn:
         # Get current content hash
-        obs_rows = conn.execute(
-            "SELECT o.content FROM observations o "
-            "JOIN entities e ON o.entity_id = e.id "
-            "WHERE e.name = ? ORDER BY o.id",
-            (entity_name,),
-        ).fetchall()
-        if not obs_rows:
+        result = _entity_content_hash(conn, entity_name)
+        if not result:
             return json.dumps(
                 {"error": f"Entity '{entity_name}' not found or has no observations"}
             )
-        c_hash = _content_hash(entity_name, [r["content"] for r in obs_rows])
+        c_hash = result[0]
 
         # Update existing rating
         cur = conn.execute(
@@ -3151,10 +3119,20 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     return result
 
 
+_GITHUB_USER_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
+
+
+def _validate_github_user(username: str) -> None:
+    """Raise ValueError if username is not a valid GitHub username."""
+    if not _GITHUB_USER_RE.match(username):
+        raise ValueError(f"Invalid GitHub username: {username!r}")
+
+
 def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
     """Push assigned tasks to another user's memory-bridge repo."""
     import tempfile
 
+    _validate_github_user(assignee)
     repo_url = f"https://github.com/{assignee}/memory-bridge.git"
     with tempfile.TemporaryDirectory() as tmpdir:
         clone = subprocess.run(
@@ -3309,6 +3287,7 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
         return 0
 
     # Clone target repo, merge knowledge, push
+    _validate_github_user(target_user)
     repo_url = f"https://github.com/{target_user}/memory-bridge.git"
     with tempfile.TemporaryDirectory() as tmpdir:
         clone = subprocess.run(
