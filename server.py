@@ -65,7 +65,7 @@ from db_utils import (
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 
 # ── Recurring task validation ─────────────────────────────────────────
-_RECURRING_EVERY = ("day", "week", "month")
+_RECURRING_EVERY = ("day", "week", "month", "year")
 _RECURRING_WEEKDAYS = frozenset(
     ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 )
@@ -82,6 +82,15 @@ def _validate_recurring(raw: str) -> str | None:
     every = config.get("every", "").lower()
     if every not in _RECURRING_EVERY:
         return f"Invalid 'every': {every}. Use: {_RECURRING_EVERY}"
+    # Optional interval (default 1)
+    interval = config.get("interval")
+    if interval is not None:
+        try:
+            iv = int(interval)
+            if iv < 1:
+                return f"'interval' must be >= 1. Got: {iv}"
+        except (ValueError, TypeError):
+            return f"'interval' must be an integer. Got: {interval!r}"
     if every == "week":
         day = config.get("day", "").lower()
         if day not in _RECURRING_WEEKDAYS:
@@ -96,6 +105,23 @@ def _validate_recurring(raw: str) -> str | None:
                 return f"Monthly 'day' must be 1-31. Got: {d}"
         except (ValueError, TypeError):
             return f"Monthly 'day' must be an integer. Got: {day!r}"
+    if every == "year":
+        month = config.get("month")
+        if month is not None:
+            try:
+                m = int(month)
+                if not 1 <= m <= 12:
+                    return f"Yearly 'month' must be 1-12. Got: {m}"
+            except (ValueError, TypeError):
+                return f"Yearly 'month' must be an integer. Got: {month!r}"
+        day = config.get("day")
+        if day is not None:
+            try:
+                d = int(day)
+                if not 1 <= d <= 31:
+                    return f"Yearly 'day' must be 1-31. Got: {d}"
+            except (ValueError, TypeError):
+                return f"Yearly 'day' must be an integer. Got: {day!r}"
     return None
 
 
@@ -186,6 +212,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_id   TEXT DEFAULT NULL REFERENCES tasks(id) ON DELETE SET NULL,  -- only affects fresh installs
     notes       TEXT DEFAULT NULL,
     recurring   TEXT DEFAULT NULL,
+    reminder_at TEXT DEFAULT NULL,
     type        TEXT NOT NULL DEFAULT 'task',
     assignee    TEXT DEFAULT NULL,
     shared_by   TEXT DEFAULT NULL,
@@ -547,6 +574,25 @@ _MIGRATIONS = [
         "UNION ALL SELECT id, 'description', updated_at, '' FROM tasks "
         "UNION ALL SELECT id, 'notes', updated_at, '' FROM tasks",
         "seed task_field_versions from existing tasks (v2.0.0)",
+    ),
+    # v2.1.0: reminder_at column
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='reminder_at'",
+        "ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT NULL",
+        "tasks.reminder_at column (v2.1.0 — reminders)",
+    ),
+    # v2.1.0: partial index for reminder queries
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_reminder_at'",
+        "CREATE INDEX idx_tasks_reminder_at ON tasks(reminder_at) WHERE reminder_at IS NOT NULL",
+        "idx_tasks_reminder_at partial index (v2.1.0)",
+    ),
+    # v2.1.0: seed reminder_at field version for existing tasks
+    (
+        "SELECT 1 FROM task_field_versions WHERE field_name = 'reminder_at' LIMIT 1",
+        "INSERT OR IGNORE INTO task_field_versions (task_id, field_name, updated_at, updated_by) "
+        "SELECT id, 'reminder_at', updated_at, '' FROM tasks",
+        "seed task_field_versions.reminder_at for existing tasks (v2.1.0)",
     ),
 ]
 
@@ -1272,6 +1318,7 @@ def create_task(
     parent_id: str | None = None,
     notes: str | None = None,
     recurring: str | None = None,
+    reminder_at: str | None = None,
 ) -> str:
     """Create a new task or note. Returns the UUID.
 
@@ -1286,6 +1333,7 @@ def create_task(
         parent_id: UUID of parent task (for subtasks).
         notes: Freeform notes.
         recurring: JSON config for recurrence (e.g. '{"every":"week","day":"monday"}').
+        reminder_at: ISO datetime for one-time reminder (e.g. '2026-03-15T14:00:00').
     """
     task_id = str(uuid.uuid4())
     now = _now()
@@ -1311,6 +1359,15 @@ def create_task(
         err = _validate_recurring(recurring)
         if err:
             return json.dumps({"error": f"Invalid recurring config: {err}"})
+    if reminder_at:
+        try:
+            datetime.fromisoformat(reminder_at)
+        except ValueError:
+            return json.dumps(
+                {
+                    "error": f"Invalid reminder_at: {reminder_at}. Use ISO datetime format (e.g. 2026-03-15T14:00:00)"
+                }
+            )
 
     with _get_conn() as conn:
         if parent_id:
@@ -1322,9 +1379,9 @@ def create_task(
 
         conn.execute(
             "INSERT INTO tasks (id, title, description, status, priority, section, "
-            "due_date, project, parent_id, notes, recurring, type, "
+            "due_date, project, parent_id, notes, recurring, reminder_at, type, "
             "created_at, updated_at) "
-            "VALUES (?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -1336,6 +1393,7 @@ def create_task(
                 parent_id,
                 notes,
                 recurring,
+                reminder_at,
                 type,
                 now,
                 now,
@@ -1363,6 +1421,7 @@ def update_task(
     parent_id: str | None = None,
     notes: str | None = None,
     recurring: str | None = None,
+    reminder_at: str | None = None,
     type: str | None = None,
 ) -> str:
     """Update a task's fields. Only provided fields are changed.
@@ -1381,6 +1440,7 @@ def update_task(
         parent_id: Parent task UUID or "" to clear.
         notes: Freeform notes or "" to clear.
         recurring: JSON recurrence config or "" to clear.
+        reminder_at: ISO datetime for one-time reminder or "" to clear.
     """
     fields = {
         "title": title,
@@ -1393,6 +1453,7 @@ def update_task(
         "parent_id": parent_id,
         "notes": notes,
         "recurring": recurring,
+        "reminder_at": reminder_at,
         "type": type,
     }
     updates = {}
@@ -1433,6 +1494,15 @@ def update_task(
         err = _validate_recurring(updates["recurring"])
         if err:
             return json.dumps({"error": f"Invalid recurring config: {err}"})
+    if "reminder_at" in updates and updates["reminder_at"] is not None:
+        try:
+            datetime.fromisoformat(updates["reminder_at"])
+        except ValueError:
+            return json.dumps(
+                {
+                    "error": f"Invalid reminder_at: {updates['reminder_at']}. Use ISO datetime format"
+                }
+            )
 
     updates["updated_at"] = _now()
     set_clause = ", ".join(f"{k} = ?" for k in updates)

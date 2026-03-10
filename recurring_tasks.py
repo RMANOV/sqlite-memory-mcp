@@ -22,24 +22,48 @@ from db_utils import DB_PATH, get_conn, now_iso
 def matches_schedule(config: dict, today: date) -> bool:
     """Return True if today matches the recurring schedule config."""
     every = config.get("every", "").lower()
+    interval = int(config.get("interval", 1))
     if every == "day":
-        return True
+        if interval == 1:
+            return True
+        return today.toordinal() % interval == 0
     if every == "week":
         day_name = config.get("day", "").lower()
-        return today.strftime("%A").lower() == day_name
+        if today.strftime("%A").lower() != day_name:
+            return False
+        if interval == 1:
+            return True
+        return today.isocalendar()[1] % interval == 0
     if every == "month":
         day_num = config.get("day")
         if day_num is None:
             return False
-        return today.day == int(day_num)
+        if today.day != int(day_num):
+            return False
+        if interval == 1:
+            return True
+        return today.month % interval == 0
+    if every == "year":
+        cfg_month = config.get("month")
+        cfg_day = config.get("day")
+        if cfg_month is not None and today.month != int(cfg_month):
+            return False
+        if cfg_day is not None and today.day != int(cfg_day):
+            return False
+        if interval > 1:
+            return today.year % interval == 0
+        return True
     return False
 
 
 def next_due_date(config: dict, today: date) -> str:
     """Calculate the due_date for the new task based on the recurring config."""
+    import calendar
+
     every = config.get("every", "").lower()
+    interval = int(config.get("interval", 1))
     if every == "day":
-        return today.isoformat()
+        return (today + timedelta(days=interval)).isoformat()
     if every == "week":
         day_name = config.get("day", "").lower()
         weekday_map = {
@@ -53,37 +77,41 @@ def next_due_date(config: dict, today: date) -> str:
         }
         target_weekday = weekday_map.get(day_name)
         if target_weekday is None:
-            return today.isoformat()
+            return (today + timedelta(weeks=interval)).isoformat()
         days_ahead = (target_weekday - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7 * interval
+        else:
+            days_ahead += 7 * (interval - 1)
         return (today + timedelta(days=days_ahead)).isoformat()
     if every == "month":
         day_num = config.get("day")
         if day_num is None:
             return today.isoformat()
         day_num = int(day_num)
-        # Use this month if day is today or in future, else next month
+        # Advance by interval months
+        new_month = today.month + interval
+        new_year = today.year + (new_month - 1) // 12
+        new_month = (new_month - 1) % 12 + 1
+        last_day = calendar.monthrange(new_year, new_month)[1]
+        return date(new_year, new_month, min(day_num, last_day)).isoformat()
+    if every == "year":
+        cfg_month = int(config.get("month", today.month))
+        cfg_day = int(config.get("day", today.day))
+        # Try this year first
         try:
-            candidate = today.replace(day=day_num)
+            candidate = date(today.year, cfg_month, cfg_day)
         except ValueError:
-            # day_num > days in this month — use last day
-            import calendar
-
-            last_day = calendar.monthrange(today.year, today.month)[1]
-            candidate = today.replace(day=last_day)
-        if candidate < today:
-            # Move to next month
-            if today.month == 12:
-                candidate = candidate.replace(year=today.year + 1, month=1)
-            else:
-                try:
-                    candidate = candidate.replace(month=today.month + 1)
-                except ValueError:
-                    import calendar
-
-                    last_day = calendar.monthrange(today.year, today.month + 1)[1]
-                    candidate = candidate.replace(
-                        month=today.month + 1, day=min(day_num, last_day)
-                    )
+            last_day = calendar.monthrange(today.year, cfg_month)[1]
+            candidate = date(today.year, cfg_month, min(cfg_day, last_day))
+        if candidate <= today:
+            # Move to next interval year
+            target_year = today.year + interval
+            try:
+                candidate = date(target_year, cfg_month, cfg_day)
+            except ValueError:
+                last_day = calendar.monthrange(target_year, cfg_month)[1]
+                candidate = date(target_year, cfg_month, min(cfg_day, last_day))
         return candidate.isoformat()
     return today.isoformat()
 
@@ -119,6 +147,7 @@ def build_new_task(source: sqlite3.Row, due: str, timestamp: str) -> dict:
         "parent_id": source["parent_id"],
         "notes": source["notes"],
         "recurring": source["recurring"],
+        "reminder_at": None,
         "created_at": timestamp,
         "updated_at": timestamp,
     }
@@ -166,10 +195,12 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
                 """
                 INSERT INTO tasks
                     (id, title, description, status, priority, section, due_date,
-                     project, parent_id, notes, recurring, created_at, updated_at)
+                     project, parent_id, notes, recurring, reminder_at,
+                     created_at, updated_at)
                 VALUES
                     (:id, :title, :description, :status, :priority, :section, :due_date,
-                     :project, :parent_id, :notes, :recurring, :created_at, :updated_at)
+                     :project, :parent_id, :notes, :recurring, :reminder_at,
+                     :created_at, :updated_at)
                 """,
                 new_task,
             )

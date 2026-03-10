@@ -44,7 +44,7 @@ _ACTIVE_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
 _ACTIVE_PARAMS = list(TASK_ACTIVE_EXCLUSIONS)
 
 # Columns needed by UI rendering (excludes parent_id, notes, assignee, shared_by, publish_requested_at)
-_UI_COLS = "id, title, description, status, section, priority, due_date, project, type, recurring, visibility, updated_at, created_at"
+_UI_COLS = "id, title, description, status, section, priority, due_date, project, type, recurring, reminder_at, visibility, updated_at, created_at"
 
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200
@@ -115,6 +115,10 @@ class TaskDB:
             (
                 "publish_requested_at",
                 "ALTER TABLE tasks ADD COLUMN publish_requested_at TEXT DEFAULT NULL",
+            ),
+            (
+                "reminder_at",
+                "ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT NULL",
             ),
         ]:
             if col not in existing:
@@ -636,12 +640,39 @@ def _recurring_label(raw: str | None) -> str:
     except (json.JSONDecodeError, TypeError):
         return ""
     every = cfg.get("every", "").lower()
+    interval = int(cfg.get("interval", 1))
     if every == "day":
-        return "Daily"
+        return "Daily" if interval == 1 else f"Every {interval} days"
     if every == "week":
-        return f"Weekly ({cfg.get('day', '?').title()})"
+        day = cfg.get("day", "?").title()
+        if interval == 1:
+            return f"Weekly ({day})"
+        if interval == 2:
+            return f"Biweekly ({day})"
+        return f"Every {interval} weeks ({day})"
     if every == "month":
-        return f"Monthly (day {cfg.get('day', '?')})"
+        day = cfg.get("day", "?")
+        if interval == 1:
+            return f"Monthly (day {day})"
+        return f"Every {interval} months (day {day})"
+    if every == "year":
+        month = cfg.get("month")
+        day = cfg.get("day")
+        parts = []
+        if month:
+            import calendar
+
+            parts.append(calendar.month_name[int(month)])
+        if day:
+            parts.append(str(day))
+        suffix = " ".join(parts) if parts else ""
+        if interval == 1:
+            return f"Yearly ({suffix})" if suffix else "Yearly"
+        return (
+            f"Every {interval} years ({suffix})"
+            if suffix
+            else f"Every {interval} years"
+        )
     return ""
 
 
@@ -1529,6 +1560,14 @@ class TaskListWidget(QListWidget):
             clear_recurring_action = menu.addAction("Clear Recurring")
         else:
             clear_recurring_action = None
+        # Reminder actions
+        has_reminder = bool(task.get("reminder_at")) if task else False
+        reminder_label = "Edit Reminder..." if has_reminder else "Set Reminder..."
+        reminder_action = menu.addAction(reminder_label)
+        if has_reminder:
+            clear_reminder_action = menu.addAction("Clear Reminder")
+        else:
+            clear_reminder_action = None
         menu.addSeparator()
         # v0.7.0: Publish / Unpublish
         task_vis = task.get("visibility", "private") if task else "private"
@@ -1550,6 +1589,10 @@ class TaskListWidget(QListWidget):
             self._show_recurring_dialog(task_id, task)
         elif action == clear_recurring_action:
             self.db.update_task(task_id, recurring=None)
+        elif action == reminder_action:
+            self._show_reminder_dialog(task_id, task)
+        elif action == clear_reminder_action:
+            self.db.update_task(task_id, reminder_at=None)
         elif publish_action and action == publish_action:
             self._publish_task(task_id)
         elif unpublish_action and action == unpublish_action:
@@ -1608,6 +1651,14 @@ class TaskListWidget(QListWidget):
             config = dlg.get_config()
             self.db.update_task(task_id, recurring=config)
 
+    def _show_reminder_dialog(self, task_id, task):
+        """Show dialog to set/edit reminder."""
+        existing = task.get("reminder_at") if task else None
+        dlg = ReminderDateTimeDialog(existing, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            reminder_at = dlg.get_reminder_at()
+            self.db.update_task(task_id, reminder_at=reminder_at)
+
 
 class RecurringDialog(QDialog):
     """Dialog to configure recurring schedule for a task."""
@@ -1630,7 +1681,7 @@ class RecurringDialog(QDialog):
         layout = QFormLayout(self)
 
         self.every_combo = QComboBox()
-        self.every_combo.addItems(["Daily", "Weekly", "Monthly"])
+        self.every_combo.addItems(["Daily", "Weekly", "Monthly", "Yearly"])
         self.every_combo.currentTextChanged.connect(self._on_every_changed)
         layout.addRow("Repeat:", self.every_combo)
 
@@ -1643,6 +1694,19 @@ class RecurringDialog(QDialog):
         self.day_of_month.setRange(1, 31)
         self._dom_label = QLabel("Day of month:")
         layout.addRow(self._dom_label, self.day_of_month)
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 52)
+        self.interval_spin.setValue(1)
+        self._interval_label = QLabel("Every N:")
+        layout.addRow(self._interval_label, self.interval_spin)
+
+        self.month_combo = QComboBox()
+        import calendar
+
+        self.month_combo.addItems([calendar.month_name[i] for i in range(1, 13)])
+        self._month_label = QLabel("Month:")
+        layout.addRow(self._month_label, self.month_combo)
 
         # Restore from existing config
         raw = task.get("recurring") if task else None
@@ -1658,8 +1722,16 @@ class RecurringDialog(QDialog):
                 elif every == "month":
                     self.every_combo.setCurrentText("Monthly")
                     self.day_of_month.setValue(int(cfg.get("day", 1)))
+                elif every == "year":
+                    self.every_combo.setCurrentText("Yearly")
+                    month = cfg.get("month")
+                    if month:
+                        self.month_combo.setCurrentIndex(int(month) - 1)
+                    if cfg.get("day"):
+                        self.day_of_month.setValue(int(cfg.get("day", 1)))
                 else:
                     self.every_combo.setCurrentText("Daily")
+                self.interval_spin.setValue(int(cfg.get("interval", 1)))
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
 
@@ -1675,22 +1747,197 @@ class RecurringDialog(QDialog):
     def _on_every_changed(self, text):
         is_weekly = text == "Weekly"
         is_monthly = text == "Monthly"
+        is_yearly = text == "Yearly"
         self.day_of_week.setVisible(is_weekly)
         self._dow_label.setVisible(is_weekly)
-        self.day_of_month.setVisible(is_monthly)
-        self._dom_label.setVisible(is_monthly)
+        self.day_of_month.setVisible(is_monthly or is_yearly)
+        self._dom_label.setVisible(is_monthly or is_yearly)
+        self.month_combo.setVisible(is_yearly)
+        self._month_label.setVisible(is_yearly)
+        if is_yearly:
+            self._dom_label.setText("Day:")
+        else:
+            self._dom_label.setText("Day of month:")
 
     def get_config(self) -> str:
         """Return recurring config as JSON string."""
         every = self.every_combo.currentText()
+        interval = self.interval_spin.value()
+        base = {}
         if every == "Daily":
-            return json.dumps({"every": "day"})
+            base = {"every": "day"}
         elif every == "Weekly":
-            return json.dumps(
-                {"every": "week", "day": self.day_of_week.currentText().lower()}
-            )
+            base = {"every": "week", "day": self.day_of_week.currentText().lower()}
+        elif every == "Monthly":
+            base = {"every": "month", "day": self.day_of_month.value()}
+        elif every == "Yearly":
+            base = {
+                "every": "year",
+                "month": self.month_combo.currentIndex() + 1,
+                "day": self.day_of_month.value(),
+            }
+        if interval > 1:
+            base["interval"] = interval
+        return json.dumps(base)
+
+
+from PyQt6.QtWidgets import QDateTimeEdit
+from PyQt6.QtCore import QDateTime, QTime
+
+
+class ReminderDateTimeDialog(QDialog):
+    """Dialog to set a one-time reminder datetime."""
+
+    def __init__(self, existing_reminder: str | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Reminder")
+        self.setMinimumWidth(320)
+        self.setStyleSheet(_build_dialog_style())
+        layout = QVBoxLayout(self)
+
+        # Quick shortcuts
+        shortcuts_layout = QHBoxLayout()
+        for label, minutes in [
+            ("1h", 60),
+            ("3h", 180),
+            ("Tomorrow 9:00", -1),
+            ("Next Monday 9:00", -2),
+        ]:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda checked, m=minutes: self._apply_shortcut(m))
+            shortcuts_layout.addWidget(btn)
+        layout.addLayout(shortcuts_layout)
+
+        # DateTime picker
+        self.dt_edit = QDateTimeEdit()
+        self.dt_edit.setCalendarPopup(True)
+        self.dt_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
+        now = QDateTime.currentDateTimeUtc()
+        self.dt_edit.setMinimumDateTime(now)
+        if existing_reminder:
+            try:
+                from datetime import datetime as _dt
+
+                parsed = _dt.fromisoformat(existing_reminder)
+                self.dt_edit.setDateTime(
+                    QDateTime(
+                        QDate(parsed.year, parsed.month, parsed.day),
+                        QTime(parsed.hour, parsed.minute),
+                    )
+                )
+            except (ValueError, TypeError):
+                self.dt_edit.setDateTime(now.addSecs(3600))
         else:
-            return json.dumps({"every": "month", "day": self.day_of_month.value()})
+            self.dt_edit.setDateTime(now.addSecs(3600))
+        layout.addWidget(self.dt_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _apply_shortcut(self, minutes):
+        now = QDateTime.currentDateTimeUtc()
+        if minutes == -1:  # Tomorrow 9:00
+            tomorrow = now.addDays(1)
+            tomorrow.setTime(QTime(9, 0))
+            self.dt_edit.setDateTime(tomorrow)
+        elif minutes == -2:  # Next Monday 9:00
+            days_until_monday = (8 - now.date().dayOfWeek()) % 7
+            if days_until_monday == 0:
+                days_until_monday = 7
+            monday = now.addDays(days_until_monday)
+            monday.setTime(QTime(9, 0))
+            self.dt_edit.setDateTime(monday)
+        else:
+            self.dt_edit.setDateTime(now.addSecs(minutes * 60))
+
+    def get_reminder_at(self) -> str:
+        """Return ISO datetime string (UTC)."""
+        qdt = self.dt_edit.dateTime()
+        return datetime(
+            qdt.date().year(),
+            qdt.date().month(),
+            qdt.date().day(),
+            qdt.time().hour(),
+            qdt.time().minute(),
+            tzinfo=timezone.utc,
+        ).isoformat()
+
+
+class ReminderPopupDialog(QDialog):
+    """Always-on-top popup for overdue/critical reminders with snooze."""
+
+    snoozed = pyqtSignal(str, int)  # task_id, minutes
+    dismissed = pyqtSignal(str)  # task_id
+
+    def __init__(
+        self,
+        task_id: str,
+        title: str,
+        priority: str,
+        description: str | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.task_id = task_id
+        self.setWindowTitle("Task Reminder")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.setMinimumWidth(350)
+        self.setStyleSheet(_build_dialog_style())
+        layout = QVBoxLayout(self)
+
+        # Priority badge
+        color = PRIORITY_COLORS.get(priority, "#718096")
+        badge = QLabel(priority.upper())
+        badge.setStyleSheet(
+            f"background: {color}; color: white; padding: 2px 8px; "
+            f"border-radius: 3px; font-weight: bold; font-size: 11px;"
+        )
+        layout.addWidget(badge)
+
+        # Title
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("font-size: 15px; font-weight: bold; padding: 4px 0;")
+        title_lbl.setWordWrap(True)
+        layout.addWidget(title_lbl)
+
+        # Description preview
+        if description:
+            desc_lbl = QLabel(
+                description[:200] + ("..." if len(description) > 200 else "")
+            )
+            desc_lbl.setWordWrap(True)
+            desc_lbl.setStyleSheet("color: #666; padding: 4px 0;")
+            layout.addWidget(desc_lbl)
+
+        # Snooze buttons
+        snooze_layout = QHBoxLayout()
+        for label, minutes in [
+            ("5 min", 5),
+            ("15 min", 15),
+            ("1 hour", 60),
+            ("Tomorrow", 1440),
+        ]:
+            btn = QPushButton(f"Snooze {label}")
+            btn.clicked.connect(lambda checked, m=minutes: self._snooze(m))
+            snooze_layout.addWidget(btn)
+        layout.addLayout(snooze_layout)
+
+        # Dismiss
+        dismiss_btn = QPushButton("Dismiss")
+        dismiss_btn.clicked.connect(self._dismiss)
+        layout.addWidget(dismiss_btn)
+
+    def _snooze(self, minutes):
+        self.snoozed.emit(self.task_id, minutes)
+        self.accept()
+
+    def _dismiss(self):
+        self.dismissed.emit(self.task_id)
+        self.accept()
 
 
 _REFRESH_INTERVAL_MS = 30_000
@@ -2768,6 +3015,13 @@ class TaskTrayApp:
         self.popup = None
         self.full_window = None
 
+        # Reminder timer — check every 60s for due reminders
+        self._reminder_timer = QTimer()
+        self._reminder_timer.timeout.connect(self._check_reminders)
+        self._reminder_timer.start(60_000)
+        self._shown_reminder_ids: set[str] = set()
+        QTimer.singleShot(5000, self._check_reminders)  # initial check after startup
+
     def _update_icon(self, summary=None):
         if summary is None:
             summary = self.db.get_summary()
@@ -2820,6 +3074,73 @@ class TaskTrayApp:
             self.popup.refresh()
         if self.full_window and self.full_window.isVisible():
             self.full_window.refresh()
+
+    def _check_reminders(self):
+        """Check for tasks with due reminders and show notifications."""
+        try:
+            now_str = datetime.now(timezone.utc).isoformat()
+            conn = sqlite3.connect(self.db.db_path, isolation_level=None, timeout=5)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute(
+                "SELECT id, title, description, priority, reminder_at FROM tasks "
+                "WHERE reminder_at IS NOT NULL AND reminder_at <= ? "
+                "AND status NOT IN ('done', 'archived', 'cancelled')",
+                (now_str,),
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return
+
+        for row in rows:
+            tid = row["id"]
+            if tid in self._shown_reminder_ids:
+                continue
+            self._shown_reminder_ids.add(tid)
+
+            # Critical priority or >1h overdue → popup dialog
+            is_critical = row["priority"] == "critical"
+            try:
+                reminder_dt = datetime.fromisoformat(row["reminder_at"])
+                overdue_minutes = (
+                    datetime.now(timezone.utc) - reminder_dt
+                ).total_seconds() / 60
+                is_very_overdue = overdue_minutes > 60
+            except (ValueError, TypeError):
+                is_very_overdue = False
+
+            if is_critical or is_very_overdue:
+                dlg = ReminderPopupDialog(
+                    tid,
+                    row["title"],
+                    row["priority"],
+                    row["description"],
+                )
+                dlg.snoozed.connect(self._snooze_reminder)
+                dlg.dismissed.connect(self._dismiss_reminder)
+                dlg.show()
+            else:
+                self.tray.showMessage(
+                    "Task Reminder",
+                    row["title"],
+                    QSystemTrayIcon.MessageIcon.Information,
+                    10_000,
+                )
+                # Evict from shown set after balloon timeout so external snoozes work
+                QTimer.singleShot(
+                    15_000, lambda _tid=tid: self._shown_reminder_ids.discard(_tid)
+                )
+
+    def _snooze_reminder(self, task_id: str, minutes: int):
+        """Reschedule reminder to NOW + minutes."""
+        new_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        self.db.update_task(task_id, reminder_at=new_time.isoformat())
+        self._shown_reminder_ids.discard(task_id)
+
+    def _dismiss_reminder(self, task_id: str):
+        """Clear the reminder."""
+        self.db.update_task(task_id, reminder_at=None)
+        self._shown_reminder_ids.discard(task_id)
 
     def _on_quit(self):
         self.db.close()

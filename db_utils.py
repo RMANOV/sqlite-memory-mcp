@@ -104,6 +104,7 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
         "parent_id",
         "notes",
         "recurring",
+        "reminder_at",
         "type",
         "assignee",
         "shared_by",
@@ -127,6 +128,7 @@ METADATA_FIELDS = (
     "project",
     "parent_id",
     "recurring",
+    "reminder_at",
     "type",
     "assignee",
     "shared_by",
@@ -146,6 +148,7 @@ MERGEABLE_FIELDS = (
     "project",
     "parent_id",
     "recurring",
+    "reminder_at",
     "type",
     "assignee",
     "shared_by",
@@ -320,7 +323,7 @@ def upsert_field_versions(
 
 _TASK_EXPORT_COLS = (
     "id, title, description, status, priority, section, due_date, "
-    "project, parent_id, notes, recurring, type, assignee, shared_by, "
+    "project, parent_id, notes, recurring, reminder_at, type, assignee, shared_by, "
     "created_at, updated_at"
 )
 
@@ -558,9 +561,9 @@ def merge_import_tasks(
             conn.execute(
                 "INSERT OR IGNORE INTO tasks "
                 "(id, title, description, status, priority, section, due_date, "
-                "project, parent_id, notes, recurring, type, assignee, shared_by, "
+                "project, parent_id, notes, recurring, reminder_at, type, assignee, shared_by, "
                 "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     tid,
                     remote.get("title", ""),
@@ -573,6 +576,7 @@ def merge_import_tasks(
                     remote.get("parent_id"),
                     notes,
                     remote.get("recurring"),
+                    remote.get("reminder_at"),
                     remote.get("type", "task"),
                     remote.get("assignee"),
                     remote.get("shared_by"),
