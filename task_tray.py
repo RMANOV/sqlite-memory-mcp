@@ -3216,11 +3216,18 @@ class FullWindow(QMainWindow):
         task_id = item.data(Qt.ItemDataRole.UserRole)
         if not task_id:
             return
-        if item.checkState() == Qt.CheckState.Checked:
+        checked = item.checkState() == Qt.CheckState.Checked
+        # Defer DB write out of signal handler — immediate clear() during
+        # itemChanged dispatch deletes the C++ QListWidgetItem, causing segfault.
+        QTimer.singleShot(0, lambda: self._apply_check_change(task_id, checked))
+
+    def _apply_check_change(self, task_id, checked):
+        if checked:
             self.db.mark_done(task_id)
         else:
             self.db.update_task(task_id, status="not_started")
-        QTimer.singleShot(300, self.refresh)
+        # on_change() already triggers _refresh_all → full_window.refresh(),
+        # so no explicit self.refresh() needed here.
 
     def _add_task(self):
         task = {"title": "", "section": "inbox", "priority": "medium"}
