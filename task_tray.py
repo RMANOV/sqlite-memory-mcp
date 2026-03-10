@@ -5,17 +5,30 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
 import base64
+import faulthandler
 import html as _html
 import json
+import logging
 import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import uuid
 import calendar as _cal_mod
 import time
 from datetime import date, datetime, timedelta, timezone
+
+_crash_log = open(
+    os.path.expanduser("~/.claude/mcp_servers/sqlite_memory/crash.log"), "a"
+)
+faulthandler.enable(file=_crash_log)
+logging.basicConfig(
+    filename=os.path.expanduser("~/.claude/mcp_servers/sqlite_memory/task_tray.log"),
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 from task_search import TaskSearchEngine, score_task
 
@@ -62,6 +75,7 @@ class TaskDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._ensure_table()
+        self._repair_fts_if_needed()
         self._wal_timer = QTimer()
         self._wal_timer.timeout.connect(self._wal_checkpoint)
         self._wal_timer.start(300_000)  # 5 minutes
@@ -71,6 +85,25 @@ class TaskDB:
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception:
             pass
+
+    def _repair_fts_if_needed(self):
+        """Check FTS5 indexes and rebuild if corrupted."""
+        for fts_table in ("tasks_fts", "memory_fts"):
+            try:
+                self._conn.execute(
+                    f"INSERT INTO {fts_table}({fts_table}, rank) VALUES('integrity-check', 1)"
+                )
+            except Exception:
+                try:
+                    self._conn.execute(
+                        f"INSERT INTO {fts_table}({fts_table}) VALUES('rebuild')"
+                    )
+                    self._conn.commit()
+                    logging.getLogger("task_tray").warning(
+                        "Repaired corrupted FTS index: %s", fts_table
+                    )
+                except Exception:
+                    pass  # FTS table may not exist yet
 
     def _ensure_table(self):
         """Create tasks table if missing; migrate existing table to v0.5.0 schema."""
@@ -354,7 +387,6 @@ class TaskDB:
 
 # ── UI Layer ────────────────────────────────────────────────────────
 
-import sys
 from PyQt6.QtWidgets import (
     QApplication,
     QSystemTrayIcon,
@@ -3082,6 +3114,15 @@ class FullWindow(QMainWindow):
         return tasks
 
     def refresh(self):
+        if getattr(self, "_refreshing", False):
+            return
+        self._refreshing = True
+        try:
+            self._do_refresh()
+        finally:
+            self._refreshing = False
+
+    def _do_refresh(self):
         # Auto-promote tasks whose due date has arrived
         self.db.promote_due_today()
 
@@ -3150,17 +3191,17 @@ class FullWindow(QMainWindow):
             self.tabs.setTabVisible(i, count > 0 or key in always_visible)
 
         # Auto-switch to first tab with results when searching
-        current_idx = self.tabs.currentIndex()
         if self._search_text:
-            current_key = (
-                self._tab_keys[current_idx] if current_idx < len(self._tab_keys) else ""
-            )
+            cur = self.tabs.currentIndex()
+            current_key = self._tab_keys[cur] if cur < len(self._tab_keys) else ""
             if not self._filtered_cache.get(current_key):
                 for i, key in enumerate(self._tab_keys):
                     if self._filtered_cache.get(key):
                         self.tabs.setCurrentIndex(i)
-                        current_idx = i
                         break
+
+        # Actual current index AFTER all tab visibility and search changes
+        current_idx = self.tabs.currentIndex()
 
         # Lazy rendering: only load the currently active tab
         if 0 <= current_idx < len(self._tab_keys):
@@ -3223,15 +3264,40 @@ class FullWindow(QMainWindow):
         checked = item.checkState() == Qt.CheckState.Checked
         # Defer DB write out of signal handler — immediate clear() during
         # itemChanged dispatch deletes the C++ QListWidgetItem, causing segfault.
-        QTimer.singleShot(0, lambda: self._apply_check_change(task_id, checked))
+        QTimer.singleShot(10, lambda: self._apply_check_change(task_id, checked))
 
     def _apply_check_change(self, task_id, checked):
-        if checked:
-            self.db.mark_done(task_id)
-        else:
-            self.db.update_task(task_id, status="not_started")
-        # on_change() already triggers _refresh_all → full_window.refresh(),
-        # so no explicit self.refresh() needed here.
+        try:
+            if checked:
+                self.db.mark_done(task_id)
+            else:
+                self.db.update_task(task_id, status="not_started")
+            # on_change() triggers _refresh_all → full_window.refresh(),
+            # but refresh explicitly as safety net (re-entrancy guard makes it cheap).
+            self.refresh()
+        except Exception:
+            import traceback
+
+            err = traceback.format_exc()
+            logging.getLogger("task_tray").error(
+                "Error toggling task %s: %s", task_id, err
+            )
+            # DB write failed — revert checkbox visual state + notify user
+            self._revert_checkbox(task_id, checked)
+            self.status.showMessage(
+                f"DB error — task not saved. {err.splitlines()[-1]}", 8000
+            )
+
+    def _revert_checkbox(self, task_id, was_checked):
+        """Revert checkbox to opposite state after a failed DB write."""
+        revert_to = Qt.CheckState.Unchecked if was_checked else Qt.CheckState.Checked
+        for lw in self.tab_lists.values():
+            lw.blockSignals(True)
+            for i in range(lw.count()):
+                item = lw.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                    item.setCheckState(revert_to)
+            lw.blockSignals(False)
 
     def _add_task(self):
         task = {"title": "", "section": "inbox", "priority": "medium"}
