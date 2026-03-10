@@ -1507,7 +1507,6 @@ def query_tasks(
 
     if use_fts:
         fts_q = _fts_query(search)
-        conditions.append("tasks_fts.rowid = t.rowid")
         conditions.append("tasks_fts MATCH ?")
         params.append(fts_q)
         where = " AND ".join(conditions) if conditions else "1=1"
@@ -1515,7 +1514,7 @@ def query_tasks(
         if not summary_only:
             cols += ", snippet(tasks_fts, 1, '<b>', '</b>', '...', 64) AS match_snippet"
         sql = (
-            f"SELECT {cols} FROM tasks t, tasks_fts "
+            f"SELECT {cols} FROM tasks t JOIN tasks_fts ON tasks_fts.rowid = t.rowid "
             f"WHERE {where} "
             f"ORDER BY tasks_fts.rank, "
             f"  {build_priority_order_sql('t.')}, "
@@ -1691,13 +1690,22 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
         return json.dumps({"error": "older_than_days must be non-negative"})
 
     with _get_conn() as conn:
+        now = _now()
+        affected = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'done' AND type = 'task' "
+            "AND updated_at < datetime('now', ? || ' days')",
+            (f"-{days}",),
+        ).fetchall()
+        affected_ids = [r["id"] for r in affected]
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', updated_at = ? "
             "WHERE status = 'done' AND type = 'task' "
             "AND updated_at < datetime('now', ? || ' days')",
-            (_now(), f"-{days}"),
+            (now, f"-{days}"),
         )
         archived = cur.rowcount
+        for tid in affected_ids:
+            _upsert_field_versions(conn, tid, ("status",), now)
 
     logger.info(
         "archive_done_tasks: %d tasks archived (older than %d days)",
@@ -1728,6 +1736,14 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
     now = _now()
 
     with _get_conn() as conn:
+        affected = conn.execute(
+            f"SELECT id FROM tasks "
+            f"WHERE due_date < date('now') "
+            f"AND status NOT IN ({_EXCL_PH}) "
+            f"AND priority IN ({ph})",
+            list(_TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
+        ).fetchall()
+        affected_ids = [r["id"] for r in affected]
         cur = conn.execute(
             f"UPDATE tasks SET priority = ?, updated_at = ? "
             f"WHERE due_date < date('now') "
@@ -1736,6 +1752,8 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
             [target_priority, now] + list(_TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
         )
         bumped = cur.rowcount
+        for tid in affected_ids:
+            _upsert_field_versions(conn, tid, ("priority",), now)
 
     logger.info("bump_overdue_priority: %d tasks bumped to %s", bumped, target_priority)
     return json.dumps({"bumped": bumped, "target_priority": target_priority})
@@ -1808,6 +1826,7 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
             "UPDATE tasks SET assignee = ?, shared_by = ?, updated_at = ? WHERE id = ?",
             (assignee, shared_by, now, task_id),
         )
+        _upsert_field_versions(conn, task_id, ("assignee", "shared_by"), now)
 
     action = f"assigned to {assignee}" if assignee else "unassigned"
     logger.info("assign_task: %s %s", task_id, action)
@@ -1892,6 +1911,9 @@ def review_shared_tasks(
                                 tid,
                             ),
                         )
+                        _upsert_field_versions(
+                            conn, tid, _MERGEABLE_FIELDS, t.get("updated_at", _now())
+                        )
                         imported += 1
                 else:
                     conn.execute(
@@ -1917,6 +1939,9 @@ def review_shared_tasks(
                             t.get("created_at"),
                             t["updated_at"],
                         ),
+                    )
+                    _upsert_field_versions(
+                        conn, tid, _MERGEABLE_FIELDS, t.get("updated_at", _now())
                     )
                     imported += 1
                 conn.execute("DELETE FROM pending_shared_tasks WHERE id = ?", (tid,))
@@ -2339,7 +2364,9 @@ def review_shared_knowledge(
                         (local["id"],),
                     ).fetchall()
                     local_contents = {r["content"] for r in local_obs}
-                    remote_contents = {o["content"] for o in pending_obs}
+                    remote_contents = {
+                        o["content"] if isinstance(o, dict) else o for o in pending_obs
+                    }
                     local_etype = conn.execute(
                         "SELECT entity_type FROM entities WHERE id = ?", (local["id"],)
                     ).fetchone()["entity_type"]
@@ -2375,6 +2402,7 @@ def review_shared_knowledge(
             imported_entities = 0
             imported_obs = 0
             now = _now()
+            approved_names: set[str] = set()
             for row in rows:
                 p = dict(row)
                 pending_obs = json.loads(p["observations"])
@@ -2396,6 +2424,7 @@ def review_shared_knowledge(
                     ),
                 )
                 imported_entities += cur.rowcount
+                approved_names.add(p["name"])
 
                 eid_row = conn.execute(
                     "SELECT id FROM entities WHERE name = ?", (p["name"],)
@@ -2419,11 +2448,16 @@ def review_shared_knowledge(
                     "DELETE FROM pending_shared_entities WHERE id = ?", (p["id"],)
                 )
 
-            # Also approve matching pending relations
+            # Also approve matching pending relations (only for approved entities)
             rel_rows = conn.execute("SELECT * FROM pending_shared_relations").fetchall()
             imported_rels = 0
             for rel in rel_rows:
                 r = dict(rel)
+                if (
+                    r["from_entity"] not in approved_names
+                    and r["to_entity"] not in approved_names
+                ):
+                    continue
                 from_row = conn.execute(
                     "SELECT id FROM entities WHERE name = ?", (r["from_entity"],)
                 ).fetchone()
@@ -3379,7 +3413,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             "SELECT id, title, description, status, priority, section, due_date, "
             "project, parent_id, notes, recurring, type, assignee, shared_by, "
             "created_at, updated_at "
-            "FROM tasks WHERE status != 'archived' ORDER BY created_at"
+            "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
         ).fetchall()
         tasks_out = [dict(r) for r in task_rows]
 
@@ -3466,56 +3500,58 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
 
     # Merge remote tasks + preserve extra keys from remote
     shared_path = Path(BRIDGE_REPO) / "shared.json"
+    index_exists = (Path(BRIDGE_REPO) / "index.json").exists()
     if shared_path.exists():
         try:
             existing = _json_loads(shared_path.read_text(encoding="utf-8"))
 
-            # Merge: keep remote tasks that don't exist locally (by title)
-            local_titles = {t["title"] for t in tasks_out}
-            remote_tasks = existing.get("tasks", [])
-            merged_count = 0
-            for rt in remote_tasks:
-                if rt.get("title") and rt["title"] not in local_titles:
-                    tasks_out.append(rt)
-                    local_titles.add(rt["title"])
-                    merged_count += 1
-            if merged_count:
-                payload["tasks"] = tasks_out
-                logger.info(
-                    "bridge_push: merged %d remote-only tasks into payload",
-                    merged_count,
-                )
+            if not index_exists:
+                # Legacy merge: keep remote tasks that don't exist locally (by title)
+                local_titles = {t["title"] for t in tasks_out}
+                remote_tasks = existing.get("tasks", [])
+                merged_count = 0
+                for rt in remote_tasks:
+                    if rt.get("title") and rt["title"] not in local_titles:
+                        tasks_out.append(rt)
+                        local_titles.add(rt["title"])
+                        merged_count += 1
+                if merged_count:
+                    payload["tasks"] = tasks_out
+                    logger.info(
+                        "bridge_push: merged %d remote-only tasks into payload",
+                        merged_count,
+                    )
 
-            # Update existing tasks where remote has newer updated_at
-            local_by_title = {t["title"]: t for t in tasks_out}
-            updated_count = 0
-            for rt in remote_tasks:
-                title = rt.get("title")
-                if not title or title not in local_by_title:
-                    continue
-                lt = local_by_title[title]
-                r_upd = rt.get("updated_at", "")
-                l_upd = lt.get("updated_at", "")
-                if r_upd > l_upd:
-                    _sanitize_task_enums(rt)
-                    for field in (
-                        "status",
-                        "section",
-                        "priority",
-                        "due_date",
-                        "notes",
-                        "description",
-                        "type",
-                    ):
-                        if rt.get(field) is not None:
-                            lt[field] = rt[field]
-                    lt["updated_at"] = r_upd
-                    updated_count += 1
-            if updated_count:
-                logger.info(
-                    "bridge_push: updated %d tasks from newer remote data",
-                    updated_count,
-                )
+                # Update existing tasks where remote has newer updated_at
+                local_by_title = {t["title"]: t for t in tasks_out}
+                updated_count = 0
+                for rt in remote_tasks:
+                    title = rt.get("title")
+                    if not title or title not in local_by_title:
+                        continue
+                    lt = local_by_title[title]
+                    r_upd = rt.get("updated_at", "")
+                    l_upd = lt.get("updated_at", "")
+                    if r_upd > l_upd:
+                        _sanitize_task_enums(rt)
+                        for field in (
+                            "status",
+                            "section",
+                            "priority",
+                            "due_date",
+                            "notes",
+                            "description",
+                            "type",
+                        ):
+                            if rt.get(field) is not None:
+                                lt[field] = rt[field]
+                        lt["updated_at"] = r_upd
+                        updated_count += 1
+                if updated_count:
+                    logger.info(
+                        "bridge_push: updated %d tasks from newer remote data",
+                        updated_count,
+                    )
 
             # Preserve extra keys (e.g. reading_tasks, shared_knowledge)
             known_keys = {
@@ -3533,12 +3569,12 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "team_manifest",
             }
             for key, val in existing.items():
-                if key not in known_keys and isinstance(val, list):
+                if key not in known_keys and isinstance(val, (list, dict)):
                     payload[key] = val
                     logger.info(
-                        "bridge_push: preserving extra key '%s' (%d items)",
+                        "bridge_push: preserving extra key '%s' (%s)",
                         key,
-                        len(val),
+                        f"{len(val)} items" if isinstance(val, list) else "dict",
                     )
         except (json.JSONDecodeError, OSError):
             pass
@@ -3593,9 +3629,16 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
 
     _git("add", "shared.json", "index.json", "tasks/")
     commit_result = _git("commit", "-m", msg)
-    if commit_result.returncode != 0 and "nothing to commit" in commit_result.stdout:
-        logger.info("bridge_push: no changes to commit")
-        return json.dumps({"pushed": 0, "message": "No changes — already up to date"})
+    if commit_result.returncode != 0:
+        if "nothing to commit" in (commit_result.stdout + commit_result.stderr):
+            logger.info("bridge_push: no changes to commit")
+            return json.dumps(
+                {"pushed": 0, "message": "No changes — already up to date"}
+            )
+        logger.error("bridge_push: commit failed: %s", commit_result.stderr)
+        return json.dumps(
+            {"error": f"git commit failed: {commit_result.stderr.strip()}"}
+        )
 
     push_result = _git("push")
     pushed = push_result.returncode == 0
@@ -3672,12 +3715,12 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             "tasks": len(public_tasks_out),
         }
 
-    # Record push timestamp for incremental sync
-    with _get_conn() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
-            (_now(),),
-        )
+    if pushed:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
+                (_now(),),
+            )
 
     return json.dumps(result)
 
@@ -3839,6 +3882,9 @@ def bridge_pull() -> str:
                                 task["updated_at"],
                                 tid,
                             ),
+                        )
+                        _upsert_field_versions(
+                            conn, tid, _MERGEABLE_FIELDS, task.get("updated_at", now)
                         )
                         updated_tasks += 1
                 else:
@@ -4098,7 +4144,7 @@ def bridge_status() -> str:
             "SELECT name FROM entities WHERE project LIKE 'shared%' ORDER BY name"
         ).fetchall()
         local_task_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE status != 'archived'"
+            "SELECT COUNT(*) as cnt FROM tasks WHERE status NOT IN ('archived', 'cancelled')"
         ).fetchone()["cnt"]
 
         # v0.6.0: collaboration stats

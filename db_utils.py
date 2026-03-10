@@ -186,7 +186,10 @@ def get_conn(db_path: str | None = None):
         yield conn
         conn.execute("COMMIT;")
     except Exception:
-        conn.execute("ROLLBACK;")
+        try:
+            conn.execute("ROLLBACK;")
+        except Exception:
+            pass  # ROLLBACK failed — original exception is more important
         raise
     finally:
         conn.close()
@@ -331,26 +334,46 @@ def export_task_files(
     tasks_dir = Path(bridge_dir) / "tasks"
     tasks_dir.mkdir(exist_ok=True)
 
+    status_filter = "AND status NOT IN ('archived', 'cancelled')"
     if changed_since:
         rows = conn.execute(
-            "SELECT id FROM tasks WHERE updated_at > ?", (changed_since,)
+            f"SELECT {_TASK_EXPORT_COLS} FROM tasks WHERE updated_at >= ? {status_filter}",
+            (changed_since,),
         ).fetchall()
     else:
-        rows = conn.execute("SELECT id FROM tasks").fetchall()
+        rows = conn.execute(
+            f"SELECT {_TASK_EXPORT_COLS} FROM tasks WHERE 1=1 {status_filter}"
+        ).fetchall()
 
     exported: list[str] = []
+    # Build task map from already-fetched rows (no second query needed)
+    task_ids = []
+    task_map: dict[str, dict] = {}
     for row in rows:
         tid = row["id"]
-        if not _SAFE_TASK_ID.match(tid):
-            continue
-        task_row = conn.execute(
-            f"SELECT {_TASK_EXPORT_COLS} FROM tasks WHERE id = ?", (tid,)
-        ).fetchone()
-        if not task_row:
-            continue
-        task = dict(task_row)
-        fvs = get_field_versions(conn, tid)
-        task["_field_ts"] = {f: list(v) for f, v in fvs.items()}
+        if _SAFE_TASK_ID.match(tid):
+            task_ids.append(tid)
+            task_map[tid] = dict(row)
+    if not task_ids:
+        return exported
+
+    # Batch fetch all field versions in one query
+    ph = ",".join("?" * len(task_ids))
+    fv_rows = conn.execute(
+        "SELECT task_id, field_name, updated_at, updated_by "
+        "FROM task_field_versions WHERE task_id IN ({})".format(ph),
+        task_ids,
+    ).fetchall()
+    fv_map: dict[str, dict] = {}
+    for fvr in fv_rows:
+        fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = [
+            fvr["updated_at"],
+            fvr["updated_by"],
+        ]
+
+    for tid in task_ids:
+        task = task_map[tid]
+        task["_field_ts"] = fv_map.get(tid, {})
         task_path = tasks_dir / f"{tid}.json"
         task_path.write_text(json_dumps(task), encoding="utf-8")
         exported.append(tid)
@@ -473,7 +496,7 @@ def merge_import_tasks(
                 if (remote_ts, remote_by) > (local_ts, local_by):
                     conn.execute(
                         "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                        (remote["status"], remote.get("updated_at", now), tid),
+                        (remote["status"], now, tid),
                     )
                     conn.execute(
                         "INSERT OR REPLACE INTO task_field_versions "
@@ -522,6 +545,9 @@ def merge_import_tasks(
                     k: v for k, v in fields_to_update.items() if k in MERGEABLE_FIELDS
                 }
                 if safe_fields:
+                    safe_fields["updated_at"] = (
+                        now  # ensure incremental export picks up merged tasks
+                    )
                     set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
                     values = list(safe_fields.values()) + [local_id]
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
@@ -584,6 +610,36 @@ def load_task_content(task_id: str, bridge_dir: str) -> dict | None:
         return None
 
 
+# ── FTS sync helper ──────────────────────────────────────────────────────
+
+
+def fts_sync_entity(conn: sqlite3.Connection, entity_id: int) -> None:
+    """Rebuild the FTS entry for a given entity.
+
+    Gathers all observations, concatenates them, and upserts into memory_fts.
+    Used by bridge_sync_worker to keep FTS in sync after entity imports.
+    """
+    row = conn.execute(
+        "SELECT id, name, entity_type FROM entities WHERE id = ?",
+        (entity_id,),
+    ).fetchone()
+    if row is None:
+        conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (entity_id,))
+        return
+
+    obs_rows = conn.execute(
+        "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+        (entity_id,),
+    ).fetchall()
+    obs_text = "\n".join(r["content"] for r in obs_rows)
+
+    conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (entity_id,))
+    conn.execute(
+        "INSERT INTO memory_fts(rowid, name, entity_type, observations) VALUES (?, ?, ?, ?)",
+        (row["id"], row["name"], row["entity_type"], obs_text),
+    )
+
+
 # ── Bridge Sync v2: Migration helper ─────────────────────────────────────
 
 
@@ -606,16 +662,30 @@ def migrate_to_per_task_files(bridge_dir: str) -> bool:
     if not tasks:
         return False
 
-    tasks_dir.mkdir(exist_ok=True)
-    count = 0
-    for task in tasks:
-        tid = task.get("id")
-        if not tid or not _SAFE_TASK_ID.match(tid):
-            continue
-        if "_field_ts" not in task:
-            task["_field_ts"] = {}
-        (tasks_dir / f"{tid}.json").write_text(json_dumps(task), encoding="utf-8")
-        count += 1
+    # Write to temp dir first, then rename for atomicity
+    import shutil
+    import tempfile
+
+    tmp_dir = Path(tempfile.mkdtemp(dir=bridge_dir, prefix=".tasks_migrate_"))
+    try:
+        count = 0
+        for task in tasks:
+            tid = task.get("id")
+            if not tid or not _SAFE_TASK_ID.match(tid):
+                continue
+            if "_field_ts" not in task:
+                task["_field_ts"] = {}
+            (tmp_dir / f"{tid}.json").write_text(json_dumps(task), encoding="utf-8")
+            count += 1
+
+        # Atomic rename
+        if tasks_dir.exists():
+            shutil.rmtree(tasks_dir)
+        tmp_dir.rename(tasks_dir)
+    except Exception:
+        # Cleanup temp dir on failure — don't leave corrupt state
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
     _log.info("Migrated %d tasks from shared.json to per-task files", count)
     return True

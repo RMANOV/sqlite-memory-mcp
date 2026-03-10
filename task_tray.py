@@ -59,6 +59,7 @@ class TaskDB:
         self._conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._ensure_table()
         self._wal_timer = QTimer()
@@ -2234,31 +2235,38 @@ class FullWindow(QMainWindow):
         """Import entities from remote shared.json that don't exist locally."""
         conn = conn or self.db._conn
         conn.execute("BEGIN")
-        for e in remote_entities:
-            existing = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (e["name"],)
-            ).fetchone()
-            if existing:
-                continue
-            now = now_iso()
-            eid = conn.execute(
-                "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    e["name"],
-                    e["entityType"],
-                    e.get("project") or "shared:bridge",
-                    now,
-                    now,
-                ),
-            ).lastrowid
-            for o in e.get("observations", []):
-                conn.execute(
-                    "INSERT INTO observations (entity_id, content, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (eid, o["content"], o.get("createdAt", now)),
-                )
-        conn.commit()
+        try:
+            for e in remote_entities:
+                existing = conn.execute(
+                    "SELECT id FROM entities WHERE name = ?", (e["name"],)
+                ).fetchone()
+                if existing:
+                    continue
+                now = now_iso()
+                eid = conn.execute(
+                    "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        e["name"],
+                        e["entityType"],
+                        e.get("project") or "shared:bridge",
+                        now,
+                        now,
+                    ),
+                ).lastrowid
+                for o in e.get("observations", []):
+                    conn.execute(
+                        "INSERT INTO observations (entity_id, content, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (eid, o["content"], o.get("createdAt", now)),
+                    )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def _sort_tasks(self, tasks):
         """Sort tasks by current sort mode."""

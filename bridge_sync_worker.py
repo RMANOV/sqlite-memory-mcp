@@ -33,6 +33,7 @@ from db_utils import (
     merge_import_tasks,
     migrate_to_per_task_files,
     get_conn,  # I3: managed connection — handles PRAGMAs, BEGIN/COMMIT/ROLLBACK, close
+    fts_sync_entity,
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -86,6 +87,7 @@ def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
                 "VALUES (?, ?, ?)",
                 (eid, o["content"], o.get("createdAt", now)),
             )
+        fts_sync_entity(conn, eid)
         imported += 1
     return imported
 
@@ -150,7 +152,7 @@ def _export_tasks(conn: sqlite3.Connection) -> list[dict]:
         "SELECT id, title, description, status, priority, section, "
         "due_date, project, parent_id, notes, recurring, type, "
         "assignee, shared_by, created_at, updated_at "
-        "FROM tasks WHERE status != 'archived' ORDER BY created_at"
+        "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -261,8 +263,8 @@ def main(
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
 
+    # Phase 1: Promote pending_public (short transaction)
     with get_conn(_db_path) as conn:
-        # Promote pending_public → public if standby elapsed
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
         ).isoformat()
@@ -277,145 +279,139 @@ def main(
             (cutoff,),
         )
 
-        # 1. Pull remote changes
-        _progress(progress_callback, 5, "git pull...")
-        _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
+    # Phase 2: Git pull (no transaction held)
+    _progress(progress_callback, 5, "git pull...")
+    _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
 
-        # 2. One-time migration: shared.json → per-task files
+    # Phase 3: Import + Export (short transaction)
+    with get_conn(_db_path) as conn:
         migrate_to_per_task_files(bridge_dir)
 
-        # 3. Import remote data (entities from shared.json, tasks via CRDT)
         _progress(progress_callback, 10, "Importing remote data...")
         shared_path = Path(bridge_dir) / "shared.json"
         index_path = Path(bridge_dir) / "index.json"
         new_t, upd_t = 0, 0
 
-        # Import entities from shared.json
         if shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                _import_remote_entities(conn, remote_data.get("entities", []))
+                try:
+                    _import_remote_entities(conn, remote_data.get("entities", []))
+                except Exception as exc:
+                    log.warning("Entity import failed: %s", exc)
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # v2.0.0: CRDT merge tasks from index.json (preferred)
         if index_path.exists():
             try:
                 idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
                 new_t, upd_t = merge_import_tasks(conn, idx_data.get("tasks", []))
-                log.info(
-                    "CRDT merged %d new tasks, %d field updates from index.json",
-                    new_t,
-                    upd_t,
-                )
+                log.info("CRDT merged %d new tasks, %d field updates", new_t, upd_t)
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
-            # Legacy fallback: task-level LWW from shared.json
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
                 new_t, upd_t = merge_import_tasks(conn, remote_data.get("tasks", []))
-                log.info("Imported %d new tasks, updated %d from remote", new_t, upd_t)
+                log.info("Imported %d new, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # 4. Export entities + observations
         _progress(progress_callback, 20, "Exporting entities...")
         entities_out, entity_ids = _export_entities(conn)
-
-        # 5. Export relations
         _progress(progress_callback, 30, "Exporting relations...")
         relations_out = _export_relations(conn, entity_ids)
-
-        # 6. Export tasks
         _progress(progress_callback, 40, "Exporting tasks...")
         tasks_out = _export_tasks(conn)
 
-        # v2.0.0: Export per-task files + index.json
         _progress(progress_callback, 45, "Exporting per-task files...")
         export_task_files(conn, bridge_dir)
         export_index_json(conn, bridge_dir)
 
-        # 7. Export public knowledge
         _progress(progress_callback, 50, "Exporting public knowledge...")
         pub_entities, pub_tasks = _export_public_knowledge(conn)
-
-        # 8. Export knowledge ratings
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
         kr_out = _export_knowledge_ratings(conn)
+    # Transaction closed — DB lock released
 
-        # 9. Build shared.json payload (backward compat)
-        _progress(progress_callback, 60, "Merging tasks...")
-        payload = {
-            "version": 3,
-            "pushed_at": now_iso(),
-            "machine_id": socket.gethostname(),
-            "entities": entities_out,
-            "relations": relations_out,
-            "tasks": tasks_out,
+    # Phase 4: Build payload + write files + git ops (no transaction)
+    _progress(progress_callback, 60, "Merging tasks...")
+    payload = {
+        "version": 3,
+        "pushed_at": now_iso(),
+        "machine_id": socket.gethostname(),
+        "entities": entities_out,
+        "relations": relations_out,
+        "tasks": tasks_out,
+    }
+    if pub_entities or pub_tasks:
+        payload["public_knowledge"] = {
+            "entities": pub_entities,
+            "tasks": pub_tasks,
         }
-        if pub_entities or pub_tasks:
-            payload["public_knowledge"] = {
-                "entities": pub_entities,
-                "tasks": pub_tasks,
-            }
-        if kr_out:
-            payload["knowledge_ratings"] = kr_out
+    if kr_out:
+        payload["knowledge_ratings"] = kr_out
 
-        # Merge remote tasks + preserve extra keys from existing shared.json
-        if shared_path.exists():
-            try:
-                existing = _json_loads(shared_path.read_text(encoding="utf-8"))
+    # Gen-B guard: only run legacy merge when index.json doesn't exist
+    if shared_path.exists():
+        try:
+            existing = _json_loads(shared_path.read_text(encoding="utf-8"))
+            if not index_path.exists():
                 _merge_remote_tasks(tasks_out, existing)
 
-                known_keys = {
-                    "version",
-                    "pushed_at",
-                    "machine_id",
-                    "entities",
-                    "relations",
-                    "tasks",
-                    "shared_tasks",
-                    "public_knowledge",
-                    "knowledge_ratings",
-                    "owner",
-                    "team_manifest",
-                    "ui_profiles",
-                }
-                for k, v in existing.items():
-                    if k not in known_keys and isinstance(v, (list, dict)):
-                        payload[k] = v
+            known_keys = {
+                "version",
+                "pushed_at",
+                "machine_id",
+                "entities",
+                "relations",
+                "tasks",
+                "shared_tasks",
+                "public_knowledge",
+                "knowledge_ratings",
+                "owner",
+                "team_manifest",
+                "ui_profiles",
+            }
+            for k, v in existing.items():
+                if k not in known_keys and isinstance(v, (list, dict)):
+                    payload[k] = v
+            if "ui_profiles" in existing:
+                payload["ui_profiles"] = existing["ui_profiles"]
+        except (json.JSONDecodeError, OSError):
+            pass
 
-                # Preserve ui_profiles (task_tray patches own profile after main())
-                if "ui_profiles" in existing:
-                    payload["ui_profiles"] = existing["ui_profiles"]
-            except (json.JSONDecodeError, OSError):
-                pass
+    _progress(progress_callback, 70, "Writing shared.json...")
+    shared_path.write_text(_json_dumps(payload), encoding="utf-8")
 
-        # 10. Write shared.json (backward compat)  # I5: use _json_dumps from db_utils
-        _progress(progress_callback, 70, "Writing shared.json...")
-        shared_path.write_text(_json_dumps(payload), encoding="utf-8")
+    _progress(progress_callback, 80, "git add...")
+    _git("add", "shared.json", "index.json", "tasks/", bridge_dir=bridge_dir)
 
-        # 11. Git add + commit + push (includes new per-task files)
-        _progress(progress_callback, 80, "git add...")
-        _git("add", "shared.json", "index.json", "tasks/", bridge_dir=bridge_dir)
+    _progress(progress_callback, 90, "git commit...")
+    n_ent = len(entities_out)
+    n_tasks = len(payload["tasks"])
+    msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {socket.gethostname()}"
+    result = _git("commit", "-m", msg, bridge_dir=bridge_dir)
 
-        _progress(progress_callback, 90, "git commit...")
-        n_ent = len(entities_out)
-        n_tasks = len(payload["tasks"])
-        msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {socket.gethostname()}"
-        result = _git("commit", "-m", msg, bridge_dir=bridge_dir)
-        pushed = result.returncode == 0
+    if result.returncode != 0:
+        if "nothing to commit" in (result.stdout + result.stderr):
+            pushed = True
+        else:
+            log.error("bridge sync commit failed: %s", result.stderr)
+            pushed = False
+    else:
+        pushed = True
 
-        if pushed:
-            _progress(progress_callback, 95, "git push...")
-            _git("push", bridge_dir=bridge_dir)
+    if pushed and result.returncode == 0:
+        _progress(progress_callback, 95, "git push...")
+        push_result = _git("push", bridge_dir=bridge_dir)
+        pushed = push_result.returncode == 0
 
-        _progress(progress_callback, 100, "Done")
-        return {
-            "entities": n_ent,
-            "tasks": n_tasks,
-            "pushed": pushed,
-            "imported_new": new_t,
-            "imported_updated": upd_t,
-        }
+    _progress(progress_callback, 100, "Done")
+    return {
+        "entities": n_ent,
+        "tasks": n_tasks,
+        "pushed": pushed,
+        "imported_new": new_t,
+        "imported_updated": upd_t,
+    }
