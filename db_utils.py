@@ -400,6 +400,19 @@ def export_task_files(
         task_path = tasks_dir / f"{tid}.json"
         task_path.write_text(json_dumps(task), encoding="utf-8")
         exported.append(tid)
+
+    # Clean stale files — remove JSONs for tasks no longer exported
+    # (cancelled, archived, or missing from DB entirely)
+    all_db_ids = {
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM tasks WHERE status NOT IN ('archived', 'cancelled')"
+        ).fetchall()
+    }
+    for stale in tasks_dir.iterdir():
+        if stale.suffix == ".json" and stale.stem not in all_db_ids:
+            stale.unlink()
+
     return exported
 
 
@@ -576,6 +589,13 @@ def merge_import_tasks(
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
         else:
             # New task — insert (content only if import_content)
+            # Guard: don't reimport tasks that were cancelled locally
+            was_cancelled = conn.execute(
+                "SELECT id FROM tasks WHERE id = ? AND status = 'cancelled'",
+                (tid,),
+            ).fetchone()
+            if was_cancelled:
+                continue  # Task was locally cancelled — don't resurrect
             desc = remote.get("description") if import_content else None
             notes = remote.get("notes") if import_content else None
             conn.execute(

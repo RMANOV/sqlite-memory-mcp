@@ -349,8 +349,32 @@ class TaskDB:
             self.on_change()
 
     def delete_task(self, task_id):
-        """Hard delete a task."""
-        self._conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        """Soft-delete: cancel task (creates tombstone for bridge sync).
+        For recurring tasks, also cancel done siblings to stop respawn cycle."""
+        now = now_iso()
+        # Read task metadata before cancelling
+        row = self._conn.execute(
+            "SELECT title, recurring, project FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        # Cancel the target task
+        self._conn.execute(
+            "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
+            (now, task_id),
+        )
+        upsert_field_versions(self._conn, task_id, ("status",), now)
+        # For recurring tasks: cancel all done siblings to break spawn cycle
+        if row and row["recurring"]:
+            siblings = self._conn.execute(
+                "SELECT id FROM tasks WHERE title=? AND status='done' "
+                "AND recurring IS NOT NULL AND id!=? AND project IS ?",
+                (row["title"], task_id, row["project"]),
+            ).fetchall()
+            for sib in siblings:
+                self._conn.execute(
+                    "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
+                    (now, sib["id"]),
+                )
+                upsert_field_versions(self._conn, sib["id"], ("status",), now)
         self._conn.commit()
         if self.on_change:
             self.on_change()
