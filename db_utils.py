@@ -155,6 +155,7 @@ MERGEABLE_FIELDS = (
     "assignee",
     "shared_by",
     "visibility",
+    "publish_requested_at",
     "description",
     "notes",
 )
