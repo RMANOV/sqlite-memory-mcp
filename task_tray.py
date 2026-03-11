@@ -30,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-from task_search import TaskSearchEngine, score_task
+from task_search import TaskSearchEngine
 
 from db_utils import (
     DB_PATH,
@@ -963,6 +963,7 @@ class TrayPopup(QWidget):
         self.setFixedWidth(380)
         self.setMaximumHeight(500)
         self.setStyleSheet(self._stylesheet())
+        self._search_engine = TaskSearchEngine()
         self._build_ui()
 
         # Auto-refresh timer (only ticks when visible)
@@ -1060,13 +1061,14 @@ class TrayPopup(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-        tasks = self.db.get_suggested_tasks(limit=8)
-
-        # Apply search filter if active
         q = self._search_text
         if q:
-            scored = [(t, score_task(t, q)) for t in tasks]
-            tasks = [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0]
+            # Search ALL tasks (same as FullWindow) via SmartKey engine
+            all_tasks = self.db.get_all_active() + self.db.get_done_tasks()
+            self._search_engine.rebuild_index(all_tasks)
+            tasks = self._search_engine.search(q, all_tasks, limit=20)
+        else:
+            tasks = self.db.get_suggested_tasks(limit=8)
 
         if tasks:
             groups = _smart_group(tasks)
