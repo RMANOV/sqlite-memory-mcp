@@ -192,8 +192,7 @@ class TaskDB:
             "PRIMARY KEY (task_id, entity_id))"
         )
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tel_entity "
-            "ON task_entity_links(entity_id)"
+            "CREATE INDEX IF NOT EXISTS idx_tel_entity ON task_entity_links(entity_id)"
         )
         self._conn.commit()
 
@@ -364,17 +363,23 @@ class TaskDB:
         upsert_field_versions(self._conn, task_id, ("status",), now)
         # For recurring tasks: cancel all done siblings to break spawn cycle
         if row and row["recurring"]:
-            siblings = self._conn.execute(
-                "SELECT id FROM tasks WHERE title=? AND status='done' "
-                "AND recurring IS NOT NULL AND id!=? AND project IS ?",
-                (row["title"], task_id, row["project"]),
-            ).fetchall()
-            for sib in siblings:
+            sibling_ids = [
+                s["id"]
+                for s in self._conn.execute(
+                    "SELECT id FROM tasks WHERE title=? AND status='done' "
+                    "AND recurring IS NOT NULL AND id!=? AND project IS ?",
+                    (row["title"], task_id, row["project"]),
+                ).fetchall()
+            ]
+            if sibling_ids:
+                ph = ",".join("?" * len(sibling_ids))
                 self._conn.execute(
-                    "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
-                    (now, sib["id"]),
+                    f"UPDATE tasks SET status='cancelled', updated_at=? "
+                    f"WHERE id IN ({ph})",
+                    [now, *sibling_ids],
                 )
-                upsert_field_versions(self._conn, sib["id"], ("status",), now)
+                for sid in sibling_ids:
+                    upsert_field_versions(self._conn, sid, ("status",), now)
         self._conn.commit()
         if self.on_change:
             self.on_change()

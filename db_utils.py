@@ -321,7 +321,7 @@ def upsert_field_versions(
 
 # ── Bridge Sync v2: Per-task file export ─────────────────────────────────
 
-_TASK_EXPORT_COLS = (
+TASK_EXPORT_COLS = (
     "id, title, description, status, priority, section, due_date, "
     "project, parent_id, notes, recurring, reminder_at, type, assignee, shared_by, "
     "created_at, updated_at"
@@ -340,12 +340,12 @@ def export_task_files(
     status_filter = "AND status NOT IN ('archived', 'cancelled')"
     if changed_since:
         rows = conn.execute(
-            f"SELECT {_TASK_EXPORT_COLS} FROM tasks WHERE updated_at >= ? {status_filter}",
+            f"SELECT {TASK_EXPORT_COLS} FROM tasks WHERE updated_at >= ? {status_filter}",
             (changed_since,),
         ).fetchall()
     else:
         rows = conn.execute(
-            f"SELECT {_TASK_EXPORT_COLS} FROM tasks WHERE 1=1 {status_filter}"
+            f"SELECT {TASK_EXPORT_COLS} FROM tasks WHERE 1=1 {status_filter}"
         ).fetchall()
 
     exported: list[str] = []
@@ -401,17 +401,13 @@ def export_task_files(
         task_path.write_text(json_dumps(task), encoding="utf-8")
         exported.append(tid)
 
-    # Clean stale files — remove JSONs for tasks no longer exported
-    # (cancelled, archived, or missing from DB entirely)
-    all_db_ids = {
-        r["id"]
-        for r in conn.execute(
-            "SELECT id FROM tasks WHERE status NOT IN ('archived', 'cancelled')"
-        ).fetchall()
-    }
-    for stale in tasks_dir.iterdir():
-        if stale.suffix == ".json" and stale.stem not in all_db_ids:
-            stale.unlink()
+    # Clean stale files only during full export (changed_since=None).
+    # During incremental export, task_ids is partial — cleanup would delete valid files.
+    if not changed_since:
+        active_ids = set(task_ids)
+        for stale in tasks_dir.iterdir():
+            if stale.suffix == ".json" and stale.stem not in active_ids:
+                stale.unlink()
 
     return exported
 
@@ -428,13 +424,6 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
         "WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
     ).fetchall()
 
-    tasks: list[dict] = []
-    for r in rows:
-        entry = dict(r)
-        fvs = get_field_versions(conn, r["id"])
-        entry["_field_ts"] = {f: list(v) for f, v in fvs.items()}
-        tasks.append(entry)
-
     # Tombstones: recently archived/cancelled (30 days)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
     tombstone_rows = conn.execute(
@@ -443,11 +432,32 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
         "ORDER BY updated_at",
         (cutoff,),
     ).fetchall()
+
+    # Batch-fetch field versions for all tasks + tombstones (avoid N+1)
+    all_ids = [r["id"] for r in rows] + [r["id"] for r in tombstone_rows]
+    fv_map: dict[str, dict[str, list]] = {}
+    if all_ids:
+        ph = ",".join("?" * len(all_ids))
+        fv_rows = conn.execute(
+            f"SELECT task_id, field_name, updated_at, updated_by "
+            f"FROM task_field_versions WHERE task_id IN ({ph})",
+            all_ids,
+        ).fetchall()
+        for fvr in fv_rows:
+            fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = [
+                fvr["updated_at"],
+                fvr["updated_by"],
+            ]
+
+    tasks: list[dict] = []
+    for r in rows:
+        entry = dict(r)
+        entry["_field_ts"] = fv_map.get(r["id"], {})
+        tasks.append(entry)
     for r in tombstone_rows:
         entry = dict(r)
         entry["_tombstone"] = True
-        fvs = get_field_versions(conn, r["id"])
-        entry["_field_ts"] = {f: list(v) for f, v in fvs.items()}
+        entry["_field_ts"] = fv_map.get(r["id"], {})
         tasks.append(entry)
 
     index = {
@@ -589,13 +599,9 @@ def merge_import_tasks(
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
         else:
             # New task — insert (content only if import_content)
-            # Guard: don't reimport tasks that were cancelled locally
-            was_cancelled = conn.execute(
-                "SELECT id FROM tasks WHERE id = ? AND status = 'cancelled'",
-                (tid,),
-            ).fetchone()
-            if was_cancelled:
-                continue  # Task was locally cancelled — don't resurrect
+            # Note: cancelled tasks still exist as rows (soft-delete), so they're
+            # handled by the `if existing:` branch above — CRDT field versioning
+            # prevents remote from overwriting the newer local cancelled status.
             desc = remote.get("description") if import_content else None
             notes = remote.get("notes") if import_content else None
             conn.execute(

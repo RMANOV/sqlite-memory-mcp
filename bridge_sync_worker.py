@@ -23,6 +23,7 @@ from db_utils import (
     BRIDGE_REPO,
     DB_PATH,
     PUBLISH_STANDBY_MINUTES,
+    TASK_EXPORT_COLS,
     now_iso,
     sanitize_task_enums,
     # v2.0.0: Bridge Sync v2 — per-field CRDT
@@ -149,9 +150,7 @@ def _export_relations(conn: sqlite3.Connection, entity_ids: set) -> list:
 def _export_tasks(conn: sqlite3.Connection) -> list[dict]:
     """Export all non-archived tasks."""
     rows = conn.execute(
-        "SELECT id, title, description, status, priority, section, "
-        "due_date, project, parent_id, notes, recurring, type, "
-        "assignee, shared_by, reminder_at, created_at, updated_at "
+        f"SELECT {TASK_EXPORT_COLS} "
         "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
     ).fetchall()
     return [dict(r) for r in rows]
