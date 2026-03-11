@@ -280,7 +280,17 @@ def main(
 
     # Phase 2: Git pull (no transaction held)
     _progress(progress_callback, 5, "git pull...")
-    _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
+    pull_result = _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
+    if pull_result.returncode != 0:
+        log.error("git pull failed: %s", pull_result.stderr)
+        _progress(progress_callback, 100, "Done (pull failed)")
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "imported_new": 0,
+            "imported_updated": 0,
+        }
 
     # Phase 3a: Import (write transaction)
     with get_conn(_db_path) as conn:
@@ -361,23 +371,6 @@ def main(
             if not index_path.exists():
                 _merge_remote_tasks(tasks_out, existing)
 
-            known_keys = {
-                "version",
-                "pushed_at",
-                "machine_id",
-                "entities",
-                "relations",
-                "tasks",
-                "shared_tasks",
-                "public_knowledge",
-                "knowledge_ratings",
-                "owner",
-                "team_manifest",
-                "ui_profiles",
-            }
-            for k, v in existing.items():
-                if k not in known_keys and isinstance(v, (list, dict)):
-                    payload[k] = v
             if "ui_profiles" in existing:
                 payload["ui_profiles"] = existing["ui_profiles"]
         except (json.JSONDecodeError, OSError):
@@ -396,18 +389,20 @@ def main(
     result = _git("commit", "-m", msg, bridge_dir=bridge_dir)
 
     if result.returncode != 0:
-        if "nothing to commit" in (result.stdout + result.stderr):
-            pushed = True
-        else:
+        if "nothing to commit" not in (result.stdout + result.stderr):
             log.error("bridge sync commit failed: %s", result.stderr)
-            pushed = False
-    else:
-        pushed = True
+            _progress(progress_callback, 100, "Done")
+            return {
+                "entities": n_ent,
+                "tasks": n_tasks,
+                "pushed": False,
+                "imported_new": new_t,
+                "imported_updated": upd_t,
+            }
 
-    if pushed and result.returncode == 0:
-        _progress(progress_callback, 95, "git push...")
-        push_result = _git("push", bridge_dir=bridge_dir)
-        pushed = push_result.returncode == 0
+    _progress(progress_callback, 95, "git push...")
+    push_result = _git("push", bridge_dir=bridge_dir)
+    pushed = push_result.returncode == 0
 
     _progress(progress_callback, 100, "Done")
     return {
