@@ -59,7 +59,7 @@ _ACTIVE_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
 _ACTIVE_PARAMS = list(TASK_ACTIVE_EXCLUSIONS)
 
 # Columns needed by UI rendering (excludes parent_id, notes, assignee, shared_by, publish_requested_at)
-_UI_COLS = "id, title, description, status, section, priority, due_date, project, type, recurring, reminder_at, visibility, updated_at, created_at"
+_UI_COLS = "id, title, description, notes, status, section, priority, due_date, project, type, recurring, reminder_at, visibility, updated_at, created_at"
 
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200

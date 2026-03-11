@@ -52,6 +52,7 @@ def score_task(task, query):
     title = (task.get("title") or "").lower()
     combined = (
         f"{title} {(task.get('description') or '').lower()} "
+        f"{(task.get('notes') or '').lower()} "
         f"{task.get('priority', '')} {task.get('project', '')} "
         f"{task.get('due_date', '')} {task.get('section', '')} {task.get('status', '')}"
     )
@@ -116,10 +117,20 @@ class TaskSearchEngine:
         word_tasks: dict[str, set[str]] = {}
         for t in tasks:
             tid = t["id"]
-            title = t.get("title") or ""
-            project = t.get("project") or ""
-            # Tokenize title + project (searchable fields)
-            words = _tokenize(title) + _tokenize(project)
+            # Tokenize all searchable fields (matches server.py tasks_fts scope)
+            words = []
+            for field in (
+                "title",
+                "description",
+                "notes",
+                "project",
+                "section",
+                "status",
+                "priority",
+            ):
+                val = t.get(field) or ""
+                if val:
+                    words.extend(_tokenize(val))
             for w in words:
                 word_tasks.setdefault(w, set()).add(tid)
 
