@@ -75,6 +75,24 @@ _RECURRING_WEEKDAYS = frozenset(
 )
 
 
+def _is_valid_timestamp(s: str) -> bool:
+    """Validate ISO 8601 timestamp: parseable and not unreasonably in the future."""
+    try:
+        dt = datetime.fromisoformat(s)
+        # Generous tolerance for clock drift; blocks obvious poisoning ("9999-...")
+        return dt <= datetime.now(timezone.utc) + timedelta(hours=24)
+    except (ValueError, TypeError):
+        return False
+
+
+def _clamp_score(val: Any, default: float = 0.0) -> float:
+    """Clamp a score to [0.0, 1.0] range, returning default on invalid input."""
+    try:
+        return max(0.0, min(1.0, float(val)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _validate_recurring(raw: str) -> str | None:
     """Validate recurring JSON config. Returns error message or None if valid."""
     try:
@@ -1967,7 +1985,11 @@ def review_shared_tasks(
                     "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
                 ).fetchone()
                 if existing:
-                    if t.get("updated_at", "") > existing["updated_at"]:
+                    remote_ts = t.get("updated_at", "")
+                    if (
+                        _is_valid_timestamp(remote_ts)
+                        and remote_ts > existing["updated_at"]
+                    ):
                         conn.execute(
                             "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
                             "section=?, due_date=?, project=?, parent_id=?, notes=?, "
@@ -2052,9 +2074,7 @@ def _content_hash(entity_name: str, observations: list[str]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _entity_content_hash(
-    conn, entity_name: str
-) -> tuple[str, list[str]] | None:
+def _entity_content_hash(conn, entity_name: str) -> tuple[str, list[str]] | None:
     """Fetch observations + compute content hash. Returns (hash, obs_list) or None."""
     obs_rows = conn.execute(
         "SELECT o.content FROM observations o "
@@ -2246,9 +2266,12 @@ def manage_collaborators(
                 )
             now = _now()
             conn.execute(
-                "INSERT OR REPLACE INTO collaborators "
+                "INSERT INTO collaborators "
                 "(github_user, display_name, trust_level, added_at, notes) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(github_user) DO UPDATE SET "
+                "display_name=excluded.display_name, trust_level=excluded.trust_level, "
+                "notes=excluded.notes",
                 (github_user, display_name, tl, now, notes),
             )
             logger.info("manage_collaborators: added %s (trust=%s)", github_user, tl)
@@ -3686,31 +3709,41 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             logger.warning("bridge_push: failed to push to %s: %s", target_user, exc)
 
     # Cross-account knowledge push: sharing_rules → collaborator repos
+    # Phase 1: collect targets inside short transaction (release WAL quickly)
     knowledge_pushed = 0
+    push_targets: list[str] = []
     with _get_conn() as conn:
         rules = conn.execute(
             "SELECT DISTINCT target_user FROM sharing_rules"
         ).fetchall()
         for rule_row in rules:
             target = rule_row["target_user"]
-            # Check trust level
             collab = conn.execute(
                 "SELECT trust_level FROM collaborators WHERE github_user = ?",
                 (target,),
             ).fetchone()
-            if not collab:
-                continue
-            try:
+            if collab:
+                push_targets.append(target)
+
+    # Phase 2: git operations outside transaction (no WAL lock during network I/O)
+    successful_targets: list[str] = []
+    for target in push_targets:
+        try:
+            with _get_conn() as conn:
                 pushed_n = _push_knowledge_to(conn, target)
-                knowledge_pushed += pushed_n
-                # Update last_sync_at
+            knowledge_pushed += pushed_n
+            successful_targets.append(target)
+        except Exception as exc:
+            logger.warning("bridge_push: knowledge push to %s failed: %s", target, exc)
+
+    # Phase 3: update sync timestamps in short transaction
+    if successful_targets:
+        with _get_conn() as conn:
+            now = _now()
+            for target in successful_targets:
                 conn.execute(
                     "UPDATE collaborators SET last_sync_at = ? WHERE github_user = ?",
-                    (_now(), target),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "bridge_push: knowledge push to %s failed: %s", target, exc
+                    (now, target),
                 )
 
     n_obs = sum(len(e["observations"]) for e in entities_out)
@@ -4149,6 +4182,10 @@ def bridge_pull() -> str:
             ).fetchone()
             if not ent or ent["visibility"] != "public":
                 continue
+            # Validate content_hash is non-empty (required for rating integrity)
+            c_hash = kr.get("content_hash", "")
+            if not c_hash:
+                continue
             try:
                 conn.execute(
                     "INSERT OR IGNORE INTO knowledge_ratings "
@@ -4159,11 +4196,11 @@ def bridge_pull() -> str:
                     (
                         kr_entity,
                         kr_rater,
-                        kr.get("content_hash", ""),
-                        kr.get("specificity", 0.0),
-                        kr.get("falsifiability", 0.0),
-                        kr.get("internal_consistency", 0.0),
-                        kr.get("novelty", 0.0),
+                        c_hash,
+                        _clamp_score(kr.get("specificity", 0.0)),
+                        _clamp_score(kr.get("falsifiability", 0.0)),
+                        _clamp_score(kr.get("internal_consistency", 0.0)),
+                        _clamp_score(kr.get("novelty", 0.0)),
                         kr.get("verification_outcome"),
                         kr.get("usefulness"),
                         kr.get("verification_context"),

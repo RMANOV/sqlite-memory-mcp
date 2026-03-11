@@ -197,6 +197,7 @@ class TaskDB:
         self._conn.commit()
 
     def close(self):
+        self._wal_timer.stop()
         self._conn.close()
 
     def promote_due_today(self):
@@ -1146,9 +1147,9 @@ class TrayPopup(QWidget):
         if due:
             kwargs["due_date"] = due
         task_type = self._add_type.currentText().lower()
-        task_id = self.db.add_task(title, type=task_type, **kwargs)
-        if desc:
-            self.db.update_task(task_id, description=desc)
+        task_id = self.db.add_task(
+            title, type=task_type, description=desc or None, **kwargs
+        )
         self._add_title.clear()
         self._add_desc.clear()
         self._add_due.clear()
@@ -1363,8 +1364,9 @@ class EditTaskDialog(QDialog):
             self._due_cleared = True
 
     def _on_section_changed(self, section):
-        """Auto-adjust due date when section changes."""
-        self._set_smart_date(section)
+        """Auto-adjust due date when section changes (only if no manual date set)."""
+        if self._due_cleared or self.due_edit.date() == self.due_edit.minimumDate():
+            self._set_smart_date(section)
 
     def _clear_due(self):
         """Clear due date (set to minimum = special value)."""
@@ -3485,15 +3487,17 @@ class TaskTrayApp:
         try:
             now_str = datetime.now(timezone.utc).isoformat()
             conn = sqlite3.connect(self.db.db_path, isolation_level=None, timeout=5)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout=5000")
-            rows = conn.execute(
-                "SELECT id, title, description, priority, reminder_at FROM tasks "
-                "WHERE reminder_at IS NOT NULL AND reminder_at <= ? "
-                "AND status NOT IN ('done', 'archived', 'cancelled')",
-                (now_str,),
-            ).fetchall()
-            conn.close()
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=5000")
+                rows = conn.execute(
+                    "SELECT id, title, description, priority, reminder_at FROM tasks "
+                    "WHERE reminder_at IS NOT NULL AND reminder_at <= ? "
+                    "AND status NOT IN ('done', 'archived', 'cancelled')",
+                    (now_str,),
+                ).fetchall()
+            finally:
+                conn.close()
         except Exception as exc:
             logging.getLogger("task_tray").warning("reminder check: %s", exc)
             return
@@ -3549,6 +3553,7 @@ class TaskTrayApp:
         self._shown_reminder_ids.discard(task_id)
 
     def _on_quit(self):
+        self._reminder_timer.stop()
         self.db.close()
 
     def run(self):

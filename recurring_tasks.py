@@ -23,26 +23,40 @@ def matches_schedule(config: dict, today: date) -> bool:
     """Return True if today matches the recurring schedule config."""
     every = config.get("every", "").lower()
     interval = int(config.get("interval", 1))
+
+    # For interval > 1, use last_spawned-relative check (not modular arithmetic)
+    last_spawned = config.get("last_spawned")
+    if last_spawned and interval > 1:
+        try:
+            last = date.fromisoformat(last_spawned)
+            elapsed = (today - last).days
+            if every == "day":
+                return elapsed >= interval
+            if every == "week":
+                day_name = config.get("day", "").lower()
+                if today.strftime("%A").lower() != day_name:
+                    return False
+                return elapsed >= interval * 7
+            if every == "month":
+                day_num = config.get("day")
+                if day_num is not None and today.day != int(day_num):
+                    return False
+                return elapsed >= interval * 28
+            if every == "year":
+                return elapsed >= interval * 365
+        except (ValueError, TypeError):
+            pass  # fall through to legacy logic
+
     if every == "day":
-        if interval == 1:
-            return True
-        return today.toordinal() % interval == 0
+        return True  # interval == 1 or no last_spawned
     if every == "week":
         day_name = config.get("day", "").lower()
-        if today.strftime("%A").lower() != day_name:
-            return False
-        if interval == 1:
-            return True
-        return today.isocalendar()[1] % interval == 0
+        return today.strftime("%A").lower() == day_name
     if every == "month":
         day_num = config.get("day")
         if day_num is None:
             return False
-        if today.day != int(day_num):
-            return False
-        if interval == 1:
-            return True
-        return today.month % interval == 0
+        return today.day == int(day_num)
     if every == "year":
         cfg_month = config.get("month")
         cfg_day = config.get("day")
@@ -50,8 +64,6 @@ def matches_schedule(config: dict, today: date) -> bool:
             return False
         if cfg_day is not None and today.day != int(cfg_day):
             return False
-        if interval > 1:
-            return today.year % interval == 0
         return True
     return False
 
@@ -147,6 +159,10 @@ def build_new_task(source: sqlite3.Row, due: str, timestamp: str) -> dict:
         "parent_id": source["parent_id"],
         "notes": source["notes"],
         "recurring": source["recurring"],
+        "type": source["type"] or "task",
+        "assignee": source["assignee"],
+        "shared_by": source["shared_by"],
+        "visibility": source["visibility"] or "private",
         "reminder_at": None,
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -195,16 +211,22 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
                 """
                 INSERT INTO tasks
                     (id, title, description, status, priority, section, due_date,
-                     project, parent_id, notes, recurring, reminder_at,
-                     created_at, updated_at)
+                     project, parent_id, notes, recurring, type, assignee,
+                     shared_by, visibility, reminder_at, created_at, updated_at)
                 VALUES
                     (:id, :title, :description, :status, :priority, :section, :due_date,
-                     :project, :parent_id, :notes, :recurring, :reminder_at,
-                     :created_at, :updated_at)
+                     :project, :parent_id, :notes, :recurring, :type, :assignee,
+                     :shared_by, :visibility, :reminder_at, :created_at, :updated_at)
                 """,
                 new_task,
             )
             upsert_field_versions(conn, new_task["id"], MERGEABLE_FIELDS)
+            # Track last_spawned in source task's recurring config for interval scheduling
+            config["last_spawned"] = today.isoformat()
+            conn.execute(
+                "UPDATE tasks SET recurring = ? WHERE id = ?",
+                (json.dumps(config), task["id"]),
+            )
             print(
                 f"  Created: title='{new_task['title']}'"
                 f"  id={new_task['id']}"

@@ -132,6 +132,8 @@ METADATA_FIELDS = (
     "type",
     "assignee",
     "shared_by",
+    "visibility",
+    "publish_requested_at",
     "created_at",
     "updated_at",
 )
@@ -152,6 +154,8 @@ MERGEABLE_FIELDS = (
     "type",
     "assignee",
     "shared_by",
+    "visibility",
+    "publish_requested_at",
     "description",
     "notes",
 )
@@ -324,7 +328,7 @@ def upsert_field_versions(
 TASK_EXPORT_COLS = (
     "id, title, description, status, priority, section, due_date, "
     "project, parent_id, notes, recurring, reminder_at, type, assignee, shared_by, "
-    "created_at, updated_at"
+    "visibility, publish_requested_at, created_at, updated_at"
 )
 
 
@@ -481,8 +485,9 @@ def _parse_field_ts(remote_fts: dict, field: str, fallback_ts: str) -> tuple[str
     entry = remote_fts.get(field)
     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
         return str(entry[0]), str(entry[1])
-    # Backward compat: no _field_ts → task-level updated_at
-    return fallback_ts, ""
+    # Backward compat: no _field_ts → task-level updated_at.
+    # Use MACHINE_ID (not "") so old peers don't systematically lose ties.
+    return fallback_ts, MACHINE_ID
 
 
 def merge_import_tasks(
@@ -516,7 +521,7 @@ def merge_import_tasks(
 
     for remote in tasks_sorted:
         tid = remote.get("id")
-        if not tid:
+        if not tid or not _SAFE_TASK_ID.match(tid):
             continue
 
         sanitize_task_enums(remote)
@@ -608,8 +613,8 @@ def merge_import_tasks(
                 "INSERT OR IGNORE INTO tasks "
                 "(id, title, description, status, priority, section, due_date, "
                 "project, parent_id, notes, recurring, reminder_at, type, assignee, shared_by, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "visibility, publish_requested_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     tid,
                     remote.get("title", ""),
@@ -626,6 +631,8 @@ def merge_import_tasks(
                     remote.get("type", "task"),
                     remote.get("assignee"),
                     remote.get("shared_by"),
+                    remote.get("visibility", "private"),
+                    remote.get("publish_requested_at"),
                     remote.get("created_at", now),
                     remote.get("updated_at", now),
                 ),
