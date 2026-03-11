@@ -402,6 +402,17 @@ def export_task_files(
         task["_field_ts"] = fv_map.get(tid, {})
         task["_links"] = link_map.get(tid, [])
         task_path = tasks_dir / f"{tid}.json"
+
+        # Content-aware export: preserve bridge descriptions/notes if local is NULL
+        if task_path.exists():
+            try:
+                existing = json_loads(task_path.read_text(encoding="utf-8"))
+                for content_field in CONTENT_FIELDS:
+                    if not task.get(content_field) and existing.get(content_field):
+                        task[content_field] = existing[content_field]
+            except (ValueError, OSError):
+                pass
+
         task_path.write_text(json_dumps(task), encoding="utf-8")
         exported.append(tid)
 
@@ -589,6 +600,21 @@ def merge_import_tasks(
                         (local_id, field, remote_ts, remote_by),
                     )
                     updated_fields += 1
+
+            # NULL-fill: adopt remote content fields when local is NULL
+            # (non-LWW — only fills gaps, never overwrites existing content)
+            if not import_content:
+                for content_field in CONTENT_FIELDS:
+                    remote_val = remote.get(content_field)
+                    if not remote_val:
+                        continue
+                    local_val = conn.execute(
+                        f"SELECT {content_field} FROM tasks WHERE id = ?",
+                        (local_id,),
+                    ).fetchone()
+                    if local_val and not local_val[0]:
+                        fields_to_update[content_field] = remote_val
+                        updated_fields += 1
 
             if fields_to_update:
                 # Validate field names against allowlist (defense-in-depth)

@@ -48,6 +48,9 @@ _NOWIN: dict = (
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
+_SAFETY_THRESHOLD = 10  # Block sync if this many descriptions would be removed
+
+
 def _progress(cb: Callable[[int, str], None] | None, pct: int, label: str) -> None:
     if cb is not None:
         cb(pct, label)
@@ -62,6 +65,60 @@ def _git(*args: str, bridge_dir: str) -> subprocess.CompletedProcess:
         timeout=30,
         **_NOWIN,
     )
+
+
+def _check_sync_safety(
+    conn: sqlite3.Connection,
+    bridge_dir: str,
+    threshold: int = _SAFETY_THRESHOLD,
+) -> dict:
+    """Compare local DB state vs bridge files. Flag destructive content changes."""
+    tasks_dir = Path(bridge_dir) / "tasks"
+    if not tasks_dir.exists():
+        return {"is_safe": True, "descriptions_removed": 0, "notes_removed": 0}
+
+    stats = {
+        "descriptions_added": 0,
+        "descriptions_removed": 0,
+        "notes_added": 0,
+        "notes_removed": 0,
+        "tasks_removed": 0,
+    }
+
+    for task_file in tasks_dir.glob("*.json"):
+        try:
+            bridge_task = _json_loads(task_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+
+        tid = bridge_task.get("id")
+        if not tid:
+            continue
+
+        local = conn.execute(
+            "SELECT description, notes FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+        if not local:
+            stats["tasks_removed"] += 1
+            continue
+
+        bridge_desc = bridge_task.get("description")
+        local_desc = local["description"]
+        if bridge_desc and not local_desc:
+            stats["descriptions_removed"] += 1
+        elif not bridge_desc and local_desc:
+            stats["descriptions_added"] += 1
+
+        bridge_notes = bridge_task.get("notes")
+        local_notes = local["notes"]
+        if bridge_notes and not local_notes:
+            stats["notes_removed"] += 1
+        elif not bridge_notes and local_notes:
+            stats["notes_added"] += 1
+
+    stats["is_safe"] = stats["descriptions_removed"] < threshold
+    return stats
 
 
 # ── Import / Export helpers ──────────────────────────────────────────────
@@ -254,10 +311,12 @@ def main(
     progress_callback: Callable[[int, str], None] | None = None,
     db_path: str | None = None,
     bridge_repo: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Run full bridge sync: pull → CRDT merge → export → push.
 
     Returns {"entities": N, "tasks": N, "pushed": bool}.
+    When force=False (default), blocks push if too many descriptions would be lost.
     """
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
@@ -375,6 +434,33 @@ def main(
                 payload["ui_profiles"] = existing["ui_profiles"]
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Safety valve: check for destructive content changes before committing
+    if not force:
+        with get_conn(_db_path) as conn:
+            safety = _check_sync_safety(conn, bridge_dir)
+        if not safety["is_safe"]:
+            log.warning(
+                "SAFETY VALVE: %d descriptions would be removed, %d notes would be removed",
+                safety["descriptions_removed"],
+                safety["notes_removed"],
+            )
+            _progress(
+                progress_callback,
+                -1,
+                f"BLOCKED: {safety['descriptions_removed']} descriptions + "
+                f"{safety['notes_removed']} notes would be deleted. "
+                f"Run with --force to override.",
+            )
+            return {
+                "entities": len(entities_out),
+                "tasks": len(tasks_out),
+                "pushed": False,
+                "imported_new": new_t,
+                "imported_updated": upd_t,
+                "blocked_by_safety": True,
+                "safety": safety,
+            }
 
     _progress(progress_callback, 70, "Writing shared.json...")
     shared_path.write_text(_json_dumps(payload), encoding="utf-8")
