@@ -26,7 +26,7 @@ from db_utils import (
     TASK_EXPORT_COLS,
     now_iso,
     sanitize_task_enums,
-    # v2.0.0: Bridge Sync v2 — per-field CRDT
+    # v2.0.0: Bridge Sync v2 — per-field LWW
     json_loads as _json_loads,
     json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
     export_task_files,
@@ -266,7 +266,7 @@ def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict
 
     DEPRECATED: Legacy title-based matching for shared.json backward compat only.
     Will be removed once all machines run Bridge v2 (per-task files + index.json).
-    New code should use merge_import_tasks() from db_utils (UUID-based CRDT).
+    New code should use merge_import_tasks() from db_utils (UUID-based LWW).
     """
     remote_tasks = existing_data.get("tasks", [])
     local_titles = {t["title"] for t in tasks_out}
@@ -313,7 +313,7 @@ def main(
     bridge_repo: str | None = None,
     force: bool = False,
 ) -> dict:
-    """Run full bridge sync: pull → CRDT merge → export → push.
+    """Run full bridge sync: pull → LWW merge → export → push.
 
     Returns {"entities": N, "tasks": N, "pushed": bool}.
     When force=False (default), blocks push if too many descriptions would be lost.
@@ -374,7 +374,7 @@ def main(
             try:
                 idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
                 new_t, upd_t = merge_import_tasks(conn, idx_data.get("tasks", []))
-                log.info("CRDT merged %d new tasks, %d field updates", new_t, upd_t)
+                log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
@@ -385,6 +385,33 @@ def main(
             except (json.JSONDecodeError, OSError):
                 pass
     # Import transaction closed — DB lock released
+
+    # Safety valve: check BEFORE export (bridge files still contain remote data)
+    if not force:
+        with get_conn(_db_path) as conn:
+            safety = _check_sync_safety(conn, bridge_dir)
+        if not safety["is_safe"]:
+            log.warning(
+                "SAFETY VALVE: %d descriptions would be removed, %d notes would be removed",
+                safety["descriptions_removed"],
+                safety["notes_removed"],
+            )
+            _progress(
+                progress_callback,
+                -1,
+                f"BLOCKED: {safety['descriptions_removed']} descriptions + "
+                f"{safety['notes_removed']} notes would be deleted. "
+                f"Run with --force to override.",
+            )
+            return {
+                "entities": 0,
+                "tasks": 0,
+                "pushed": False,
+                "imported_new": new_t,
+                "imported_updated": upd_t,
+                "blocked_by_safety": True,
+                "safety": safety,
+            }
 
     # Phase 3b: Export (read-only, separate short transaction)
     with get_conn(_db_path) as conn:
@@ -434,33 +461,6 @@ def main(
                 payload["ui_profiles"] = existing["ui_profiles"]
         except (json.JSONDecodeError, OSError):
             pass
-
-    # Safety valve: check for destructive content changes before committing
-    if not force:
-        with get_conn(_db_path) as conn:
-            safety = _check_sync_safety(conn, bridge_dir)
-        if not safety["is_safe"]:
-            log.warning(
-                "SAFETY VALVE: %d descriptions would be removed, %d notes would be removed",
-                safety["descriptions_removed"],
-                safety["notes_removed"],
-            )
-            _progress(
-                progress_callback,
-                -1,
-                f"BLOCKED: {safety['descriptions_removed']} descriptions + "
-                f"{safety['notes_removed']} notes would be deleted. "
-                f"Run with --force to override.",
-            )
-            return {
-                "entities": len(entities_out),
-                "tasks": len(tasks_out),
-                "pushed": False,
-                "imported_new": new_t,
-                "imported_updated": upd_t,
-                "blocked_by_safety": True,
-                "safety": safety,
-            }
 
     _progress(progress_callback, 70, "Writing shared.json...")
     shared_path.write_text(_json_dumps(payload), encoding="utf-8")

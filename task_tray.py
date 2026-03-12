@@ -200,7 +200,7 @@ class TaskDB:
             "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status)",
         ):
             self._conn.execute(idx_sql)
-        # v0.6.0+: supporting tables for per-field CRDT and entity links
+        # v0.6.0+: supporting tables for per-field LWW and entity links
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS task_field_versions ("
             "task_id TEXT NOT NULL, field_name TEXT NOT NULL, "
@@ -316,9 +316,17 @@ class TaskDB:
         now = now_iso()
         with self._transact(self._conn):
             TaskDAO.create(
-                self._conn, task_id, title, now,
-                description=description, status=status, section=section,
-                priority=priority, due_date=due_date, project=project, type=type,
+                self._conn,
+                task_id,
+                title,
+                now,
+                description=description,
+                status=status,
+                section=section,
+                priority=priority,
+                due_date=due_date,
+                project=project,
+                type=type,
             )
             upsert_field_versions(self._conn, task_id, MERGEABLE_FIELDS, now)
         if self.on_change:
@@ -359,7 +367,9 @@ class TaskDB:
             # Read task metadata before cancelling
             row = TaskDAO.get_by_id(self._conn, task_id, "title, recurring, project")
             # Cancel the target task
-            TaskDAO.update(self._conn, task_id, {"status": "cancelled", "updated_at": now})
+            TaskDAO.update(
+                self._conn, task_id, {"status": "cancelled", "updated_at": now}
+            )
             upsert_field_versions(self._conn, task_id, ("status",), now)
             # For recurring tasks: cancel all done siblings to break spawn cycle
             if row and row["recurring"]:
@@ -407,7 +417,9 @@ class TaskDB:
         """Create a manual link between a task and an entity."""
         now = now_iso()
         try:
-            TaskDAO.link_entity(self._conn, task_id, entity_id, link_type, created_at=now)
+            TaskDAO.link_entity(
+                self._conn, task_id, entity_id, link_type, created_at=now
+            )
             self._conn.commit()
             return True
         except Exception:
