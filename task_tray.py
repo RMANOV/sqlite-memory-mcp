@@ -1749,10 +1749,10 @@ class TaskReaderDialog(QDialog):
             reading = len(paragraphs) > 1
 
             if reading:
-                font = f"{_font_size + 3}px"
+                font = f"{_font_size + 8}px"
                 style = (
                     f"font-family: Georgia, 'Noto Serif', serif; font-size: {font}; "
-                    f"line-height: 180%; color: #d4d4d4; max-width: 680px; "
+                    f"line-height: 230%; color: #d4d4d4; max-width: 680px; "
                     f"margin: 0 auto; letter-spacing: 0.3px;"
                 )
             else:
@@ -1776,7 +1776,7 @@ class TaskReaderDialog(QDialog):
             if reading:
                 self._body_label.setStyleSheet(
                     f"QLabel#reader-body {{ background: #0a0a0a; color: #d4d4d4; "
-                    f"font-size: {_font_size + 3}px; padding: 40px 32px; }}"
+                    f"font-size: {_font_size + 8}px; padding: 40px 32px; }}"
                 )
                 self._scroll.setStyleSheet("background: #0a0a0a;")
             else:
