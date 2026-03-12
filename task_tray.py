@@ -505,15 +505,27 @@ class _ClickableLabel(QLabel):
 
 
 class _TooltipCopyFilter(QObject):
-    """Copies task title to clipboard when tooltip is about to show."""
+    """Copies full task summary to clipboard when tooltip is about to show."""
 
-    def __init__(self, text, parent=None):
+    def __init__(self, task, parent=None):
         super().__init__(parent)
-        self._text = text
+        self._task = task
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.ToolTip:
-            QApplication.clipboard().setText(self._text)
+            t = self._task
+            parts = [t["title"]]
+            if t.get("description"):
+                parts.append(t["description"])
+            if t.get("priority"):
+                parts.append(f"Priority: {t['priority']}")
+            if t.get("due_date"):
+                parts.append(f"Due: {t['due_date']}")
+            if t.get("project"):
+                parts.append(f"Project: {t['project']}")
+            if t.get("section"):
+                parts.append(f"Section: {t['section']}")
+            QApplication.clipboard().setText("\n".join(parts))
         return False  # let tooltip show normally
 
 
@@ -1149,10 +1161,17 @@ class TrayPopup(QWidget):
         plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, '#718096')};")
         hl.addWidget(plbl)
 
-        desc = task.get("description")
-        if desc:
-            row.setToolTip(desc)
-        row.installEventFilter(_TooltipCopyFilter(task["title"], row))
+        # Build rich tooltip with all task details
+        tip_parts = []
+        if task.get("description"):
+            tip_parts.append(task["description"])
+        if task.get("due_date"):
+            tip_parts.append(f"Due: {task['due_date']}")
+        if task.get("project"):
+            tip_parts.append(f"Project: {task['project']}")
+        if tip_parts:
+            row.setToolTip("\n".join(tip_parts))
+        row.installEventFilter(_TooltipCopyFilter(task, row))
 
         return row
 
