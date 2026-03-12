@@ -1749,11 +1749,11 @@ class TaskReaderDialog(QDialog):
             reading = len(paragraphs) > 1
 
             if reading:
-                font = f"{_font_size + 5}px"
+                font = f"{_font_size + 3}px"
                 style = (
-                    f"font-family: Georgia, 'Segoe UI', serif; font-size: {font}; "
-                    f"line-height: 200%; color: #ffffff; max-width: 720px; "
-                    f"margin: 0 auto; letter-spacing: 0.2px;"
+                    f"font-family: Georgia, 'Noto Serif', serif; font-size: {font}; "
+                    f"line-height: 180%; color: #d4d4d4; max-width: 680px; "
+                    f"margin: 0 auto; letter-spacing: 0.3px;"
                 )
             else:
                 style = (
@@ -1761,16 +1761,24 @@ class TaskReaderDialog(QDialog):
                     f"line-height: 160%; color: #e2e8f0;"
                 )
 
-            inner = "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs)
+            if reading:
+                inner = "".join(
+                    f'<p style="margin: 0 0 1.2em 0;">{p.replace(chr(10), "<br>")}</p>'
+                    for p in paragraphs
+                )
+            else:
+                inner = "".join(
+                    f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs
+                )
             body_html = f'<div style="{style}">{inner}</div>'
 
-            # Reading mode: true black background override
+            # Reading mode: Kindle Dark background override
             if reading:
                 self._body_label.setStyleSheet(
-                    f"QLabel#reader-body {{ background: #000000; color: #ffffff; "
-                    f"font-size: {_font_size + 5}px; padding: 32px 24px; }}"
+                    f"QLabel#reader-body {{ background: #0a0a0a; color: #d4d4d4; "
+                    f"font-size: {_font_size + 3}px; padding: 40px 32px; }}"
                 )
-                self._scroll.setStyleSheet("background: #000000;")
+                self._scroll.setStyleSheet("background: #0a0a0a;")
             else:
                 self._body_label.setStyleSheet("")
                 self._scroll.setStyleSheet("")
