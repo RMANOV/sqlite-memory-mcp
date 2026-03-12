@@ -8,9 +8,15 @@ license = {text = "MIT"}
 authors = [{name = "rmanov"}]
 readme = "README.md"
 
+[project.optional-dependencies]
+gui = ["PyQt6>=6.5"]
+dev = ["pytest>=7.0"]
+
 [project.scripts]
 sqlite-memory-mcp = "server:mcp.run"
+task-tray = "task_tray:main"
+memory-digest = "daily_digest:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
