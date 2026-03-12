@@ -177,18 +177,38 @@ _PRAGMAS = (
 )
 
 
+_BUSY_RETRIES = 3
+_BUSY_BASE_DELAY = 0.5  # seconds, doubles each retry
+
+
 @contextmanager
 def get_conn(db_path: str | None = None):
     """Yield a SQLite connection with PRAGMAs set, auto-commit/rollback.
 
     Uses explicit BEGIN/COMMIT to ensure each context-manager block is atomic.
-    (isolation_level=None = autocommit; commit()/rollback() are no-ops without BEGIN.)
+    Retries BEGIN up to 3× on SQLITE_BUSY (exponential backoff on top of busy_timeout).
     """
-    conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=10)
-    conn.row_factory = sqlite3.Row
-    for pragma in _PRAGMAS:
-        conn.execute(pragma)
-    conn.execute("BEGIN;")
+    import time as _time
+
+    # Retry connection + BEGIN on SQLITE_BUSY (lock contention with tray/bridge)
+    conn = None
+    for attempt in range(_BUSY_RETRIES):
+        conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=10)
+        conn.row_factory = sqlite3.Row
+        for pragma in _PRAGMAS:
+            conn.execute(pragma)
+        try:
+            conn.execute("BEGIN;")
+            break  # transaction started successfully
+        except sqlite3.OperationalError as e:
+            conn.close()
+            conn = None
+            if "locked" in str(e).lower() and attempt < _BUSY_RETRIES - 1:
+                _time.sleep(_BUSY_BASE_DELAY * (2**attempt))
+                continue
+            raise
+
+    # Yield exactly once, outside the retry loop
     try:
         yield conn
         conn.execute("COMMIT;")
@@ -603,18 +623,21 @@ def merge_import_tasks(
 
             # NULL-fill: adopt remote content fields when local is NULL
             # (non-LWW — only fills gaps, never overwrites existing content)
-            if not import_content:
-                for content_field in CONTENT_FIELDS:
-                    remote_val = remote.get(content_field)
-                    if not remote_val:
-                        continue
-                    local_val = conn.execute(
-                        f"SELECT {content_field} FROM tasks WHERE id = ?",
-                        (local_id,),
-                    ).fetchone()
-                    if local_val and not local_val[0]:
-                        fields_to_update[content_field] = remote_val
-                        updated_fields += 1
+            # Always applied regardless of import_content: LWW may skip content
+            # when local has newer timestamp but NULL value (e.g. freshly created task).
+            for content_field in CONTENT_FIELDS:
+                if content_field in fields_to_update:
+                    continue  # already handled by LWW above
+                remote_val = remote.get(content_field)
+                if not remote_val:
+                    continue
+                local_val = conn.execute(
+                    f"SELECT {content_field} FROM tasks WHERE id = ?",
+                    (local_id,),
+                ).fetchone()
+                if local_val and not local_val[0]:
+                    fields_to_update[content_field] = remote_val
+                    updated_fields += 1
 
             if fields_to_update:
                 # Validate field names against allowlist (defense-in-depth)
@@ -674,8 +697,7 @@ def merge_import_tasks(
                 )
             new_count += 1
 
-    # Import task-entity links from remote tasks
-    now = datetime.now(timezone.utc).isoformat()
+    # Import task-entity links from remote tasks (reuse `now` from above)
     for rt in remote_tasks:
         remote_links = rt.get("_links")
         if not remote_links:
