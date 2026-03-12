@@ -570,7 +570,7 @@ _MIGRATIONS = [
         "CREATE TABLE bridge_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         "bridge_meta table (v1.0.0)",
     ),
-    # v2.0.0: per-field CRDT — task_field_versions table
+    # v2.0.0: per-field LWW — task_field_versions table
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_field_versions'",
         "CREATE TABLE task_field_versions ("
@@ -578,7 +578,7 @@ _MIGRATIONS = [
         "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', "
         "PRIMARY KEY (task_id, field_name), "
         "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE)",
-        "task_field_versions table (v2.0.0 — per-field CRDT)",
+        "task_field_versions table (v2.0.0 — per-field LWW)",
     ),
     # v2.0.0: seed field versions from existing tasks
     (
@@ -1419,7 +1419,7 @@ def create_task(
             reminder_at=reminder_at,
             type=type,
         )
-        # v2.0.0: Seed field versions for CRDT sync
+        # v2.0.0: Seed field versions for LWW sync
         _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now)
 
     logger.info("create_task: %s (%s)", title, task_id)
@@ -1529,7 +1529,7 @@ def update_task(
     with _get_conn() as conn:
         if TaskDAO.update(conn, task_id, updates) == 0:
             return json.dumps({"error": f"Task {task_id} not found"})
-        # v2.0.0: Track field versions for CRDT sync
+        # v2.0.0: Track field versions for LWW sync
         changed = [k for k in updates if k != "updated_at"]
         _upsert_field_versions(conn, task_id, changed, updates["updated_at"])
 
@@ -3390,7 +3390,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     _migrate_to_per_task_files(BRIDGE_REPO)
 
     with _get_conn() as conn:
-        # v2.0.0: CRDT merge remote index.json into local DB
+        # v2.0.0: LWW merge remote index.json into local DB
         _bp_index_path = Path(BRIDGE_REPO) / "index.json"
         if _bp_index_path.exists():
             try:
@@ -3916,7 +3916,7 @@ def bridge_pull() -> str:
                 )
                 new_relations += cur3.rowcount
 
-        # v2.0.0: Import tasks via per-field CRDT merge from index.json
+        # v2.0.0: Import tasks via per-field LWW merge from index.json
         if _has_index:
             try:
                 _idx_data = _json_loads(_pull_index_path.read_text(encoding="utf-8"))
@@ -4352,7 +4352,9 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
         entity_id = entity["id"]
         now = datetime.now(timezone.utc).isoformat()
 
-        TaskDAO.link_entity(conn, task_id, entity_id, link_type="manual", created_at=now)
+        TaskDAO.link_entity(
+            conn, task_id, entity_id, link_type="manual", created_at=now
+        )
 
         return json.dumps(
             {

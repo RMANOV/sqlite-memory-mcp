@@ -114,9 +114,22 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
     }
 )
 
-# ── Bridge Sync v2: Per-field LWW CRDT ──────────────────────────────────
+# ── Bridge Sync v2: Per-field LWW conflict resolver ─────────────────────
 
 MACHINE_ID = socket.gethostname()
+_write_counter = 0  # monotonic counter for same-microsecond tie-breaking
+
+
+def _next_machine_id() -> str:
+    """Return machine_id with monotonic counter suffix for deterministic ordering.
+
+    Two writes in the same microsecond on the same machine get different IDs:
+    DESKTOP:0001, DESKTOP:0002 → lexicographic comparison picks the later write.
+    """
+    global _write_counter
+    _write_counter += 1
+    return f"{MACHINE_ID}:{_write_counter:06d}"
+
 
 METADATA_FIELDS = (
     "id",
@@ -140,7 +153,7 @@ METADATA_FIELDS = (
 
 CONTENT_FIELDS = ("description", "notes")
 
-# Fields eligible for per-field CRDT merge (excludes id, created_at, updated_at)
+# Fields eligible for per-field LWW merge (excludes id, created_at, updated_at)
 MERGEABLE_FIELDS = (
     "title",
     "status",
@@ -589,7 +602,7 @@ def upsert_field_versions(
 ) -> None:
     """Upsert field versions for the given fields."""
     ts = timestamp or now_iso()
-    mid = machine_id or MACHINE_ID
+    mid = machine_id or _next_machine_id()
     for field in fields:
         conn.execute(
             "INSERT OR REPLACE INTO task_field_versions "
@@ -763,7 +776,7 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
     return len(tasks)
 
 
-# ── Bridge Sync v2: Per-field LWW CRDT merge ────────────────────────────
+# ── Bridge Sync v2: Per-field LWW merge ──────────────────────────────────
 
 
 def _parse_field_ts(remote_fts: dict, field: str, fallback_ts: str) -> tuple[str, str]:
@@ -781,7 +794,10 @@ def merge_import_tasks(
     remote_tasks: list[dict],
     import_content: bool = False,
 ) -> tuple[int, int]:
-    """Per-field LWW CRDT merge. Returns (new_count, updated_field_count).
+    """Per-field LWW (Last-Write-Wins) merge. Returns (new_count, updated_field_count).
+
+    NOT a true CRDT — uses timestamp-based conflict resolution without vector clocks.
+    Works well for single-user multi-machine sync. May lose updates on clock skew >1s.
 
     Merge rule: for each field, (timestamp, machine_id) lexicographic comparison.
     Remote wins if (remote_ts, remote_by) > (local_ts, local_by).
@@ -798,6 +814,7 @@ def merge_import_tasks(
     new_count = 0
     updated_fields = 0
     now = now_iso()
+    _clock_skew_warned = False  # only log once per merge batch
 
     # Sort parents before children to avoid FK violations
     tasks_sorted = sorted(
@@ -813,6 +830,23 @@ def merge_import_tasks(
         sanitize_task_enums(remote)
         remote_fts = remote.get("_field_ts", {})
         fallback_ts = remote.get("updated_at", "")
+
+        # Clock skew detection: warn if remote timestamp is >5s ahead of local
+        if not _clock_skew_warned and fallback_ts > now:
+            try:
+                delta = (
+                    datetime.fromisoformat(fallback_ts) - datetime.fromisoformat(now)
+                ).total_seconds()
+                if delta > 5:
+                    _log.warning(
+                        "Clock skew detected: remote is %.1fs ahead (task %s). "
+                        "LWW merge may produce unexpected results.",
+                        delta,
+                        tid,
+                    )
+                    _clock_skew_warned = True
+            except (ValueError, TypeError):
+                pass
 
         # Handle tombstones — only merge status field
         if remote.get("_tombstone"):
@@ -844,7 +878,7 @@ def merge_import_tasks(
                     updated_fields += 1
             continue
 
-        # Match by UUID only — authoritative in CRDT model
+        # Match by UUID only — authoritative in LWW model
         existing = conn.execute(
             "SELECT id, updated_at FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
@@ -853,7 +887,7 @@ def merge_import_tasks(
             local_id = existing["id"]
             local_fvs = get_field_versions(conn, local_id)
 
-            # Per-field CRDT merge
+            # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
             for field in fields_to_merge:
                 if field not in remote:
@@ -909,7 +943,7 @@ def merge_import_tasks(
         else:
             # New task — insert (content only if import_content)
             # Note: cancelled tasks still exist as rows (soft-delete), so they're
-            # handled by the `if existing:` branch above — CRDT field versioning
+            # handled by the `if existing:` branch above — LWW field versioning
             # prevents remote from overwriting the newer local cancelled status.
             desc = remote.get("description") if import_content else None
             notes = remote.get("notes") if import_content else None
