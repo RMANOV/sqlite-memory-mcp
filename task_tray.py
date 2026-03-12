@@ -78,9 +78,34 @@ class TaskDB:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._ensure_table()
         self._repair_fts_if_needed()
+
         self._wal_timer = QTimer()
         self._wal_timer.timeout.connect(self._wal_checkpoint)
         self._wal_timer.start(300_000)  # 5 minutes
+
+    class _transact:
+        """Explicit transaction block for multi-statement atomic writes.
+
+        In autocommit mode (isolation_level=None), each execute() auto-commits.
+        This context manager groups multiple statements into a single transaction.
+        """
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            self._conn.execute("BEGIN")
+            return self._conn
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                self._conn.execute("COMMIT")
+            else:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            return False
 
     def _wal_checkpoint(self):
         try:
@@ -293,26 +318,26 @@ class TaskDB:
         """Insert new task, return its ID."""
         task_id = str(uuid.uuid4())
         now = now_iso()
-        self._conn.execute(
-            "INSERT INTO tasks (id, title, description, status, section, priority, "
-            "due_date, project, type, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                title,
-                description,
-                status,
-                section,
-                priority,
-                due_date,
-                project,
-                type,
-                now,
-                now,
-            ),
-        )
-        upsert_field_versions(self._conn, task_id, MERGEABLE_FIELDS, now)
-        self._conn.commit()
+        with self._transact(self._conn):
+            self._conn.execute(
+                "INSERT INTO tasks (id, title, description, status, section, priority, "
+                "due_date, project, type, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    title,
+                    description,
+                    status,
+                    section,
+                    priority,
+                    due_date,
+                    project,
+                    type,
+                    now,
+                    now,
+                ),
+            )
+            upsert_field_versions(self._conn, task_id, MERGEABLE_FIELDS, now)
         if self.on_change:
             self.on_change()
         return task_id
@@ -320,12 +345,12 @@ class TaskDB:
     def mark_done(self, task_id):
         """Set status=done."""
         now = now_iso()
-        self._conn.execute(
-            "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
-            (now, task_id),
-        )
-        upsert_field_versions(self._conn, task_id, ("status",), now)
-        self._conn.commit()
+        with self._transact(self._conn):
+            self._conn.execute(
+                "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
+                (now, task_id),
+            )
+            upsert_field_versions(self._conn, task_id, ("status",), now)
         if self.on_change:
             self.on_change()
 
@@ -341,10 +366,10 @@ class TaskDB:
         fields["updated_at"] = now
         sets = ", ".join(f"{k}=?" for k in fields)
         vals = list(fields.values()) + [task_id]
-        self._conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals)
-        if changed:
-            upsert_field_versions(self._conn, task_id, changed, now)
-        self._conn.commit()
+        with self._transact(self._conn):
+            self._conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals)
+            if changed:
+                upsert_field_versions(self._conn, task_id, changed, now)
         if self.on_change:
             self.on_change()
 
@@ -352,36 +377,36 @@ class TaskDB:
         """Soft-delete: cancel task (creates tombstone for bridge sync).
         For recurring tasks, also cancel done siblings to stop respawn cycle."""
         now = now_iso()
-        # Read task metadata before cancelling
-        row = self._conn.execute(
-            "SELECT title, recurring, project FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()
-        # Cancel the target task
-        self._conn.execute(
-            "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
-            (now, task_id),
-        )
-        upsert_field_versions(self._conn, task_id, ("status",), now)
-        # For recurring tasks: cancel all done siblings to break spawn cycle
-        if row and row["recurring"]:
-            sibling_ids = [
-                s["id"]
-                for s in self._conn.execute(
-                    "SELECT id FROM tasks WHERE title=? AND status='done' "
-                    "AND recurring IS NOT NULL AND id!=? AND project IS ?",
-                    (row["title"], task_id, row["project"]),
-                ).fetchall()
-            ]
-            if sibling_ids:
-                ph = ",".join("?" * len(sibling_ids))
-                self._conn.execute(
-                    f"UPDATE tasks SET status='cancelled', updated_at=? "
-                    f"WHERE id IN ({ph})",
-                    [now, *sibling_ids],
-                )
-                for sid in sibling_ids:
-                    upsert_field_versions(self._conn, sid, ("status",), now)
-        self._conn.commit()
+        with self._transact(self._conn):
+            # Read task metadata before cancelling
+            row = self._conn.execute(
+                "SELECT title, recurring, project FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            # Cancel the target task
+            self._conn.execute(
+                "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
+                (now, task_id),
+            )
+            upsert_field_versions(self._conn, task_id, ("status",), now)
+            # For recurring tasks: cancel all done siblings to break spawn cycle
+            if row and row["recurring"]:
+                sibling_ids = [
+                    s["id"]
+                    for s in self._conn.execute(
+                        "SELECT id FROM tasks WHERE title=? AND status='done' "
+                        "AND recurring IS NOT NULL AND id!=? AND project IS ?",
+                        (row["title"], task_id, row["project"]),
+                    ).fetchall()
+                ]
+                if sibling_ids:
+                    ph = ",".join("?" * len(sibling_ids))
+                    self._conn.execute(
+                        f"UPDATE tasks SET status='cancelled', updated_at=? "
+                        f"WHERE id IN ({ph})",
+                        [now, *sibling_ids],
+                    )
+                    for sid in sibling_ids:
+                        upsert_field_versions(self._conn, sid, ("status",), now)
         if self.on_change:
             self.on_change()
 
