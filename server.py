@@ -37,6 +37,7 @@ from db_utils import (
     json_dumps as _json_dumps,
     json_loads as _json_loads,
     get_conn as _get_conn,
+    TaskDAO,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
@@ -1399,33 +1400,24 @@ def create_task(
 
     with _get_conn() as conn:
         if parent_id:
-            parent = conn.execute(
-                "SELECT id FROM tasks WHERE id = ?", (parent_id,)
-            ).fetchone()
-            if not parent:
+            if not TaskDAO.exists(conn, parent_id):
                 return json.dumps({"error": f"Parent task {parent_id} not found"})
 
-        conn.execute(
-            "INSERT INTO tasks (id, title, description, status, priority, section, "
-            "due_date, project, parent_id, notes, recurring, reminder_at, type, "
-            "created_at, updated_at) "
-            "VALUES (?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                title,
-                description,
-                priority,
-                section,
-                due_date,
-                project,
-                parent_id,
-                notes,
-                recurring,
-                reminder_at,
-                type,
-                now,
-                now,
-            ),
+        TaskDAO.create(
+            conn,
+            task_id,
+            title,
+            now,
+            description=description,
+            priority=priority,
+            section=section,
+            due_date=due_date,
+            project=project,
+            parent_id=parent_id,
+            notes=notes,
+            recurring=recurring,
+            reminder_at=reminder_at,
+            type=type,
         )
         # v2.0.0: Seed field versions for CRDT sync
         _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now)
@@ -1533,12 +1525,9 @@ def update_task(
             )
 
     updates["updated_at"] = _now()
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [task_id]
 
     with _get_conn() as conn:
-        cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
-        if cur.rowcount == 0:
+        if TaskDAO.update(conn, task_id, updates) == 0:
             return json.dumps({"error": f"Task {task_id} not found"})
         # v2.0.0: Track field versions for CRDT sync
         changed = [k for k in updates if k != "updated_at"]
@@ -1789,19 +1778,8 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
 
     with _get_conn() as conn:
         now = _now()
-        affected = conn.execute(
-            "SELECT id FROM tasks WHERE status = 'done' AND type = 'task' "
-            "AND updated_at < datetime('now', ? || ' days')",
-            (f"-{days}",),
-        ).fetchall()
-        affected_ids = [r["id"] for r in affected]
-        cur = conn.execute(
-            "UPDATE tasks SET status = 'archived', updated_at = ? "
-            "WHERE status = 'done' AND type = 'task' "
-            "AND updated_at < datetime('now', ? || ' days')",
-            (now, f"-{days}"),
-        )
-        archived = cur.rowcount
+        affected_ids = TaskDAO.archive_done(conn, days)
+        archived = len(affected_ids)
         for tid in affected_ids:
             _upsert_field_versions(conn, tid, ("status",), now)
 
@@ -2018,29 +1996,24 @@ def review_shared_tasks(
                         )
                         imported += 1
                 else:
-                    conn.execute(
-                        "INSERT INTO tasks (id, title, description, status, priority, "
-                        "section, due_date, project, parent_id, notes, recurring, "
-                        "type, assignee, shared_by, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            tid,
-                            t["title"],
-                            t.get("description"),
-                            t["status"],
-                            t["priority"],
-                            t["section"],
-                            t.get("due_date"),
-                            t.get("project"),
-                            t.get("parent_id"),
-                            t.get("notes"),
-                            t.get("recurring"),
-                            t.get("type", "task"),
-                            t.get("assignee"),
-                            t.get("shared_by"),
-                            t.get("created_at"),
-                            t["updated_at"],
-                        ),
+                    TaskDAO.create(
+                        conn,
+                        tid,
+                        t["title"],
+                        t["updated_at"],
+                        description=t.get("description"),
+                        status=t["status"],
+                        priority=t["priority"],
+                        section=t["section"],
+                        due_date=t.get("due_date"),
+                        project=t.get("project"),
+                        parent_id=t.get("parent_id"),
+                        notes=t.get("notes"),
+                        recurring=t.get("recurring"),
+                        type=t.get("type", "task"),
+                        assignee=t.get("assignee"),
+                        shared_by=t.get("shared_by"),
+                        created_at=t.get("created_at"),
                     )
                     _upsert_field_versions(
                         conn, tid, _MERGEABLE_FIELDS, t.get("updated_at", _now())
@@ -3459,11 +3432,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             "WHERE visibility='pending_public' AND publish_requested_at <= ?",
             (cutoff,),
         ).rowcount
-        promoted_tasks = conn.execute(
-            "UPDATE tasks SET visibility='public' "
-            "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-            (cutoff,),
-        ).rowcount
+        promoted_tasks = TaskDAO.promote_pending_public(conn, cutoff)
         if promoted_ent or promoted_tasks:
             logger.info(
                 "bridge_push: promoted %d entities, %d tasks to public",
@@ -4013,30 +3982,24 @@ def bridge_pull() -> str:
                         )
                         updated_tasks += 1
                 else:
-                    conn.execute(
-                        "INSERT INTO tasks (id, title, description, status, "
-                        "priority, section, due_date, project, parent_id, "
-                        "notes, recurring, type, assignee, shared_by, "
-                        "created_at, updated_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            tid,
-                            task["title"],
-                            task.get("description"),
-                            task["status"],
-                            task["priority"],
-                            task["section"],
-                            task.get("due_date"),
-                            task.get("project"),
-                            task.get("parent_id"),
-                            task.get("notes"),
-                            task.get("recurring"),
-                            task.get("type", "task"),
-                            task.get("assignee"),
-                            task.get("shared_by"),
-                            task.get("created_at", now),
-                            task.get("updated_at", now),
-                        ),
+                    TaskDAO.create(
+                        conn,
+                        tid,
+                        task["title"],
+                        task.get("updated_at", now),
+                        description=task.get("description"),
+                        status=task["status"],
+                        priority=task["priority"],
+                        section=task["section"],
+                        due_date=task.get("due_date"),
+                        project=task.get("project"),
+                        parent_id=task.get("parent_id"),
+                        notes=task.get("notes"),
+                        recurring=task.get("recurring"),
+                        type=task.get("type", "task"),
+                        assignee=task.get("assignee"),
+                        shared_by=task.get("shared_by"),
+                        created_at=task.get("created_at", now),
                     )
                     new_tasks += 1
 
@@ -4272,9 +4235,7 @@ def bridge_status() -> str:
         local_rows = conn.execute(
             "SELECT name FROM entities WHERE project LIKE 'shared%' ORDER BY name"
         ).fetchall()
-        local_task_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE status NOT IN ('archived', 'cancelled')"
-        ).fetchone()["cnt"]
+        local_task_count = TaskDAO.count_active(conn)
 
         # v0.6.0: collaboration stats
         collab_rows = conn.execute(
@@ -4298,12 +4259,8 @@ def bridge_status() -> str:
         pending_pub_ent_count = conn.execute(
             "SELECT COUNT(*) as cnt FROM entities WHERE visibility='pending_public'"
         ).fetchone()["cnt"]
-        public_task_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE visibility='public'"
-        ).fetchone()["cnt"]
-        pending_pub_task_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE visibility='pending_public'"
-        ).fetchone()["cnt"]
+        public_task_count = TaskDAO.count_by_visibility(conn, "public")
+        pending_pub_task_count = TaskDAO.count_by_visibility(conn, "pending_public")
 
         # v0.9.0: rating statistics
         total_ratings = conn.execute(
@@ -4383,8 +4340,7 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
     link already exists, it upgrades to manual (manual always wins).
     """
     with _get_conn() as conn:
-        task = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if not task:
+        if not TaskDAO.exists(conn, task_id):
             return json.dumps({"error": f"Task {task_id} not found"})
 
         entity = conn.execute(
@@ -4396,12 +4352,7 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
         entity_id = entity["id"]
         now = datetime.now(timezone.utc).isoformat()
 
-        conn.execute(
-            "INSERT INTO task_entity_links (task_id, entity_id, link_type, created_at) "
-            "VALUES (?, ?, 'manual', ?) "
-            "ON CONFLICT(task_id, entity_id) DO UPDATE SET link_type = 'manual', created_at = ?",
-            (task_id, entity_id, now, now),
-        )
+        TaskDAO.link_entity(conn, task_id, entity_id, link_type="manual", created_at=now)
 
         return json.dumps(
             {
@@ -4424,28 +4375,17 @@ def unlink_task_entity(task_id: str, entity_name: str) -> str:
         if not entity:
             return json.dumps({"error": f"Entity '{entity_name}' not found"})
 
-        cursor = conn.execute(
-            "DELETE FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
-            (task_id, entity["id"]),
-        )
+        removed = TaskDAO.unlink_entity(conn, task_id, entity["id"])
 
-        return json.dumps({"removed": cursor.rowcount > 0})
+        return json.dumps({"removed": removed > 0})
 
 
 @mcp.tool()
 def get_task_links(task_id: str) -> str:
     """Get all knowledge graph entities linked to a task."""
     with _get_conn() as conn:
-        rows = conn.execute(
-            "SELECT e.name AS entity_name, e.entity_type, "
-            "tel.link_type, tel.score, tel.created_at "
-            "FROM task_entity_links tel "
-            "JOIN entities e ON e.id = tel.entity_id "
-            "WHERE tel.task_id = ?",
-            (task_id,),
-        ).fetchall()
-
-        return json.dumps({"task_id": task_id, "links": [dict(r) for r in rows]})
+        links = TaskDAO.get_task_links(conn, task_id)
+        return json.dumps({"task_id": task_id, "links": links})
 
 
 @mcp.tool()
@@ -4458,21 +4398,8 @@ def get_entity_tasks(entity_name: str) -> str:
         if not entity:
             return json.dumps({"error": f"Entity '{entity_name}' not found"})
 
-        rows = conn.execute(
-            "SELECT t.id AS task_id, t.title, t.status, t.priority, "
-            "tel.link_type, tel.score "
-            "FROM task_entity_links tel "
-            "JOIN tasks t ON t.id = tel.task_id "
-            "WHERE tel.entity_id = ?",
-            (entity["id"],),
-        ).fetchall()
-
-        return json.dumps(
-            {
-                "entity_name": entity_name,
-                "tasks": [dict(r) for r in rows],
-            }
-        )
+        tasks = TaskDAO.get_entity_tasks(conn, entity["id"])
+        return json.dumps({"entity_name": entity_name, "tasks": tasks})
 
 
 @mcp.tool()
@@ -4483,9 +4410,7 @@ def suggest_task_links(task_id: str, limit: int = 5) -> str:
     Does NOT auto-create links — returns suggestions for human/Claude review.
     """
     with _get_conn() as conn:
-        task = conn.execute(
-            "SELECT title, description FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
+        task = TaskDAO.get_by_id(conn, task_id, "title, description")
         if not task:
             return json.dumps({"error": f"Task {task_id} not found"})
 
@@ -4505,13 +4430,7 @@ def suggest_task_links(task_id: str, limit: int = 5) -> str:
             (fts_q,),
         ).fetchall()
 
-        linked_ids = {
-            r["entity_id"]
-            for r in conn.execute(
-                "SELECT entity_id FROM task_entity_links WHERE task_id = ?",
-                (task_id,),
-            ).fetchall()
-        }
+        linked_ids = TaskDAO.get_linked_entity_ids(conn, task_id)
 
         scored = []
         for c in candidates:
@@ -4761,23 +4680,21 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
             "FROM task_entity_links WHERE entity_id = ?",
             (src_id,),
         ).fetchall()
+        tgt_linked_task_ids = {
+            r["task_id"]
+            for r in conn.execute(
+                "SELECT task_id FROM task_entity_links WHERE entity_id = ?", (tgt_id,)
+            ).fetchall()
+        }
         for link in src_links:
-            existing = conn.execute(
-                "SELECT 1 FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
-                (link["task_id"], tgt_id),
-            ).fetchone()
-            if not existing:
-                conn.execute(
-                    "INSERT INTO task_entity_links "
-                    "(task_id, entity_id, link_type, score, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        link["task_id"],
-                        tgt_id,
-                        link["link_type"],
-                        link["score"],
-                        link["created_at"],
-                    ),
+            if link["task_id"] not in tgt_linked_task_ids:
+                TaskDAO.link_entity(
+                    conn,
+                    link["task_id"],
+                    tgt_id,
+                    link_type=link["link_type"],
+                    score=link["score"],
+                    created_at=link["created_at"],
                 )
 
         # 4. Delete source entity (CASCADE cleans orphan observations/relations/links)

@@ -310,6 +310,261 @@ def priority_sort_key(task: dict[str, Any]) -> tuple:
     return (inv_rank, due)
 
 
+# ── Task DAO ──────────────────────────────────────────────────────────────
+
+
+class TaskDAO:
+    """Data Access Object for tasks table. All raw SQL lives here.
+
+    All methods are static and take a sqlite3.Connection as first argument,
+    so they work with both get_conn() (server.py) and persistent connections
+    (task_tray.py).
+    """
+
+    # ── All task columns for full SELECT ──
+    ALL_COLS = (
+        "id, title, description, status, priority, section, due_date, "
+        "project, parent_id, notes, recurring, reminder_at, type, assignee, "
+        "shared_by, visibility, publish_requested_at, created_at, updated_at"
+    )
+
+    @staticmethod
+    def get_by_id(
+        conn: sqlite3.Connection, task_id: str, columns: str | None = None
+    ) -> dict | None:
+        """Fetch a single task by ID. Returns dict or None."""
+        cols = columns or TaskDAO.ALL_COLS
+        row = conn.execute(
+            f"SELECT {cols} FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def exists(conn: sqlite3.Connection, task_id: str) -> bool:
+        """Check if a task exists by ID."""
+        return (
+            conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def create(
+        conn: sqlite3.Connection,
+        task_id: str,
+        title: str,
+        now: str,
+        *,
+        description: str | None = None,
+        status: str = "not_started",
+        priority: str = "medium",
+        section: str = "inbox",
+        due_date: str | None = None,
+        project: str | None = None,
+        parent_id: str | None = None,
+        notes: str | None = None,
+        recurring: str | None = None,
+        reminder_at: str | None = None,
+        type: str = "task",
+        assignee: str | None = None,
+        shared_by: str | None = None,
+        visibility: str = "private",
+        publish_requested_at: str | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Insert a new task. Caller must also call upsert_field_versions."""
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, description, status, priority, section, due_date, "
+            "project, parent_id, notes, recurring, reminder_at, type, assignee, "
+            "shared_by, visibility, publish_requested_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                title,
+                description,
+                status,
+                priority,
+                section,
+                due_date,
+                project,
+                parent_id,
+                notes,
+                recurring,
+                reminder_at,
+                type,
+                assignee,
+                shared_by,
+                visibility,
+                publish_requested_at,
+                created_at or now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def update(conn: sqlite3.Connection, task_id: str, fields: dict[str, Any]) -> int:
+        """Update arbitrary fields on a task. Returns rowcount.
+
+        Caller must set updated_at in fields and call upsert_field_versions.
+        """
+        if not fields:
+            return 0
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [task_id]
+        cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
+        return cur.rowcount
+
+    @staticmethod
+    def delete(conn: sqlite3.Connection, task_id: str) -> int:
+        """Hard-delete a task. Returns rowcount. Prefer soft-delete (status=cancelled)."""
+        return conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,)).rowcount
+
+    @staticmethod
+    def get_active(
+        conn: sqlite3.Connection,
+        columns: str | None = None,
+        order_by: str = "created_at",
+    ) -> list[dict]:
+        """Return all active tasks (excludes done, archived, cancelled)."""
+        cols = columns or TaskDAO.ALL_COLS
+        exclusions = ",".join("?" * len(TASK_ACTIVE_EXCLUSIONS))
+        rows = conn.execute(
+            f"SELECT {cols} FROM tasks WHERE status NOT IN ({exclusions}) "
+            f"ORDER BY {order_by}",
+            list(TASK_ACTIVE_EXCLUSIONS),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
+        """FTS5 search across tasks. Returns matching tasks ranked by relevance."""
+        if not query or not query.strip():
+            return []
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.description, t.status, t.priority, "
+            "t.section, t.due_date, t.project, t.type, t.updated_at, "
+            "rank "
+            "FROM tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid "
+            "WHERE tasks_fts MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (query, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def count_active(conn: sqlite3.Connection) -> int:
+        """Count active (non-archived, non-cancelled) tasks."""
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks "
+            "WHERE status NOT IN ('archived', 'cancelled')"
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    @staticmethod
+    def count_by_visibility(conn: sqlite3.Connection, visibility: str) -> int:
+        """Count tasks by visibility level."""
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE visibility = ?",
+            (visibility,),
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    @staticmethod
+    def archive_done(conn: sqlite3.Connection, older_than_days: int) -> list[str]:
+        """Archive done tasks older than N days. Returns archived task IDs."""
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'done' AND type = 'task' "
+            "AND updated_at < datetime('now', ?)",
+            (f"-{older_than_days} days",),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            now = now_iso()
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', updated_at = ? "
+                "WHERE status = 'done' AND type = 'task' "
+                "AND updated_at < datetime('now', ?)",
+                (now, f"-{older_than_days} days"),
+            )
+        return ids
+
+    @staticmethod
+    def promote_pending_public(conn: sqlite3.Connection, cutoff_ts: str) -> int:
+        """Promote pending_public tasks to public. Returns count promoted."""
+        cur = conn.execute(
+            "UPDATE tasks SET visibility = 'public' "
+            "WHERE visibility = 'pending_public' AND publish_requested_at <= ?",
+            (cutoff_ts,),
+        )
+        return cur.rowcount
+
+    # ── Task-Entity Link operations ──
+
+    @staticmethod
+    def link_entity(
+        conn: sqlite3.Connection,
+        task_id: str,
+        entity_id: int,
+        link_type: str = "manual",
+        score: float | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Create or update a task↔entity link."""
+        ts = created_at or now_iso()
+        conn.execute(
+            "INSERT INTO task_entity_links "
+            "(task_id, entity_id, link_type, score, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, entity_id) DO UPDATE SET "
+            "link_type = excluded.link_type, score = excluded.score, "
+            "created_at = excluded.created_at",
+            (task_id, entity_id, link_type, score, ts),
+        )
+
+    @staticmethod
+    def unlink_entity(conn: sqlite3.Connection, task_id: str, entity_id: int) -> int:
+        """Remove a task↔entity link. Returns rowcount."""
+        return conn.execute(
+            "DELETE FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
+            (task_id, entity_id),
+        ).rowcount
+
+    @staticmethod
+    def get_task_links(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+        """Get all entities linked to a task."""
+        rows = conn.execute(
+            "SELECT e.id AS entity_id, e.name AS entity_name, e.entity_type, "
+            "tel.link_type, tel.score, tel.created_at "
+            "FROM task_entity_links tel "
+            "JOIN entities e ON e.id = tel.entity_id "
+            "WHERE tel.task_id = ?",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_entity_tasks(conn: sqlite3.Connection, entity_id: int) -> list[dict]:
+        """Get all tasks linked to an entity."""
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.status, t.priority, t.section, "
+            "tel.link_type, tel.score, tel.created_at AS linked_at "
+            "FROM task_entity_links tel "
+            "JOIN tasks t ON t.id = tel.task_id "
+            "WHERE tel.entity_id = ?",
+            (entity_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_linked_entity_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
+        """Get set of entity IDs already linked to a task."""
+        rows = conn.execute(
+            "SELECT entity_id FROM task_entity_links WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        return {r["entity_id"] for r in rows}
+
+
 # ── Bridge Sync v2: Field version tracking ───────────────────────────────
 
 

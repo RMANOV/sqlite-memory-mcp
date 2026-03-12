@@ -40,6 +40,7 @@ from db_utils import (
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
+    TaskDAO,
     build_priority_order_sql,
     get_conn,
     is_overdue,
@@ -238,12 +239,7 @@ class TaskDB:
 
     def get_all_active(self):
         """Return all active tasks (excludes done, archived, cancelled)."""
-        rows = self._conn.execute(
-            f"SELECT {_UI_COLS} FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
-            "ORDER BY created_at",
-            _ACTIVE_PARAMS,
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return TaskDAO.get_active(self._conn, columns=_UI_COLS)
 
     def get_done_tasks(self):
         """Return completed tasks, newest first."""
@@ -319,23 +315,10 @@ class TaskDB:
         task_id = str(uuid.uuid4())
         now = now_iso()
         with self._transact(self._conn):
-            self._conn.execute(
-                "INSERT INTO tasks (id, title, description, status, section, priority, "
-                "due_date, project, type, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    task_id,
-                    title,
-                    description,
-                    status,
-                    section,
-                    priority,
-                    due_date,
-                    project,
-                    type,
-                    now,
-                    now,
-                ),
+            TaskDAO.create(
+                self._conn, task_id, title, now,
+                description=description, status=status, section=section,
+                priority=priority, due_date=due_date, project=project, type=type,
             )
             upsert_field_versions(self._conn, task_id, MERGEABLE_FIELDS, now)
         if self.on_change:
@@ -346,10 +329,7 @@ class TaskDB:
         """Set status=done."""
         now = now_iso()
         with self._transact(self._conn):
-            self._conn.execute(
-                "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
-                (now, task_id),
-            )
+            TaskDAO.update(self._conn, task_id, {"status": "done", "updated_at": now})
             upsert_field_versions(self._conn, task_id, ("status",), now)
         if self.on_change:
             self.on_change()
@@ -364,10 +344,8 @@ class TaskDB:
         now = now_iso()
         changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
         fields["updated_at"] = now
-        sets = ", ".join(f"{k}=?" for k in fields)
-        vals = list(fields.values()) + [task_id]
         with self._transact(self._conn):
-            self._conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals)
+            TaskDAO.update(self._conn, task_id, fields)
             if changed:
                 upsert_field_versions(self._conn, task_id, changed, now)
         if self.on_change:
@@ -379,14 +357,9 @@ class TaskDB:
         now = now_iso()
         with self._transact(self._conn):
             # Read task metadata before cancelling
-            row = self._conn.execute(
-                "SELECT title, recurring, project FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
+            row = TaskDAO.get_by_id(self._conn, task_id, "title, recurring, project")
             # Cancel the target task
-            self._conn.execute(
-                "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
-                (now, task_id),
-            )
+            TaskDAO.update(self._conn, task_id, {"status": "cancelled", "updated_at": now})
             upsert_field_versions(self._conn, task_id, ("status",), now)
             # For recurring tasks: cancel all done siblings to break spawn cycle
             if row and row["recurring"]:
@@ -434,12 +407,7 @@ class TaskDB:
         """Create a manual link between a task and an entity."""
         now = now_iso()
         try:
-            self._conn.execute(
-                "INSERT INTO task_entity_links (task_id, entity_id, link_type, created_at) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(task_id, entity_id) DO UPDATE SET link_type = ?, created_at = ?",
-                (task_id, entity_id, link_type, now, link_type, now),
-            )
+            TaskDAO.link_entity(self._conn, task_id, entity_id, link_type, created_at=now)
             self._conn.commit()
             return True
         except Exception:
@@ -448,26 +416,15 @@ class TaskDB:
     def get_task_links(self, task_id: str) -> list[dict]:
         """Get all entities linked to a task."""
         try:
-            rows = self._conn.execute(
-                "SELECT e.id AS entity_id, e.name AS entity_name, e.entity_type, "
-                "tel.link_type, tel.score, tel.created_at "
-                "FROM task_entity_links tel "
-                "JOIN entities e ON e.id = tel.entity_id "
-                "WHERE tel.task_id = ?",
-                (task_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+            return TaskDAO.get_task_links(self._conn, task_id)
         except Exception:
             return []
 
     def unlink_task_entity(self, task_id: str, entity_id: int) -> bool:
         """Remove a link between a task and an entity."""
-        cursor = self._conn.execute(
-            "DELETE FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
-            (task_id, entity_id),
-        )
+        removed = TaskDAO.unlink_entity(self._conn, task_id, entity_id)
         self._conn.commit()
-        return cursor.rowcount > 0
+        return removed > 0
 
 
 # ── UI Layer ────────────────────────────────────────────────────────
