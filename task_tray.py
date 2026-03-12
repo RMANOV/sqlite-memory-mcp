@@ -493,6 +493,30 @@ from PyQt6.QtCore import (
 from pathlib import Path
 
 
+class _ClickableLabel(QLabel):
+    """Label that emits clicked signal on mouse press."""
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class _TooltipCopyFilter(QObject):
+    """Copies task title to clipboard when tooltip is about to show."""
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self._text = text
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ToolTip:
+            QApplication.clipboard().setText(self._text)
+        return False  # let tooltip show normally
+
+
 def create_tray_icon_pixmap(overdue_count=0):
     """Generate a 64x64 tray icon with optional overdue badge."""
     pm = QPixmap(64, 64)
@@ -1070,6 +1094,8 @@ class TrayPopup(QWidget):
         else:
             tasks = self.db.get_suggested_tasks(limit=8)
 
+        self._tasks = tasks  # cache for _open_reader lookup
+
         if tasks:
             groups = _smart_group(tasks)
             for group_label, group_tasks in groups:
@@ -1100,13 +1126,22 @@ class TrayPopup(QWidget):
         hl = QHBoxLayout(row)
         hl.setContentsMargins(14, 2, 14, 2)
 
-        cb = QCheckBox(task["title"])
+        # Checkbox — no text, only the square
+        cb = QCheckBox()
         cb.setChecked(task["status"] == "done")
-        if task["status"] == "done":
-            cb.setStyleSheet(f"color: {_T()['done']}; text-decoration: line-through;")
         task_id = task["id"]
         cb.toggled.connect(lambda checked, tid=task_id: self._on_toggle(tid, checked))
-        hl.addWidget(cb, 1)
+        hl.addWidget(cb)
+
+        # Clickable title label — opens TaskReaderDialog
+        title_lbl = _ClickableLabel(task["title"])
+        title_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        if task["status"] == "done":
+            title_lbl.setStyleSheet(
+                f"color: {_T()['done']}; text-decoration: line-through;"
+            )
+        title_lbl.clicked.connect(lambda tid=task_id: self._open_reader(tid))
+        hl.addWidget(title_lbl, 1)
 
         priority = (task.get("priority") or "medium").upper()
         plbl = QLabel(priority)
@@ -1117,6 +1152,7 @@ class TrayPopup(QWidget):
         desc = task.get("description")
         if desc:
             row.setToolTip(desc)
+        row.installEventFilter(_TooltipCopyFilter(task["title"], row))
 
         return row
 
@@ -1130,6 +1166,12 @@ class TrayPopup(QWidget):
             self.db.mark_done(task_id)
         else:
             self.db.update_task(task_id, status="not_started")
+
+    def _open_reader(self, task_id):
+        task = next((t for t in self._tasks if t["id"] == task_id), None)
+        if task:
+            dlg = TaskReaderDialog(task, self.db, self)
+            dlg.exec()
 
     def _toggle_add_form(self):
         visible = not self._add_form.isVisible()
