@@ -1679,6 +1679,7 @@ class TaskReaderDialog(QDialog):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         )
         scroll.setWidget(self._body_label)
+        self._scroll = scroll
         layout.addWidget(scroll, 1)
 
         # Button bar
@@ -1745,16 +1746,41 @@ class TaskReaderDialog(QDialog):
         if desc:
             escaped = _html.escape(desc)
             paragraphs = escaped.split("\n\n")
+            reading = len(paragraphs) > 1
+
+            if reading:
+                font = f"{_font_size + 5}px"
+                style = (
+                    f"font-family: Georgia, 'Segoe UI', serif; font-size: {font}; "
+                    f"line-height: 200%; color: #ffffff; max-width: 720px; "
+                    f"margin: 0 auto; letter-spacing: 0.2px;"
+                )
+            else:
+                style = (
+                    f"font-family: Segoe UI; font-size: {_font_size}px; "
+                    f"line-height: 160%; color: #e2e8f0;"
+                )
+
             inner = "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs)
-            body_html = (
-                f'<div style="font-family: Segoe UI; font-size: 13px; '
-                f'line-height: 160%; color: #e2e8f0;">{inner}</div>'
-            )
+            body_html = f'<div style="{style}">{inner}</div>'
+
+            # Reading mode: true black background override
+            if reading:
+                self._body_label.setStyleSheet(
+                    f"QLabel#reader-body {{ background: #000000; color: #ffffff; "
+                    f"font-size: {_font_size + 5}px; padding: 32px 24px; }}"
+                )
+                self._scroll.setStyleSheet("background: #000000;")
+            else:
+                self._body_label.setStyleSheet("")
+                self._scroll.setStyleSheet("")
         else:
             body_html = (
                 '<div style="font-family: Segoe UI; font-size: 13px; '
                 'color: #4a5568; font-style: italic;">No description</div>'
             )
+            self._body_label.setStyleSheet("")
+            self._scroll.setStyleSheet("")
 
         # Linked entities section
         links = self.db.get_task_links(self.task.get("id", ""))
