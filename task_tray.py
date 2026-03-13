@@ -2984,6 +2984,15 @@ class FullWindow(QMainWindow):
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=10000")
 
+                # First: assess no_enrich chunks to unlock them
+                pending = conn.execute(
+                    "SELECT chunk_id FROM context_chunks "
+                    "WHERE state = 'no_enrich' LIMIT 50"
+                ).fetchall()
+                for row in pending:
+                    _assess(conn, row["chunk_id"])
+
+                # Now fetch all enrichable chunks (including freshly unlocked)
                 enrichable = conn.execute(
                     "SELECT chunk_id FROM context_chunks "
                     "WHERE state = 'enrichable' LIMIT 20"

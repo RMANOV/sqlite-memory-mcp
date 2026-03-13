@@ -71,7 +71,7 @@ CHUNK_STATES = (
 # Valid transitions: (from_state, to_state)
 _VALID_TRANSITIONS = frozenset(
     {
-        ("no_enrich", "enrichable"),
+        ("no_enrich", "enrichable"),  # assess_context can unlock no_enrich chunks
         ("no_enrich", "frozen"),
         ("no_enrich", "stale"),
         ("no_enrich", "archived"),
@@ -383,6 +383,13 @@ def assess_context(
                     source_hash,
                 )
             )
+
+    else:
+        # No explicit signals — unlock no_enrich chunks by default
+        if current_state == "no_enrich" and is_valid_transition(
+            "no_enrich", "enrichable"
+        ):
+            new_state = "enrichable"
 
     # Skip logic: awaiting_human + same source_hash → skip
     if (
