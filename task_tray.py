@@ -2479,7 +2479,6 @@ class FullWindow(QMainWindow):
         self._tab_views = {
             key: copy.deepcopy(_DEFAULT_TAB_VIEW)
             for key in self._tab_keys
-            if key not in _FIXED_VIEW_TABS
         }
         self._current_tab_idx = 0  # track for state swapping on tab change
 
@@ -2685,7 +2684,6 @@ class FullWindow(QMainWindow):
         _initial_key = self._tab_keys[min(self._saved_active_tab, len(self._tab_keys) - 1)]
         _is_fixed_initial = _initial_key in _FIXED_VIEW_TABS
         self._sort_btn.setVisible(not _is_fixed_initial)
-        self._filter_bar.setVisible(not _is_fixed_initial)
 
         # Status bar
         self.status = QStatusBar()
@@ -3550,18 +3548,14 @@ class FullWindow(QMainWindow):
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
                 matched = [t for t in raw[key] if t["id"] in global_ids]
-                if key in _FIXED_VIEW_TABS:
-                    self._filtered_cache[key] = matched
-                elif key in self._tab_views:
+                if key in self._tab_views:
                     v = self._tab_views[key]
                     self._filtered_cache[key] = self._sort_tasks(matched, v["sort"])
                 else:
                     self._filtered_cache[key] = self._sort_tasks(matched)
         else:
             for key in self._tab_keys:
-                if key in _FIXED_VIEW_TABS:
-                    self._filtered_cache[key] = raw[key]
-                elif key in self._tab_views:
+                if key in self._tab_views:
                     v = self._tab_views[key]
                     filtered = self._filter(raw[key], v["active"], v["excluded"])
                     self._filtered_cache[key] = self._sort_tasks(filtered, v["sort"])
@@ -3648,7 +3642,6 @@ class FullWindow(QMainWindow):
             # Hide sort/filter UI for fixed tabs
             is_fixed = new_key in _FIXED_VIEW_TABS
             self._sort_btn.setVisible(not is_fixed)
-            self._filter_bar.setVisible(not is_fixed)
 
         self._save_ui_state()
         if idx < len(self._tab_keys):
