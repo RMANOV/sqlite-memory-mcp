@@ -376,6 +376,139 @@ CREATE TRIGGER IF NOT EXISTS tasks_fts_au AFTER UPDATE ON tasks BEGIN
     INSERT INTO tasks_fts(rowid, title, description, notes)
     VALUES (new.rowid, new.title, new.description, new.notes);
 END;
+
+-- ── Intelligence v2 tables (context state machine + knowledge tiers) ──
+
+CREATE TABLE IF NOT EXISTS context_chunks (
+    chunk_id            TEXT PRIMARY KEY,
+    session_id          TEXT NULL,
+    entity_id           TEXT NULL,
+    source_type         TEXT NOT NULL,
+    source_ref          TEXT NOT NULL,
+    source_hash         TEXT NOT NULL,
+    title               TEXT NULL,
+    body                TEXT NOT NULL,
+    language            TEXT DEFAULT 'bg',
+    state               TEXT NOT NULL DEFAULT 'no_enrich',
+    enrich_policy       TEXT NOT NULL DEFAULT 'manual',
+    materiality_score   REAL DEFAULT 0.0,
+    last_human_update_at TEXT NULL,
+    last_ai_attempt_at  TEXT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cc_state ON context_chunks(state);
+CREATE INDEX IF NOT EXISTS idx_cc_source_hash ON context_chunks(source_hash);
+
+CREATE TABLE IF NOT EXISTS context_annotations (
+    annotation_id       TEXT PRIMARY KEY,
+    chunk_id            TEXT NOT NULL REFERENCES context_chunks(chunk_id) ON DELETE CASCADE,
+    author_type         TEXT NOT NULL,
+    annotation_type     TEXT NOT NULL,
+    body                TEXT NOT NULL,
+    source_hash_seen    TEXT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ca_chunk ON context_annotations(chunk_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS context_questions (
+    question_id         TEXT PRIMARY KEY,
+    chunk_id            TEXT NOT NULL REFERENCES context_chunks(chunk_id) ON DELETE CASCADE,
+    question_text       TEXT NOT NULL,
+    question_type       TEXT NOT NULL,
+    priority_score      REAL NOT NULL,
+    state               TEXT NOT NULL DEFAULT 'open',
+    answered_by         TEXT NULL,
+    answered_at         TEXT NULL,
+    answer_text         TEXT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cq_open ON context_questions(state, priority_score DESC);
+
+CREATE TABLE IF NOT EXISTS candidate_claims (
+    claim_id            TEXT PRIMARY KEY,
+    chunk_id            TEXT NOT NULL REFERENCES context_chunks(chunk_id) ON DELETE CASCADE,
+    subject             TEXT NOT NULL,
+    predicate           TEXT NOT NULL,
+    object_text         TEXT NOT NULL,
+    object_type         TEXT NOT NULL DEFAULT 'text',
+    claim_scope         TEXT NOT NULL,
+    confidence          REAL NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'candidate',
+    requires_human      INTEGER NOT NULL DEFAULT 1,
+    promoted_to_fact_id TEXT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ccm_status ON candidate_claims(status, confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_ccm_scope ON candidate_claims(claim_scope);
+
+CREATE TABLE IF NOT EXISTS claim_evidence (
+    evidence_id         TEXT PRIMARY KEY,
+    claim_id            TEXT NOT NULL REFERENCES candidate_claims(claim_id) ON DELETE CASCADE,
+    evidence_type       TEXT NOT NULL,
+    evidence_ref        TEXT NOT NULL,
+    weight              REAL NOT NULL,
+    excerpt             TEXT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ce_claim ON claim_evidence(claim_id);
+
+CREATE TABLE IF NOT EXISTS canonical_facts (
+    fact_id             TEXT PRIMARY KEY,
+    subject             TEXT NOT NULL,
+    predicate           TEXT NOT NULL,
+    object_text         TEXT NOT NULL,
+    object_type         TEXT NOT NULL DEFAULT 'text',
+    fact_scope          TEXT NOT NULL,
+    provenance_summary  TEXT NOT NULL,
+    confidence          REAL NOT NULL,
+    validation_mode     TEXT NOT NULL,
+    source_claim_id     TEXT NULL REFERENCES candidate_claims(claim_id),
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cf_scope ON canonical_facts(fact_scope);
+
+CREATE TABLE IF NOT EXISTS context_packs (
+    pack_id             TEXT PRIMARY KEY,
+    session_id          TEXT NULL,
+    entity_id           TEXT NULL,
+    pack_type           TEXT NOT NULL,
+    target_ref          TEXT NULL,
+    input_signature     TEXT NOT NULL,
+    token_budget        INTEGER NOT NULL,
+    body                TEXT NOT NULL,
+    freshness_score     REAL NOT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cp_target ON context_packs(pack_type, target_ref);
+
+CREATE TABLE IF NOT EXISTS impact_edges (
+    edge_id             TEXT PRIMARY KEY,
+    source_kind         TEXT NOT NULL,
+    source_ref          TEXT NOT NULL,
+    target_kind         TEXT NOT NULL,
+    target_ref          TEXT NOT NULL,
+    impact_type         TEXT NOT NULL,
+    impact_score        REAL NOT NULL,
+    rationale           TEXT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ie_source ON impact_edges(source_kind, source_ref);
+CREATE INDEX IF NOT EXISTS idx_ie_target ON impact_edges(target_kind, target_ref);
+
+CREATE TABLE IF NOT EXISTS enrichment_runs (
+    run_id              TEXT PRIMARY KEY,
+    tool_name           TEXT NOT NULL,
+    chunk_id            TEXT NULL,
+    session_id          TEXT NULL,
+    result_status       TEXT NOT NULL,
+    reason_code         TEXT NULL,
+    input_signature     TEXT NOT NULL,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT NOT NULL
+);
 """
 
 
@@ -634,6 +767,151 @@ _MIGRATIONS = [
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tel_entity'",
         "CREATE INDEX idx_tel_entity ON task_entity_links(entity_id)",
         "idx_tel_entity index (v2.2.0)",
+    ),
+    # ── v3.0.0: Intelligence v2 — context state machine + knowledge tiers ──
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_chunks'",
+        "CREATE TABLE context_chunks ("
+        "chunk_id TEXT PRIMARY KEY, session_id TEXT NULL, entity_id TEXT NULL, "
+        "source_type TEXT NOT NULL, source_ref TEXT NOT NULL, source_hash TEXT NOT NULL, "
+        "title TEXT NULL, body TEXT NOT NULL, language TEXT DEFAULT 'bg', "
+        "state TEXT NOT NULL DEFAULT 'no_enrich', enrich_policy TEXT NOT NULL DEFAULT 'manual', "
+        "materiality_score REAL DEFAULT 0.0, last_human_update_at TEXT NULL, "
+        "last_ai_attempt_at TEXT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        "context_chunks table (v3.0.0 — intelligence v2)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_cc_state'",
+        "CREATE INDEX idx_cc_state ON context_chunks(state)",
+        "idx_cc_state index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_cc_source_hash'",
+        "CREATE INDEX idx_cc_source_hash ON context_chunks(source_hash)",
+        "idx_cc_source_hash index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_annotations'",
+        "CREATE TABLE context_annotations ("
+        "annotation_id TEXT PRIMARY KEY, "
+        "chunk_id TEXT NOT NULL REFERENCES context_chunks(chunk_id) ON DELETE CASCADE, "
+        "author_type TEXT NOT NULL, annotation_type TEXT NOT NULL, "
+        "body TEXT NOT NULL, source_hash_seen TEXT NULL, created_at TEXT NOT NULL)",
+        "context_annotations table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ca_chunk'",
+        "CREATE INDEX idx_ca_chunk ON context_annotations(chunk_id, created_at DESC)",
+        "idx_ca_chunk index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_questions'",
+        "CREATE TABLE context_questions ("
+        "question_id TEXT PRIMARY KEY, "
+        "chunk_id TEXT NOT NULL REFERENCES context_chunks(chunk_id) ON DELETE CASCADE, "
+        "question_text TEXT NOT NULL, question_type TEXT NOT NULL, "
+        "priority_score REAL NOT NULL, state TEXT NOT NULL DEFAULT 'open', "
+        "answered_by TEXT NULL, answered_at TEXT NULL, answer_text TEXT NULL, "
+        "created_at TEXT NOT NULL)",
+        "context_questions table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_cq_open'",
+        "CREATE INDEX idx_cq_open ON context_questions(state, priority_score DESC)",
+        "idx_cq_open index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_claims'",
+        "CREATE TABLE candidate_claims ("
+        "claim_id TEXT PRIMARY KEY, "
+        "chunk_id TEXT NOT NULL REFERENCES context_chunks(chunk_id) ON DELETE CASCADE, "
+        "subject TEXT NOT NULL, predicate TEXT NOT NULL, "
+        "object_text TEXT NOT NULL, object_type TEXT NOT NULL DEFAULT 'text', "
+        "claim_scope TEXT NOT NULL, confidence REAL NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'candidate', requires_human INTEGER NOT NULL DEFAULT 1, "
+        "promoted_to_fact_id TEXT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        "candidate_claims table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ccm_status'",
+        "CREATE INDEX idx_ccm_status ON candidate_claims(status, confidence DESC)",
+        "idx_ccm_status index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ccm_scope'",
+        "CREATE INDEX idx_ccm_scope ON candidate_claims(claim_scope)",
+        "idx_ccm_scope index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='claim_evidence'",
+        "CREATE TABLE claim_evidence ("
+        "evidence_id TEXT PRIMARY KEY, "
+        "claim_id TEXT NOT NULL REFERENCES candidate_claims(claim_id) ON DELETE CASCADE, "
+        "evidence_type TEXT NOT NULL, evidence_ref TEXT NOT NULL, "
+        "weight REAL NOT NULL, excerpt TEXT NULL, created_at TEXT NOT NULL)",
+        "claim_evidence table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ce_claim'",
+        "CREATE INDEX idx_ce_claim ON claim_evidence(claim_id)",
+        "idx_ce_claim index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canonical_facts'",
+        "CREATE TABLE canonical_facts ("
+        "fact_id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, "
+        "object_text TEXT NOT NULL, object_type TEXT NOT NULL DEFAULT 'text', "
+        "fact_scope TEXT NOT NULL, provenance_summary TEXT NOT NULL, "
+        "confidence REAL NOT NULL, validation_mode TEXT NOT NULL, "
+        "source_claim_id TEXT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        "canonical_facts table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_cf_scope'",
+        "CREATE INDEX idx_cf_scope ON canonical_facts(fact_scope)",
+        "idx_cf_scope index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_packs'",
+        "CREATE TABLE context_packs ("
+        "pack_id TEXT PRIMARY KEY, session_id TEXT NULL, entity_id TEXT NULL, "
+        "pack_type TEXT NOT NULL, target_ref TEXT NULL, input_signature TEXT NOT NULL, "
+        "token_budget INTEGER NOT NULL, body TEXT NOT NULL, "
+        "freshness_score REAL NOT NULL, created_at TEXT NOT NULL)",
+        "context_packs table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_cp_target'",
+        "CREATE INDEX idx_cp_target ON context_packs(pack_type, target_ref)",
+        "idx_cp_target index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='impact_edges'",
+        "CREATE TABLE impact_edges ("
+        "edge_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, source_ref TEXT NOT NULL, "
+        "target_kind TEXT NOT NULL, target_ref TEXT NOT NULL, "
+        "impact_type TEXT NOT NULL, impact_score REAL NOT NULL, "
+        "rationale TEXT NULL, created_at TEXT NOT NULL)",
+        "impact_edges table (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ie_source'",
+        "CREATE INDEX idx_ie_source ON impact_edges(source_kind, source_ref)",
+        "idx_ie_source index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ie_target'",
+        "CREATE INDEX idx_ie_target ON impact_edges(target_kind, target_ref)",
+        "idx_ie_target index (v3.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='enrichment_runs'",
+        "CREATE TABLE enrichment_runs ("
+        "run_id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, "
+        "chunk_id TEXT NULL, session_id TEXT NULL, "
+        "result_status TEXT NOT NULL, reason_code TEXT NULL, "
+        "input_signature TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL)",
+        "enrichment_runs table (v3.0.0)",
     ),
 ]
 
@@ -4709,6 +4987,269 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
         preview["merged"] = True
         preview["dry_run"] = False
         return json.dumps(preview)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Intelligence v2 — Context State Machine + Knowledge Tiers (tools 32-40)
+# ═══════════════════════════════════════════════════════════════════════════
+
+from intelligence_v2 import (
+    assess_context as _assess_context,
+    queue_clarification as _queue_clarification,
+    record_human_answer as _record_human_answer,
+    load_config as _load_intel_config,
+)
+from claim_graph import (
+    extract_candidate_claims as _extract_claims,
+    promote_candidate as _promote_candidate,
+)
+from context_packer import (
+    build_context_pack as _build_pack,
+    resume_context as _resume_context,
+)
+from impact_graph import (
+    explain_impact as _explain_impact,
+)
+
+
+@mcp.tool()
+def assess_context(
+    chunk_ref: str,
+    session_id: str | None = None,
+    force: bool = False,
+) -> str:
+    """Classify context chunk, detect signals, determine state transition.
+
+    Scans for signal phrases (ENRICH_OK, NO_ENRICH, WAIT_HUMAN, FREEZE_CONTEXT),
+    computes materiality and uncertainty scores, and manages state transitions.
+    Skips reprocessing if chunk is awaiting_human with unchanged source_hash.
+
+    Args:
+        chunk_ref: ID of the context chunk to assess
+        session_id: Optional session context
+        force: If True, bypass skip logic and frozen state
+    """
+    with _get_conn() as conn:
+        result = _assess_context(conn, chunk_ref, session_id, force)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def queue_clarification(
+    chunk_ref: str,
+    max_questions: int = 5,
+) -> str:
+    """Generate AWAITING_HUMAN block with focused clarification questions.
+
+    Analyzes the chunk content to produce typed questions (scope, semantics,
+    time, action, downstream_use) and locks the chunk until human answers.
+
+    Args:
+        chunk_ref: ID of the context chunk
+        max_questions: Maximum number of questions to generate (1-5)
+    """
+    with _get_conn() as conn:
+        result = _queue_clarification(conn, chunk_ref, max_questions)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def record_human_answer(
+    chunk_ref: str,
+    answer_text: str,
+    question_id: str | None = None,
+) -> str:
+    """Ingest human answer, update chunk state, resolve open questions.
+
+    Transitions chunk from awaiting_human/uncertain back to enrichable,
+    updates source_hash to reflect the new information.
+
+    Args:
+        chunk_ref: ID of the context chunk
+        answer_text: Human's answer text
+        question_id: Optional specific question to answer (answers all if omitted)
+    """
+    with _get_conn() as conn:
+        result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def extract_candidate_claims(
+    chunk_ref: str,
+    scope_hint: str | None = None,
+) -> str:
+    """Extract typed (subject, predicate, object, scope) claims from a context chunk.
+
+    Only works on enrichable or uncertain chunks. Creates candidate claims with
+    evidence records linking back to the source. Claims require governance gate
+    (promote_candidate) before becoming canonical facts.
+
+    Args:
+        chunk_ref: ID of the context chunk to extract from
+        scope_hint: Optional scope override (memory|bridge|mapping|validation|export)
+    """
+    with _get_conn() as conn:
+        result = _extract_claims(conn, chunk_ref, scope_hint)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def promote_candidate(
+    claim_id: str,
+    mode: str = "human_confirmed",
+) -> str:
+    """Governance gate: promote candidate claim to canonical fact.
+
+    Modes:
+    - human_confirmed: explicit human approval (always allowed)
+    - multi_evidence: auto-promotion if enough independent evidence (policy-gated)
+    - imported: bulk import from trusted source
+
+    Sensitive scopes (mapping, validation, bridge, export) require human_confirmed.
+
+    Args:
+        claim_id: ID of the candidate claim
+        mode: Promotion mode (human_confirmed|multi_evidence|imported)
+    """
+    with _get_conn() as conn:
+        result = _promote_candidate(conn, claim_id, mode)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def build_context_pack(
+    pack_type: str = "executor",
+    target_ref: str | None = None,
+    session_id: str | None = None,
+    token_budget: int | None = None,
+) -> str:
+    """Compile role-specific context pack with token budget optimization.
+
+    Greedy coverage algorithm: scores available facts, claims, questions, and
+    chunks by relevance × role weight, then fills the token budget.
+
+    Pack types:
+    - planner: facts + questions (what do we know, what's uncertain)
+    - reviewer: facts + claims (what to validate)
+    - executor: facts + chunks (confirmed context for implementation)
+    - bridge_checker: claims + questions (what needs bridge verification)
+    - handoff: everything prioritized for session continuity
+
+    Args:
+        pack_type: Role-specific pack type
+        target_ref: Optional target reference for context filtering
+        session_id: Optional session context
+        token_budget: Token limit (default from config, typically 4000)
+    """
+    with _get_conn() as conn:
+        result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def explain_impact(
+    source_kind: str = "chunk",
+    source_ref: str = "",
+    depth: str = "standard",
+) -> str:
+    """Show downstream impact of a knowledge change via bounded BFS.
+
+    Traverses impact_edges graph to find affected sessions, snapshots,
+    mappings, validations, and exports. Results grouped and ranked by
+    propagated impact score.
+
+    Args:
+        source_kind: Type of source (chunk|claim|fact)
+        source_ref: ID of the source entity
+        depth: Traversal depth (quick=1, standard=3, deep=5)
+    """
+    with _get_conn() as conn:
+        result = _explain_impact(conn, source_kind, source_ref, depth)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def resume_context(
+    session_id: str | None = None,
+    include_open_questions: bool = True,
+) -> str:
+    """Session continuity: handoff pack + unresolved items + changed facts.
+
+    Builds a handoff context pack and includes open questions, chunks
+    awaiting human input, and recently changed canonical facts.
+
+    Args:
+        session_id: Optional session to resume from
+        include_open_questions: Include open clarification questions (default True)
+    """
+    with _get_conn() as conn:
+        result = _resume_context(conn, session_id, include_open_questions)
+        return json.dumps(result)
+
+
+@mcp.tool()
+def enrich_context(depth: str = "quick") -> str:
+    """Compatibility wrapper: enriches context at different depth levels.
+
+    Depth levels:
+    - quick: assess all enrichable chunks + build executor pack
+    - standard: + extract candidate claims
+    - deep: + explain impact for all recent facts
+
+    Args:
+        depth: Enrichment depth (quick|standard|deep)
+    """
+    config = _load_intel_config()
+    if not config["enabled"]:
+        return json.dumps(
+            {"status": "disabled", "message": "Intelligence v2 is disabled"}
+        )
+
+    results: dict = {"depth": depth, "steps": []}
+
+    with _get_conn() as conn:
+        # Step 1: Assess all enrichable chunks
+        enrichable = conn.execute(
+            "SELECT chunk_id FROM context_chunks WHERE state = 'enrichable' LIMIT 20"
+        ).fetchall()
+        assessed = []
+        for row in enrichable:
+            r = _assess_context(conn, row["chunk_id"])
+            assessed.append(r.get("chunk_id", "?"))
+        results["steps"].append({"assess": len(assessed)})
+
+        # Step 2: Build executor pack
+        pack = _build_pack(conn, "executor")
+        results["steps"].append(
+            {
+                "pack": pack.get("pack_id"),
+                "tokens": pack.get("token_usage", 0),
+            }
+        )
+        results["pack_body"] = pack.get("body", "")
+
+        if depth in ("standard", "deep"):
+            # Step 3: Extract claims from enrichable chunks
+            claims_total = 0
+            for row in enrichable:
+                cr = _extract_claims(conn, row["chunk_id"])
+                claims_total += cr.get("claims_extracted", 0)
+            results["steps"].append({"claims_extracted": claims_total})
+
+        if depth == "deep":
+            # Step 4: Explain impact for recent facts
+            recent = conn.execute(
+                "SELECT fact_id FROM canonical_facts "
+                "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
+            ).fetchall()
+            impacts = []
+            for f in recent:
+                imp = _explain_impact(conn, "fact", f["fact_id"])
+                impacts.append(imp.get("total_impacts", 0))
+            results["steps"].append({"impacts_analyzed": len(impacts)})
+
+    return json.dumps(results)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
