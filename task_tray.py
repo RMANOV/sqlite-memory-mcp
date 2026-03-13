@@ -645,12 +645,12 @@ def _build_main_style():
                                padding: 4px 12px; font-weight: bold; font-size: {fs}px; }}
         QToolBar QToolButton:hover {{ background: {t["accent"]}; color: #ffffff; }}
         QToolBar QToolButton:checked {{ background: {t["accent"]}; color: #ffffff; }}
-        QToolBar QToolButton#enrich_quick {{ background: #f6ad55; color: #1a202c; border: 1px solid #ed8936; font-weight: bold; }}
-        QToolBar QToolButton#enrich_quick:hover {{ background: #ed8936; color: #ffffff; }}
-        QToolBar QToolButton#enrich_standard {{ background: #ed8936; color: #1a202c; border: 1px solid #dd6b20; font-weight: bold; }}
-        QToolBar QToolButton#enrich_standard:hover {{ background: #dd6b20; color: #ffffff; }}
-        QToolBar QToolButton#enrich_deep {{ background: #e53e3e; color: #ffffff; border: 1px solid #c53030; font-weight: bold; }}
-        QToolBar QToolButton#enrich_deep:hover {{ background: #c53030; color: #ffffff; }}
+        QToolBar QToolButton#enrich_quick,
+        QToolBar QToolButton#enrich_standard,
+        QToolBar QToolButton#enrich_deep {{ background: {t["accent"]}; color: #ffffff; border: 1px solid {t["border"]}; font-weight: bold; }}
+        QToolBar QToolButton#enrich_quick:hover,
+        QToolBar QToolButton#enrich_standard:hover,
+        QToolBar QToolButton#enrich_deep:hover {{ background: #1a5cb0; color: #ffffff; }}
         QStatusBar {{ background: {t["bg2"]}; color: {t["text2"]}; font-weight: bold;
                      border-top: 1px solid {t["bg3"]}; padding: 2px 8px; font-size: {fs - 1}px; }}
         QMenu {{ background: {t["bg2"]}; color: {t["text"]}; border: 1px solid {t["border"]}; }}
