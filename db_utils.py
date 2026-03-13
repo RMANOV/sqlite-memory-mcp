@@ -577,6 +577,80 @@ class TaskDAO:
         ).fetchall()
         return {r["entity_id"] for r in rows}
 
+    # ── UI-oriented queries (centralized from TaskDB) ──
+
+    @staticmethod
+    def get_done(conn: sqlite3.Connection, columns: str | None = None) -> list[dict]:
+        """Return completed tasks, newest first."""
+        cols = columns or TaskDAO.ALL_COLS
+        rows = conn.execute(
+            f"SELECT {cols} FROM tasks WHERE status = 'done' ORDER BY updated_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def purge_done(conn: sqlite3.Connection, cutoff_iso: str) -> int:
+        """Delete done tasks older than cutoff. Returns count deleted."""
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE status = 'done' AND type = 'task' "
+            "AND updated_at < ?",
+            (cutoff_iso,),
+        )
+        if cur.rowcount:
+            conn.commit()
+        return cur.rowcount
+
+    @staticmethod
+    def get_suggested(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+        """Return prioritized mix: overdue + high/critical + nearest due."""
+        pri_sql = build_priority_order_sql()
+        exclusions = ",".join("?" * len(TASK_ACTIVE_EXCLUSIONS))
+        rows = conn.execute(
+            f"SELECT {TaskDAO.ALL_COLS} FROM tasks "
+            f"WHERE status NOT IN ({exclusions}) "
+            "ORDER BY "
+            "CASE WHEN due_date IS NOT NULL AND due_date < date('now') THEN 0 ELSE 1 END, "
+            f"{pri_sql}, "
+            "CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, "
+            "created_at DESC "
+            "LIMIT ?",
+            list(TASK_ACTIVE_EXCLUSIONS) + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_notes(conn: sqlite3.Connection) -> list[dict]:
+        """All notes (type='note'), excluding archived/cancelled."""
+        pri_sql = build_priority_order_sql()
+        rows = conn.execute(
+            f"SELECT {TaskDAO.ALL_COLS} FROM tasks WHERE type = 'note' "
+            "AND status NOT IN ('archived', 'cancelled') "
+            f"ORDER BY {pri_sql}, updated_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_project_names(conn: sqlite3.Connection) -> list[str]:
+        """Return project names sorted by active task count (most first)."""
+        rows = conn.execute(
+            "SELECT project, COUNT(*) as cnt FROM tasks "
+            "WHERE project IS NOT NULL AND status NOT IN ('archived','cancelled') "
+            "GROUP BY project ORDER BY cnt DESC"
+        ).fetchall()
+        return [r["project"] for r in rows]
+
+    @staticmethod
+    def promote_due_today(conn: sqlite3.Connection) -> int:
+        """Auto-move tasks with due_date <= today from inbox/next to today."""
+        cur = conn.execute(
+            "UPDATE tasks SET section = 'today' "
+            "WHERE due_date <= date('now') AND section IN ('inbox', 'next') "
+            "AND status <> 'done' AND type = 'task'"
+        )
+        if cur.rowcount:
+            conn.commit()
+        return cur.rowcount
+
 
 # ── Bridge Sync v2: Field version tracking ───────────────────────────────
 
