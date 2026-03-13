@@ -1,7 +1,7 @@
 [project]
 name = "sqlite-memory-mcp"
-version = "2.0.0"
-description = "SQLite-backed MCP Memory Server with WAL concurrent safety, FTS5 search, session tracking, cross-machine bridge sync, and task management"
+version = "3.0.0"
+description = "SQLite-backed MCP Memory Server with Intelligence v2, context state machine, knowledge tiers, WAL concurrent safety, FTS5 search, cross-machine bridge sync, and 49 MCP tools"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=2.0.0", "orjson>=3.9.0"]
 license = {text = "MIT"}
