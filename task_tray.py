@@ -2918,7 +2918,7 @@ class FullWindow(QMainWindow):
                         from context_packer import build_context_pack as _pack
                         from impact_graph import explain_impact as _impact
 
-                        econn = _sql.connect(self.db.db_path, timeout=10)
+                        econn = _sql.connect(self.db.db_path, isolation_level=None, timeout=10)
                         econn.row_factory = _sql.Row
                         econn.execute("PRAGMA journal_mode=WAL")
                         econn.execute("PRAGMA busy_timeout=10000")
@@ -2979,7 +2979,7 @@ class FullWindow(QMainWindow):
                 from context_packer import build_context_pack as _pack
                 from impact_graph import explain_impact as _impact
 
-                conn = _sql.connect(self.db.db_path, timeout=10)
+                conn = _sql.connect(self.db.db_path, isolation_level=None, timeout=10)
                 conn.row_factory = _sql.Row
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=10000")

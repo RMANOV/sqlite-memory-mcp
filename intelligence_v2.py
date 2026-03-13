@@ -91,6 +91,9 @@ _VALID_TRANSITIONS = frozenset(
         ("frozen", "archived"),
         ("stale", "enrichable"),
         ("stale", "archived"),
+        ("enrichable", "no_enrich"),  # NO_ENRICH signal revokes enrichment
+        ("uncertain", "no_enrich"),  # NO_ENRICH signal revokes enrichment
+        ("awaiting_human", "no_enrich"),  # NO_ENRICH signal revokes enrichment
     }
 )
 
@@ -353,7 +356,7 @@ def assess_context(
             )
 
     elif "NO_ENRICH" in signals:
-        if current_state != "no_enrich":
+        if is_valid_transition(current_state, "no_enrich"):
             new_state = "no_enrich"
 
     elif "WAIT_HUMAN" in signals:

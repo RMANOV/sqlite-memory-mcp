@@ -1137,7 +1137,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                 _ingest_chunk(
                     conn,
                     "\n".join(item.get("contents", [])),
-                    "observation",
+                    "entity_obs",
                     entity_name,
                     entity_name,
                     None,
