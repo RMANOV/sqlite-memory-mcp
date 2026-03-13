@@ -490,11 +490,30 @@ def main(
     push_result = _git("push", bridge_dir=bridge_dir)
     pushed = push_result.returncode == 0
 
+    # Deploy to Cloudflare Pages (auto-update after push)
+    deployed = False
+    if pushed:
+        _progress(progress_callback, 97, "CF Pages deploy...")
+        try:
+            deploy_result = subprocess.run(
+                ["wrangler", "pages", "deploy", bridge_dir,
+                 "--project-name=memory-bridge", "--branch=main"],
+                capture_output=True, text=True, timeout=60, **_NOWIN,
+            )
+            deployed = deploy_result.returncode == 0
+            if not deployed:
+                log.warning("CF Pages deploy failed: %s", deploy_result.stderr)
+        except FileNotFoundError:
+            log.warning("wrangler not found — skipping CF Pages deploy")
+        except subprocess.TimeoutExpired:
+            log.warning("CF Pages deploy timed out")
+
     _progress(progress_callback, 100, "Done")
     return {
         "entities": n_ent,
         "tasks": n_tasks,
         "pushed": pushed,
+        "deployed": deployed,
         "imported_new": new_t,
         "imported_updated": upd_t,
     }
