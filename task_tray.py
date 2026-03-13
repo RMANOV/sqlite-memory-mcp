@@ -1297,6 +1297,10 @@ class EditTaskDialog(QDialog):
         self.type_combo.setCurrentText(task.get("type", "task").title())
         layout.addRow("Type:", self.type_combo)
 
+        self.status_check = QCheckBox()
+        self.status_check.setChecked(task.get("status") == "done")
+        layout.addRow("Completed:", self.status_check)
+
         self.title_edit = QLineEdit(task.get("title", ""))
         layout.addRow("Title:", self.title_edit)
 
@@ -1445,6 +1449,7 @@ class EditTaskDialog(QDialog):
         project = self.project_combo.currentText().strip()
         vals["project"] = project if project else None
         vals["type"] = self.type_combo.currentText().lower()
+        vals["status"] = "done" if self.status_check.isChecked() else "not_started"
         return vals
 
 
@@ -3301,23 +3306,11 @@ class FullWindow(QMainWindow):
 
         raw = {
             "suggested": suggested,
-            "today": [
-                t
-                for t in all_active
-                if t.get("section") == "today" and t.get("type", "task") != "note"
-            ],
-            "inbox": [
-                t
-                for t in all_active
-                if t.get("section") == "inbox" and t.get("type", "task") != "note"
-            ],
-            "next": [
-                t
-                for t in all_active
-                if t.get("section") == "next" and t.get("type", "task") != "note"
-            ],
+            "today": [t for t in all_active if t.get("section") == "today"],
+            "inbox": [t for t in all_active if t.get("section") == "inbox"],
+            "next": [t for t in all_active if t.get("section") == "next"],
             "notes": notes,
-            "projects": [t for t in all_active if t.get("type", "task") != "note"],
+            "projects": all_active,
             "all": all_active,
             "done": done,
         }
