@@ -3563,7 +3563,7 @@ class FullWindow(QMainWindow):
                     self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
 
         # Update tab visibility (suggested, notes, projects always visible)
-        always_visible = ("suggested", "notes", "projects")
+        always_visible = ("suggested", "today", "notes", "projects")
         for i, key in enumerate(self._tab_keys):
             count = len(self._filtered_cache[key])
             self.tabs.setTabVisible(i, count > 0 or key in always_visible)
