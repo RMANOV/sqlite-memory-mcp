@@ -36,12 +36,10 @@ from db_utils import (
     DB_PATH,
     MERGEABLE_FIELDS,
     PRIORITY_COLORS,
-    TASK_ACTIVE_EXCLUSIONS,
     TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
     TaskDAO,
-    build_priority_order_sql,
     get_conn,
     is_overdue,
     now_iso,
@@ -54,10 +52,6 @@ PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
 
 # Upper-case priority colors for UI lookups
 _PRIORITY_COLORS_UPPER = {k.upper(): v for k, v in PRIORITY_COLORS.items()}
-
-# SQL fragment for active-task exclusion (reused across queries)
-_ACTIVE_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
-_ACTIVE_PARAMS = list(TASK_ACTIVE_EXCLUSIONS)
 
 # Columns needed by UI rendering (excludes parent_id, notes, assignee, shared_by, publish_requested_at)
 _UI_COLS = "id, title, description, notes, status, section, priority, due_date, project, type, recurring, reminder_at, visibility, updated_at, created_at"
@@ -79,6 +73,9 @@ class TaskDB:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._ensure_table()
         self._repair_fts_if_needed()
+
+        self._last_promote_time: float = 0.0
+        self.search_engine = TaskSearchEngine()
 
         self._wal_timer = QTimer()
         self._wal_timer.timeout.connect(self._wal_checkpoint)
@@ -227,15 +224,12 @@ class TaskDB:
         self._conn.close()
 
     def promote_due_today(self):
-        """Auto-move tasks with due_date <= today from inbox/next to today."""
-        cur = self._conn.execute(
-            "UPDATE tasks SET section = 'today' "
-            "WHERE due_date <= date('now') AND section IN ('inbox', 'next') "
-            "AND status <> 'done' AND type = 'task'"
-        )
-        if cur.rowcount:
-            self._conn.commit()
-        return cur.rowcount
+        """Auto-move tasks with due_date <= today (throttled to 60s)."""
+        now = time.monotonic()
+        if now - self._last_promote_time < 60:
+            return 0
+        self._last_promote_time = now
+        return TaskDAO.promote_due_today(self._conn)
 
     def get_all_active(self):
         """Return all active tasks (excludes done, archived, cancelled)."""
@@ -243,55 +237,24 @@ class TaskDB:
 
     def get_done_tasks(self):
         """Return completed tasks, newest first."""
-        rows = self._conn.execute(
-            f"SELECT {_UI_COLS} FROM tasks WHERE status = 'done' ORDER BY updated_at DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return TaskDAO.get_done(self._conn, columns=_UI_COLS)
 
     def purge_old_done(self, days=30):
         """Delete done tasks older than `days` days. Returns count deleted."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        cur = self._conn.execute(
-            "DELETE FROM tasks WHERE status = 'done' AND type = 'task' AND updated_at < ?",
-            (cutoff,),
-        )
-        if cur.rowcount:
-            self._conn.commit()
-        return cur.rowcount
+        return TaskDAO.purge_done(self._conn, cutoff)
 
     def get_suggested_tasks(self, limit=20):
         """Return prioritized mix: overdue + high/critical + nearest due."""
-        pri_sql = build_priority_order_sql()
-        rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE status NOT IN ({_ACTIVE_PH}) "
-            "ORDER BY "
-            "CASE WHEN due_date IS NOT NULL AND due_date < date('now') THEN 0 ELSE 1 END, "
-            f"{pri_sql}, "
-            "CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, "
-            "created_at DESC "
-            "LIMIT ?",
-            _ACTIVE_PARAMS + [limit],
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return TaskDAO.get_suggested(self._conn, limit)
 
     def get_all_notes(self):
         """All notes (never-deleted). Excludes archived/cancelled."""
-        pri_sql = build_priority_order_sql()
-        rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE type = 'note' "
-            "AND status NOT IN ('archived', 'cancelled') "
-            f"ORDER BY {pri_sql}, updated_at DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return TaskDAO.get_notes(self._conn)
 
     def get_project_names(self):
         """Return project names sorted by active task count (most first)."""
-        rows = self._conn.execute(
-            "SELECT project, COUNT(*) as cnt FROM tasks "
-            "WHERE project IS NOT NULL AND status NOT IN ('archived','cancelled') "
-            "GROUP BY project ORDER BY cnt DESC"
-        ).fetchall()
-        return [r["project"] for r in rows]
+        return TaskDAO.get_project_names(self._conn)
 
     def get_summary(self, tasks=None):
         """Return dict with total, overdue counts. Accepts pre-fetched tasks."""
@@ -993,7 +956,7 @@ class TrayPopup(QWidget):
         self.setFixedWidth(380)
         self.setMaximumHeight(500)
         self.setStyleSheet(self._stylesheet())
-        self._search_engine = TaskSearchEngine()
+        self._search_engine = db.search_engine
         self._build_ui()
 
         # Auto-refresh timer (only ticks when visible)
@@ -2434,7 +2397,7 @@ class FullWindow(QMainWindow):
         self._last_projects = None
         self._project_cache_time: float = 0.0  # monotonic time of last project query
         self._filtered_cache: dict[str, list] = {}  # lazy tab rendering cache
-        self._search_engine = TaskSearchEngine()
+        self._search_engine = db.search_engine
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
 
@@ -2473,8 +2436,8 @@ class FullWindow(QMainWindow):
             self._excluded_filters = {
                 k: set(parsed_ex.get(k, [])) for k in ("priority", "due", "project")
             }
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass  # defaults already set above
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logging.getLogger("task_tray").warning("Failed to restore filters: %s", exc)
 
         # First-run recovery: if QSettings has no sort_mode, try bridge profile
         if self._settings.value("sort_mode") is None:
@@ -3510,7 +3473,7 @@ class TaskTrayApp:
         self._reminder_timer = QTimer()
         self._reminder_timer.timeout.connect(self._check_reminders)
         self._reminder_timer.start(60_000)
-        self._shown_reminder_ids: set[str] = set()
+        self._shown_reminder_ids: dict[str, float] = {}  # task_id → monotonic ts
         QTimer.singleShot(5000, self._check_reminders)  # initial check after startup
 
     def _update_icon(self, summary=None):
@@ -3568,6 +3531,12 @@ class TaskTrayApp:
 
     def _check_reminders(self):
         """Check for tasks with due reminders and show notifications."""
+        # Auto-cleanup: evict entries older than 5 min so reminders can re-fire
+        cutoff = time.monotonic() - 300
+        self._shown_reminder_ids = {
+            k: v for k, v in self._shown_reminder_ids.items() if v > cutoff
+        }
+
         try:
             now_str = datetime.now(timezone.utc).isoformat()
             conn = sqlite3.connect(self.db.db_path, isolation_level=None, timeout=5)
@@ -3590,7 +3559,7 @@ class TaskTrayApp:
             tid = row["id"]
             if tid in self._shown_reminder_ids:
                 continue
-            self._shown_reminder_ids.add(tid)
+            self._shown_reminder_ids[tid] = time.monotonic()
 
             # Critical priority or >1h overdue → popup dialog
             is_critical = row["priority"] == "critical"
@@ -3620,21 +3589,17 @@ class TaskTrayApp:
                     QSystemTrayIcon.MessageIcon.Information,
                     10_000,
                 )
-                # Evict from shown set after balloon timeout so external snoozes work
-                QTimer.singleShot(
-                    15_000, lambda _tid=tid: self._shown_reminder_ids.discard(_tid)
-                )
 
     def _snooze_reminder(self, task_id: str, minutes: int):
         """Reschedule reminder to NOW + minutes."""
         new_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
         self.db.update_task(task_id, reminder_at=new_time.isoformat())
-        self._shown_reminder_ids.discard(task_id)
+        self._shown_reminder_ids.pop(task_id, None)
 
     def _dismiss_reminder(self, task_id: str):
         """Clear the reminder."""
         self.db.update_task(task_id, reminder_at=None)
-        self._shown_reminder_ids.discard(task_id)
+        self._shown_reminder_ids.pop(task_id, None)
 
     def _on_quit(self):
         self._reminder_timer.stop()
