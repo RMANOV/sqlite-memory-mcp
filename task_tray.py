@@ -3421,15 +3421,20 @@ class FullWindow(QMainWindow):
     def _matches_due_filter(task, due_filters, today, week_start, week_end):
         """Check if task matches any active due filter (OR within)."""
         due = parse_iso_date(task.get("due_date"))
+        section = task.get("section")
         for f in due_filters:
             # "today" matches by due_date OR by section (user intent = "work today")
-            if f == "today" and (due == today or task.get("section") == "today"):
+            if f == "today" and (due == today or section == "today"):
+                return True
+            # "week" matches by due_date range OR section=today (today ⊂ this week)
+            if f == "week" and (
+                section == "today"
+                or (due is not None and week_start <= due <= week_end)
+            ):
                 return True
             if due is None:
                 continue
             if f == "overdue" and due < today:
-                return True
-            if f == "week" and week_start <= due <= week_end:
                 return True
         return False
 
