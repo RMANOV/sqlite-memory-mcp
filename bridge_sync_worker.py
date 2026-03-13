@@ -31,6 +31,8 @@ from db_utils import (
     json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
     export_task_files,
     export_index_json,
+    load_task_content,
+    CONTENT_FIELDS,
     merge_import_tasks,
     migrate_to_per_task_files,
     get_conn,  # I3: managed connection — handles PRAGMAs, BEGIN/COMMIT/ROLLBACK, close
@@ -373,14 +375,31 @@ def main(
         if index_path.exists():
             try:
                 idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
-                new_t, upd_t = merge_import_tasks(conn, idx_data.get("tasks", []))
+                remote_tasks = idx_data.get("tasks", [])
+
+                # Enrich with content from per-task files (fixes dead load_task_content)
+                enriched = 0
+                for task in remote_tasks:
+                    if task.get("_tombstone"):
+                        continue
+                    content = load_task_content(task.get("id", ""), bridge_dir)
+                    if content:
+                        for cf in CONTENT_FIELDS:
+                            if cf in content:
+                                task[cf] = content[cf]
+                        if content.get("description") or content.get("notes"):
+                            enriched += 1
+                if enriched:
+                    log.info("Enriched %d tasks with content from per-task files", enriched)
+
+                new_t, upd_t = merge_import_tasks(conn, remote_tasks, import_content=True)
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                new_t, upd_t = merge_import_tasks(conn, remote_data.get("tasks", []))
+                new_t, upd_t = merge_import_tasks(conn, remote_data.get("tasks", []), import_content=True)
                 log.info("Imported %d new, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
