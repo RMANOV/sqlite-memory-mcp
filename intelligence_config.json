@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "default_enrich_policy": "manual",
+  "respect_signal_phrases": true,
+  "skip_same_unresolved_source": true,
+  "max_questions_per_chunk": 5,
+  "auto_promote_scopes": ["memory"],
+  "human_required_scopes": ["mapping", "validation", "bridge", "export"],
+  "context_pack_token_budget_default": 4000,
+  "conflict_detection_enabled": false,
+  "query_expansion_enabled": false
+}
