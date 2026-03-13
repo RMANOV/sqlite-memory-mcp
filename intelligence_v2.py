@@ -358,6 +358,16 @@ def assess_context(
     elif "NO_ENRICH" in signals:
         if is_valid_transition(current_state, "no_enrich"):
             new_state = "no_enrich"
+            annotations_created.append(
+                _create_annotation(
+                    conn,
+                    chunk_id,
+                    "system",
+                    "signal",
+                    "NO_ENRICH signal detected — enrichment revoked",
+                    source_hash,
+                )
+            )
 
     elif "WAIT_HUMAN" in signals:
         if is_valid_transition(current_state, "awaiting_human"):

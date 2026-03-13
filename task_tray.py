@@ -5,12 +5,13 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
 import base64
+import copy
 import faulthandler
 import html as _html
 import json
 import logging
 import os
-import socket
+import socket as _socket
 import sqlite3
 import subprocess
 import sys
@@ -2374,6 +2375,14 @@ class ReminderPopupDialog(QDialog):
 _REFRESH_INTERVAL_MS = 30_000
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
 
+# Per-tab sort/filter constants
+_FIXED_VIEW_TABS = frozenset({"suggested", "projects"})
+_DEFAULT_TAB_VIEW = {
+    "sort": "priority",
+    "active": {"priority": set(), "due": set(), "project": set()},
+    "excluded": {"priority": set(), "due": set(), "project": set()},
+}
+
 
 class FullWindow(QMainWindow):
     """Full task manager window with tabs, search, sort, and suggested view."""
@@ -2428,28 +2437,8 @@ class FullWindow(QMainWindow):
         _bold = self._settings.value("bold", "false") == "true"
         _update_theme_colors()
 
-        # Restore sort/tab/filter state from QSettings
-        self._sort_mode = self._settings.value("sort_mode", "priority")
-        if self._sort_mode not in self._SORT_MODES:
-            self._sort_mode = "priority"
-        self._saved_active_tab = int(self._settings.value("active_tab", 0))
-        try:
-            raw = self._settings.value("active_filters", "{}")
-            parsed = json.loads(raw) if isinstance(raw, str) else {}
-            self._active_filters = {
-                k: set(parsed.get(k, [])) for k in ("priority", "due", "project")
-            }
-            raw_ex = self._settings.value("excluded_filters", "{}")
-            parsed_ex = json.loads(raw_ex) if isinstance(raw_ex, str) else {}
-            self._excluded_filters = {
-                k: set(parsed_ex.get(k, [])) for k in ("priority", "due", "project")
-            }
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            logging.getLogger("task_tray").warning("Failed to restore filters: %s", exc)
-
-        # First-run recovery: if QSettings has no sort_mode, try bridge profile
-        if self._settings.value("sort_mode") is None:
-            self._restore_profile_from_bridge()
+        # First-run recovery: if QSettings has no tab_views, try bridge profile
+        # (deferred — _tab_keys not yet defined; called after tab init below)
 
         self.setStyleSheet(_build_main_style())
 
@@ -2486,11 +2475,70 @@ class FullWindow(QMainWindow):
             self.tab_lists[key] = lw
             self.tabs.addTab(lw, self._tab_labels[key])
 
+        # B1: Per-tab view state dict (sort + filters per tab)
+        self._tab_views = {
+            key: copy.deepcopy(_DEFAULT_TAB_VIEW)
+            for key in self._tab_keys
+            if key not in _FIXED_VIEW_TABS
+        }
+        self._current_tab_idx = 0  # track for state swapping on tab change
+
+        # B2: Restore per-tab state from QSettings
+        parsed = {}
+        try:
+            raw_views = self._settings.value("tab_views", "{}")
+            parsed = json.loads(raw_views) if isinstance(raw_views, str) else {}
+            for key, view in parsed.items():
+                if key in self._tab_views:
+                    if view.get("sort") in self._SORT_MODES:
+                        self._tab_views[key]["sort"] = view["sort"]
+                    self._tab_views[key]["active"] = {
+                        k: set(view.get("active", {}).get(k, []))
+                        for k in ("priority", "due", "project")
+                    }
+                    self._tab_views[key]["excluded"] = {
+                        k: set(view.get("excluded", {}).get(k, []))
+                        for k in ("priority", "due", "project")
+                    }
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            pass
+
+        # Backward compat: if no tab_views saved, load old scalar values as defaults
+        if not parsed:
+            old_sort = self._settings.value("sort_mode", "priority")
+            if old_sort in self._SORT_MODES:
+                for v in self._tab_views.values():
+                    v["sort"] = old_sort
+            try:
+                raw = self._settings.value("active_filters", "{}")
+                old_af = json.loads(raw) if isinstance(raw, str) else {}
+                raw_ex = self._settings.value("excluded_filters", "{}")
+                old_ef = json.loads(raw_ex) if isinstance(raw_ex, str) else {}
+                for v in self._tab_views.values():
+                    v["active"] = {k: set(old_af.get(k, [])) for k in ("priority", "due", "project")}
+                    v["excluded"] = {k: set(old_ef.get(k, [])) for k in ("priority", "due", "project")}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        # Set working state from the initial tab
+        self._saved_active_tab = int(self._settings.value("active_tab", 0))
+        initial_key = self._tab_keys[min(self._saved_active_tab, len(self._tab_keys) - 1)]
+        if initial_key in self._tab_views:
+            v = self._tab_views[initial_key]
+            self._sort_mode = v["sort"]
+            self._active_filters = v["active"]
+            self._excluded_filters = v["excluded"]
+
+        # First-run recovery: if QSettings has no tab_views, try bridge profile
+        if self._settings.value("tab_views") is None:
+            self._restore_profile_from_bridge()
+
         # Restore saved active tab
         if hasattr(self, "_saved_active_tab"):
             self.tabs.setCurrentIndex(
                 min(self._saved_active_tab, len(self._tab_keys) - 1)
             )
+        self._current_tab_idx = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Toolbar: actions + search + sort
@@ -2633,6 +2681,12 @@ class FullWindow(QMainWindow):
         self._build_filter_chips()
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._filter_bar)
 
+        # Hide sort/filter UI for fixed tabs on initial load
+        _initial_key = self._tab_keys[min(self._saved_active_tab, len(self._tab_keys) - 1)]
+        _is_fixed_initial = _initial_key in _FIXED_VIEW_TABS
+        self._sort_btn.setVisible(not _is_fixed_initial)
+        self._filter_bar.setVisible(not _is_fixed_initial)
+
         # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -2733,17 +2787,28 @@ class FullWindow(QMainWindow):
         self.refresh()
 
     def _save_ui_state(self):
-        """Persist all UI state to QSettings."""
-        self._settings.setValue("sort_mode", self._sort_mode)
+        """Persist all UI state to QSettings (per-tab views)."""
+        # Sync working state back to current tab before serializing
+        idx = getattr(self, "_current_tab_idx", 0)
+        if idx < len(self._tab_keys):
+            key = self._tab_keys[idx]
+            if key in self._tab_views:
+                self._tab_views[key] = {
+                    "sort": self._sort_mode,
+                    "active": copy.deepcopy(self._active_filters),
+                    "excluded": copy.deepcopy(self._excluded_filters),
+                }
+
+        # Serialize per-tab views
+        serializable = {}
+        for key, view in self._tab_views.items():
+            serializable[key] = {
+                "sort": view["sort"],
+                "active": {k: list(v) for k, v in view["active"].items()},
+                "excluded": {k: list(v) for k, v in view["excluded"].items()},
+            }
+        self._settings.setValue("tab_views", json.dumps(serializable))
         self._settings.setValue("active_tab", self.tabs.currentIndex())
-        self._settings.setValue(
-            "active_filters",
-            json.dumps({k: list(v) for k, v in self._active_filters.items()}),
-        )
-        self._settings.setValue(
-            "excluded_filters",
-            json.dumps({k: list(v) for k, v in self._excluded_filters.items()}),
-        )
 
     def _restore_profile_from_bridge(self):
         """First-run recovery: load UI state from bridge shared.json profile."""
@@ -2753,7 +2818,7 @@ class FullWindow(QMainWindow):
         try:
             data = json.loads(shared_path.read_text(encoding="utf-8"))
             profiles = data.get("ui_profiles", {})
-            profile = profiles.get(socket.gethostname())
+            profile = profiles.get(_socket.gethostname())
             if not profile:
                 return
             global _theme_name, _font_size, _bold
@@ -2765,20 +2830,56 @@ class FullWindow(QMainWindow):
             ):
                 _font_size = profile["font_size"]
             _bold = bool(profile.get("bold", False))
-            if profile.get("sort_mode") in self._SORT_MODES:
-                self._sort_mode = profile["sort_mode"]
             if isinstance(profile.get("active_tab"), int):
                 self._saved_active_tab = profile["active_tab"]
-            if isinstance(profile.get("active_filters"), dict):
-                self._active_filters = {
-                    k: set(profile["active_filters"].get(k, []))
-                    for k in ("priority", "due", "project")
-                }
-            if isinstance(profile.get("excluded_filters"), dict):
-                self._excluded_filters = {
-                    k: set(profile["excluded_filters"].get(k, []))
-                    for k in ("priority", "due", "project")
-                }
+
+            # Load per-tab views from bridge profile (new format)
+            bridge_tab_views = profile.get("tab_views")
+            if isinstance(bridge_tab_views, dict):
+                for key, view in bridge_tab_views.items():
+                    if key in self._tab_views:
+                        if view.get("sort") in self._SORT_MODES:
+                            self._tab_views[key]["sort"] = view["sort"]
+                        self._tab_views[key]["active"] = {
+                            k: set(view.get("active", {}).get(k, []))
+                            for k in ("priority", "due", "project")
+                        }
+                        self._tab_views[key]["excluded"] = {
+                            k: set(view.get("excluded", {}).get(k, []))
+                            for k in ("priority", "due", "project")
+                        }
+                # Sync working state from current tab
+                cur_key = self._tab_keys[min(
+                    getattr(self, "_saved_active_tab", 0), len(self._tab_keys) - 1
+                )]
+                if cur_key in self._tab_views:
+                    v = self._tab_views[cur_key]
+                    self._sort_mode = v["sort"]
+                    self._active_filters = v["active"]
+                    self._excluded_filters = v["excluded"]
+            else:
+                # Backward compat: old format had flat sort_mode/active_filters
+                if profile.get("sort_mode") in self._SORT_MODES:
+                    for v in self._tab_views.values():
+                        v["sort"] = profile["sort_mode"]
+                    self._sort_mode = profile["sort_mode"]
+                if isinstance(profile.get("active_filters"), dict):
+                    af = {
+                        k: set(profile["active_filters"].get(k, []))
+                        for k in ("priority", "due", "project")
+                    }
+                    for v in self._tab_views.values():
+                        v["active"] = copy.deepcopy(af)
+                    self._active_filters = af
+                if isinstance(profile.get("excluded_filters"), dict):
+                    ef = {
+                        k: set(profile["excluded_filters"].get(k, []))
+                        for k in ("priority", "due", "project")
+                    }
+                    for v in self._tab_views.values():
+                        v["excluded"] = copy.deepcopy(ef)
+                    self._excluded_filters = ef
+
             geo_b64 = profile.get("geometry_b64")
             if geo_b64:
                 from PyQt6.QtCore import QByteArray
@@ -2912,35 +3013,29 @@ class FullWindow(QMainWindow):
                 if auto_depth != "off":
                     self._enrich_running.emit(f"Pre-sync enrich ({auto_depth})...")
                     try:
-                        import sqlite3 as _sql
                         from intelligence_v2 import assess_context as _assess
                         from claim_graph import extract_candidate_claims as _extract
                         from context_packer import build_context_pack as _pack
                         from impact_graph import explain_impact as _impact
 
-                        econn = _sql.connect(self.db.db_path, isolation_level=None, timeout=10)
-                        econn.row_factory = _sql.Row
-                        econn.execute("PRAGMA journal_mode=WAL")
-                        econn.execute("PRAGMA busy_timeout=10000")
-
-                        enrichable = econn.execute(
-                            "SELECT chunk_id FROM context_chunks "
-                            "WHERE state = 'enrichable' LIMIT 20"
-                        ).fetchall()
-                        for row in enrichable:
-                            _assess(econn, row["chunk_id"])
-                        _pack(econn, "executor")
-                        if auto_depth in ("standard", "deep"):
+                        with get_conn(self.db.db_path) as econn:
+                            enrichable = econn.execute(
+                                "SELECT chunk_id FROM context_chunks "
+                                "WHERE state = 'enrichable' LIMIT 20"
+                            ).fetchall()
                             for row in enrichable:
-                                _extract(econn, row["chunk_id"])
-                        if auto_depth == "deep":
-                            for f in econn.execute(
-                                "SELECT fact_id FROM canonical_facts "
-                                "WHERE updated_at >= datetime('now', '-7 days') "
-                                "LIMIT 10"
-                            ).fetchall():
-                                _impact(econn, "fact", f["fact_id"])
-                        econn.close()
+                                _assess(econn, row["chunk_id"])
+                            _pack(econn, "executor")
+                            if auto_depth in ("standard", "deep"):
+                                for row in enrichable:
+                                    _extract(econn, row["chunk_id"])
+                            if auto_depth == "deep":
+                                for f in econn.execute(
+                                    "SELECT fact_id FROM canonical_facts "
+                                    "WHERE updated_at >= datetime('now', '-7 days') "
+                                    "LIMIT 10"
+                                ).fetchall():
+                                    _impact(econn, "fact", f["fact_id"])
                     except Exception:
                         pass  # Enrich failure must not block sync
 
@@ -2973,55 +3068,49 @@ class FullWindow(QMainWindow):
 
         def _work():
             try:
-                import sqlite3 as _sql
                 from intelligence_v2 import assess_context as _assess
                 from claim_graph import extract_candidate_claims as _extract
                 from context_packer import build_context_pack as _pack
                 from impact_graph import explain_impact as _impact
 
-                conn = _sql.connect(self.db.db_path, isolation_level=None, timeout=10)
-                conn.row_factory = _sql.Row
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA busy_timeout=10000")
-
-                # First: assess no_enrich chunks to unlock them
-                pending = conn.execute(
-                    "SELECT chunk_id FROM context_chunks "
-                    "WHERE state = 'no_enrich' LIMIT 50"
-                ).fetchall()
-                for row in pending:
-                    _assess(conn, row["chunk_id"])
-
-                # Now fetch all enrichable chunks (including freshly unlocked)
-                enrichable = conn.execute(
-                    "SELECT chunk_id FROM context_chunks "
-                    "WHERE state = 'enrichable' LIMIT 20"
-                ).fetchall()
-                assessed = 0
-                for row in enrichable:
-                    _assess(conn, row["chunk_id"])
-                    assessed += 1
-
-                _pack(conn, "executor")
-
-                claims = 0
-                if depth in ("standard", "deep"):
-                    for row in enrichable:
-                        cr = _extract(conn, row["chunk_id"])
-                        claims += cr.get("claims_extracted", 0)
-
-                impacts = 0
-                if depth == "deep":
-                    recent = conn.execute(
-                        "SELECT fact_id FROM canonical_facts "
-                        "WHERE updated_at >= datetime('now', '-7 days') "
-                        "LIMIT 10"
+                with get_conn(self.db.db_path) as conn:
+                    # First: assess no_enrich chunks to unlock them
+                    pending = conn.execute(
+                        "SELECT chunk_id FROM context_chunks "
+                        "WHERE state = 'no_enrich' LIMIT 50"
                     ).fetchall()
-                    for f in recent:
-                        _impact(conn, "fact", f["fact_id"])
-                        impacts += 1
+                    for row in pending:
+                        _assess(conn, row["chunk_id"])
 
-                conn.close()
+                    # Now fetch all enrichable chunks (including freshly unlocked)
+                    enrichable = conn.execute(
+                        "SELECT chunk_id FROM context_chunks "
+                        "WHERE state = 'enrichable' LIMIT 20"
+                    ).fetchall()
+                    assessed = 0
+                    for row in enrichable:
+                        _assess(conn, row["chunk_id"])
+                        assessed += 1
+
+                    _pack(conn, "executor")
+
+                    claims = 0
+                    if depth in ("standard", "deep"):
+                        for row in enrichable:
+                            cr = _extract(conn, row["chunk_id"])
+                            claims += cr.get("claims_extracted", 0)
+
+                    impacts = 0
+                    if depth == "deep":
+                        recent = conn.execute(
+                            "SELECT fact_id FROM canonical_facts "
+                            "WHERE updated_at >= datetime('now', '-7 days') "
+                            "LIMIT 10"
+                        ).fetchall()
+                        for f in recent:
+                            _impact(conn, "fact", f["fact_id"])
+                            impacts += 1
+
                 self._enrich_done.emit(
                     f"Enriched: {assessed} assessed, {claims} claims, {impacts} impacts"
                 )
@@ -3044,20 +3133,27 @@ class FullWindow(QMainWindow):
         try:
             data = json.loads(shared_path.read_text(encoding="utf-8"))
             profiles = data.get("ui_profiles", {})
-            profiles[socket.gethostname()] = {
+
+            # Serialize per-tab views for bridge profile
+            serializable_views = {}
+            for key, view in self._tab_views.items():
+                serializable_views[key] = {
+                    "sort": view["sort"],
+                    "active": {k: list(v) for k, v in view["active"].items()},
+                    "excluded": {k: list(v) for k, v in view["excluded"].items()},
+                }
+
+            profiles[_socket.gethostname()] = {
                 "theme": _theme_name,
                 "font_size": _font_size,
                 "bold": _bold,
-                "sort_mode": self._settings.value("sort_mode", "priority"),
                 "active_tab": int(self._settings.value("active_tab", 0)),
-                "active_filters": json.loads(
-                    self._settings.value("active_filters", "{}")
-                ),
+                "tab_views": serializable_views,
                 "updated_at": now_iso(),
             }
             geo = self._settings.value("geometry")
             if geo:
-                profiles[socket.gethostname()]["geometry_b64"] = base64.b64encode(
+                profiles[_socket.gethostname()]["geometry_b64"] = base64.b64encode(
                     bytes(geo)
                 ).decode("ascii")
             data["ui_profiles"] = profiles
@@ -3104,9 +3200,9 @@ class FullWindow(QMainWindow):
                 pass
             raise
 
-    def _sort_tasks(self, tasks):
-        """Sort tasks by current sort mode."""
-        mode = self._sort_mode
+    def _sort_tasks(self, tasks, sort_mode=None):
+        """Sort tasks by given sort mode (or current working sort mode)."""
+        mode = sort_mode or self._sort_mode
         if mode == "priority":
             return sorted(tasks, key=priority_sort_key)
         if mode == "due":
@@ -3339,23 +3435,26 @@ class FullWindow(QMainWindow):
                 return True
         return False
 
-    def _filter(self, tasks):
-        """Apply search OR chip filters. Search bypasses chip filters."""
+    def _filter(self, tasks, active_filters=None, excluded_filters=None):
+        """Apply chip filters. Accepts explicit filter dicts or falls back to working state."""
         q = self._search_text
         if q:
             # SmartKey fuzzy search (falls back to substring if unavailable)
             return self._search_engine.search(q, tasks)
 
+        af = active_filters if active_filters is not None else self._active_filters
+        ef = excluded_filters if excluded_filters is not None else self._excluded_filters
+
         # ── Include filters (AND between dims, OR within dim) ──
-        if self._active_filters["priority"]:
+        if af["priority"]:
             tasks = [
                 t
                 for t in tasks
-                if t.get("priority", "medium") in self._active_filters["priority"]
+                if t.get("priority", "medium") in af["priority"]
             ]
 
-        due_inc = self._active_filters["due"]
-        due_exc = self._excluded_filters["due"]
+        due_inc = af["due"]
+        due_exc = ef["due"]
         if due_inc or due_exc:
             today = date.today()
             week_start = today - timedelta(days=today.weekday())
@@ -3375,24 +3474,24 @@ class FullWindow(QMainWindow):
                     )
                 ]
 
-        if self._active_filters["project"]:
+        if af["project"]:
             tasks = [
-                t for t in tasks if t.get("project") in self._active_filters["project"]
+                t for t in tasks if t.get("project") in af["project"]
             ]
 
         # ── Exclude filters (remove matching) ──
-        if self._excluded_filters["priority"]:
+        if ef["priority"]:
             tasks = [
                 t
                 for t in tasks
-                if t.get("priority", "medium") not in self._excluded_filters["priority"]
+                if t.get("priority", "medium") not in ef["priority"]
             ]
 
-        if self._excluded_filters["project"]:
+        if ef["project"]:
             tasks = [
                 t
                 for t in tasks
-                if t.get("project") not in self._excluded_filters["project"]
+                if t.get("project") not in ef["project"]
             ]
 
         return tasks
@@ -3451,10 +3550,23 @@ class FullWindow(QMainWindow):
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
                 matched = [t for t in raw[key] if t["id"] in global_ids]
-                self._filtered_cache[key] = self._sort_tasks(matched)
+                if key in _FIXED_VIEW_TABS:
+                    self._filtered_cache[key] = matched
+                elif key in self._tab_views:
+                    v = self._tab_views[key]
+                    self._filtered_cache[key] = self._sort_tasks(matched, v["sort"])
+                else:
+                    self._filtered_cache[key] = self._sort_tasks(matched)
         else:
             for key in self._tab_keys:
-                self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
+                if key in _FIXED_VIEW_TABS:
+                    self._filtered_cache[key] = raw[key]
+                elif key in self._tab_views:
+                    v = self._tab_views[key]
+                    filtered = self._filter(raw[key], v["active"], v["excluded"])
+                    self._filtered_cache[key] = self._sort_tasks(filtered, v["sort"])
+                else:
+                    self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
 
         # Update tab visibility (suggested, notes, projects always visible)
         always_visible = ("suggested", "notes", "projects")
@@ -3499,7 +3611,45 @@ class FullWindow(QMainWindow):
         self.status.showMessage(msg)
 
     def _on_tab_changed(self, idx):
-        """Handle tab switch: save state + lazy-load the newly visible tab."""
+        """Handle tab switch: save current tab's view, load new tab's view."""
+        # Save outgoing tab's state
+        old_idx = getattr(self, "_current_tab_idx", 0)
+        if old_idx < len(self._tab_keys):
+            old_key = self._tab_keys[old_idx]
+            if old_key in self._tab_views:
+                self._tab_views[old_key] = {
+                    "sort": self._sort_mode,
+                    "active": copy.deepcopy(self._active_filters),
+                    "excluded": copy.deepcopy(self._excluded_filters),
+                }
+
+        # Load incoming tab's state
+        self._current_tab_idx = idx
+        if idx < len(self._tab_keys):
+            new_key = self._tab_keys[idx]
+            if new_key in self._tab_views:
+                v = self._tab_views[new_key]
+                self._sort_mode = v["sort"]
+                self._active_filters = copy.deepcopy(v["active"])
+                self._excluded_filters = copy.deepcopy(v["excluded"])
+            else:
+                self._sort_mode = "priority"
+                self._active_filters = {"priority": set(), "due": set(), "project": set()}
+                self._excluded_filters = {"priority": set(), "due": set(), "project": set()}
+
+            # Update sort button
+            self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
+            if hasattr(self, "_sort_actions") and self._sort_mode in self._sort_actions:
+                self._sort_actions[self._sort_mode].setChecked(True)
+
+            # Rebuild filter chips for new tab
+            self._build_filter_chips()
+
+            # Hide sort/filter UI for fixed tabs
+            is_fixed = new_key in _FIXED_VIEW_TABS
+            self._sort_btn.setVisible(not is_fixed)
+            self._filter_bar.setVisible(not is_fixed)
+
         self._save_ui_state()
         if idx < len(self._tab_keys):
             self._load_tab(self._tab_keys[idx])
@@ -3602,7 +3752,7 @@ class FullWindow(QMainWindow):
 class TaskTrayApp:
     """Main application controller."""
 
-    def __init__(self):
+    def __init__(self, instance_socket=None):
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
         self.db = TaskDB()
@@ -3639,6 +3789,13 @@ class TaskTrayApp:
         self._reminder_timer.start(60_000)
         self._shown_reminder_ids: dict[str, float] = {}  # task_id → monotonic ts
         QTimer.singleShot(5000, self._check_reminders)  # initial check after startup
+
+        # Single-instance socket polling
+        self._instance_socket = instance_socket
+        if instance_socket:
+            self._instance_timer = QTimer()
+            self._instance_timer.timeout.connect(self._poll_instance_socket)
+            self._instance_timer.start(500)
 
     def _update_icon(self, summary=None):
         if summary is None:
@@ -3682,6 +3839,21 @@ class TaskTrayApp:
         self.full_window.show()
         self.full_window.raise_()
         self.full_window.activateWindow()
+
+    def _poll_instance_socket(self):
+        """Check if another instance sent a SHOW command."""
+        if not self._instance_socket:
+            return
+        try:
+            conn, _ = self._instance_socket.accept()
+            data = conn.recv(64)
+            conn.close()
+            if data == b"SHOW":
+                self._open_full()
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
 
     def _refresh_all(self):
         """Update tray icon badge + tooltip after any change."""
@@ -3773,8 +3945,38 @@ class TaskTrayApp:
         return self.app.exec()
 
 
+_INSTANCE_SOCK = "\0TaskTray_SingleInstance"
+
+
+def _try_single_instance():
+    """If another instance is running, send SHOW signal and return None.
+    Otherwise, bind the socket and return the server socket."""
+    try:
+        client = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        client.connect(_INSTANCE_SOCK)
+        client.send(b"SHOW")
+        client.close()
+        return None
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        pass
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        srv.bind(_INSTANCE_SOCK)
+        srv.listen(1)
+        srv.setblocking(False)
+        return srv
+    except OSError:
+        srv.close()
+        raise
+
+
 def main():
-    app = TaskTrayApp()
+    srv = _try_single_instance()
+    if srv is None:
+        sys.exit(0)
+    app = TaskTrayApp(instance_socket=srv)
+    if "--show" in sys.argv:
+        app._open_full()
     sys.exit(app.run())
 
 

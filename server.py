@@ -1121,7 +1121,8 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                 logger.warning("add_observations: entity %r not found", entity_name)
                 continue
             eid = row["id"]
-            for content in item.get("contents", []):
+            contents = item.get("contents", [])
+            for content in contents:
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO observations "
                     "(entity_id, content, created_at) VALUES (?, ?, ?)",
@@ -1131,20 +1132,21 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
             conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, eid))
             _fts_sync(conn, eid)
             # Auto-ingest to Intelligence v2 context chunks
-            try:
-                from intelligence_v2 import ingest_chunk as _ingest_chunk
+            if contents:
+                try:
+                    from intelligence_v2 import ingest_chunk as _ingest_chunk
 
-                _ingest_chunk(
-                    conn,
-                    "\n".join(item.get("contents", [])),
-                    "entity_obs",
-                    entity_name,
-                    entity_name,
-                    None,
-                    str(eid),
-                )
-            except Exception:
-                pass  # Intelligence v2 optional — don't break core
+                    _ingest_chunk(
+                        conn,
+                        "\n".join(contents),
+                        "entity_obs",
+                        entity_name,
+                        entity_name,
+                        None,
+                        str(eid),
+                    )
+                except Exception:
+                    pass  # Intelligence v2 optional — don't break core
 
     logger.info("add_observations: %d observations added", added)
     return json.dumps({"added": added})
