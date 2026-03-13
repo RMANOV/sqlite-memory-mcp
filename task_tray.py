@@ -645,6 +645,12 @@ def _build_main_style():
                                padding: 4px 12px; font-weight: bold; font-size: {fs}px; }}
         QToolBar QToolButton:hover {{ background: {t["accent"]}; color: #ffffff; }}
         QToolBar QToolButton:checked {{ background: {t["accent"]}; color: #ffffff; }}
+        QToolBar QToolButton#enrich_quick {{ background: #f6ad55; color: #1a202c; border: 1px solid #ed8936; font-weight: bold; }}
+        QToolBar QToolButton#enrich_quick:hover {{ background: #ed8936; color: #ffffff; }}
+        QToolBar QToolButton#enrich_standard {{ background: #ed8936; color: #1a202c; border: 1px solid #dd6b20; font-weight: bold; }}
+        QToolBar QToolButton#enrich_standard:hover {{ background: #dd6b20; color: #ffffff; }}
+        QToolBar QToolButton#enrich_deep {{ background: #e53e3e; color: #ffffff; border: 1px solid #c53030; font-weight: bold; }}
+        QToolBar QToolButton#enrich_deep:hover {{ background: #c53030; color: #ffffff; }}
         QStatusBar {{ background: {t["bg2"]}; color: {t["text2"]}; font-weight: bold;
                      border-top: 1px solid {t["bg3"]}; padding: 2px 8px; font-size: {fs - 1}px; }}
         QMenu {{ background: {t["bg2"]}; color: {t["text"]}; border: 1px solid {t["border"]}; }}
@@ -2374,6 +2380,8 @@ class FullWindow(QMainWindow):
 
     _bridge_done = pyqtSignal(str)
     _bridge_progress = pyqtSignal(int, str)  # (percent, step_label)
+    _enrich_done = pyqtSignal(str)
+    _enrich_running = pyqtSignal(str)
 
     # Sort modes cycle: priority → due → created → priority ...
     _SORT_MODES = ("priority", "due", "created", "project")
@@ -2496,6 +2504,20 @@ class FullWindow(QMainWindow):
         toolbar.addAction(refresh_action)
         toolbar.addSeparator()
 
+        # ── Intelligence v2 enrich buttons (amber→orange→red gradient) ──
+        for obj_name, label, depth in [
+            ("enrich_quick", "\u26a1 Quick", "quick"),
+            ("enrich_standard", "\U0001f52c Std", "standard"),
+            ("enrich_deep", "\U0001f9e0 Deep", "deep"),
+        ]:
+            btn = QToolButton()
+            btn.setText(label)
+            btn.setObjectName(obj_name)
+            btn.setToolTip(f"Enrich context: {depth}")
+            btn.clicked.connect(lambda checked, d=depth: self._run_enrich(d))
+            toolbar.addWidget(btn)
+        toolbar.addSeparator()
+
         # Instant search bar (debounced 300ms)
         self._search_input = QLineEdit()
         self._search_input.setObjectName("search")
@@ -2573,6 +2595,29 @@ class FullWindow(QMainWindow):
         view_menu.addAction(self._bold_action)
         view_menu.addSeparator()
 
+        # ── Auto-Enrich depth (Intelligence v2) ──
+        enrich_header = QAction("Auto-Enrich before Sync:", self)
+        enrich_header.setEnabled(False)
+        view_menu.addAction(enrich_header)
+        self._enrich_depth_group = QActionGroup(self)
+        self._enrich_depth_group.setExclusive(True)
+        saved_depth = self._settings.value("auto_enrich_depth", "off")
+        for depth_val, depth_label in [
+            ("off", "Off"),
+            ("quick", "\u26a1 Quick"),
+            ("standard", "\U0001f52c Standard"),
+            ("deep", "\U0001f9e0 Deep"),
+        ]:
+            act = QAction(depth_label, self)
+            act.setCheckable(True)
+            act.setChecked(depth_val == saved_depth)
+            act.triggered.connect(
+                lambda checked, d=depth_val: self._set_enrich_depth(d)
+            )
+            self._enrich_depth_group.addAction(act)
+            view_menu.addAction(act)
+        view_menu.addSeparator()
+
         reset_view_act = QAction("Reset View", self)
         reset_view_act.triggered.connect(self._reset_view)
         view_menu.addAction(reset_view_act)
@@ -2610,6 +2655,11 @@ class FullWindow(QMainWindow):
         # Bridge sync signals (thread-safe → main thread)
         self._bridge_progress.connect(self._on_sync_progress)
         self._bridge_done.connect(self._on_sync_done)
+
+        # Intelligence v2 enrich signals
+        self._enrich_in_progress = False
+        self._enrich_running.connect(lambda msg: self.status.showMessage(msg, 30000))
+        self._enrich_done.connect(self._on_enrich_done)
 
         # Auto-refresh every 30s
         self._refresh_timer = QTimer(self)
@@ -2765,6 +2815,10 @@ class FullWindow(QMainWindow):
             self._theme_actions[name].setChecked(True)
         self._apply_appearance()
 
+    def _set_enrich_depth(self, depth):
+        """Set auto-enrich depth for pre-sync pipeline."""
+        self._settings.setValue("auto_enrich_depth", depth)
+
     def _set_sort(self, mode):
         """Set sort mode from mega-button menu."""
         self._sort_mode = mode
@@ -2846,13 +2900,50 @@ class FullWindow(QMainWindow):
         self._sync_label.show()
 
     def _sync_bridge(self):
-        """Sync memory bridge via bridge_sync_worker (pull + push + shared.js)."""
+        """Enrich (if configured) then sync memory bridge (pull + push + shared.js)."""
         if not os.path.isdir(self._BRIDGE_DIR):
             self.status.showMessage("Bridge dir not found", 3000)
             return
 
         def _run():
             try:
+                # ── Auto-enrich BEFORE sync so enriched data is included in push ──
+                auto_depth = self._settings.value("auto_enrich_depth", "off")
+                if auto_depth != "off":
+                    self._enrich_running.emit(f"Pre-sync enrich ({auto_depth})...")
+                    try:
+                        import sqlite3 as _sql
+                        from intelligence_v2 import assess_context as _assess
+                        from claim_graph import extract_candidate_claims as _extract
+                        from context_packer import build_context_pack as _pack
+                        from impact_graph import explain_impact as _impact
+
+                        econn = _sql.connect(self.db.db_path, timeout=10)
+                        econn.row_factory = _sql.Row
+                        econn.execute("PRAGMA journal_mode=WAL")
+                        econn.execute("PRAGMA busy_timeout=10000")
+
+                        enrichable = econn.execute(
+                            "SELECT chunk_id FROM context_chunks "
+                            "WHERE state = 'enrichable' LIMIT 20"
+                        ).fetchall()
+                        for row in enrichable:
+                            _assess(econn, row["chunk_id"])
+                        _pack(econn, "executor")
+                        if auto_depth in ("standard", "deep"):
+                            for row in enrichable:
+                                _extract(econn, row["chunk_id"])
+                        if auto_depth == "deep":
+                            for f in econn.execute(
+                                "SELECT fact_id FROM canonical_facts "
+                                "WHERE updated_at >= datetime('now', '-7 days') "
+                                "LIMIT 10"
+                            ).fetchall():
+                                _impact(econn, "fact", f["fact_id"])
+                        econn.close()
+                    except Exception:
+                        pass  # Enrich failure must not block sync
+
                 import bridge_sync_worker
 
                 stats = bridge_sync_worker.main(
@@ -2871,6 +2962,70 @@ class FullWindow(QMainWindow):
                 self._bridge_done.emit(f"Sync error: {exc}")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _run_enrich(self, depth: str = "quick"):
+        """Run Intelligence v2 enrich pipeline in background thread."""
+        if getattr(self, "_enrich_in_progress", False):
+            self.status.showMessage("Enrich already running...", 2000)
+            return
+        self._enrich_in_progress = True
+        self._enrich_running.emit(f"Enriching ({depth})...")
+
+        def _work():
+            try:
+                import sqlite3 as _sql
+                from intelligence_v2 import assess_context as _assess
+                from claim_graph import extract_candidate_claims as _extract
+                from context_packer import build_context_pack as _pack
+                from impact_graph import explain_impact as _impact
+
+                conn = _sql.connect(self.db.db_path, timeout=10)
+                conn.row_factory = _sql.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=10000")
+
+                enrichable = conn.execute(
+                    "SELECT chunk_id FROM context_chunks "
+                    "WHERE state = 'enrichable' LIMIT 20"
+                ).fetchall()
+                assessed = 0
+                for row in enrichable:
+                    _assess(conn, row["chunk_id"])
+                    assessed += 1
+
+                _pack(conn, "executor")
+
+                claims = 0
+                if depth in ("standard", "deep"):
+                    for row in enrichable:
+                        cr = _extract(conn, row["chunk_id"])
+                        claims += cr.get("claims_extracted", 0)
+
+                impacts = 0
+                if depth == "deep":
+                    recent = conn.execute(
+                        "SELECT fact_id FROM canonical_facts "
+                        "WHERE updated_at >= datetime('now', '-7 days') "
+                        "LIMIT 10"
+                    ).fetchall()
+                    for f in recent:
+                        _impact(conn, "fact", f["fact_id"])
+                        impacts += 1
+
+                conn.close()
+                self._enrich_done.emit(
+                    f"Enriched: {assessed} assessed, {claims} claims, {impacts} impacts"
+                )
+            except Exception as exc:
+                self._enrich_done.emit(f"Enrich error: {exc}")
+            finally:
+                self._enrich_in_progress = False
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_enrich_done(self, msg):
+        is_error = msg.startswith("Enrich error")
+        self.status.showMessage(msg, 10000 if is_error else 5000)
 
     def _patch_ui_profile(self):
         """Write own UI profile into shared.json (persisted on next sync cycle)."""
