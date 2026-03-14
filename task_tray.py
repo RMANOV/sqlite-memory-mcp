@@ -1041,7 +1041,9 @@ class TrayPopup(QWidget):
 
         # Search bar (bottom)
         self._search_input = QLineEdit()
+        self._search_input.setObjectName("search")
         self._search_input.setPlaceholderText("Search tasks...")
+        self._search_input.setClearButtonEnabled(True)
         self._search_input.textChanged.connect(self._on_search)
         layout.addWidget(self._search_input)
 
