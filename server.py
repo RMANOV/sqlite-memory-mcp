@@ -913,6 +913,49 @@ _MIGRATIONS = [
         "input_signature TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL)",
         "enrichment_runs table (v3.0.0)",
     ),
+    # ── v3.1.0: Layer 1+2 — smart retrieval + lazy enrichment ──
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_access_log'",
+        "CREATE TABLE entity_access_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, "
+        "tool_name TEXT NOT NULL, "
+        "accessed_at TEXT NOT NULL)",
+        "entity_access_log table (v3.1.0 — smart retrieval)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_eal_entity'",
+        "CREATE INDEX idx_eal_entity ON entity_access_log(entity_id, accessed_at DESC)",
+        "idx_eal_entity index (v3.1.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lazy_claims'",
+        "CREATE TABLE lazy_claims ("
+        "claim_id TEXT PRIMARY KEY, "
+        "entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, "
+        "observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE, "
+        "subject TEXT NOT NULL, predicate TEXT NOT NULL, "
+        "object_text TEXT NOT NULL, confidence REAL NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'candidate', "
+        "promoted_to_fact_id TEXT NULL, "
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        "lazy_claims table (v3.1.0 — lazy enrichment)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lc_entity'",
+        "CREATE INDEX idx_lc_entity ON lazy_claims(entity_id, status)",
+        "idx_lc_entity index (v3.1.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lc_obs'",
+        "CREATE INDEX idx_lc_obs ON lazy_claims(observation_id)",
+        "idx_lc_obs index (v3.1.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lc_status'",
+        "CREATE INDEX idx_lc_status ON lazy_claims(status, confidence DESC)",
+        "idx_lc_status index (v3.1.0)",
+    ),
 ]
 
 
@@ -1088,13 +1131,24 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                         "WHERE id = ? AND (project IS NULL OR project != ?)",
                         (project, now, eid, project),
                     )
+                new_obs_ids: list[tuple[int, str]] = []
                 for obs in observations:
-                    conn.execute(
+                    cur_obs = conn.execute(
                         "INSERT OR IGNORE INTO observations "
                         "(entity_id, content, created_at) VALUES (?, ?, ?)",
                         (eid, obs, now),
                     )
+                    if cur_obs.rowcount > 0:
+                        new_obs_ids.append((cur_obs.lastrowid, obs))
                 _fts_sync(conn, eid)
+                # L2 inline enrichment for newly inserted observations
+                if new_obs_ids:
+                    try:
+                        from lazy_enrichment import extract_inline_claims
+                        for obs_id, obs_text in new_obs_ids:
+                            extract_inline_claims(conn, eid, obs_id, obs_text)
+                    except Exception:
+                        pass  # L2 enrichment is optional
 
     logger.info(
         "create_entities: %d created out of %d requested", created, len(entities)
@@ -1131,22 +1185,19 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                 added += cur.rowcount
             conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, eid))
             _fts_sync(conn, eid)
-            # Auto-ingest to Intelligence v2 context chunks
+            # L2 inline enrichment: extract SPO claims from new observations
             if contents:
                 try:
-                    from intelligence_v2 import ingest_chunk as _ingest_chunk
-
-                    _ingest_chunk(
-                        conn,
-                        "\n".join(contents),
-                        "entity_obs",
-                        entity_name,
-                        entity_name,
-                        None,
-                        str(eid),
-                    )
+                    from lazy_enrichment import extract_inline_claims
+                    for content in contents:
+                        obs_row = conn.execute(
+                            "SELECT id FROM observations WHERE entity_id = ? AND content = ?",
+                            (eid, content),
+                        ).fetchone()
+                        if obs_row:
+                            extract_inline_claims(conn, eid, obs_row["id"], content)
                 except Exception:
-                    pass  # Intelligence v2 optional — don't break core
+                    pass  # L2 enrichment is optional — don't break core
 
     logger.info("add_observations: %d observations added", added)
     return json.dumps({"added": added})
@@ -1362,10 +1413,12 @@ def _tokenize(text: str) -> set[str]:
 
 
 @mcp.tool()
-def search_nodes(query: str) -> str:
+def search_nodes(query: str, project: str | None = None) -> str:
     """Search the knowledge graph using FTS5 BM25-ranked full-text search.
 
     Returns matching entities with their observations, ranked by relevance.
+    Applies multi-signal re-ranking (recency, project affinity, graph proximity,
+    observation richness, canonical facts, session context).
     """
     fts_q = _fts_query(query)
     with _get_conn() as conn:
@@ -1376,21 +1429,42 @@ def search_nodes(query: str) -> str:
                 "FROM entities e ORDER BY e.name LIMIT 50"
             ).fetchall()
         else:
-            # Single JOIN query instead of N+1 per-entity subqueries
+            # Fetch larger pool for re-ranking
+            try:
+                from smart_retrieval import RERANKING_POOL_SIZE
+                pool_size = RERANKING_POOL_SIZE
+            except Exception:
+                pool_size = 50
+
             rows = conn.execute(
                 "SELECT memory_fts.rowid AS eid, memory_fts.name, "
                 "memory_fts.entity_type, e.project, memory_fts.rank "
                 "FROM memory_fts "
                 "JOIN entities e ON e.id = memory_fts.rowid "
-                "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT 50",
-                (fts_q,),
+                "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT ?",
+                (fts_q, pool_size),
             ).fetchall()
 
         if not rows:
             return json.dumps({"entities": [], "query": query})
 
+        # Try smart re-ranking (L1), fallback to BM25 order
+        reranked = None
+        try:
+            from smart_retrieval import rerank_entities
+            reranked = rerank_entities(
+                conn, rows, current_project=project,
+                session_id=None, query_entity_ids=None, limit=50,
+            )
+        except Exception:
+            pass  # L1 re-ranking is optional — fallback to BM25
+
+        if reranked:
+            eids = [r["eid"] for r in reranked]
+        else:
+            eids = [r["eid"] for r in rows[:50]]
+
         # Batch-fetch observations for all matched entities in one query
-        eids = [r["eid"] for r in rows]
         ph = ",".join("?" * len(eids))
         obs_rows = conn.execute(
             f"SELECT entity_id, content FROM observations "
@@ -1404,15 +1478,39 @@ def search_nodes(query: str) -> str:
             obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
 
         results = []
-        for r in rows:
-            entity: dict[str, Any] = {
-                "name": r["name"],
-                "entityType": r["entity_type"],
-                "observations": obs_by_eid.get(r["eid"], []),
-            }
-            if r["project"]:
-                entity["project"] = r["project"]
-            results.append(entity)
+        if reranked:
+            for r in reranked:
+                entity: dict[str, Any] = {
+                    "name": r["name"],
+                    "entityType": r["entity_type"],
+                    "observations": obs_by_eid.get(r["eid"], []),
+                }
+                if r["project"]:
+                    entity["project"] = r["project"]
+                entity["_score"] = r["_score"]
+                results.append(entity)
+        else:
+            for r in rows[:50]:
+                entity = {
+                    "name": r["name"],
+                    "entityType": r["entity_type"],
+                    "observations": obs_by_eid.get(r["eid"], []),
+                }
+                if r["project"]:
+                    entity["project"] = r["project"]
+                results.append(entity)
+
+        # Log entity access for staleness tracking
+        now = _now()
+        try:
+            for eid in eids:
+                conn.execute(
+                    "INSERT INTO entity_access_log (entity_id, tool_name, accessed_at) "
+                    "VALUES (?, 'search_nodes', ?)",
+                    (eid, now),
+                )
+        except Exception:
+            pass  # access logging is optional
 
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
     return json.dumps({"entities": results, "query": query})
@@ -1475,6 +1573,19 @@ def open_nodes(names: list[str]) -> str:
                 }
                 for r in rel_rows
             ]
+
+        # Log entity access for staleness tracking
+        if found_ids:
+            now = _now()
+            try:
+                for eid in found_ids:
+                    conn.execute(
+                        "INSERT INTO entity_access_log (entity_id, tool_name, accessed_at) "
+                        "VALUES (?, 'open_nodes', ?)",
+                        (eid, now),
+                    )
+            except Exception:
+                pass  # access logging is optional
 
     return json.dumps({"entities": entities_out, "relations": relations_out})
 
@@ -1573,26 +1684,47 @@ def session_recall(last_n: int = 5) -> str:
 def search_by_project(query: str, project: str) -> str:
     """Search the knowledge graph scoped to a specific project.
 
-    Uses FTS5 BM25-ranked search, then filters results to entities
-    whose project field matches the given project.
+    Uses FTS5 BM25-ranked search filtered by project, then applies
+    multi-signal re-ranking for improved relevance.
     """
     fts_q = _fts_query(query)
     with _get_conn() as conn:
+        try:
+            from smart_retrieval import RERANKING_POOL_SIZE
+            pool_size = RERANKING_POOL_SIZE
+        except Exception:
+            pool_size = 50
+
         rows = conn.execute(
-            "SELECT memory_fts.rowid, memory_fts.name, memory_fts.entity_type, "
-            "memory_fts.observations_text, memory_fts.rank "
+            "SELECT memory_fts.rowid AS eid, memory_fts.name, memory_fts.entity_type, "
+            "entities.project, memory_fts.rank "
             "FROM memory_fts "
             "JOIN entities ON entities.id = memory_fts.rowid "
             "WHERE memory_fts MATCH ? AND entities.project = ? "
-            "ORDER BY memory_fts.rank LIMIT 50",
-            (fts_q, project),
+            "ORDER BY memory_fts.rank LIMIT ?",
+            (fts_q, project, pool_size),
         ).fetchall()
 
         if not rows:
             results = []
         else:
-            # Batch-fetch observations (avoids N+1 per-entity queries)
-            eids = [r["rowid"] for r in rows]
+            # Try smart re-ranking (L1)
+            reranked = None
+            try:
+                from smart_retrieval import rerank_entities
+                reranked = rerank_entities(
+                    conn, rows, current_project=project,
+                    session_id=None, query_entity_ids=None, limit=50,
+                )
+            except Exception:
+                pass
+
+            if reranked:
+                eids = [r["eid"] for r in reranked]
+            else:
+                eids = [r["eid"] for r in rows[:50]]
+
+            # Batch-fetch observations
             ph = ",".join("?" * len(eids))
             obs_rows = conn.execute(
                 f"SELECT entity_id, content FROM observations "
@@ -1603,15 +1735,27 @@ def search_by_project(query: str, project: str) -> str:
             for o in obs_rows:
                 obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
 
-            results = [
-                {
-                    "name": r["name"],
-                    "entityType": r["entity_type"],
-                    "project": project,
-                    "observations": obs_by_eid.get(r["rowid"], []),
-                }
-                for r in rows
-            ]
+            if reranked:
+                results = [
+                    {
+                        "name": r["name"],
+                        "entityType": r["entity_type"],
+                        "project": project,
+                        "observations": obs_by_eid.get(r["eid"], []),
+                        "_score": r["_score"],
+                    }
+                    for r in reranked
+                ]
+            else:
+                results = [
+                    {
+                        "name": r["name"],
+                        "entityType": r["entity_type"],
+                        "project": project,
+                        "observations": obs_by_eid.get(r["eid"], []),
+                    }
+                    for r in rows[:50]
+                ]
 
     logger.info(
         "search_by_project: query=%r project=%r matched=%d",
@@ -1620,6 +1764,56 @@ def search_by_project(query: str, project: str) -> str:
         len(results),
     )
     return json.dumps({"entities": results, "query": query, "project": project})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool: knowledge_health (L2b health sweep)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def knowledge_health(
+    include_duplicates: bool = True,
+    include_contradictions: bool = True,
+    include_stale: bool = True,
+    auto_promote: bool = False,
+) -> str:
+    """Run observation health scan and return findings.
+
+    Checks for near-duplicate observations, contradicting claims,
+    stale entities, and optionally auto-promotes high-confidence claims.
+    """
+    with _get_conn() as conn:
+        try:
+            from lazy_enrichment import (
+                detect_contradictions,
+                detect_near_duplicates,
+                detect_stale_entities,
+                promote_ready_claims,
+            )
+        except ImportError:
+            return json.dumps({"error": "lazy_enrichment module not available"})
+
+        report: dict[str, Any] = {}
+        if include_duplicates:
+            report["near_duplicates"] = detect_near_duplicates(conn)
+        if include_contradictions:
+            report["contradictions"] = detect_contradictions(conn)
+        if include_stale:
+            report["stale_entities"] = detect_stale_entities(conn)
+        if auto_promote:
+            report["promoted"] = promote_ready_claims(conn)
+        else:
+            report["promoted"] = []
+
+        report["summary"] = {
+            "duplicates_found": len(report.get("near_duplicates", [])),
+            "contradictions_found": len(report.get("contradictions", [])),
+            "stale_entities_found": len(report.get("stale_entities", [])),
+            "claims_promoted": len(report["promoted"]),
+        }
+
+    return json.dumps(report)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
