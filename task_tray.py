@@ -2479,8 +2479,7 @@ class FullWindow(QMainWindow):
 
         # B1: Per-tab view state dict (sort + filters per tab)
         self._tab_views = {
-            key: copy.deepcopy(_DEFAULT_TAB_VIEW)
-            for key in self._tab_keys
+            key: copy.deepcopy(_DEFAULT_TAB_VIEW) for key in self._tab_keys
         }
         self._current_tab_idx = 0  # track for state swapping on tab change
 
@@ -2516,14 +2515,22 @@ class FullWindow(QMainWindow):
                 raw_ex = self._settings.value("excluded_filters", "{}")
                 old_ef = json.loads(raw_ex) if isinstance(raw_ex, str) else {}
                 for v in self._tab_views.values():
-                    v["active"] = {k: set(old_af.get(k, [])) for k in ("priority", "due", "project")}
-                    v["excluded"] = {k: set(old_ef.get(k, [])) for k in ("priority", "due", "project")}
+                    v["active"] = {
+                        k: set(old_af.get(k, []))
+                        for k in ("priority", "due", "project")
+                    }
+                    v["excluded"] = {
+                        k: set(old_ef.get(k, []))
+                        for k in ("priority", "due", "project")
+                    }
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
 
         # Set working state from the initial tab
         self._saved_active_tab = int(self._settings.value("active_tab", 0))
-        initial_key = self._tab_keys[min(self._saved_active_tab, len(self._tab_keys) - 1)]
+        initial_key = self._tab_keys[
+            min(self._saved_active_tab, len(self._tab_keys) - 1)
+        ]
         if initial_key in self._tab_views:
             v = self._tab_views[initial_key]
             self._sort_mode = v["sort"]
@@ -2683,7 +2690,9 @@ class FullWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._filter_bar)
 
         # Hide sort/filter UI for fixed tabs on initial load
-        _initial_key = self._tab_keys[min(self._saved_active_tab, len(self._tab_keys) - 1)]
+        _initial_key = self._tab_keys[
+            min(self._saved_active_tab, len(self._tab_keys) - 1)
+        ]
         _is_fixed_initial = _initial_key in _FIXED_VIEW_TABS
         self._sort_btn.setVisible(not _is_fixed_initial)
 
@@ -2849,9 +2858,9 @@ class FullWindow(QMainWindow):
                             for k in ("priority", "due", "project")
                         }
                 # Sync working state from current tab
-                cur_key = self._tab_keys[min(
-                    getattr(self, "_saved_active_tab", 0), len(self._tab_keys) - 1
-                )]
+                cur_key = self._tab_keys[
+                    min(getattr(self, "_saved_active_tab", 0), len(self._tab_keys) - 1)
+                ]
                 if cur_key in self._tab_views:
                     v = self._tab_views[cur_key]
                     self._sort_mode = v["sort"]
@@ -3448,15 +3457,13 @@ class FullWindow(QMainWindow):
             return self._search_engine.search(q, tasks)
 
         af = active_filters if active_filters is not None else self._active_filters
-        ef = excluded_filters if excluded_filters is not None else self._excluded_filters
+        ef = (
+            excluded_filters if excluded_filters is not None else self._excluded_filters
+        )
 
         # ── Include filters (AND between dims, OR within dim) ──
         if af["priority"]:
-            tasks = [
-                t
-                for t in tasks
-                if t.get("priority", "medium") in af["priority"]
-            ]
+            tasks = [t for t in tasks if t.get("priority", "medium") in af["priority"]]
 
         due_inc = af["due"]
         due_exc = ef["due"]
@@ -3480,24 +3487,16 @@ class FullWindow(QMainWindow):
                 ]
 
         if af["project"]:
-            tasks = [
-                t for t in tasks if t.get("project") in af["project"]
-            ]
+            tasks = [t for t in tasks if t.get("project") in af["project"]]
 
         # ── Exclude filters (remove matching) ──
         if ef["priority"]:
             tasks = [
-                t
-                for t in tasks
-                if t.get("priority", "medium") not in ef["priority"]
+                t for t in tasks if t.get("priority", "medium") not in ef["priority"]
             ]
 
         if ef["project"]:
-            tasks = [
-                t
-                for t in tasks
-                if t.get("project") not in ef["project"]
-            ]
+            tasks = [t for t in tasks if t.get("project") not in ef["project"]]
 
         return tasks
 
@@ -3635,8 +3634,16 @@ class FullWindow(QMainWindow):
                 self._excluded_filters = copy.deepcopy(v["excluded"])
             else:
                 self._sort_mode = "priority"
-                self._active_filters = {"priority": set(), "due": set(), "project": set()}
-                self._excluded_filters = {"priority": set(), "due": set(), "project": set()}
+                self._active_filters = {
+                    "priority": set(),
+                    "due": set(),
+                    "project": set(),
+                }
+                self._excluded_filters = {
+                    "priority": set(),
+                    "due": set(),
+                    "project": set(),
+                }
 
             # Update sort button
             self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
@@ -3939,21 +3946,32 @@ class TaskTrayApp:
 
     def _on_quit(self):
         self._reminder_timer.stop()
+        if self._instance_socket:
+            self._instance_socket.close()
         self.db.close()
 
     def run(self):
         return self.app.exec()
 
 
-_INSTANCE_SOCK = "\0TaskTray_SingleInstance"
+_INSTANCE_TCP_PORT = 47831  # localhost-only, for Windows (no AF_UNIX)
+_USE_UNIX = hasattr(_socket, "AF_UNIX")
 
 
 def _try_single_instance():
     """If another instance is running, send SHOW signal and return None.
     Otherwise, bind the socket and return the server socket."""
+    if _USE_UNIX:
+        return _try_single_instance_unix()
+    return _try_single_instance_tcp()
+
+
+def _try_single_instance_unix():
+    """AF_UNIX variant (Linux): abstract namespace, zero cleanup."""
+    addr = "\0TaskTray_SingleInstance"
     try:
         client = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        client.connect(_INSTANCE_SOCK)
+        client.connect(addr)
         client.send(b"SHOW")
         client.close()
         return None
@@ -3961,7 +3979,30 @@ def _try_single_instance():
         pass
     srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     try:
-        srv.bind(_INSTANCE_SOCK)
+        srv.bind(addr)
+        srv.listen(1)
+        srv.setblocking(False)
+        return srv
+    except OSError:
+        srv.close()
+        raise
+
+
+def _try_single_instance_tcp():
+    """TCP localhost variant (Windows): no AF_UNIX available."""
+    addr = ("127.0.0.1", _INSTANCE_TCP_PORT)
+    try:
+        client = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        client.connect(addr)
+        client.send(b"SHOW")
+        client.close()
+        return None
+    except (ConnectionRefusedError, OSError):
+        pass
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(addr)
         srv.listen(1)
         srv.setblocking(False)
         return srv
