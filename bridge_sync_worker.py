@@ -127,28 +127,35 @@ def _check_sync_safety(
 
 
 def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
-    """Import entities from remote shared.json that don't exist locally."""
+    """Import entities from remote shared.json that don't exist locally.
+
+    Per-entity error handling: one bad entity does not abort the rest.
+    """
     imported = 0
     for e in entities:
-        existing = conn.execute(
-            "SELECT id FROM entities WHERE name = ?", (e["name"],)
-        ).fetchone()
-        if existing:
+        try:
+            existing = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (e["name"],)
+            ).fetchone()
+            if existing:
+                continue
+            now = now_iso()
+            eid = conn.execute(
+                "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (e["name"], e["entityType"], e.get("project") or "shared:bridge", now, now),
+            ).lastrowid
+            for o in e.get("observations", []):
+                conn.execute(
+                    "INSERT INTO observations (entity_id, content, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (eid, o["content"], o.get("createdAt", now)),
+                )
+            fts_sync_entity(conn, eid)
+            imported += 1
+        except Exception as exc:
+            log.warning("Entity import failed for %s: %s", e.get("name"), exc)
             continue
-        now = now_iso()
-        eid = conn.execute(
-            "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (e["name"], e["entityType"], e.get("project") or "shared:bridge", now, now),
-        ).lastrowid
-        for o in e.get("observations", []):
-            conn.execute(
-                "INSERT INTO observations (entity_id, content, created_at) "
-                "VALUES (?, ?, ?)",
-                (eid, o["content"], o.get("createdAt", now)),
-            )
-        fts_sync_entity(conn, eid)
-        imported += 1
     return imported
 
 
@@ -306,6 +313,22 @@ def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict
     return tasks_out
 
 
+def _merge_remote_entities(entities_out: list, existing_data: dict) -> list:
+    """Keep remote entities missing from local export.
+
+    Mirrors _merge_remote_tasks — prevents overwriting remote-only entities
+    when local export doesn't contain them (e.g. Win pushed entities that
+    fedora hasn't imported yet).
+    """
+    remote_entities = existing_data.get("entities", [])
+    local_names = {e["name"] for e in entities_out}
+    for re in remote_entities:
+        if re.get("name") and re["name"] not in local_names:
+            entities_out.append(re)
+            local_names.add(re["name"])
+    return entities_out
+
+
 # ── Main entry point ────────────────────────────────────────────────────
 
 
@@ -353,25 +376,30 @@ def main(
             "imported_updated": 0,
         }
 
-    # Phase 3a: Import (write transaction)
+    # Phase 3a-1: Import entities (own transaction — survives task merge failures)
+    shared_path = Path(bridge_dir) / "shared.json"
+    index_path = Path(bridge_dir) / "index.json"
+    new_t, upd_t = 0, 0
+
+    migrate_to_per_task_files(bridge_dir)
+
     with get_conn(_db_path) as conn:
-        migrate_to_per_task_files(bridge_dir)
-
-        _progress(progress_callback, 10, "Importing remote data...")
-        shared_path = Path(bridge_dir) / "shared.json"
-        index_path = Path(bridge_dir) / "index.json"
-        new_t, upd_t = 0, 0
-
+        _progress(progress_callback, 10, "Importing remote entities...")
         if shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                try:
-                    _import_remote_entities(conn, remote_data.get("entities", []))
-                except Exception as exc:
-                    log.warning("Entity import failed: %s", exc)
-            except (json.JSONDecodeError, OSError):
-                pass
+                n_ent_imported = _import_remote_entities(
+                    conn, remote_data.get("entities", [])
+                )
+                if n_ent_imported:
+                    log.info("Imported %d remote entities", n_ent_imported)
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("shared.json read failed for entity import: %s", exc)
+    # Entity import transaction closed — entities committed independently
 
+    # Phase 3a-2: Import tasks (own transaction — entity imports safe even if this fails)
+    with get_conn(_db_path) as conn:
+        _progress(progress_callback, 15, "Importing remote tasks...")
         if index_path.exists():
             try:
                 idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
@@ -398,7 +426,7 @@ def main(
                     conn, remote_tasks, import_content=True
                 )
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
-            except (json.JSONDecodeError, OSError) as exc:
+            except Exception as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
             try:
@@ -407,9 +435,9 @@ def main(
                     conn, remote_data.get("tasks", []), import_content=True
                 )
                 log.info("Imported %d new, updated %d from remote", new_t, upd_t)
-            except (json.JSONDecodeError, OSError):
-                pass
-    # Import transaction closed — DB lock released
+            except Exception as exc:
+                log.warning("Task merge from shared.json failed: %s", exc)
+    # Task import transaction closed — DB lock released
 
     # Safety valve: check BEFORE export (bridge files still contain remote data)
     if not force:
@@ -514,6 +542,10 @@ def main(
             existing = _json_loads(shared_path.read_text(encoding="utf-8"))
             if not index_path.exists():
                 _merge_remote_tasks(tasks_out, existing)
+
+            # Preserve remote-only entities (e.g. pushed by another machine
+            # but not yet imported locally)
+            _merge_remote_entities(entities_out, existing)
 
             if "ui_profiles" in existing:
                 payload["ui_profiles"] = existing["ui_profiles"]
