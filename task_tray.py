@@ -3050,44 +3050,13 @@ class FullWindow(QMainWindow):
         self._sync_label.show()
 
     def _sync_bridge(self):
-        """Enrich (if configured) then sync memory bridge (pull + push + shared.js)."""
+        """Sync memory bridge (pull + push + shared.json)."""
         if not os.path.isdir(self._BRIDGE_DIR):
             self.status.showMessage("Bridge dir not found", 3000)
             return
 
         def _run():
             try:
-                # ── Auto-enrich BEFORE sync so enriched data is included in push ──
-                auto_depth = self._settings.value("auto_enrich_depth", "off")
-                if auto_depth != "off":
-                    self._enrich_running.emit(f"Pre-sync enrich ({auto_depth})...")
-                    try:
-                        from intelligence_v2 import assess_context as _assess
-                        from claim_graph import extract_candidate_claims as _extract
-                        from context_packer import build_context_pack as _pack
-                        from impact_graph import explain_impact as _impact
-
-                        with get_conn(self.db.db_path) as econn:
-                            enrichable = econn.execute(
-                                "SELECT chunk_id FROM context_chunks "
-                                "WHERE state = 'enrichable' LIMIT 20"
-                            ).fetchall()
-                            for row in enrichable:
-                                _assess(econn, row["chunk_id"])
-                            _pack(econn, "executor")
-                            if auto_depth in ("standard", "deep"):
-                                for row in enrichable:
-                                    _extract(econn, row["chunk_id"])
-                            if auto_depth == "deep":
-                                for f in econn.execute(
-                                    "SELECT fact_id FROM canonical_facts "
-                                    "WHERE updated_at >= datetime('now', '-7 days') "
-                                    "LIMIT 10"
-                                ).fetchall():
-                                    _impact(econn, "fact", f["fact_id"])
-                    except Exception:
-                        pass  # Enrich failure must not block sync
-
                 import bridge_sync_worker
 
                 stats = bridge_sync_worker.main(
@@ -3099,9 +3068,12 @@ class FullWindow(QMainWindow):
                 # Patch UI profile into shared.json (tray-specific, no extra commit)
                 self._patch_ui_profile()
 
-                n_ent = stats.get("entities", 0)
-                n_tasks = stats.get("tasks", 0)
-                self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
+                if stats.get("skipped"):
+                    self._bridge_done.emit("Already in sync — no changes to push")
+                else:
+                    n_ent = stats.get("entities", 0)
+                    n_tasks = stats.get("tasks", 0)
+                    self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
             except Exception as exc:
                 self._bridge_done.emit(f"Sync error: {exc}")
 

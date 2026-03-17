@@ -390,16 +390,22 @@ def main(
                         if content.get("description") or content.get("notes"):
                             enriched += 1
                 if enriched:
-                    log.info("Enriched %d tasks with content from per-task files", enriched)
+                    log.info(
+                        "Enriched %d tasks with content from per-task files", enriched
+                    )
 
-                new_t, upd_t = merge_import_tasks(conn, remote_tasks, import_content=True)
+                new_t, upd_t = merge_import_tasks(
+                    conn, remote_tasks, import_content=True
+                )
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                new_t, upd_t = merge_import_tasks(conn, remote_data.get("tasks", []), import_content=True)
+                new_t, upd_t = merge_import_tasks(
+                    conn, remote_data.get("tasks", []), import_content=True
+                )
                 log.info("Imported %d new, updated %d from remote", new_t, upd_t)
             except (json.JSONDecodeError, OSError):
                 pass
@@ -431,6 +437,39 @@ def main(
                 "blocked_by_safety": True,
                 "safety": safety,
             }
+
+    # Incremental check: skip export+push if nothing changed since last push
+    if not force:
+        try:
+            with get_conn(_db_path) as conn:
+                meta_row = conn.execute(
+                    "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+                ).fetchone()
+                if meta_row:
+                    last_push_at = meta_row["value"]
+                    chk = conn.execute(
+                        "SELECT "
+                        "  (SELECT COUNT(*) FROM tasks WHERE updated_at > ?) AS ct, "
+                        "  (SELECT COUNT(*) FROM entities WHERE updated_at > ?) AS ce, "
+                        "  (SELECT COUNT(*) FROM entities "
+                        "   WHERE visibility = 'pending_public') AS pp",
+                        (last_push_at, last_push_at),
+                    ).fetchone()
+                    if chk["ct"] == 0 and chk["ce"] == 0 and chk["pp"] == 0:
+                        log.info(
+                            "No changes since %s — skipping export+push", last_push_at
+                        )
+                        _progress(progress_callback, 100, "No changes — skipped push")
+                        return {
+                            "entities": 0,
+                            "tasks": 0,
+                            "pushed": False,
+                            "imported_new": new_t,
+                            "imported_updated": upd_t,
+                            "skipped": True,
+                        }
+        except Exception:
+            pass  # bridge_meta may not exist yet — push normally
 
     # Phase 3b: Export (read-only, separate short transaction)
     with get_conn(_db_path) as conn:
@@ -509,15 +548,33 @@ def main(
     push_result = _git("push", bridge_dir=bridge_dir)
     pushed = push_result.returncode == 0
 
+    # Record last_push_at so incremental check can skip next time
+    if pushed:
+        with get_conn(_db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO bridge_meta(key, value) "
+                "VALUES('last_push_at', ?)",
+                (now_iso(),),
+            )
+
     # Deploy to Cloudflare Pages (auto-update after push)
     deployed = False
     if pushed:
         _progress(progress_callback, 97, "CF Pages deploy...")
         try:
             deploy_result = subprocess.run(
-                ["wrangler", "pages", "deploy", bridge_dir,
-                 "--project-name=memory-bridge", "--branch=main"],
-                capture_output=True, text=True, timeout=60, **_NOWIN,
+                [
+                    "wrangler",
+                    "pages",
+                    "deploy",
+                    bridge_dir,
+                    "--project-name=memory-bridge",
+                    "--branch=main",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                **_NOWIN,
             )
             deployed = deploy_result.returncode == 0
             if not deployed:
