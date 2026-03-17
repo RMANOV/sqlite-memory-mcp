@@ -1,4 +1,5 @@
 """Tests for lazy_enrichment.py — L2 inline claim extraction + health sweep."""
+
 import os
 import sqlite3
 import sys
@@ -8,9 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 
 from lazy_enrichment import (
-    AUTO_PROMOTE_THRESHOLD,
-    EVIDENCE_BOOST_PER,
-    REJECTION_PENALTY,
     auto_promote_claim,
     detect_contradictions,
     detect_near_duplicates,
@@ -90,7 +88,13 @@ def conn():
     db.close()
 
 
-def _add_entity(conn, name, entity_type="concept", project=None, updated_at="2026-03-01T00:00:00+00:00"):
+def _add_entity(
+    conn,
+    name,
+    entity_type="concept",
+    project=None,
+    updated_at="2026-03-01T00:00:00+00:00",
+):
     conn.execute(
         "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -111,9 +115,13 @@ class TestInlineExtraction:
     def test_basic_extraction(self, conn):
         eid = _add_entity(conn, "TestProject")
         obs_id = _add_obs(conn, eid, "TestProject uses Python for backend processing.")
-        count = extract_inline_claims(conn, eid, obs_id, "TestProject uses Python for backend processing.")
+        count = extract_inline_claims(
+            conn, eid, obs_id, "TestProject uses Python for backend processing."
+        )
         assert count >= 1
-        claims = conn.execute("SELECT * FROM lazy_claims WHERE entity_id = ?", (eid,)).fetchall()
+        claims = conn.execute(
+            "SELECT * FROM lazy_claims WHERE entity_id = ?", (eid,)
+        ).fetchall()
         assert len(claims) >= 1
         claim = claims[0]
         assert claim["predicate"] == "uses"
@@ -122,7 +130,9 @@ class TestInlineExtraction:
     def test_no_match(self, conn):
         eid = _add_entity(conn, "TestEntity")
         obs_id = _add_obs(conn, eid, "Just a plain observation with no patterns.")
-        count = extract_inline_claims(conn, eid, obs_id, "Just a plain observation with no patterns.")
+        count = extract_inline_claims(
+            conn, eid, obs_id, "Just a plain observation with no patterns."
+        )
         assert count == 0
 
     def test_evidence_accumulation(self, conn):
@@ -149,11 +159,15 @@ class TestInlineExtraction:
         extract_inline_claims(conn, eid, obs_id, "TestTool uses Docker for deployment.")
 
         # Manually reject the claim
-        conn.execute("UPDATE lazy_claims SET status = 'rejected' WHERE entity_id = ?", (eid,))
+        conn.execute(
+            "UPDATE lazy_claims SET status = 'rejected' WHERE entity_id = ?", (eid,)
+        )
 
         # Re-extract: should get penalty
         obs_id2 = _add_obs(conn, eid, "TestTool uses Docker for deployment again.")
-        extract_inline_claims(conn, eid, obs_id2, "TestTool uses Docker for deployment.")
+        extract_inline_claims(
+            conn, eid, obs_id2, "TestTool uses Docker for deployment."
+        )
         claim = conn.execute(
             "SELECT confidence FROM lazy_claims WHERE entity_id = ? AND status = 'rejected'",
             (eid,),
@@ -187,12 +201,16 @@ class TestAutoPromotion:
         assert fact_id.startswith("lf-")
 
         # Check claim status updated
-        claim = conn.execute("SELECT * FROM lazy_claims WHERE claim_id = 'test-claim'").fetchone()
+        claim = conn.execute(
+            "SELECT * FROM lazy_claims WHERE claim_id = 'test-claim'"
+        ).fetchone()
         assert claim["status"] == "promoted"
         assert claim["promoted_to_fact_id"] == fact_id
 
         # Check canonical fact created
-        fact = conn.execute("SELECT * FROM canonical_facts WHERE fact_id = ?", (fact_id,)).fetchone()
+        fact = conn.execute(
+            "SELECT * FROM canonical_facts WHERE fact_id = ?", (fact_id,)
+        ).fetchone()
         assert fact["subject"] == "StableProject"
         assert fact["validation_mode"] == "auto_lazy"
 
@@ -215,8 +233,16 @@ class TestAutoPromotion:
 class TestNearDuplicates:
     def test_detect_similar_observations(self, conn):
         eid = _add_entity(conn, "DupEntity")
-        _add_obs(conn, eid, "The server uses PostgreSQL database for persistent storage of user data.")
-        _add_obs(conn, eid, "The server uses PostgreSQL database for persistent storage of all user data.")
+        _add_obs(
+            conn,
+            eid,
+            "The server uses PostgreSQL database for persistent storage of user data.",
+        )
+        _add_obs(
+            conn,
+            eid,
+            "The server uses PostgreSQL database for persistent storage of all user data.",
+        )
 
         dups = detect_near_duplicates(conn)
         assert len(dups) >= 1
@@ -316,7 +342,9 @@ class TestHealthSweep:
     def test_full_sweep(self, conn):
         eid = _add_entity(conn, "SweepEntity", updated_at="2025-01-01T00:00:00+00:00")
         _add_obs(conn, eid, "SweepEntity uses Python for processing data effectively.")
-        _add_obs(conn, eid, "SweepEntity uses Python for processing data very effectively.")
+        _add_obs(
+            conn, eid, "SweepEntity uses Python for processing data very effectively."
+        )
 
         report = run_health_sweep(conn)
         assert "summary" in report

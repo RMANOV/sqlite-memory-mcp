@@ -465,6 +465,8 @@ class _ClickableLabel(QLabel):
 class _TooltipCopyFilter(QObject):
     """Copies full task summary to clipboard when tooltip is about to show."""
 
+    _last_copied_id = None  # class-level debounce
+
     def __init__(self, task, parent=None):
         super().__init__(parent)
         self._task = task
@@ -472,19 +474,70 @@ class _TooltipCopyFilter(QObject):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.ToolTip:
             t = self._task
-            parts = [t["title"]]
-            if t.get("description"):
-                parts.append(t["description"])
-            if t.get("priority"):
-                parts.append(f"Priority: {t['priority']}")
-            if t.get("due_date"):
-                parts.append(f"Due: {t['due_date']}")
-            if t.get("project"):
-                parts.append(f"Project: {t['project']}")
-            if t.get("section"):
-                parts.append(f"Section: {t['section']}")
-            QApplication.clipboard().setText("\n".join(parts))
+            tid = t.get("id")
+            if tid != _TooltipCopyFilter._last_copied_id:
+                QApplication.clipboard().setText(_build_copy_text(t))
+                _TooltipCopyFilter._last_copied_id = tid
         return False  # let tooltip show normally
+
+
+def _build_rich_tooltip(task):
+    """Build consistent rich tooltip for task display."""
+    parts = []
+    rl = _recurring_label(task.get("recurring"))
+    if rl:
+        parts.append(f"\U0001f504 {rl}")
+    if task.get("description"):
+        parts.append(task["description"])
+    if task.get("priority"):
+        parts.append(f"Priority: {task['priority']}")
+    if task.get("due_date"):
+        parts.append(f"Due: {task['due_date']}")
+    if task.get("project"):
+        parts.append(f"Project: {task['project']}")
+    if task.get("section"):
+        parts.append(f"Section: {task['section']}")
+    return "\n".join(parts) if parts else None
+
+
+def _build_copy_text(task):
+    """Build clipboard text for task (title always included)."""
+    parts = [task["title"]]
+    if task.get("description"):
+        parts.append(task["description"])
+    if task.get("priority"):
+        parts.append(f"Priority: {task['priority']}")
+    if task.get("due_date"):
+        parts.append(f"Due: {task['due_date']}")
+    if task.get("project"):
+        parts.append(f"Project: {task['project']}")
+    if task.get("section"):
+        parts.append(f"Section: {task['section']}")
+    return "\n".join(parts)
+
+
+class _ListTooltipCopyFilter(QObject):
+    """Copies task summary to clipboard when hovering items in TaskListWidget."""
+
+    def __init__(self, list_widget, parent=None):
+        super().__init__(parent)
+        self._list = list_widget
+        self._last_copied_id = None
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ToolTip:
+            item = self._list.itemAt(event.pos())
+            if item:
+                task_id = item.data(Qt.ItemDataRole.UserRole)
+                if task_id and task_id != self._last_copied_id:
+                    task = next(
+                        (t for t in self._list._tasks if t["id"] == task_id),
+                        None,
+                    )
+                    if task:
+                        QApplication.clipboard().setText(_build_copy_text(task))
+                        self._last_copied_id = task_id
+        return False
 
 
 def create_tray_icon_pixmap(overdue_count=0):
@@ -1127,16 +1180,9 @@ class TrayPopup(QWidget):
         plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, '#718096')};")
         hl.addWidget(plbl)
 
-        # Build rich tooltip with all task details
-        tip_parts = []
-        if task.get("description"):
-            tip_parts.append(task["description"])
-        if task.get("due_date"):
-            tip_parts.append(f"Due: {task['due_date']}")
-        if task.get("project"):
-            tip_parts.append(f"Project: {task['project']}")
-        if tip_parts:
-            row.setToolTip("\n".join(tip_parts))
+        tip = _build_rich_tooltip(task)
+        if tip:
+            row.setToolTip(tip)
         row.installEventFilter(_TooltipCopyFilter(task, row))
 
         return row
@@ -1821,17 +1867,11 @@ class TaskListWidget(QListWidget):
         self.customContextMenuRequested.connect(self._context_menu)
         self._tasks = []
         self._last_fp = None  # fingerprint for skip-if-unchanged
+        self.installEventFilter(_ListTooltipCopyFilter(self, self))
 
     @staticmethod
     def _build_tooltip(task):
-        parts = []
-        rl = _recurring_label(task.get("recurring"))
-        if rl:
-            parts.append(f"\U0001f504 {rl}")
-        desc = task.get("description")
-        if desc:
-            parts.append(desc)
-        return "\n".join(parts) if parts else None
+        return _build_rich_tooltip(task)
 
     @staticmethod
     def _fingerprint(tasks):

@@ -1,4 +1,5 @@
 """Tests for smart_retrieval.py — L1 multi-signal re-ranking."""
+
 import os
 import sys
 
@@ -6,7 +7,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from smart_retrieval import (
     RERANKING_POOL_SIZE,
@@ -54,9 +54,7 @@ class TestCompositeScore:
 
     def test_project_boost(self):
         now = datetime.now(timezone.utc).isoformat()
-        base = compute_composite_score(
-            -5.0, now, "proj-a", None, 5, 0, False, False
-        )
+        base = compute_composite_score(-5.0, now, "proj-a", None, 5, 0, False, False)
         boosted = compute_composite_score(
             -5.0, now, "proj-a", "proj-a", 5, 0, False, False
         )
@@ -65,59 +63,37 @@ class TestCompositeScore:
 
     def test_graph_proximity_1hop(self):
         now = datetime.now(timezone.utc).isoformat()
-        base = compute_composite_score(
-            -5.0, now, None, None, 5, 0, False, False
-        )
-        one_hop = compute_composite_score(
-            -5.0, now, None, None, 5, 1, False, False
-        )
+        base = compute_composite_score(-5.0, now, None, None, 5, 0, False, False)
+        one_hop = compute_composite_score(-5.0, now, None, None, 5, 1, False, False)
         assert one_hop > base
 
     def test_graph_proximity_2hop(self):
         now = datetime.now(timezone.utc).isoformat()
-        one_hop = compute_composite_score(
-            -5.0, now, None, None, 5, 1, False, False
-        )
-        two_hop = compute_composite_score(
-            -5.0, now, None, None, 5, 2, False, False
-        )
+        one_hop = compute_composite_score(-5.0, now, None, None, 5, 1, False, False)
+        two_hop = compute_composite_score(-5.0, now, None, None, 5, 2, False, False)
         assert one_hop > two_hop  # 1-hop boost > 2-hop boost
 
     def test_fact_boost(self):
         now = datetime.now(timezone.utc).isoformat()
-        no_facts = compute_composite_score(
-            -5.0, now, None, None, 5, 0, False, False
-        )
-        with_facts = compute_composite_score(
-            -5.0, now, None, None, 5, 0, True, False
-        )
+        no_facts = compute_composite_score(-5.0, now, None, None, 5, 0, False, False)
+        with_facts = compute_composite_score(-5.0, now, None, None, 5, 0, True, False)
         assert with_facts > no_facts
 
     def test_session_boost(self):
         now = datetime.now(timezone.utc).isoformat()
-        no_session = compute_composite_score(
-            -5.0, now, None, None, 5, 0, False, False
-        )
-        in_session = compute_composite_score(
-            -5.0, now, None, None, 5, 0, False, True
-        )
+        no_session = compute_composite_score(-5.0, now, None, None, 5, 0, False, False)
+        in_session = compute_composite_score(-5.0, now, None, None, 5, 0, False, True)
         assert in_session > no_session
 
     def test_zero_obs(self):
         now = datetime.now(timezone.utc).isoformat()
-        score = compute_composite_score(
-            -5.0, now, None, None, 0, 0, False, False
-        )
+        score = compute_composite_score(-5.0, now, None, None, 0, 0, False, False)
         assert score > 0  # Should not be zero
 
     def test_richness_increases_with_obs(self):
         now = datetime.now(timezone.utc).isoformat()
-        few = compute_composite_score(
-            -5.0, now, None, None, 1, 0, False, False
-        )
-        many = compute_composite_score(
-            -5.0, now, None, None, 50, 0, False, False
-        )
+        few = compute_composite_score(-5.0, now, None, None, 1, 0, False, False)
+        many = compute_composite_score(-5.0, now, None, None, 50, 0, False, False)
         assert many > few
 
 

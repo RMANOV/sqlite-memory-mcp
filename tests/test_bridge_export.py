@@ -1,5 +1,6 @@
 # tests/test_bridge_export.py
 """Unit tests for bridge export functions: export_task_files, export_index_json."""
+
 import json
 import os
 import sys
@@ -10,7 +11,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from db_utils import (
-    MERGEABLE_FIELDS,
     export_index_json,
     export_task_files,
     json_loads,
@@ -100,9 +100,7 @@ def setup(tmp_path):
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(
-        _TASKS_DDL + _FIELD_VERSIONS_DDL + _ENTITIES_DDL + _LINKS_DDL
-    )
+    conn.executescript(_TASKS_DDL + _FIELD_VERSIONS_DDL + _ENTITIES_DDL + _LINKS_DDL)
     conn.execute("BEGIN")
     yield conn, bridge_dir
     conn.execute("COMMIT")
@@ -134,7 +132,9 @@ class TestExportTaskFiles:
         export_task_files(conn, bridge_dir)
 
         data = json_loads(
-            open(os.path.join(bridge_dir, "tasks", "task-001.json"), encoding="utf-8").read()
+            open(
+                os.path.join(bridge_dir, "tasks", "task-001.json"), encoding="utf-8"
+            ).read()
         )
         assert data["id"] == "task-001"
         assert data["title"] == "Buy milk"
@@ -146,7 +146,7 @@ class TestExportTaskFiles:
         """Archived and cancelled tasks are not exported."""
         conn, bridge_dir = setup
         _insert_task(conn, "task-active", "Active task")
-        _insert_task(conn, "task-arch",   "Archived task",  status="archived")
+        _insert_task(conn, "task-arch", "Archived task", status="archived")
         _insert_task(conn, "task-cancel", "Cancelled task", status="cancelled")
 
         exported = export_task_files(conn, bridge_dir)
@@ -164,7 +164,11 @@ class TestExportTaskFiles:
         # Pre-seed bridge file with a description
         tasks_dir = os.path.join(bridge_dir, "tasks")
         os.makedirs(tasks_dir, exist_ok=True)
-        existing = {"id": "task-001", "description": "Bridge-written content", "notes": None}
+        existing = {
+            "id": "task-001",
+            "description": "Bridge-written content",
+            "notes": None,
+        }
         open(os.path.join(tasks_dir, "task-001.json"), "w", encoding="utf-8").write(
             json.dumps(existing)
         )
@@ -183,7 +187,11 @@ class TestExportTaskFiles:
 
         tasks_dir = os.path.join(bridge_dir, "tasks")
         os.makedirs(tasks_dir, exist_ok=True)
-        existing = {"id": "task-001", "description": "Old bridge description", "notes": None}
+        existing = {
+            "id": "task-001",
+            "description": "Old bridge description",
+            "notes": None,
+        }
         open(os.path.join(tasks_dir, "task-001.json"), "w", encoding="utf-8").write(
             json.dumps(existing)
         )
@@ -242,12 +250,20 @@ class TestExportTaskFiles:
         """_field_ts in per-task file contains version entries for seeded fields."""
         conn, bridge_dir = setup
         _insert_task(conn, "task-001", "Task with versions")
-        upsert_field_versions(conn, "task-001", ("title", "status"), timestamp="2026-01-01T00:00:00+00:00", machine_id="testmachine")
+        upsert_field_versions(
+            conn,
+            "task-001",
+            ("title", "status"),
+            timestamp="2026-01-01T00:00:00+00:00",
+            machine_id="testmachine",
+        )
 
         export_task_files(conn, bridge_dir)
 
         data = json_loads(
-            open(os.path.join(bridge_dir, "tasks", "task-001.json"), encoding="utf-8").read()
+            open(
+                os.path.join(bridge_dir, "tasks", "task-001.json"), encoding="utf-8"
+            ).read()
         )
         fts = data["_field_ts"]
         assert "title" in fts
@@ -297,7 +313,7 @@ class TestExportIndexJson:
         """Archived tasks are not in the main tasks list (only as tombstones)."""
         conn, bridge_dir = setup
         _insert_task(conn, "task-active", "Active")
-        _insert_task(conn, "task-arch",   "Archived", status="archived")
+        _insert_task(conn, "task-arch", "Archived", status="archived")
 
         export_index_json(conn, bridge_dir)
 
@@ -328,7 +344,9 @@ class TestExportIndexJson:
         conn, bridge_dir = setup
         _insert_task(conn, "task-001", "Versioned task")
         upsert_field_versions(
-            conn, "task-001", ("title",),
+            conn,
+            "task-001",
+            ("title",),
             timestamp="2026-02-01T00:00:00+00:00",
             machine_id="machine-x",
         )
@@ -340,7 +358,10 @@ class TestExportIndexJson:
         )
         task_entry = next(t for t in idx["tasks"] if t["id"] == "task-001")
         assert "_field_ts" in task_entry
-        assert task_entry["_field_ts"].get("title") == ["2026-02-01T00:00:00+00:00", "machine-x"]
+        assert task_entry["_field_ts"].get("title") == [
+            "2026-02-01T00:00:00+00:00",
+            "machine-x",
+        ]
 
     def test_index_returns_correct_count(self, setup):
         """Return value equals total tasks in index (active + tombstones)."""

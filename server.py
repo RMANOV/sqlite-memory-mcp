@@ -1145,6 +1145,7 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                 if new_obs_ids:
                     try:
                         from lazy_enrichment import extract_inline_claims
+
                         for obs_id, obs_text in new_obs_ids:
                             extract_inline_claims(conn, eid, obs_id, obs_text)
                     except Exception:
@@ -1189,6 +1190,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
             if contents:
                 try:
                     from lazy_enrichment import extract_inline_claims
+
                     for content in contents:
                         obs_row = conn.execute(
                             "SELECT id FROM observations WHERE entity_id = ? AND content = ?",
@@ -1432,6 +1434,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
             # Fetch larger pool for re-ranking
             try:
                 from smart_retrieval import RERANKING_POOL_SIZE
+
                 pool_size = RERANKING_POOL_SIZE
             except Exception:
                 pool_size = 50
@@ -1452,9 +1455,14 @@ def search_nodes(query: str, project: str | None = None) -> str:
         reranked = None
         try:
             from smart_retrieval import rerank_entities
+
             reranked = rerank_entities(
-                conn, rows, current_project=project,
-                session_id=None, query_entity_ids=None, limit=50,
+                conn,
+                rows,
+                current_project=project,
+                session_id=None,
+                query_entity_ids=None,
+                limit=50,
             )
         except Exception:
             pass  # L1 re-ranking is optional — fallback to BM25
@@ -1691,6 +1699,7 @@ def search_by_project(query: str, project: str) -> str:
     with _get_conn() as conn:
         try:
             from smart_retrieval import RERANKING_POOL_SIZE
+
             pool_size = RERANKING_POOL_SIZE
         except Exception:
             pool_size = 50
@@ -1712,9 +1721,14 @@ def search_by_project(query: str, project: str) -> str:
             reranked = None
             try:
                 from smart_retrieval import rerank_entities
+
                 reranked = rerank_entities(
-                    conn, rows, current_project=project,
-                    session_id=None, query_entity_ids=None, limit=50,
+                    conn,
+                    rows,
+                    current_project=project,
+                    session_id=None,
+                    query_entity_ids=None,
+                    limit=50,
                 )
             except Exception:
                 pass
@@ -4318,7 +4332,7 @@ def bridge_pull() -> str:
     if not Path(BRIDGE_REPO).is_dir():
         return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}"})
 
-    pull_result = _git("pull", "--rebase")
+    pull_result = _git("pull", "--rebase", "--autostash")
     if pull_result.returncode != 0:
         logger.warning("bridge_pull: git pull failed, proceeding with local copy")
 
