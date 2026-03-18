@@ -14,7 +14,6 @@ import logging
 import socket
 import sqlite3
 import subprocess
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -24,6 +23,9 @@ from db_utils import (
     DB_PATH,
     PUBLISH_STANDBY_MINUTES,
     TASK_EXPORT_COLS,
+    _NOWIN,
+    serialize_entity,
+    export_relations,
     now_iso,
     sanitize_task_enums,
     # v2.0.0: Bridge Sync v2 — per-field LWW
@@ -40,11 +42,6 @@ from db_utils import (
 )
 
 log = logging.getLogger("bridge_sync_worker")
-
-# Suppress console windows on Windows
-_NOWIN: dict = (
-    {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
-)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -168,49 +165,13 @@ def _export_entities(conn: sqlite3.Connection) -> tuple[list, set]:
     entities, ids = [], set()
     for e in rows:
         ids.add(e["id"])
-        obs = conn.execute(
-            "SELECT content, created_at FROM observations "
-            "WHERE entity_id = ? ORDER BY id",
-            (e["id"],),
-        ).fetchall()
-        entities.append(
-            {
-                "name": e["name"],
-                "entityType": e["entity_type"],
-                "project": e["project"],
-                "observations": [
-                    {"content": o["content"], "createdAt": o["created_at"]} for o in obs
-                ],
-                "createdAt": e["created_at"],
-                "updatedAt": e["updated_at"],
-            }
-        )
+        entities.append(serialize_entity(conn, e, include_timestamps=True))
     return entities, ids
 
 
 def _export_relations(conn: sqlite3.Connection, entity_ids: set) -> list:
     """Export relations between shared entities."""
-    if not entity_ids:
-        return []
-    ph = ",".join("?" * len(entity_ids))
-    ids = list(entity_ids)
-    rows = conn.execute(
-        f"SELECT ef.name AS from_name, et.name AS to_name, "
-        f"r.relation_type, r.created_at FROM relations r "
-        f"JOIN entities ef ON r.from_id = ef.id "
-        f"JOIN entities et ON r.to_id = et.id "
-        f"WHERE r.from_id IN ({ph}) AND r.to_id IN ({ph})",
-        ids + ids,
-    ).fetchall()
-    return [
-        {
-            "from": r["from_name"],
-            "to": r["to_name"],
-            "relationType": r["relation_type"],
-            "createdAt": r["created_at"],
-        }
-        for r in rows
-    ]
+    return export_relations(conn, entity_ids, include_timestamps=True)
 
 
 def _export_tasks(conn: sqlite3.Connection) -> list[dict]:

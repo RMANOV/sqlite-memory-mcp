@@ -26,70 +26,12 @@ from db_utils import (
     TASK_STATUSES as _TASK_STATUSES,
     TASK_TYPES as _TASK_TYPES,
     MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
+    validate_recurring as _validate_recurring,
+    validate_task_fields as _validate_task_fields,
     build_priority_order_sql,
     now_iso as _now,
     upsert_field_versions as _upsert_field_versions,
 )
-
-# ── Recurring task validation (copied from server.py) ────────────────────
-_RECURRING_EVERY = ("day", "week", "month", "year")
-_RECURRING_WEEKDAYS = frozenset(
-    ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-)
-
-
-def _validate_recurring(raw: str) -> str | None:
-    """Validate recurring JSON config. Returns error message or None if valid."""
-    try:
-        config = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return f"Invalid JSON: {raw!r}"
-    if not isinstance(config, dict):
-        return "Recurring config must be a JSON object"
-    every = config.get("every", "").lower()
-    if every not in _RECURRING_EVERY:
-        return f"Invalid 'every': {every}. Use: {_RECURRING_EVERY}"
-    interval = config.get("interval")
-    if interval is not None:
-        try:
-            iv = int(interval)
-            if iv < 1:
-                return f"'interval' must be >= 1. Got: {iv}"
-        except (ValueError, TypeError):
-            return f"'interval' must be an integer. Got: {interval!r}"
-    if every == "week":
-        day = config.get("day", "").lower()
-        if day not in _RECURRING_WEEKDAYS:
-            return f"Weekly recurrence requires 'day' (weekday name). Got: {day!r}"
-    if every == "month":
-        day = config.get("day")
-        if day is None:
-            return "Monthly recurrence requires 'day' (1-31)"
-        try:
-            d = int(day)
-            if not 1 <= d <= 31:
-                return f"Monthly 'day' must be 1-31. Got: {d}"
-        except (ValueError, TypeError):
-            return f"Monthly 'day' must be an integer. Got: {day!r}"
-    if every == "year":
-        month = config.get("month")
-        if month is not None:
-            try:
-                m = int(month)
-                if not 1 <= m <= 12:
-                    return f"Yearly 'month' must be 1-12. Got: {m}"
-            except (ValueError, TypeError):
-                return f"Yearly 'month' must be an integer. Got: {month!r}"
-        day = config.get("day")
-        if day is not None:
-            try:
-                d = int(day)
-                if not 1 <= d <= 31:
-                    return f"Yearly 'day' must be 1-31. Got: {d}"
-            except (ValueError, TypeError):
-                return f"Yearly 'day' must be an integer. Got: {day!r}"
-    return None
-
 
 # Pre-built SQL for active-task exclusion
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
@@ -159,34 +101,9 @@ def create_task(
     task_id = str(uuid.uuid4())
     now = _now()
 
-    if section not in _TASK_SECTIONS:
-        return json.dumps(
-            {"error": f"Invalid section: {section}. Use: {_TASK_SECTIONS}"}
-        )
-    if priority not in _TASK_PRIORITIES:
-        return json.dumps(
-            {"error": f"Invalid priority: {priority}. Use: {_TASK_PRIORITIES}"}
-        )
-    if type not in _TASK_TYPES:
-        return json.dumps({"error": f"Invalid type: {type}. Use: {_TASK_TYPES}"})
-    if due_date:
-        try:
-            datetime.strptime(due_date, "%Y-%m-%d")
-        except ValueError:
-            return json.dumps(
-                {"error": f"Invalid due_date: {due_date}. Use YYYY-MM-DD"}
-            )
-    if recurring:
-        err = _validate_recurring(recurring)
-        if err:
-            return json.dumps({"error": f"Invalid recurring config: {err}"})
-    if reminder_at:
-        try:
-            datetime.fromisoformat(reminder_at)
-        except ValueError:
-            return json.dumps(
-                {"error": f"Invalid reminder_at: {reminder_at}. Use ISO datetime"}
-            )
+    if err := _validate_task_fields(section=section, priority=priority, type=type,
+                                     due_date=due_date, recurring=recurring, reminder_at=reminder_at):
+        return json.dumps({"error": err})
 
     with _get_conn() as conn:
         if parent_id:
@@ -277,40 +194,11 @@ def update_task(
     if not updates:
         return json.dumps({"error": "No fields to update. Pass non-empty values."})
 
-    if "status" in updates and updates["status"] not in _TASK_STATUSES:
-        return json.dumps(
-            {"error": f"Invalid status: {updates['status']}. Use: {_TASK_STATUSES}"}
-        )
-    if "priority" in updates and updates["priority"] not in _TASK_PRIORITIES:
-        return json.dumps(
-            {
-                "error": f"Invalid priority: {updates['priority']}. Use: {_TASK_PRIORITIES}"
-            }
-        )
-    if "section" in updates and updates["section"] not in _TASK_SECTIONS:
-        return json.dumps(
-            {"error": f"Invalid section: {updates['section']}. Use: {_TASK_SECTIONS}"}
-        )
-    if "type" in updates and updates["type"] not in _TASK_TYPES:
-        return json.dumps(
-            {"error": f"Invalid type: {updates['type']}. Use: {_TASK_TYPES}"}
-        )
-    if "due_date" in updates and updates["due_date"] is not None:
-        try:
-            datetime.strptime(updates["due_date"], "%Y-%m-%d")
-        except ValueError:
-            return json.dumps(
-                {"error": f"Invalid due_date: {updates['due_date']}. Use YYYY-MM-DD"}
-            )
-    if "recurring" in updates and updates["recurring"] is not None:
-        err = _validate_recurring(updates["recurring"])
-        if err:
-            return json.dumps({"error": f"Invalid recurring config: {err}"})
-    if "reminder_at" in updates and updates["reminder_at"] is not None:
-        try:
-            datetime.fromisoformat(updates["reminder_at"])
-        except ValueError:
-            return json.dumps({"error": "Invalid reminder_at. Use ISO datetime"})
+    val_fields = {k: v for k, v in updates.items()
+                  if k in ("status", "section", "priority", "type", "due_date", "recurring", "reminder_at")
+                  and v is not None}
+    if err := _validate_task_fields(**val_fields):
+        return json.dumps({"error": err})
 
     updates["updated_at"] = _now()
 

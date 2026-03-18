@@ -13,7 +13,7 @@ import sqlite3
 import uuid
 from typing import Any
 
-from db_utils import now_iso
+from db_utils import now_iso, tokenize_for_similarity as _tokenize, STOPWORDS as _STOPWORDS
 
 # ── Adaptive confidence per predicate ──────────────────────────────────────
 
@@ -187,21 +187,6 @@ def auto_promote_claim(
 
 
 # ── L2b: Periodic health sweep ─────────────────────────────────────────────
-
-# Tokenizer for Jaccard — reuse server._tokenize pattern
-_STOPWORDS = frozenset(
-    "the a an is are was were be been being have has had do does did "
-    "will would shall should may might can could and or but if then "
-    "else for of in on at to from by with".split()
-)
-
-
-def _tokenize(text: str) -> set[str]:
-    if not text:
-        return set()
-    words = re.findall(r"\w+", text.lower())
-    return {w for w in words if len(w) >= 3 and w not in _STOPWORDS}
-
 
 def detect_near_duplicates(conn: sqlite3.Connection) -> list[dict]:
     """Find near-duplicate observations within the same entity (Jaccard >= 0.7)."""

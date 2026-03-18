@@ -6,15 +6,23 @@ utilities used by server.py, task_tray.py, and utility scripts.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import socket
 import sqlite3
+import subprocess
+import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+# Suppress console windows on Windows when spawning git/gh from GUI
+_NOWIN: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+)
 
 try:
     import orjson
@@ -113,6 +121,105 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
         "publish_requested_at",
     }
 )
+
+# ── Recurring task validation ─────────────────────────────────────────
+RECURRING_EVERY = ("day", "week", "month", "year")
+RECURRING_WEEKDAYS = frozenset(
+    ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+)
+
+
+def validate_recurring(raw: str) -> str | None:
+    """Validate recurring JSON config. Returns error message or None if valid."""
+    try:
+        config = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return f"Invalid JSON: {raw!r}"
+    if not isinstance(config, dict):
+        return "Recurring config must be a JSON object"
+    every = config.get("every", "").lower()
+    if every not in RECURRING_EVERY:
+        return f"Invalid 'every': {every}. Use: {RECURRING_EVERY}"
+    # Optional interval (default 1)
+    interval = config.get("interval")
+    if interval is not None:
+        try:
+            iv = int(interval)
+            if iv < 1:
+                return f"'interval' must be >= 1. Got: {iv}"
+        except (ValueError, TypeError):
+            return f"'interval' must be an integer. Got: {interval!r}"
+    if every == "week":
+        day = config.get("day", "").lower()
+        if day not in RECURRING_WEEKDAYS:
+            return f"Weekly recurrence requires 'day' (weekday name). Got: {day!r}"
+    if every == "month":
+        day = config.get("day")
+        if day is None:
+            return "Monthly recurrence requires 'day' (1-31)"
+        try:
+            d = int(day)
+            if not 1 <= d <= 31:
+                return f"Monthly 'day' must be 1-31. Got: {d}"
+        except (ValueError, TypeError):
+            return f"Monthly 'day' must be an integer. Got: {day!r}"
+    if every == "year":
+        month = config.get("month")
+        if month is not None:
+            try:
+                m = int(month)
+                if not 1 <= m <= 12:
+                    return f"Yearly 'month' must be 1-12. Got: {m}"
+            except (ValueError, TypeError):
+                return f"Yearly 'month' must be an integer. Got: {month!r}"
+        day = config.get("day")
+        if day is not None:
+            try:
+                d = int(day)
+                if not 1 <= d <= 31:
+                    return f"Yearly 'day' must be 1-31. Got: {d}"
+            except (ValueError, TypeError):
+                return f"Yearly 'day' must be an integer. Got: {day!r}"
+    return None
+
+
+def validate_task_fields(**kwargs: str | None) -> str | None:
+    """Validate task enum/date/recurring fields. Returns error message or None.
+
+    Pass only the fields that need validation. None values are skipped.
+    Works for both create_task (pass all fields) and update_task (pass only changed fields).
+    """
+    section = kwargs.get("section")
+    if section is not None and section not in TASK_SECTIONS:
+        return f"Invalid section: {section}. Use: {TASK_SECTIONS}"
+    priority = kwargs.get("priority")
+    if priority is not None and priority not in TASK_PRIORITIES:
+        return f"Invalid priority: {priority}. Use: {TASK_PRIORITIES}"
+    status = kwargs.get("status")
+    if status is not None and status not in TASK_STATUSES:
+        return f"Invalid status: {status}. Use: {TASK_STATUSES}"
+    type_ = kwargs.get("type")
+    if type_ is not None and type_ not in TASK_TYPES:
+        return f"Invalid type: {type_}. Use: {TASK_TYPES}"
+    due_date = kwargs.get("due_date")
+    if due_date:
+        try:
+            datetime.strptime(due_date, "%Y-%m-%d")
+        except ValueError:
+            return f"Invalid due_date: {due_date}. Use YYYY-MM-DD format"
+    recurring = kwargs.get("recurring")
+    if recurring:
+        err = validate_recurring(recurring)
+        if err:
+            return f"Invalid recurring config: {err}"
+    reminder_at = kwargs.get("reminder_at")
+    if reminder_at:
+        try:
+            datetime.fromisoformat(reminder_at)
+        except ValueError:
+            return f"Invalid reminder_at: {reminder_at}. Use ISO datetime format"
+    return None
+
 
 # ── Bridge Sync v2: Per-field LWW conflict resolver ─────────────────────
 
@@ -321,6 +428,126 @@ def priority_sort_key(task: dict[str, Any]) -> tuple:
     parsed = parse_iso_date(task.get("due_date"))
     due = parsed.isoformat() if parsed else "9999-12-31"
     return (inv_rank, due)
+
+
+# ── Entity helpers ────────────────────────────────────────────────────────
+
+
+def get_entity_id(conn: sqlite3.Connection, name: str) -> int | None:
+    """Look up entity ID by name. Returns None if not found."""
+    row = conn.execute(
+        "SELECT id FROM entities WHERE name = ?", (name,)
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def serialize_entity(
+    conn: sqlite3.Connection, entity_row, *, include_timestamps: bool = False
+) -> dict:
+    """Serialize an entity row with its observations for export.
+
+    Args:
+        conn: DB connection.
+        entity_row: Row from entities table (needs id, name, entity_type; optionally project, created_at, updated_at).
+        include_timestamps: If True, observations include createdAt and entity includes createdAt/updatedAt.
+    """
+    eid = entity_row["id"]
+    if include_timestamps:
+        obs = conn.execute(
+            "SELECT content, created_at FROM observations WHERE entity_id = ? ORDER BY id",
+            (eid,),
+        ).fetchall()
+        entity: dict = {
+            "name": entity_row["name"],
+            "entityType": entity_row["entity_type"],
+            "observations": [
+                {"content": o["content"], "createdAt": o["created_at"]} for o in obs
+            ],
+        }
+        if entity_row.get("created_at"):
+            entity["createdAt"] = entity_row["created_at"]
+        if entity_row.get("updated_at"):
+            entity["updatedAt"] = entity_row["updated_at"]
+    else:
+        obs = conn.execute(
+            "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+            (eid,),
+        ).fetchall()
+        entity = {
+            "name": entity_row["name"],
+            "entityType": entity_row["entity_type"],
+            "observations": [o["content"] for o in obs],
+        }
+    if entity_row.get("project"):
+        entity["project"] = entity_row["project"]
+    return entity
+
+
+def export_relations(
+    conn: sqlite3.Connection,
+    entity_ids: set | list | None = None,
+    *,
+    include_timestamps: bool = False,
+) -> list[dict]:
+    """Export relations as list of dicts, optionally filtered by entity ID set."""
+    base = (
+        "SELECT ef.name AS from_name, et.name AS to_name, "
+        "r.relation_type, r.created_at FROM relations r "
+        "JOIN entities ef ON r.from_id = ef.id "
+        "JOIN entities et ON r.to_id = et.id"
+    )
+    if entity_ids is not None:
+        if not entity_ids:
+            return []
+        ids = list(entity_ids)
+        ph = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"{base} WHERE r.from_id IN ({ph}) AND r.to_id IN ({ph})",
+            ids + ids,
+        ).fetchall()
+    else:
+        rows = conn.execute(f"{base} ORDER BY ef.name, et.name").fetchall()
+    out = []
+    for r in rows:
+        d: dict = {
+            "from": r["from_name"],
+            "to": r["to_name"],
+            "relationType": r["relation_type"],
+        }
+        if include_timestamps:
+            d["createdAt"] = r["created_at"]
+        out.append(d)
+    return out
+
+
+# ── Text helpers ──────────────────────────────────────────────────────────
+
+STOPWORDS = frozenset(
+    "the a an is are was were be been being have has had do does did "
+    "will would shall should may might can could and or but if then "
+    "else for of in on at to from by with".split()
+)
+
+
+def tokenize_for_similarity(text: str) -> set[str]:
+    """Extract meaningful tokens from text for Jaccard similarity."""
+    if not text:
+        return set()
+    words = re.findall(r"\w+", text.lower())
+    return {w for w in words if len(w) >= 3 and w not in STOPWORDS}
+
+
+def fts_query(raw: str) -> str:
+    """Sanitize a user query for FTS5 MATCH.
+
+    Wraps each token in double quotes to avoid FTS5 syntax errors
+    from special characters, then joins with OR for broad matching.
+    """
+    tokens = raw.split()
+    if not tokens:
+        return '""'
+    escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
+    return " OR ".join(escaped)
 
 
 # ── Task DAO ──────────────────────────────────────────────────────────────

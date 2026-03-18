@@ -27,23 +27,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-# Suppress console windows on Windows when spawning git/gh from GUI
-import sys as _sys
-
-_NOWIN: dict = (
-    {"creationflags": subprocess.CREATE_NO_WINDOW} if _sys.platform == "win32" else {}
-)
-
 from db_utils import (
     json_dumps as _json_dumps,
     json_loads as _json_loads,
     get_conn as _get_conn,
+    get_entity_id as _get_entity_id,
+    fts_query as _fts_query,
+    tokenize_for_similarity as _tokenize,
     TaskDAO,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
-    TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
-    TASK_STATUSES as _TASK_STATUSES,
-    TASK_TYPES as _TASK_TYPES,
     TRUST_LEVELS as _TRUST_LEVELS,
     VISIBILITY_LEVELS as _VISIBILITY_LEVELS,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
@@ -54,6 +47,7 @@ from db_utils import (
     RATING_BURST_THRESHOLD as _RATING_BURST_THRESHOLD,
     RATING_BURST_WINDOW_HOURS as _RATING_BURST_WINDOW_HOURS,
     MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
+    _NOWIN,
     build_priority_order_sql,
     now_iso as _now,
     sanitize_task_enums as _sanitize_task_enums,
@@ -70,11 +64,20 @@ from db_utils import (
 # Pre-built SQL fragment for active-task exclusion filter
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 
-# ── Recurring task validation ─────────────────────────────────────────
-_RECURRING_EVERY = ("day", "week", "month", "year")
-_RECURRING_WEEKDAYS = frozenset(
-    ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-)
+
+# ── Response helpers ──────────────────────────────────────────────────────
+
+
+def _error(msg: str) -> str:
+    """Build a JSON error response string."""
+    return json.dumps({"error": msg})
+
+
+def _check_enum(value: str, allowed: tuple, field: str) -> str | None:
+    """Return error string if value not in allowed, else None."""
+    if value not in allowed:
+        return _error(f"Invalid {field}: {value}. Use: {allowed}")
+    return None
 
 
 def _is_valid_timestamp(s: str) -> bool:
@@ -93,60 +96,6 @@ def _clamp_score(val: Any, default: float = 0.0) -> float:
         return max(0.0, min(1.0, float(val)))
     except (TypeError, ValueError):
         return default
-
-
-def _validate_recurring(raw: str) -> str | None:
-    """Validate recurring JSON config. Returns error message or None if valid."""
-    try:
-        config = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return f"Invalid JSON: {raw!r}"
-    if not isinstance(config, dict):
-        return "Recurring config must be a JSON object"
-    every = config.get("every", "").lower()
-    if every not in _RECURRING_EVERY:
-        return f"Invalid 'every': {every}. Use: {_RECURRING_EVERY}"
-    # Optional interval (default 1)
-    interval = config.get("interval")
-    if interval is not None:
-        try:
-            iv = int(interval)
-            if iv < 1:
-                return f"'interval' must be >= 1. Got: {iv}"
-        except (ValueError, TypeError):
-            return f"'interval' must be an integer. Got: {interval!r}"
-    if every == "week":
-        day = config.get("day", "").lower()
-        if day not in _RECURRING_WEEKDAYS:
-            return f"Weekly recurrence requires 'day' (weekday name). Got: {day!r}"
-    if every == "month":
-        day = config.get("day")
-        if day is None:
-            return "Monthly recurrence requires 'day' (1-31)"
-        try:
-            d = int(day)
-            if not 1 <= d <= 31:
-                return f"Monthly 'day' must be 1-31. Got: {d}"
-        except (ValueError, TypeError):
-            return f"Monthly 'day' must be an integer. Got: {day!r}"
-    if every == "year":
-        month = config.get("month")
-        if month is not None:
-            try:
-                m = int(month)
-                if not 1 <= m <= 12:
-                    return f"Yearly 'month' must be 1-12. Got: {m}"
-            except (ValueError, TypeError):
-                return f"Yearly 'month' must be an integer. Got: {month!r}"
-        day = config.get("day")
-        if day is not None:
-            try:
-                d = int(day)
-                if not 1 <= d <= 31:
-                    return f"Yearly 'day' must be 1-31. Got: {d}"
-            except (ValueError, TypeError):
-                return f"Yearly 'day' must be an integer. Got: {day!r}"
-    return None
 
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
@@ -1025,11 +974,9 @@ def _init_db() -> None:
 
 def _fts_sync_by_name(conn: sqlite3.Connection, entity_name: str) -> None:
     """FTS sync by entity name (convenience wrapper)."""
-    row = conn.execute(
-        "SELECT id FROM entities WHERE name = ?", (entity_name,)
-    ).fetchone()
-    if row:
-        _fts_sync(conn, row["id"])
+    eid = _get_entity_id(conn, entity_name)
+    if eid:
+        _fts_sync(conn, eid)
 
 
 def _fts_remove(conn: sqlite3.Connection, entity_id: int) -> None:
@@ -1077,32 +1024,26 @@ def _migrate_jsonl() -> None:
                 "VALUES (?, ?, ?, ?)",
                 (ent["name"], ent.get("entityType", "unknown"), now, now),
             )
-            row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (ent["name"],)
-            ).fetchone()
-            if row:
+            eid = _get_entity_id(conn, ent["name"])
+            if eid:
                 for obs in ent.get("observations", []):
                     conn.execute(
                         "INSERT OR IGNORE INTO observations (entity_id, content, created_at) "
                         "VALUES (?, ?, ?)",
-                        (row["id"], obs, now),
+                        (eid, obs, now),
                     )
-                _fts_sync(conn, row["id"])
+                _fts_sync(conn, eid)
 
         for rel in relations:
-            from_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (rel["from"],)
-            ).fetchone()
-            to_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (rel["to"],)
-            ).fetchone()
-            if from_row and to_row:
+            from_id = _get_entity_id(conn, rel["from"])
+            to_id = _get_entity_id(conn, rel["to"])
+            if from_id and to_id:
                 conn.execute(
                     "INSERT OR IGNORE INTO relations "
                     "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
                     (
-                        from_row["id"],
-                        to_row["id"],
+                        from_id,
+                        to_id,
                         rel.get("relationType", "related_to"),
                         now,
                     ),
@@ -1152,11 +1093,8 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
             if cur.rowcount > 0:
                 created += 1
 
-            row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (name,)
-            ).fetchone()
-            if row:
-                eid = row["id"]
+            eid = _get_entity_id(conn, name)
+            if eid:
                 # Update project if provided and entity already existed
                 if project is not None and cur.rowcount == 0:
                     conn.execute(
@@ -1203,13 +1141,10 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
     with _get_conn() as conn:
         for item in observations:
             entity_name = item["entityName"]
-            row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (entity_name,)
-            ).fetchone()
-            if row is None:
+            eid = _get_entity_id(conn, entity_name)
+            if eid is None:
                 logger.warning("add_observations: entity %r not found", entity_name)
                 continue
-            eid = row["id"]
             contents = item.get("contents", [])
             for content in contents:
                 cur = conn.execute(
@@ -1255,13 +1190,9 @@ def create_relations(relations: list[dict[str, Any]]) -> str:
             to_name = rel["to"]
             rel_type = rel["relationType"]
 
-            from_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (from_name,)
-            ).fetchone()
-            to_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (to_name,)
-            ).fetchone()
-            if from_row is None or to_row is None:
+            from_id = _get_entity_id(conn, from_name)
+            to_id = _get_entity_id(conn, to_name)
+            if from_id is None or to_id is None:
                 logger.warning(
                     "create_relations: missing entity for %r -> %r", from_name, to_name
                 )
@@ -1270,7 +1201,7 @@ def create_relations(relations: list[dict[str, Any]]) -> str:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO relations "
                 "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
-                (from_row["id"], to_row["id"], rel_type, now),
+                (from_id, to_id, rel_type, now),
             )
             created += cur.rowcount
 
@@ -1294,12 +1225,9 @@ def delete_entities(entityNames: list[str]) -> str:
     deleted = 0
     with _get_conn() as conn:
         for name in entityNames:
-            row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (name,)
-            ).fetchone()
-            if row is None:
+            eid = _get_entity_id(conn, name)
+            if eid is None:
                 continue
-            eid = row["id"]
             _fts_remove(conn, eid)
             conn.execute("DELETE FROM entities WHERE id = ?", (eid,))
             deleted += 1
@@ -1318,12 +1246,9 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
     with _get_conn() as conn:
         for item in deletions:
             entity_name = item["entityName"]
-            row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (entity_name,)
-            ).fetchone()
-            if row is None:
+            eid = _get_entity_id(conn, entity_name)
+            if eid is None:
                 continue
-            eid = row["id"]
             for obs in item.get("observations", []):
                 cur = conn.execute(
                     "DELETE FROM observations WHERE entity_id = ? AND content = ?",
@@ -1345,18 +1270,14 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
     deleted = 0
     with _get_conn() as conn:
         for rel in relations:
-            from_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (rel["from"],)
-            ).fetchone()
-            to_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (rel["to"],)
-            ).fetchone()
-            if from_row is None or to_row is None:
+            from_id = _get_entity_id(conn, rel["from"])
+            to_id = _get_entity_id(conn, rel["to"])
+            if from_id is None or to_id is None:
                 continue
             cur = conn.execute(
                 "DELETE FROM relations "
                 "WHERE from_id = ? AND to_id = ? AND relation_type = ?",
-                (from_row["id"], to_row["id"], rel["relationType"]),
+                (from_id, to_id, rel["relationType"]),
             )
             deleted += cur.rowcount
 
@@ -1380,38 +1301,8 @@ def read_graph() -> str:
         ent_rows = conn.execute(
             "SELECT id, name, entity_type, project FROM entities ORDER BY name"
         ).fetchall()
-
-        entities_out = []
-        for e in ent_rows:
-            obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-                (e["id"],),
-            ).fetchall()
-            entity = {
-                "name": e["name"],
-                "entityType": e["entity_type"],
-                "observations": [o["content"] for o in obs],
-            }
-            if e["project"]:
-                entity["project"] = e["project"]
-            entities_out.append(entity)
-
-        rel_rows = conn.execute(
-            "SELECT r.relation_type, ef.name AS from_name, et.name AS to_name "
-            "FROM relations r "
-            "JOIN entities ef ON r.from_id = ef.id "
-            "JOIN entities et ON r.to_id = et.id "
-            "ORDER BY ef.name, et.name",
-        ).fetchall()
-
-        relations_out = [
-            {
-                "from": r["from_name"],
-                "to": r["to_name"],
-                "relationType": r["relation_type"],
-            }
-            for r in rel_rows
-        ]
+        entities_out = [_serialize_entity(conn, e) for e in ent_rows]
+        relations_out = _export_relations(conn)
 
     return json.dumps({"entities": entities_out, "relations": relations_out})
 
@@ -1419,34 +1310,6 @@ def read_graph() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 8: search_nodes (FTS5 BM25)
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-def _fts_query(raw: str) -> str:
-    """Sanitize a user query for FTS5 MATCH.
-
-    Wraps each token in double quotes to avoid FTS5 syntax errors
-    from special characters, then joins with OR for broad matching.
-    """
-    tokens = raw.split()
-    if not tokens:
-        return '""'
-    escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
-    return " OR ".join(escaped)
-
-
-_STOPWORDS = frozenset(
-    "the a an is are was were be been being have has had do does did "
-    "will would shall should may might can could and or but if then "
-    "else for of in on at to from by with".split()
-)
-
-
-def _tokenize(text: str) -> set[str]:
-    """Extract meaningful tokens from text for Jaccard similarity."""
-    if not text:
-        return set()
-    words = re.findall(r"\w+", text.lower())
-    return {w for w in words if len(w) >= 3 and w not in _STOPWORDS}
 
 
 @mcp.tool()
@@ -1583,39 +1446,10 @@ def open_nodes(names: list[str]) -> str:
             if row is None:
                 continue
             found_ids.append(row["id"])
-            obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-                (row["id"],),
-            ).fetchall()
-            entity = {
-                "name": row["name"],
-                "entityType": row["entity_type"],
-                "observations": [o["content"] for o in obs],
-            }
-            if row["project"]:
-                entity["project"] = row["project"]
-            entities_out.append(entity)
+            entities_out.append(_serialize_entity(conn, row))
 
         # Inter-relations: relations where BOTH from and to are in the opened set
-        relations_out = []
-        if len(found_ids) >= 2:
-            placeholders = ",".join("?" * len(found_ids))
-            rel_rows = conn.execute(
-                f"SELECT r.relation_type, ef.name AS from_name, et.name AS to_name "
-                f"FROM relations r "
-                f"JOIN entities ef ON r.from_id = ef.id "
-                f"JOIN entities et ON r.to_id = et.id "
-                f"WHERE r.from_id IN ({placeholders}) AND r.to_id IN ({placeholders})",
-                found_ids + found_ids,
-            ).fetchall()
-            relations_out = [
-                {
-                    "from": r["from_name"],
-                    "to": r["to_name"],
-                    "relationType": r["relation_type"],
-                }
-                for r in rel_rows
-            ]
+        relations_out = _export_relations(conn, found_ids) if len(found_ids) >= 2 else []
 
         # Log entity access for staleness tracking
         if found_ids:
@@ -1841,7 +1675,7 @@ def knowledge_health(
                 promote_ready_claims,
             )
         except ImportError:
-            return json.dumps({"error": "lazy_enrichment module not available"})
+            return _error("lazy_enrichment module not available")
 
         report: dict[str, Any] = {}
         if include_duplicates:
@@ -1905,41 +1739,14 @@ def create_task(
     task_id = str(uuid.uuid4())
     now = _now()
 
-    if section not in _TASK_SECTIONS:
-        return json.dumps(
-            {"error": f"Invalid section: {section}. Use: {_TASK_SECTIONS}"}
-        )
-    if priority not in _TASK_PRIORITIES:
-        return json.dumps(
-            {"error": f"Invalid priority: {priority}. Use: {_TASK_PRIORITIES}"}
-        )
-    if type not in _TASK_TYPES:
-        return json.dumps({"error": f"Invalid type: {type}. Use: {_TASK_TYPES}"})
-    if due_date:
-        try:
-            datetime.strptime(due_date, "%Y-%m-%d")
-        except ValueError:
-            return json.dumps(
-                {"error": f"Invalid due_date: {due_date}. Use YYYY-MM-DD format"}
-            )
-    if recurring:
-        err = _validate_recurring(recurring)
-        if err:
-            return json.dumps({"error": f"Invalid recurring config: {err}"})
-    if reminder_at:
-        try:
-            datetime.fromisoformat(reminder_at)
-        except ValueError:
-            return json.dumps(
-                {
-                    "error": f"Invalid reminder_at: {reminder_at}. Use ISO datetime format (e.g. 2026-03-15T14:00:00)"
-                }
-            )
+    if err := _validate_task_fields(section=section, priority=priority, type=type,
+                                     due_date=due_date, recurring=recurring, reminder_at=reminder_at):
+        return _error(err)
 
     with _get_conn() as conn:
         if parent_id:
             if not TaskDAO.exists(conn, parent_id):
-                return json.dumps({"error": f"Parent task {parent_id} not found"})
+                return _error(f"Parent task {parent_id} not found")
 
         TaskDAO.create(
             conn,
@@ -2022,52 +1829,19 @@ def update_task(
         elif v is not None:
             updates[k] = v
     if not updates:
-        return json.dumps({"error": "No valid fields to update"})
+        return _error("No valid fields to update")
 
-    if "status" in updates and updates["status"] not in _TASK_STATUSES:
-        return json.dumps(
-            {"error": f"Invalid status: {updates['status']}. Use: {_TASK_STATUSES}"}
-        )
-    if "priority" in updates and updates["priority"] not in _TASK_PRIORITIES:
-        return json.dumps(
-            {
-                "error": f"Invalid priority: {updates['priority']}. Use: {_TASK_PRIORITIES}"
-            }
-        )
-    if "section" in updates and updates["section"] not in _TASK_SECTIONS:
-        return json.dumps(
-            {"error": f"Invalid section: {updates['section']}. Use: {_TASK_SECTIONS}"}
-        )
-    if "type" in updates and updates["type"] not in _TASK_TYPES:
-        return json.dumps(
-            {"error": f"Invalid type: {updates['type']}. Use: {_TASK_TYPES}"}
-        )
-    if "due_date" in updates and updates["due_date"] is not None:
-        try:
-            datetime.strptime(updates["due_date"], "%Y-%m-%d")
-        except ValueError:
-            return json.dumps(
-                {"error": f"Invalid due_date: {updates['due_date']}. Use YYYY-MM-DD"}
-            )
-    if "recurring" in updates and updates["recurring"] is not None:
-        err = _validate_recurring(updates["recurring"])
-        if err:
-            return json.dumps({"error": f"Invalid recurring config: {err}"})
-    if "reminder_at" in updates and updates["reminder_at"] is not None:
-        try:
-            datetime.fromisoformat(updates["reminder_at"])
-        except ValueError:
-            return json.dumps(
-                {
-                    "error": f"Invalid reminder_at: {updates['reminder_at']}. Use ISO datetime format"
-                }
-            )
+    val_fields = {k: v for k, v in updates.items()
+                  if k in ("status", "section", "priority", "type", "due_date", "recurring", "reminder_at")
+                  and v is not None}
+    if err := _validate_task_fields(**val_fields):
+        return _error(err)
 
     updates["updated_at"] = _now()
 
     with _get_conn() as conn:
         if TaskDAO.update(conn, task_id, updates) == 0:
-            return json.dumps({"error": f"Task {task_id} not found"})
+            return _error(f"Task {task_id} not found")
         # v2.0.0: Track field versions for LWW sync
         changed = [k for k in updates if k != "updated_at"]
         _upsert_field_versions(conn, task_id, changed, updates["updated_at"])
@@ -2312,9 +2086,9 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
     try:
         days = int(older_than_days)
     except (ValueError, TypeError):
-        return json.dumps({"error": "older_than_days must be an integer"})
+        return _error("older_than_days must be an integer")
     if days < 0:
-        return json.dumps({"error": "older_than_days must be non-negative"})
+        return _error("older_than_days must be non-negative")
 
     with _get_conn() as conn:
         now = _now()
@@ -2338,7 +2112,7 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
     Only bumps tasks whose current priority is lower than target.
     """
     if target_priority not in _TASK_PRIORITIES:
-        return json.dumps({"error": f"Invalid priority: {target_priority}"})
+        return _error(f"Invalid priority: {target_priority}")
 
     priority_rank = {p: i for i, p in enumerate(_TASK_PRIORITIES)}
     target_rank = priority_rank[target_priority]
@@ -2422,7 +2196,7 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
             "SELECT id FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not existing:
-            return json.dumps({"error": f"Task {task_id} not found"})
+            return _error(f"Task {task_id} not found")
 
         shared_by = None
         if assignee:
@@ -2466,7 +2240,7 @@ def review_shared_tasks(
         task_ids: UUIDs to approve/reject. If None with approve/reject, applies to ALL pending.
     """
     if action not in ("list", "approve", "reject"):
-        return json.dumps({"error": "action must be: list, approve, reject"})
+        return _error("action must be: list, approve, reject")
 
     with _get_conn() as conn:
         if action == "list":
@@ -2758,7 +2532,7 @@ def manage_collaborators(
         notes: Free-text notes about this collaborator.
     """
     if action not in ("add", "remove", "list", "update"):
-        return json.dumps({"error": "action must be: add, remove, list, update"})
+        return _error("action must be: add, remove, list, update")
 
     with _get_conn() as conn:
         if action == "list":
@@ -2769,14 +2543,12 @@ def manage_collaborators(
             return json.dumps({"collaborators": items, "count": len(items)})
 
         if not github_user:
-            return json.dumps({"error": "github_user required for add/remove/update"})
+            return _error("github_user required for add/remove/update")
 
         if action == "add":
             tl = trust_level or "read_write"
             if tl not in _TRUST_LEVELS:
-                return json.dumps(
-                    {"error": f"trust_level must be one of: {', '.join(_TRUST_LEVELS)}"}
-                )
+                return _error(f"trust_level must be one of: {', '.join(_TRUST_LEVELS)}")
             now = _now()
             conn.execute(
                 "INSERT INTO collaborators "
@@ -2801,7 +2573,7 @@ def manage_collaborators(
                 "DELETE FROM sharing_rules WHERE target_user = ?", (github_user,)
             )
             if cur.rowcount == 0:
-                return json.dumps({"error": f"Collaborator '{github_user}' not found"})
+                return _error(f"Collaborator '{github_user}' not found")
             logger.info("manage_collaborators: removed %s", github_user)
             return json.dumps({"removed": github_user})
 
@@ -2810,21 +2582,19 @@ def manage_collaborators(
             "SELECT * FROM collaborators WHERE github_user = ?", (github_user,)
         ).fetchone()
         if not existing:
-            return json.dumps({"error": f"Collaborator '{github_user}' not found"})
+            return _error(f"Collaborator '{github_user}' not found")
 
         updates = {}
         if display_name is not None:
             updates["display_name"] = display_name
         if trust_level is not None:
             if trust_level not in _TRUST_LEVELS:
-                return json.dumps(
-                    {"error": f"trust_level must be one of: {', '.join(_TRUST_LEVELS)}"}
-                )
+                return _error(f"trust_level must be one of: {', '.join(_TRUST_LEVELS)}")
             updates["trust_level"] = trust_level
         if notes is not None:
             updates["notes"] = notes
         if not updates:
-            return json.dumps({"error": "Nothing to update"})
+            return _error("Nothing to update")
 
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
@@ -2854,9 +2624,7 @@ def share_knowledge(
         priority: critical | high | medium | low — urgency signal for recipients.
     """
     if priority not in _TASK_PRIORITIES:
-        return json.dumps(
-            {"error": f"priority must be one of: {', '.join(_TASK_PRIORITIES)}"}
-        )
+        return _error(f"priority must be one of: {', '.join(_TASK_PRIORITIES)}")
 
     with _get_conn() as conn:
         # Resolve target users
@@ -2869,11 +2637,7 @@ def share_knowledge(
             targets = target_users
 
         if not targets:
-            return json.dumps(
-                {
-                    "error": "No collaborators found. Use manage_collaborators(action='add') first."
-                }
-            )
+            return _error("No collaborators found. Use manage_collaborators(action='add') first.")
 
         # Validate entities exist (unless wildcard)
         if entity_names != ["*"]:
@@ -2882,7 +2646,7 @@ def share_knowledge(
                     "SELECT 1 FROM entities WHERE name = ?", (name,)
                 ).fetchone()
                 if not row:
-                    return json.dumps({"error": f"Entity '{name}' not found"})
+                    return _error(f"Entity '{name}' not found")
 
         share_types = ["entity"]
         if include_relations:
@@ -2935,7 +2699,7 @@ def review_shared_knowledge(
         item_ids: IDs from pending_shared_entities to act on. If None, applies to ALL.
     """
     if action not in ("list", "approve", "reject", "diff"):
-        return json.dumps({"error": "action must be: list, approve, reject, diff"})
+        return _error("action must be: list, approve, reject, diff")
 
     with _get_conn() as conn:
         if action == "list":
@@ -2960,7 +2724,7 @@ def review_shared_knowledge(
 
         if action == "diff":
             if not item_ids:
-                return json.dumps({"error": "item_ids required for diff"})
+                return _error("item_ids required for diff")
             diffs = []
             for iid in item_ids:
                 pending = conn.execute(
@@ -2971,10 +2735,8 @@ def review_shared_knowledge(
                     continue
                 p = dict(pending)
                 pending_obs = json.loads(p["observations"])
-                local = conn.execute(
-                    "SELECT id FROM entities WHERE name = ?", (p["name"],)
-                ).fetchone()
-                if not local:
+                local_id = _get_entity_id(conn, p["name"])
+                if not local_id:
                     diffs.append(
                         {
                             "id": iid,
@@ -2988,7 +2750,7 @@ def review_shared_knowledge(
                 else:
                     local_obs = conn.execute(
                         "SELECT content FROM observations WHERE entity_id = ?",
-                        (local["id"],),
+                        (local_id,),
                     ).fetchall()
                     local_contents = {r["content"] for r in local_obs}
                     remote_contents = {
@@ -3053,11 +2815,8 @@ def review_shared_knowledge(
                 imported_entities += cur.rowcount
                 approved_names.add(p["name"])
 
-                eid_row = conn.execute(
-                    "SELECT id FROM entities WHERE name = ?", (p["name"],)
-                ).fetchone()
-                if eid_row:
-                    eid = eid_row["id"]
+                eid = _get_entity_id(conn, p["name"])
+                if eid:
                     for obs in pending_obs:
                         content = obs["content"] if isinstance(obs, dict) else obs
                         created = (
@@ -3085,17 +2844,13 @@ def review_shared_knowledge(
                     and r["to_entity"] not in approved_names
                 ):
                     continue
-                from_row = conn.execute(
-                    "SELECT id FROM entities WHERE name = ?", (r["from_entity"],)
-                ).fetchone()
-                to_row = conn.execute(
-                    "SELECT id FROM entities WHERE name = ?", (r["to_entity"],)
-                ).fetchone()
-                if from_row and to_row:
+                from_id = _get_entity_id(conn, r["from_entity"])
+                to_id = _get_entity_id(conn, r["to_entity"])
+                if from_id and to_id:
                     cur3 = conn.execute(
                         "INSERT OR IGNORE INTO relations "
                         "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
-                        (from_row["id"], to_row["id"], r["relation_type"], now),
+                        (from_id, to_id, r["relation_type"], now),
                     )
                     imported_rels += cur3.rowcount
                     conn.execute(
@@ -3160,7 +2915,7 @@ def request_publish(
     before becoming truly public on next bridge_push.
     """
     if not entity_names and not task_ids:
-        return json.dumps({"error": "Provide entity_names and/or task_ids"})
+        return _error("Provide entity_names and/or task_ids")
 
     if not safety_confirmed:
         return json.dumps(
@@ -3259,7 +3014,7 @@ def cancel_publish(
     Only works during the standby period (before content becomes truly public).
     """
     if not entity_names and not task_ids:
-        return json.dumps({"error": "Provide entity_names and/or task_ids"})
+        return _error("Provide entity_names and/or task_ids")
 
     now = _now()
     reverted_entities = 0
@@ -3415,28 +3170,16 @@ def rate_public_knowledge(
         ("novelty", novelty),
     ]:
         if not (0.0 <= val <= 1.0):
-            return json.dumps(
-                {"error": f"{name} must be between 0.0 and 1.0, got {val}"}
-            )
+            return _error(f"{name} must be between 0.0 and 1.0, got {val}")
 
     if verification_outcome is not None:
         if verification_outcome not in _VERIFICATION_OUTCOMES:
-            return json.dumps(
-                {
-                    "error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"
-                }
-            )
+            return _error(f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}")
         if usefulness is None:
-            return json.dumps(
-                {
-                    "error": "usefulness is required when verification_outcome is provided"
-                }
-            )
+            return _error("usefulness is required when verification_outcome is provided")
 
     if usefulness is not None and not (0.0 <= usefulness <= 1.0):
-        return json.dumps(
-            {"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"}
-        )
+        return _error(f"usefulness must be between 0.0 and 1.0, got {usefulness}")
 
     # rater_id: server-side identity (never user input)
     rater_id = os.environ.get("GITHUB_USER", socket.gethostname())
@@ -3447,18 +3190,14 @@ def rate_public_knowledge(
             "SELECT name, visibility FROM entities WHERE name = ?", (entity_name,)
         ).fetchone()
         if not entity:
-            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+            return _error(f"Entity '{entity_name}' not found")
         if entity["visibility"] != "public":
-            return json.dumps(
-                {
-                    "error": f"Entity '{entity_name}' is not public (visibility={entity['visibility']})"
-                }
-            )
+            return _error(f"Entity '{entity_name}' is not public (visibility={entity['visibility']})")
 
         # Anti-gaming: no self-rating
         publisher_id = _get_publisher_id(conn, entity_name)
         if rater_id == publisher_id:
-            return json.dumps({"error": "Cannot rate your own published knowledge"})
+            return _error("Cannot rate your own published knowledge")
 
         # Compute content hash from current DB content
         result = _entity_content_hash(conn, entity_name)
@@ -3533,7 +3272,7 @@ def get_knowledge_ratings(
             "SELECT name, visibility FROM entities WHERE name = ?", (entity_name,)
         ).fetchone()
         if not entity:
-            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+            return _error(f"Entity '{entity_name}' not found")
 
         score_info = _compute_truth_score(entity_name, conn)
 
@@ -3576,13 +3315,9 @@ def update_verification(
         verification_context: Description of how verification was done
     """
     if verification_outcome not in _VERIFICATION_OUTCOMES:
-        return json.dumps(
-            {"error": f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}"}
-        )
+        return _error(f"verification_outcome must be one of {_VERIFICATION_OUTCOMES}")
     if not (0.0 <= usefulness <= 1.0):
-        return json.dumps(
-            {"error": f"usefulness must be between 0.0 and 1.0, got {usefulness}"}
-        )
+        return _error(f"usefulness must be between 0.0 and 1.0, got {usefulness}")
 
     rater_id = os.environ.get("GITHUB_USER", socket.gethostname())
 
@@ -3590,9 +3325,7 @@ def update_verification(
         # Get current content hash
         result = _entity_content_hash(conn, entity_name)
         if not result:
-            return json.dumps(
-                {"error": f"Entity '{entity_name}' not found or has no observations"}
-            )
+            return _error(f"Entity '{entity_name}' not found or has no observations")
         c_hash = result[0]
 
         # Update existing rating
@@ -4270,9 +4003,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 {"pushed": 0, "message": "No changes — already up to date"}
             )
         logger.error("bridge_push: commit failed: %s", commit_result.stderr)
-        return json.dumps(
-            {"error": f"git commit failed: {commit_result.stderr.strip()}"}
-        )
+        return _error(f"git commit failed: {commit_result.stderr.strip()}")
 
     push_result = _git("push")
     pushed = push_result.returncode == 0
@@ -4367,7 +4098,7 @@ def bridge_pull() -> str:
     UNIQUE constraints handle deduplication automatically.
     """
     if not Path(BRIDGE_REPO).is_dir():
-        return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}"})
+        return _error(f"Bridge repo not found at {BRIDGE_REPO}")
 
     pull_result = _git("pull", "--rebase", "--autostash")
     if pull_result.returncode != 0:
@@ -4378,7 +4109,7 @@ def bridge_pull() -> str:
     _has_index = _pull_index_path.exists()
 
     if not shared_path.exists() and not _has_index:
-        return json.dumps({"error": "No sync data found in bridge repo"})
+        return _error("No sync data found in bridge repo")
 
     # Read shared.json for entities/relations (and legacy task fallback)
     payload: dict = {}
@@ -4387,7 +4118,7 @@ def bridge_pull() -> str:
             payload = json.loads(shared_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             if not _has_index:
-                return json.dumps({"error": f"Failed to read shared.json: {exc}"})
+                return _error(f"Failed to read shared.json: {exc}")
             logger.warning("bridge_pull: shared.json parse failed: %s", exc)
 
     entities = payload.get("entities", [])
@@ -4418,11 +4149,8 @@ def bridge_pull() -> str:
             )
             new_entities += cur.rowcount
 
-            row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (ent["name"],)
-            ).fetchone()
-            if row:
-                eid = row["id"]
+            eid = _get_entity_id(conn, ent["name"])
+            if eid:
                 for obs in ent.get("observations", []):
                     content = obs["content"] if isinstance(obs, dict) else obs
                     created = (
@@ -4437,19 +4165,15 @@ def bridge_pull() -> str:
                 _fts_sync(conn, eid)
 
         for rel in relations:
-            from_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (rel["from"],)
-            ).fetchone()
-            to_row = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (rel["to"],)
-            ).fetchone()
-            if from_row and to_row:
+            from_id = _get_entity_id(conn, rel["from"])
+            to_id = _get_entity_id(conn, rel["to"])
+            if from_id and to_id:
                 cur3 = conn.execute(
                     "INSERT OR IGNORE INTO relations "
                     "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
                     (
-                        from_row["id"],
-                        to_row["id"],
+                        from_id,
+                        to_id,
                         rel["relationType"],
                         rel.get("createdAt", now),
                     ),
@@ -4769,7 +4493,7 @@ def bridge_pull() -> str:
 def bridge_status() -> str:
     """Show bridge sync status — local shared entities vs repo contents."""
     if not Path(BRIDGE_REPO).is_dir():
-        return json.dumps({"error": f"Bridge repo not found at {BRIDGE_REPO}"})
+        return _error(f"Bridge repo not found at {BRIDGE_REPO}")
 
     with _get_conn() as conn:
         local_rows = conn.execute(
@@ -4881,15 +4605,11 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
     """
     with _get_conn() as conn:
         if not TaskDAO.exists(conn, task_id):
-            return json.dumps({"error": f"Task {task_id} not found"})
+            return _error(f"Task {task_id} not found")
 
-        entity = conn.execute(
-            "SELECT id FROM entities WHERE name = ?", (entity_name,)
-        ).fetchone()
-        if not entity:
-            return json.dumps({"error": f"Entity '{entity_name}' not found"})
-
-        entity_id = entity["id"]
+        entity_id = _get_entity_id(conn, entity_name)
+        if not entity_id:
+            return _error(f"Entity '{entity_name}' not found")
         now = datetime.now(timezone.utc).isoformat()
 
         TaskDAO.link_entity(
@@ -4911,13 +4631,11 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
 def unlink_task_entity(task_id: str, entity_name: str) -> str:
     """Remove a link between a task and a knowledge graph entity."""
     with _get_conn() as conn:
-        entity = conn.execute(
-            "SELECT id FROM entities WHERE name = ?", (entity_name,)
-        ).fetchone()
-        if not entity:
-            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+        entity_id = _get_entity_id(conn, entity_name)
+        if not entity_id:
+            return _error(f"Entity '{entity_name}' not found")
 
-        removed = TaskDAO.unlink_entity(conn, task_id, entity["id"])
+        removed = TaskDAO.unlink_entity(conn, task_id, entity_id)
 
         return json.dumps({"removed": removed > 0})
 
@@ -4934,13 +4652,11 @@ def get_task_links(task_id: str) -> str:
 def get_entity_tasks(entity_name: str) -> str:
     """Get all tasks linked to a knowledge graph entity."""
     with _get_conn() as conn:
-        entity = conn.execute(
-            "SELECT id FROM entities WHERE name = ?", (entity_name,)
-        ).fetchone()
-        if not entity:
-            return json.dumps({"error": f"Entity '{entity_name}' not found"})
+        entity_id = _get_entity_id(conn, entity_name)
+        if not entity_id:
+            return _error(f"Entity '{entity_name}' not found")
 
-        tasks = TaskDAO.get_entity_tasks(conn, entity["id"])
+        tasks = TaskDAO.get_entity_tasks(conn, entity_id)
         return json.dumps({"entity_name": entity_name, "tasks": tasks})
 
 
@@ -4954,7 +4670,7 @@ def suggest_task_links(task_id: str, limit: int = 5) -> str:
     with _get_conn() as conn:
         task = TaskDAO.get_by_id(conn, task_id, "title, description")
         if not task:
-            return json.dumps({"error": f"Task {task_id} not found"})
+            return _error(f"Task {task_id} not found")
 
         search_text = f"{task['title'] or ''} {task['description'] or ''}"
         task_tokens = _tokenize(search_text)
@@ -5030,7 +4746,7 @@ def find_entity_overlaps(
                 (entity_name,),
             ).fetchall()
             if not sources:
-                return json.dumps({"error": f"Entity '{entity_name}' not found"})
+                return _error(f"Entity '{entity_name}' not found")
         else:
             sources = conn.execute(
                 "SELECT id, name, entity_type FROM entities"
@@ -5121,18 +4837,18 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
             "SELECT id, name FROM entities WHERE name = ?", (source_name,)
         ).fetchone()
         if not source:
-            return json.dumps({"error": f"Source entity '{source_name}' not found"})
+            return _error(f"Source entity '{source_name}' not found")
 
         target = conn.execute(
             "SELECT id, name FROM entities WHERE name = ?", (target_name,)
         ).fetchone()
         if not target:
-            return json.dumps({"error": f"Target entity '{target_name}' not found"})
+            return _error(f"Target entity '{target_name}' not found")
 
         src_id, tgt_id = source["id"], target["id"]
 
         if src_id == tgt_id:
-            return json.dumps({"error": "Source and target are the same entity"})
+            return _error("Source and target are the same entity")
 
         # Count what will be moved
         unique_obs = conn.execute(
