@@ -66,6 +66,31 @@ def _git(*args: str, bridge_dir: str) -> subprocess.CompletedProcess:
     )
 
 
+def _git_retry(
+    *args: str, bridge_dir: str, max_retries: int = 3
+) -> subprocess.CompletedProcess:
+    """Git command with exponential backoff retry for push/pull failures."""
+    import time
+
+    delays = [2, 4, 8]  # exponential backoff
+    last_result = None
+    for attempt in range(max_retries):
+        last_result = _git(*args, bridge_dir=bridge_dir)
+        if last_result.returncode == 0:
+            return last_result
+        if attempt < max_retries - 1:
+            log.warning(
+                "git %s attempt %d/%d failed: %s — retrying in %ds",
+                " ".join(args),
+                attempt + 1,
+                max_retries,
+                last_result.stderr.strip(),
+                delays[attempt],
+            )
+            time.sleep(delays[attempt])
+    return last_result
+
+
 def _check_sync_safety(
     conn: sqlite3.Connection,
     bridge_dir: str,
@@ -140,7 +165,13 @@ def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
             eid = conn.execute(
                 "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (e["name"], e["entityType"], e.get("project") or "shared:bridge", now, now),
+                (
+                    e["name"],
+                    e["entityType"],
+                    e.get("project") or "shared:bridge",
+                    now,
+                    now,
+                ),
             ).lastrowid
             for o in e.get("observations", []):
                 conn.execute(
@@ -325,9 +356,16 @@ def main(
 
     # Phase 2: Git pull (no transaction held)
     _progress(progress_callback, 5, "git pull...")
-    pull_result = _git("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
+    pull_result = _git_retry("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
     if pull_result.returncode != 0:
         log.error("git pull failed: %s", pull_result.stderr)
+        # Log conflict for debugging
+        _conflict_log = Path.home() / ".claude" / "memory" / "bridge_conflicts.log"
+        try:
+            with open(_conflict_log, "a", encoding="utf-8") as f:
+                f.write(f"{now_iso()} git_pull_failed: {pull_result.stderr.strip()}\n")
+        except OSError:
+            pass
         _progress(progress_callback, 100, "Done (pull failed)")
         return {
             "entities": 0,
@@ -410,6 +448,19 @@ def main(
                 safety["descriptions_removed"],
                 safety["notes_removed"],
             )
+            # Write notification for hook to surface to user
+            _notify_path = (
+                Path.home() / ".claude" / "memory" / "bridge_notifications.log"
+            )
+            try:
+                with open(_notify_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{now_iso()} WARN safety_valve_block: "
+                        f"{safety['descriptions_removed']} descriptions, "
+                        f"{safety['notes_removed']} notes would be deleted\n"
+                    )
+            except OSError:
+                pass
             _progress(
                 progress_callback,
                 -1,
@@ -538,7 +589,7 @@ def main(
             }
 
     _progress(progress_callback, 95, "git push...")
-    push_result = _git("push", bridge_dir=bridge_dir)
+    push_result = _git_retry("push", bridge_dir=bridge_dir)
     pushed = push_result.returncode == 0
 
     # Record last_push_at so incremental check can skip next time

@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Thin MCP server exposing Intelligence v2 tools.
+
+Shares the same SQLite database as the main sqlite-kb server.
+Exists because Claude Code 2.x has a tool-count limit per MCP server
+(~9 tools visible out of 50), so intelligence tools are split into a separate server.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+from fastmcp import FastMCP
+
+from db_utils import get_conn as _get_conn
+from schema import init_db
+from intelligence_v2 import (
+    assess_context as _assess_context,
+    queue_clarification as _queue_clarification,
+    record_human_answer as _record_human_answer,
+    load_config as _load_intel_config,
+)
+from claim_graph import (
+    extract_candidate_claims as _extract_claims,
+    promote_candidate as _promote_candidate,
+    auto_promote_layer1 as _auto_promote_layer1,
+)
+from context_packer import (
+    build_context_pack as _build_pack,
+)
+from impact_graph import explain_impact as _explain_impact
+
+# ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
+LOG_PATH = Path.home() / ".claude" / "memory" / "intel_server.log"
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger("sqlite-intel")
+logger.setLevel(logging.DEBUG)
+_fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+if not logger.handlers:
+    logger.addHandler(_fh)
+
+# ── FastMCP app ──────────────────────────────────────────────────────────
+
+mcp = FastMCP(
+    "sqlite-intel",
+    instructions=(
+        "Intelligence v2 tools: context assessment, claim extraction, knowledge tiers. "
+        "Shares DB with sqlite-kb."
+    ),
+)
+
+# init DB
+init_db()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 1: assess_context
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def assess_context(
+    chunk_ref: str,
+    session_id: str | None = None,
+    force: bool = False,
+) -> str:
+    """Classify context chunk, detect signals, determine state transition.
+
+    Scans for signal phrases (ENRICH_OK, NO_ENRICH, WAIT_HUMAN, FREEZE_CONTEXT),
+    computes materiality and uncertainty scores, and manages state transitions.
+    Skips reprocessing if chunk is awaiting_human with unchanged source_hash.
+
+    Args:
+        chunk_ref: ID of the context chunk to assess
+        session_id: Optional session context
+        force: If True, bypass skip logic and frozen state
+    """
+    with _get_conn() as conn:
+        result = _assess_context(conn, chunk_ref, session_id, force)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 2: queue_clarification
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def queue_clarification(
+    chunk_ref: str,
+    max_questions: int = 5,
+) -> str:
+    """Generate AWAITING_HUMAN block with focused clarification questions.
+
+    Analyzes the chunk content to produce typed questions (scope, semantics,
+    time, action, downstream_use) and locks the chunk until human answers.
+
+    Args:
+        chunk_ref: ID of the context chunk
+        max_questions: Maximum number of questions to generate (1-5)
+    """
+    with _get_conn() as conn:
+        result = _queue_clarification(conn, chunk_ref, max_questions)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 3: record_human_answer
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def record_human_answer(
+    chunk_ref: str,
+    answer_text: str,
+    question_id: str | None = None,
+) -> str:
+    """Ingest human answer, update chunk state, resolve open questions.
+
+    Transitions chunk from awaiting_human/uncertain back to enrichable,
+    updates source_hash to reflect the new information.
+
+    Args:
+        chunk_ref: ID of the context chunk
+        answer_text: Human's answer text
+        question_id: Optional specific question to answer (answers all if omitted)
+    """
+    with _get_conn() as conn:
+        result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 4: extract_candidate_claims
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def extract_candidate_claims(
+    chunk_ref: str,
+    scope_hint: str | None = None,
+) -> str:
+    """Extract typed (subject, predicate, object, scope) claims from a context chunk.
+
+    Only works on enrichable or uncertain chunks. Creates candidate claims with
+    evidence records linking back to the source. Claims require governance gate
+    (promote_candidate) before becoming canonical facts.
+
+    Args:
+        chunk_ref: ID of the context chunk to extract from
+        scope_hint: Optional scope override (memory|bridge|mapping|validation|export)
+    """
+    with _get_conn() as conn:
+        result = _extract_claims(conn, chunk_ref, scope_hint)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 5: promote_candidate
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def promote_candidate(
+    claim_id: str,
+    mode: str = "human_confirmed",
+) -> str:
+    """Governance gate: promote candidate claim to canonical fact.
+
+    Modes:
+    - human_confirmed: explicit human approval (always allowed)
+    - multi_evidence: auto-promotion if enough independent evidence (policy-gated)
+    - imported: bulk import from trusted source
+
+    Sensitive scopes (mapping, validation, bridge, export) require human_confirmed.
+
+    Args:
+        claim_id: ID of the candidate claim
+        mode: Promotion mode (human_confirmed|multi_evidence|imported)
+    """
+    with _get_conn() as conn:
+        result = _promote_candidate(conn, claim_id, mode)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 6: build_context_pack
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def build_context_pack(
+    pack_type: str = "executor",
+    target_ref: str | None = None,
+    session_id: str | None = None,
+    token_budget: int | None = None,
+) -> str:
+    """Compile role-specific context pack with token budget optimization.
+
+    Greedy coverage algorithm: scores available facts, claims, questions, and
+    chunks by relevance × role weight, then fills the token budget.
+
+    Pack types:
+    - planner: facts + questions (what do we know, what's uncertain)
+    - reviewer: facts + claims (what to validate)
+    - executor: facts + chunks (confirmed context for implementation)
+    - bridge_checker: claims + questions (what needs bridge verification)
+    - handoff: everything prioritized for session continuity
+
+    Args:
+        pack_type: Role-specific pack type
+        target_ref: Optional target reference for context filtering
+        session_id: Optional session context
+        token_budget: Token limit (default from config, typically 4000)
+    """
+    with _get_conn() as conn:
+        result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 7: explain_impact
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def explain_impact(
+    source_kind: str = "chunk",
+    source_ref: str = "",
+    depth: str = "standard",
+) -> str:
+    """Show downstream impact of a knowledge change via bounded BFS.
+
+    Traverses impact_edges graph to find affected sessions, snapshots,
+    mappings, validations, and exports. Results grouped and ranked by
+    propagated impact score.
+
+    Args:
+        source_kind: Type of source (chunk|claim|fact)
+        source_ref: ID of the source entity
+        depth: Traversal depth (quick=1, standard=3, deep=5)
+    """
+    with _get_conn() as conn:
+        result = _explain_impact(conn, source_kind, source_ref, depth)
+        return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 8: enrich_context
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def enrich_context(depth: str = "quick") -> str:
+    """Compatibility wrapper: enriches context at different depth levels.
+
+    Depth levels:
+    - quick: assess all enrichable chunks + build executor pack
+    - standard: + extract candidate claims
+    - deep: + explain impact for all recent facts
+
+    Args:
+        depth: Enrichment depth (quick|standard|deep)
+    """
+    config = _load_intel_config()
+    if not config["enabled"]:
+        return json.dumps(
+            {"status": "disabled", "message": "Intelligence v2 is disabled"}
+        )
+
+    results: dict = {"depth": depth, "steps": []}
+
+    with _get_conn() as conn:
+        # Step 1: Assess all enrichable chunks
+        enrichable = conn.execute(
+            "SELECT chunk_id FROM context_chunks WHERE state = 'enrichable' LIMIT 20"
+        ).fetchall()
+        assessed = []
+        for row in enrichable:
+            r = _assess_context(conn, row["chunk_id"])
+            assessed.append(r.get("chunk_id", "?"))
+        results["steps"].append({"assess": len(assessed)})
+
+        # Step 2: Build executor pack
+        pack = _build_pack(conn, "executor")
+        results["steps"].append(
+            {
+                "pack": pack.get("pack_id"),
+                "tokens": pack.get("token_usage", 0),
+            }
+        )
+        results["pack_body"] = pack.get("body", "")
+
+        if depth in ("standard", "deep"):
+            # Step 3: Extract claims from enrichable chunks
+            claims_total = 0
+            all_claims: list = []
+            for row in enrichable:
+                cr = _extract_claims(conn, row["chunk_id"])
+                claims_total += cr.get("claims_extracted", 0)
+                all_claims.extend(cr.get("claims", []))
+            results["steps"].append({"claims_extracted": claims_total})
+
+            # Step 3b: Auto-promote high-confidence claims
+            promoted = _auto_promote_layer1(conn, all_claims)
+            results["steps"].append({"claims_promoted": len(promoted)})
+            if promoted:
+                results["promoted_facts"] = [
+                    {
+                        "subject": p["subject"],
+                        "predicate": p["predicate"],
+                        "object": p["object"],
+                        "fact_id": p["fact_id"],
+                    }
+                    for p in promoted
+                ]
+
+        if depth == "deep":
+            # Step 4: Explain impact for recent facts
+            recent = conn.execute(
+                "SELECT fact_id FROM canonical_facts "
+                "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
+            ).fetchall()
+            impacts = []
+            for f in recent:
+                imp = _explain_impact(conn, "fact", f["fact_id"])
+                impacts.append(imp.get("total_impacts", 0))
+            results["steps"].append({"impacts_analyzed": len(impacts)})
+
+    return json.dumps(results)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
