@@ -356,6 +356,11 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
                 )
                 deleted += cur.rowcount
             _fts_sync(conn, eid)
+            if _VEC_AVAILABLE:
+                try:
+                    _vec_sync(conn, eid)
+                except Exception:
+                    pass
 
     logger.info("delete_observations: %d deleted", deleted)
     return json.dumps({"deleted": deleted})
@@ -414,11 +419,12 @@ def read_graph() -> str:
 
 @mcp.tool()
 def search_nodes(query: str, project: str | None = None) -> str:
-    """Search the knowledge graph using FTS5 BM25-ranked full-text search.
+    """Search the knowledge graph using hybrid BM25 + semantic search.
 
-    Returns matching entities with their observations, ranked by relevance.
-    Applies multi-signal re-ranking (recency, project affinity, graph proximity,
-    observation richness, canonical facts, session context).
+    When sqlite-vec is installed, combines FTS5 keyword matching with vector
+    cosine similarity via Reciprocal Rank Fusion. Falls back to FTS5-only
+    otherwise. Results are re-ranked with 6 contextual signals (recency,
+    project affinity, graph proximity, richness, canonical facts, session).
     """
     fts_q = _fts_query(query)
     with _get_conn() as conn:

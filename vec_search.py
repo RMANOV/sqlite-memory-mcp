@@ -46,6 +46,7 @@ VEC_AVAILABLE: bool = _HAS_VEC and _HAS_ST
 _model: SentenceTransformer | None = None
 _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
+MAX_OBS_FOR_EMBEDDING = 20  # MiniLM-L6-v2 has 256-token limit; cap observations to fit
 
 
 def _get_model() -> SentenceTransformer:
@@ -108,7 +109,7 @@ def init_vec_table(conn: sqlite3.Connection) -> bool:
 
 def _entity_text(name: str, entity_type: str, observations: list[str]) -> str:
     """Compose the text to embed for an entity."""
-    obs_str = ". ".join(observations[:20])
+    obs_str = ". ".join(observations[:MAX_OBS_FOR_EMBEDDING])
     return f"{name} ({entity_type}): {obs_str}"
 
 
@@ -159,8 +160,8 @@ def vec_remove_entity(conn: sqlite3.Connection, entity_id: int) -> None:
     try:
         if load_vec(conn):
             conn.execute("DELETE FROM entity_embeddings WHERE rowid = ?", (entity_id,))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("vec_remove_entity(%d) failed: %s", entity_id, e)
 
 
 # ── Vector search ──────────────────────────────────────────────────────
