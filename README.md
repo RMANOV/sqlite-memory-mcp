@@ -24,14 +24,14 @@ SQLite hits the sweet spot:
 ## Features
 
 - **WAL mode** -- 10+ concurrent Claude Code sessions with no file locking conflicts
-- **FTS5 BM25 ranked search** -- Full-text search across entity names, types, and observations with relevance ranking
+- **Hybrid search (BM25 + semantic)** -- FTS5 keyword search fused with optional sqlite-vec cosine similarity via Reciprocal Rank Fusion, then re-ranked with 6 contextual signals (recency, project affinity, graph proximity, observation richness, canonical facts, active session)
 - **Session tracking** -- Save and recall session snapshots for context continuity across restarts
 - **Task management** -- Structured task CRUD with typed queries, priorities, sections, due dates, and recurring tasks
 - **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
 - **Drop-in compatible** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically, plus 12 new tools
-- **Zero dependencies beyond stdlib** -- Only `fastmcp` for the MCP protocol; `sqlite3` is Python stdlib
+- **Zero required dependencies beyond stdlib** -- Only `fastmcp` for MCP protocol; `sqlite3` is Python stdlib. Optional `sqlite-vec` + `sentence-transformers` unlock semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
 
@@ -41,7 +41,7 @@ SQLite hits the sweet spot:
 |---|---|---|---|---|---|---|---|---|---|
 | Storage | SQLite | JSONL file | Mem0 Cloud | SQLite | JSON file | ChromaDB | Qdrant | SQLite | Neo4j |
 | Concurrent 10+ sessions | WAL mode | file locks | cloud | no WAL | file locks | yes | yes | no | yes |
-| FTS5 BM25 search | yes | substring | no | no | no | vector | vector | no | Cypher |
+| Hybrid search (BM25 + vector) | yes (RRF fusion) | substring | no | no | no | vector only | vector only | no | Cypher only |
 | Session tracking | built-in | no | no | no | no | no | no | no | no |
 | Task management | built-in | no | no | no | no | no | no | no | no |
 | Cross-project sharing | project field | no | no | no | no | no | no | no | no |

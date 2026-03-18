@@ -1,0 +1,279 @@
+"""Optional vector search layer using sqlite-vec + sentence-transformers.
+
+Adds semantic similarity search (cosine distance) alongside FTS5 BM25.
+Gracefully degrades to FTS5-only when dependencies are not installed.
+
+Architecture:
+    embed_text() → float32 bytes (384-dim MiniLM-L6-v2)
+    vec_sync_entity() → called after FTS sync on entity writes
+    vector_search() → KNN query against entity_embeddings vec0 table
+    rrf_merge() → Reciprocal Rank Fusion of FTS5 + vector results
+
+The merged results feed into the existing 6-signal reranker (smart_retrieval.py)
+without any changes to that module.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from typing import Any
+
+logger = logging.getLogger("sqlite-kb")
+
+
+# ── Availability check ─────────────────────────────────────────────────
+
+try:
+    import sqlite_vec
+
+    _HAS_VEC = True
+except ImportError:
+    _HAS_VEC = False
+
+try:
+    from sentence_transformers import SentenceTransformer
+
+    _HAS_ST = True
+except ImportError:
+    _HAS_ST = False
+
+VEC_AVAILABLE: bool = _HAS_VEC and _HAS_ST
+
+
+# ── Model singleton (lazy loaded) ─────────────────────────────────────
+
+_model: SentenceTransformer | None = None
+_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_DIM = 384
+
+
+def _get_model() -> SentenceTransformer:
+    """Lazy-load the embedding model on first use."""
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(_MODEL_NAME)
+        logger.info("Loaded embedding model: %s", _MODEL_NAME)
+    return _model
+
+
+# ── Extension loader ───────────────────────────────────────────────────
+
+
+def load_vec(conn: sqlite3.Connection) -> bool:
+    """Load sqlite-vec extension on a connection.
+
+    Uses a sentinel table query to detect if already loaded, avoiding
+    redundant enable_load_extension cycles.
+    """
+    if not _HAS_VEC:
+        return False
+    # Fast check: if vec0 is already usable, skip reload
+    try:
+        conn.execute("SELECT vec_version()")
+        return True
+    except Exception:
+        pass
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return True
+    except Exception as e:
+        logger.debug("sqlite-vec load failed: %s", e)
+        return False
+
+
+# ── Table management ───────────────────────────────────────────────────
+
+
+def init_vec_table(conn: sqlite3.Connection) -> bool:
+    """Create the vec0 virtual table if it doesn't exist."""
+    if not load_vec(conn):
+        return False
+    try:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings "
+            f"USING vec0(embedding float[{EMBEDDING_DIM}])"
+        )
+        logger.info("entity_embeddings vec0 table ready (dim=%d)", EMBEDDING_DIM)
+        return True
+    except Exception as e:
+        logger.warning("Failed to create entity_embeddings: %s", e)
+        return False
+
+
+# ── Embedding generation ───────────────────────────────────────────────
+
+
+def _entity_text(name: str, entity_type: str, observations: list[str]) -> str:
+    """Compose the text to embed for an entity."""
+    obs_str = ". ".join(observations[:20])
+    return f"{name} ({entity_type}): {obs_str}"
+
+
+def embed_text(text: str) -> bytes:
+    """Generate a 384-dim embedding and return as raw float32 bytes for vec0."""
+    model = _get_model()
+    vec = model.encode(text, normalize_embeddings=True)
+    return vec.astype("float32").tobytes()
+
+
+# ── Sync helpers (called after FTS sync on writes) ─────────────────────
+
+
+def vec_sync_entity(conn: sqlite3.Connection, entity_id: int) -> None:
+    """Update the embedding for an entity. Creates or replaces."""
+    if not VEC_AVAILABLE or not load_vec(conn):
+        return
+
+    row = conn.execute(
+        "SELECT name, entity_type FROM entities WHERE id = ?",
+        (entity_id,),
+    ).fetchone()
+    if row is None:
+        vec_remove_entity(conn, entity_id)
+        return
+
+    obs_rows = conn.execute(
+        "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+        (entity_id,),
+    ).fetchall()
+    obs = [r["content"] for r in obs_rows]
+
+    text = _entity_text(row["name"], row["entity_type"], obs)
+    emb = embed_text(text)
+
+    # vec0 doesn't support UPDATE — DELETE + INSERT
+    conn.execute("DELETE FROM entity_embeddings WHERE rowid = ?", (entity_id,))
+    conn.execute(
+        "INSERT INTO entity_embeddings(rowid, embedding) VALUES (?, ?)",
+        (entity_id, emb),
+    )
+
+
+def vec_remove_entity(conn: sqlite3.Connection, entity_id: int) -> None:
+    """Remove an entity's embedding."""
+    if not VEC_AVAILABLE:
+        return
+    try:
+        if load_vec(conn):
+            conn.execute("DELETE FROM entity_embeddings WHERE rowid = ?", (entity_id,))
+    except Exception:
+        pass
+
+
+# ── Vector search ──────────────────────────────────────────────────────
+
+
+def vector_search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
+    """Perform KNN vector search.
+
+    Returns list of dicts with: eid, name, entity_type, project, distance.
+    """
+    if not VEC_AVAILABLE or not load_vec(conn):
+        return []
+
+    emb = embed_text(query)
+    try:
+        rows = conn.execute(
+            "SELECT ee.rowid AS eid, ee.distance, "
+            "e.name, e.entity_type, e.project "
+            "FROM entity_embeddings ee "
+            "JOIN entities e ON e.id = ee.rowid "
+            "WHERE ee.embedding MATCH ? AND k = ? "
+            "ORDER BY ee.distance",
+            (emb, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("vector_search failed: %s", e)
+        return []
+
+
+# ── Reciprocal Rank Fusion ─────────────────────────────────────────────
+
+
+def rrf_merge(
+    fts_results: list[Any],
+    vec_results: list[dict],
+    k: int = 60,
+) -> list[dict]:
+    """Merge FTS5 and vector results using Reciprocal Rank Fusion.
+
+    RRF(d) = sum(1 / (k + rank_i(d))) for each ranking source.
+
+    Returns combined results ordered by RRF score (descending), formatted
+    to match the FTS5 row format expected by rerank_entities().
+    """
+    scores: dict[int, float] = {}
+    entity_data: dict[int, dict] = {}
+
+    # FTS5 contributions (fts_results may be sqlite3.Row objects)
+    for rank, item in enumerate(fts_results):
+        eid = item["eid"]
+        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank + 1)
+        entity_data[eid] = {
+            "eid": eid,
+            "name": item["name"],
+            "entity_type": item["entity_type"],
+            "project": item["project"],
+        }
+
+    # Vector contributions
+    for rank, item in enumerate(vec_results):
+        eid = item["eid"]
+        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank + 1)
+        if eid not in entity_data:
+            entity_data[eid] = {
+                "eid": eid,
+                "name": item["name"],
+                "entity_type": item["entity_type"],
+                "project": item.get("project"),
+            }
+
+    # Sort by RRF score descending
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    results = []
+    for eid, rrf_score in ranked:
+        data = entity_data[eid]
+        # Use negative RRF score as rank (matches FTS5 convention: lower = better)
+        data["rank"] = -rrf_score
+        results.append(data)
+    return results
+
+
+# ── Backfill utility ───────────────────────────────────────────────────
+
+
+def backfill_embeddings(conn: sqlite3.Connection) -> int:
+    """Generate embeddings for all entities that don't have one yet.
+
+    Returns the number of entities backfilled.
+    """
+    if not VEC_AVAILABLE or not load_vec(conn):
+        return 0
+
+    # Find entities without embeddings
+    existing = set()
+    try:
+        for row in conn.execute("SELECT rowid FROM entity_embeddings"):
+            existing.add(row[0])
+    except Exception:
+        pass
+
+    all_entities = conn.execute("SELECT id FROM entities").fetchall()
+    missing = [r["id"] for r in all_entities if r["id"] not in existing]
+
+    count = 0
+    for eid in missing:
+        try:
+            vec_sync_entity(conn, eid)
+            count += 1
+        except Exception as e:
+            logger.warning("backfill failed for entity %d: %s", eid, e)
+
+    if count:
+        logger.info("Backfilled embeddings for %d entities", count)
+    return count

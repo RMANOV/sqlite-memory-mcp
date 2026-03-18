@@ -1,7 +1,7 @@
 [project]
 name = "sqlite-memory-mcp"
-version = "3.0.0"
-description = "SQLite-backed MCP Memory Server with Intelligence v2, context state machine, knowledge tiers, WAL concurrent safety, FTS5 search, cross-machine bridge sync, and 49 MCP tools"
+version = "3.1.0"
+description = "SQLite-backed MCP Memory Server with hybrid search (BM25 + semantic via sqlite-vec), Intelligence v2, context state machine, knowledge tiers, WAL concurrent safety, cross-machine bridge sync, and 50 MCP tools"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=2.0.0", "orjson>=3.9.0"]
 license = {text = "MIT"}
@@ -11,6 +11,7 @@ readme = "README.md"
 [project.optional-dependencies]
 gui = ["PyQt6>=6.5"]
 dev = ["pytest>=7.0"]
+vector = ["sqlite-vec>=0.1.6", "sentence-transformers>=3.0.0"]
 
 [project.scripts]
 sqlite-memory-mcp = "server:mcp.run"

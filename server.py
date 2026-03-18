@@ -30,6 +30,18 @@ from db_utils import (
 )
 from schema import init_db
 
+# Optional vector search (graceful fallback to FTS5-only)
+try:
+    from vec_search import (
+        VEC_AVAILABLE as _VEC_AVAILABLE,
+        vec_sync_entity as _vec_sync,
+        vec_remove_entity as _vec_remove,
+        vector_search as _vector_search,
+        rrf_merge as _rrf_merge,
+    )
+except ImportError:
+    _VEC_AVAILABLE = False
+
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
 LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
@@ -179,6 +191,11 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                     if cur_obs.rowcount > 0:
                         new_obs_ids.append((cur_obs.lastrowid, obs))
                 _fts_sync(conn, eid)
+                if _VEC_AVAILABLE:
+                    try:
+                        _vec_sync(conn, eid)
+                    except Exception:
+                        pass
                 if new_obs_ids:
                     try:
                         from lazy_enrichment import extract_inline_claims
@@ -225,6 +242,11 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                 added += cur.rowcount
             conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, eid))
             _fts_sync(conn, eid)
+            if _VEC_AVAILABLE:
+                try:
+                    _vec_sync(conn, eid)
+                except Exception:
+                    pass
             if contents:
                 try:
                     from lazy_enrichment import extract_inline_claims
@@ -302,6 +324,11 @@ def delete_entities(entityNames: list[str]) -> str:
             if eid is None:
                 continue
             _fts_remove(conn, eid)
+            if _VEC_AVAILABLE:
+                try:
+                    _vec_remove(conn, eid)
+                except Exception:
+                    pass
             conn.execute("DELETE FROM entities WHERE id = ?", (eid,))
             deleted += 1
 
@@ -416,6 +443,18 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT ?",
                 (fts_q, pool_size),
             ).fetchall()
+
+        # Optional: parallel vector search + RRF merge
+        if _VEC_AVAILABLE and query.strip():
+            try:
+                vec_rows = _vector_search(conn, query, pool_size)
+                if vec_rows and rows:
+                    rows = _rrf_merge(rows, vec_rows)
+                elif vec_rows and not rows:
+                    # Vector found results that FTS5 missed (semantic match)
+                    rows = _rrf_merge([], vec_rows)
+            except Exception:
+                pass  # Fall through to FTS5-only
 
         if not rows:
             return json.dumps({"entities": [], "query": query})

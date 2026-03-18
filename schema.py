@@ -827,4 +827,14 @@ def init_db(db_path: str | None = None) -> None:
                 "tasks_fts: rebuilt FTS index for %d existing tasks", task_count
             )
 
+    # Optional: initialize sqlite-vec virtual table for semantic search
+    try:
+        from vec_search import VEC_AVAILABLE, init_vec_table
+
+        if VEC_AVAILABLE:
+            with _get_conn(_path) as conn:
+                init_vec_table(conn)
+    except Exception as e:
+        logger.debug("sqlite-vec init skipped: %s", e)
+
     logger.info("Database initialized at %s", _path)
