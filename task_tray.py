@@ -3116,10 +3116,18 @@ class FullWindow(QMainWindow):
                     _pack(conn, "executor")
 
                     claims = 0
+                    promoted = 0
                     if depth in ("standard", "deep"):
+                        from claim_graph import auto_promote_layer1
+
+                        all_claims: list = []
                         for row in enrichable:
                             cr = _extract(conn, row["chunk_id"])
                             claims += cr.get("claims_extracted", 0)
+                            all_claims.extend(cr.get("claims", []))
+
+                        promoted_results = auto_promote_layer1(conn, all_claims)
+                        promoted = len(promoted_results)
 
                     impacts = 0
                     if depth == "deep":
@@ -3133,7 +3141,8 @@ class FullWindow(QMainWindow):
                             impacts += 1
 
                 self._enrich_done.emit(
-                    f"Enriched: {assessed} assessed, {claims} claims, {impacts} impacts"
+                    f"Enriched: {assessed} assessed, {claims} claims, "
+                    f"{promoted} promoted, {impacts} impacts"
                 )
             except Exception as exc:
                 self._enrich_done.emit(f"Enrich error: {exc}")

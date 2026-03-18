@@ -19,6 +19,7 @@ from intelligence_v2 import (
     load_config,
     log_enrichment_run,
 )
+from lazy_enrichment import _PREDICATE_BASE_CONFIDENCE
 
 # ── Claim Extraction Heuristics ──────────────────────────────────────────
 
@@ -195,8 +196,8 @@ def extract_candidate_claims(
     for t in tuples:
         claim_id = _new_id()
 
-        # Confidence based on match quality (simple heuristic)
-        confidence = 0.5  # base confidence for pattern match
+        # Adaptive confidence from predicate type (Layer 2 parity)
+        confidence = _PREDICATE_BASE_CONFIDENCE.get(t["predicate"], 0.5)
 
         conn.execute(
             "INSERT INTO candidate_claims "
@@ -264,7 +265,7 @@ def extract_candidate_claims(
 # ── Core: Promote Candidate ──────────────────────────────────────────────
 
 # Promotion modes
-PROMOTION_MODES = ("human_confirmed", "multi_evidence", "imported")
+PROMOTION_MODES = ("human_confirmed", "multi_evidence", "imported", "auto_layer1")
 
 # Minimum evidence count for auto-promotion
 _MIN_EVIDENCE_FOR_AUTO = 3
@@ -328,6 +329,35 @@ def promote_candidate(
             "reason": f"Scope '{claim_scope}' requires human confirmation. "
             f"Use mode='human_confirmed' to promote.",
         }
+
+    # Auto Layer 1: confidence-only check, no evidence count requirement
+    if mode == "auto_layer1":
+        if claim_scope not in auto_promote_scopes:
+            log_enrichment_run(
+                conn,
+                "promote_candidate",
+                "blocked",
+                claim_id,
+                reason_code=f"scope_{claim_scope}_not_auto",
+                started_at=started,
+            )
+            return {
+                "claim_id": claim_id,
+                "promoted": False,
+                "reason": f"Scope '{claim_scope}' not in auto_promote_scopes.",
+            }
+        if row["confidence"] < _MIN_CONFIDENCE_FOR_AUTO:
+            return {
+                "claim_id": claim_id,
+                "promoted": False,
+                "reason": f"Confidence {row['confidence']:.2f} < {_MIN_CONFIDENCE_FOR_AUTO}",
+            }
+        if requires_human:
+            return {
+                "claim_id": claim_id,
+                "promoted": False,
+                "reason": "Claim requires human confirmation",
+            }
 
     # Multi-evidence validation
     if mode == "multi_evidence":
@@ -407,6 +437,23 @@ def promote_candidate(
         (fact_id, now, claim_id),
     )
 
+    # Create impact edge: source_chunk → promoted fact
+    try:
+        from impact_graph import add_impact_edge
+
+        add_impact_edge(
+            conn,
+            source_kind="chunk",
+            source_ref=row["chunk_id"],
+            target_kind="fact",
+            target_ref=fact_id,
+            impact_type="informs",
+            impact_score=row["confidence"],
+            rationale=f"Claim {claim_id} promoted via {mode}",
+        )
+    except Exception:
+        pass  # impact_graph is optional enhancement
+
     log_enrichment_run(
         conn, "promote_candidate", "success", claim_id, started_at=started
     )
@@ -421,3 +468,28 @@ def promote_candidate(
         "scope": claim_scope,
         "validation_mode": mode,
     }
+
+
+def auto_promote_layer1(
+    conn: sqlite3.Connection,
+    claims: list[dict[str, Any]],
+    threshold: float = 0.7,
+) -> list[dict[str, Any]]:
+    """Auto-promote high-confidence Layer 1 claims. Returns list of promoted results."""
+    promoted = []
+    for c in claims:
+        if c.get("requires_human"):
+            continue
+        if c.get("confidence", 0) < threshold:
+            continue
+        # Dedup check against existing canonical facts
+        exists = conn.execute(
+            "SELECT 1 FROM canonical_facts WHERE subject = ? AND predicate = ? AND object_text = ?",
+            (c["subject"], c["predicate"], c["object"]),
+        ).fetchone()
+        if exists:
+            continue
+        result = promote_candidate(conn, c["claim_id"], mode="auto_layer1")
+        if result.get("promoted"):
+            promoted.append(result)
+    return promoted

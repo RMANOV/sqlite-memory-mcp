@@ -24,7 +24,7 @@ from intelligence_v2 import (
 IMPACT_TYPES = ("informs", "blocks", "risks", "invalidates", "requires_review")
 
 SOURCE_KINDS = ("chunk", "claim", "fact")
-TARGET_KINDS = ("session", "snapshot", "mapping", "validation", "export")
+TARGET_KINDS = ("session", "snapshot", "mapping", "validation", "export", "fact")
 
 # Depth presets
 _DEPTH_LIMITS = {
