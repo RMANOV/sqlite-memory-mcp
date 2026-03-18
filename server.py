@@ -17,7 +17,7 @@ import json
 import logging
 import math
 import os
-import re  # used by _tokenize() for Jaccard similarity
+import re  # used by _GITHUB_USER_RE
 import socket
 import sqlite3
 import subprocess
@@ -57,6 +57,9 @@ from db_utils import (
     export_index_json as _export_index_json,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     fts_sync_entity as _fts_sync,
+    serialize_entity as _serialize_entity,
+    export_relations as _export_relations,
+    validate_task_fields as _validate_task_fields,
     DB_PATH,
     BRIDGE_REPO,
 )
@@ -73,11 +76,6 @@ def _error(msg: str) -> str:
     return json.dumps({"error": msg})
 
 
-def _check_enum(value: str, allowed: tuple, field: str) -> str | None:
-    """Return error string if value not in allowed, else None."""
-    if value not in allowed:
-        return _error(f"Invalid {field}: {value}. Use: {allowed}")
-    return None
 
 
 def _is_valid_timestamp(s: str) -> bool:
