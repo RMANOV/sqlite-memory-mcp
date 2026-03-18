@@ -21,6 +21,7 @@ import re  # used by _tokenize() for Jaccard similarity
 import socket
 import sqlite3
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -172,6 +173,38 @@ mcp = FastMCP(
 )
 
 # DB_PATH and BRIDGE_REPO imported from db_utils (single source of truth)
+
+# ── Debounced bridge auto-sync ──────────────────────────────────────
+_bridge_sync_timer: threading.Timer | None = None
+_bridge_sync_lock = threading.Lock()
+_BRIDGE_SYNC_DELAY = 60  # seconds, matches task_tray.py
+
+
+def _schedule_bridge_sync():
+    """Schedule a debounced bridge sync. Resets timer on each call."""
+    global _bridge_sync_timer
+    with _bridge_sync_lock:
+        if _bridge_sync_timer is not None:
+            _bridge_sync_timer.cancel()
+        _bridge_sync_timer = threading.Timer(_BRIDGE_SYNC_DELAY, _run_bridge_sync)
+        _bridge_sync_timer.daemon = True  # don't block process exit
+        _bridge_sync_timer.start()
+
+
+def _run_bridge_sync():
+    """Execute bridge sync in background thread."""
+    global _bridge_sync_timer
+    try:
+        import bridge_sync_worker
+
+        stats = bridge_sync_worker.main()
+        logger.info("auto-sync: %s", stats)
+    except Exception as exc:
+        logger.warning("auto-sync failed: %s", exc)
+    finally:
+        with _bridge_sync_lock:
+            _bridge_sync_timer = None
+
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -1154,6 +1187,7 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
     logger.info(
         "create_entities: %d created out of %d requested", created, len(entities)
     )
+    _schedule_bridge_sync()
     return json.dumps({"created": created, "total_requested": len(entities)})
 
 
@@ -1202,6 +1236,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                     pass  # L2 enrichment is optional — don't break core
 
     logger.info("add_observations: %d observations added", added)
+    _schedule_bridge_sync()
     return json.dumps({"added": added})
 
 
@@ -1926,6 +1961,7 @@ def create_task(
         _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now)
 
     logger.info("create_task: %s (%s)", title, task_id)
+    _schedule_bridge_sync()
     return json.dumps(
         {"task_id": task_id, "title": title, "type": type, "status": "not_started"}
     )
@@ -2037,6 +2073,7 @@ def update_task(
         _upsert_field_versions(conn, task_id, changed, updates["updated_at"])
 
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
+    _schedule_bridge_sync()
     return json.dumps({"updated": task_id, "fields": list(updates.keys())})
 
 
