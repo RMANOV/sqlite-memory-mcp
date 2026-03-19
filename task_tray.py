@@ -62,6 +62,19 @@ _UI_COLS = "id, title, description, notes, status, section, priority, due_date, 
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200
 
+# Entity type → badge color (shared between TaskReaderDialog + entity search cards)
+_ENTITY_TYPE_COLORS = {
+    "concept": "#1a3a5c",
+    "tool": "#2d6a2e",
+    "person": "#8b4513",
+    "project": "#4a148c",
+    "technology": "#00695c",
+    "fact": "#555",
+    "claim": "#8b6914",
+    "process": "#2e4057",
+}
+_ENTITY_DEFAULT_COLOR = "#555"
+
 
 class TaskDB:
     """Direct sqlite3 wrapper for tasks table."""
@@ -79,6 +92,13 @@ class TaskDB:
 
         self._last_promote_time: float = 0.0
         self.search_engine = TaskSearchEngine()
+
+        # Entity enrichment cache — pre-loaded obs preview + task count
+        self._enrich_cache_obs: dict[int, str] = {}
+        self._enrich_cache_tc: dict[int, int] = {}
+        self._enrich_cache_valid = False
+        self._enrich_cache_lock = threading.Lock()
+        threading.Thread(target=self._refresh_enrich_cache, daemon=True).start()
 
         self._wal_timer = QTimer(QApplication.instance())
         self._wal_timer.timeout.connect(self._wal_checkpoint)
@@ -376,6 +396,209 @@ class TaskDB:
             (fts_q, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def search_entities_hybrid(
+        self, query: str, limit: int = 10, use_vector: bool = True
+    ) -> list[dict]:
+        """Hybrid entity search: FTS5 + optional vector, enriched with obs preview + task count."""
+        fts_results = self.search_entities(query, limit)
+        if not fts_results:
+            return []
+
+        # Optional vector search via vec_search module
+        if use_vector:
+            try:
+                from vec_search import vector_search, rrf_merge
+
+                vec_results = vector_search(self._conn, query, limit)
+                if vec_results:
+                    # Normalize FTS results to match rrf_merge expected format (eid key)
+                    fts_for_rrf = [
+                        {
+                            "eid": r["rowid"],
+                            "name": r["name"],
+                            "entity_type": r.get("entity_type", ""),
+                            "project": None,
+                        }
+                        for r in fts_results
+                    ]
+                    merged = rrf_merge(fts_for_rrf, vec_results, k=60)
+                    # Rebuild result list from merged ranking
+                    by_id = {r["rowid"]: r for r in fts_results}
+                    for vr in vec_results:
+                        if vr["eid"] not in by_id:
+                            by_id[vr["eid"]] = {
+                                "rowid": vr["eid"],
+                                "name": vr["name"],
+                                "entity_type": vr.get("entity_type", ""),
+                                "obs_count": 0,
+                            }
+                    fts_results = [
+                        by_id[m["eid"]] for m in merged if m["eid"] in by_id
+                    ][:limit]
+            except Exception:
+                pass  # Graceful degradation to FTS5-only
+
+        # Batch enrich: obs preview + task count
+        eids = [r["rowid"] for r in fts_results]
+        if not eids:
+            return []
+        placeholders = ",".join("?" * len(eids))
+
+        obs_map = {}
+        for row in self._conn.execute(
+            f"SELECT entity_id, content FROM observations WHERE entity_id IN ({placeholders}) "
+            "GROUP BY entity_id",
+            eids,
+        ).fetchall():
+            obs_map[row["entity_id"]] = row["content"][:80]
+
+        tc_map = {}
+        try:
+            for row in self._conn.execute(
+                f"SELECT entity_id, COUNT(*) as cnt FROM task_entity_links "
+                f"WHERE entity_id IN ({placeholders}) GROUP BY entity_id",
+                eids,
+            ).fetchall():
+                tc_map[row["entity_id"]] = row["cnt"]
+        except Exception:
+            pass  # table may not exist in older DBs
+
+        return [
+            {
+                "entity_id": r["rowid"],
+                "name": r["name"],
+                "entity_type": r.get("entity_type", ""),
+                "obs_preview": obs_map.get(r["rowid"], ""),
+                "obs_count": r.get("obs_count", 0),
+                "task_count": tc_map.get(r["rowid"], 0),
+                "_is_entity": True,
+            }
+            for r in fts_results
+        ]
+
+    def _refresh_enrich_cache(self):
+        """Bulk-load obs preview + task count for all entities. Thread-safe."""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            conn.row_factory = sqlite3.Row
+            obs = {}
+            for row in conn.execute(
+                "SELECT entity_id, content FROM observations GROUP BY entity_id"
+            ).fetchall():
+                obs[row["entity_id"]] = row["content"][:80]
+            tc = {}
+            try:
+                for row in conn.execute(
+                    "SELECT entity_id, COUNT(*) as cnt FROM task_entity_links GROUP BY entity_id"
+                ).fetchall():
+                    tc[row["entity_id"]] = row["cnt"]
+            except Exception:
+                pass
+            conn.close()
+            with self._enrich_cache_lock:
+                self._enrich_cache_obs = obs
+                self._enrich_cache_tc = tc
+                self._enrich_cache_valid = True
+        except Exception:
+            pass
+
+    def _invalidate_enrich_cache(self):
+        """Mark cache stale. Next refresh will reload."""
+        with self._enrich_cache_lock:
+            self._enrich_cache_valid = False
+
+    def _get_enrich(self, entity_id: int) -> tuple[str, int]:
+        """Get cached (obs_preview, task_count). Returns ("", 0) on miss."""
+        with self._enrich_cache_lock:
+            return (
+                self._enrich_cache_obs.get(entity_id, ""),
+                self._enrich_cache_tc.get(entity_id, 0),
+            )
+
+    def search_entities_fast(self, query: str, limit: int = 10) -> list[dict]:
+        """FTS5 + vector search with cached enrichment. Thread-safe (own connection)."""
+        if not query or len(query.strip()) < 2:
+            return []
+        words = query.strip().split()
+        fts_q = " OR ".join(f'"{w}"' for w in words if w)
+        if not fts_q:
+            return []
+        conn = sqlite3.connect(self.db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT rowid, name, entity_type, "
+                "(SELECT COUNT(*) FROM observations WHERE entity_id = memory_fts.rowid) AS obs_count "
+                "FROM memory_fts WHERE memory_fts MATCH ? LIMIT ?",
+                (fts_q, limit),
+            ).fetchall()
+        except Exception:
+            conn.close()
+            return []
+        fts_results = [dict(r) for r in rows]
+
+        # Vector search (ALWAYS enabled) — graceful degradation if deps missing
+        try:
+            from vec_search import vector_search, rrf_merge, load_vec
+
+            if load_vec(conn):
+                vec_results = vector_search(conn, query, limit)
+                if vec_results and fts_results:
+                    fts_for_rrf = [
+                        {
+                            "eid": r["rowid"],
+                            "name": r["name"],
+                            "entity_type": r.get("entity_type", ""),
+                            "project": None,
+                        }
+                        for r in fts_results
+                    ]
+                    merged = rrf_merge(fts_for_rrf, vec_results, k=60)
+                    by_id = {r["rowid"]: r for r in fts_results}
+                    for vr in vec_results:
+                        if vr["eid"] not in by_id:
+                            by_id[vr["eid"]] = {
+                                "rowid": vr["eid"],
+                                "name": vr["name"],
+                                "entity_type": vr.get("entity_type", ""),
+                                "obs_count": 0,
+                            }
+                    fts_results = [
+                        by_id[m["eid"]] for m in merged if m["eid"] in by_id
+                    ][:limit]
+                elif vec_results and not fts_results:
+                    fts_results = [
+                        {
+                            "rowid": vr["eid"],
+                            "name": vr["name"],
+                            "entity_type": vr.get("entity_type", ""),
+                            "obs_count": 0,
+                        }
+                        for vr in vec_results[:limit]
+                    ]
+        except Exception:
+            pass  # Graceful degradation to FTS5-only
+
+        conn.close()
+
+        # Apply cached enrichment (zero SQL queries)
+        results = []
+        for r in fts_results:
+            eid = r["rowid"]
+            obs_preview, task_count = self._get_enrich(eid)
+            results.append(
+                {
+                    "entity_id": eid,
+                    "name": r["name"],
+                    "entity_type": r.get("entity_type", ""),
+                    "obs_preview": obs_preview,
+                    "obs_count": r.get("obs_count", 0),
+                    "task_count": task_count,
+                    "_is_entity": True,
+                }
+            )
+        return results
 
     def link_task_entity(
         self, task_id: str, entity_id: int, link_type: str = "manual"
@@ -1035,6 +1258,8 @@ def _smart_group(tasks):
 class TrayPopup(QWidget):
     """Compact popup showing top suggested tasks."""
 
+    _entity_search_done = pyqtSignal(list, int)  # (entity_results, seq_id)
+
     def __init__(self, db, on_open_full, parent=None):
         super().__init__(
             parent,
@@ -1045,6 +1270,8 @@ class TrayPopup(QWidget):
         self.db = db
         self.on_open_full = on_open_full
         self._tasks = []
+        self._entity_seq_id = 0
+        self._entity_search_done.connect(self._on_entity_results)
         self.setFixedWidth(380)
         self.setMaximumHeight(500)
         self.setStyleSheet(self._stylesheet())
@@ -1156,12 +1383,41 @@ class TrayPopup(QWidget):
             tasks = self._search_engine.search(
                 q, all_tasks, limit=20, conn=self.db._conn, use_vector=False
             )
+            # Show tasks immediately, entities arrive async
+            merged = [{**t, "_is_entity": False} for t in tasks]
+
+            # Async entity search (with vector — always on)
+            self._entity_seq_id += 1
+            _seq = self._entity_seq_id
+            _q = q
+
+            def _entity_worker(seq_id=_seq, query=_q):
+                results = self.db.search_entities_fast(query, limit=5)
+                self._entity_search_done.emit(results, seq_id)
+
+            threading.Thread(target=_entity_worker, daemon=True).start()
         else:
             tasks = self.db.get_suggested_tasks(limit=8)
+            merged = None  # no search — use smart grouping
 
-        self._tasks = tasks  # cache for _open_reader lookup
+        self._tasks = (
+            [m for m in merged if not m.get("_is_entity")] if merged else tasks
+        )
 
-        if tasks:
+        if q and merged:
+            # Flat interleaved list when searching
+            if merged:
+                for item in merged:
+                    if item.get("_is_entity"):
+                        self.task_layout.addWidget(self._make_entity_row(item))
+                    else:
+                        self.task_layout.addWidget(self._make_task_row(item))
+            else:
+                lbl = QLabel("No matches")
+                lbl.setObjectName("section-header")
+                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.task_layout.addWidget(lbl)
+        elif tasks:
             groups = _smart_group(tasks)
             for group_label, group_tasks in groups:
                 if not group_tasks:
@@ -1172,12 +1428,84 @@ class TrayPopup(QWidget):
                 for task in group_tasks:
                     self.task_layout.addWidget(self._make_task_row(task))
         else:
-            msg = "No matches" if q else "All clear!"
-            lbl = QLabel(msg)
+            lbl = QLabel("All clear!")
             lbl.setObjectName("section-header")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.task_layout.addWidget(lbl)
 
+        self.task_layout.addStretch()
+
+    def _make_entity_row(self, entity):
+        """Compact entity card for search results in TrayPopup."""
+        etype = (entity.get("entity_type") or "").lower()
+        color = _ENTITY_TYPE_COLORS.get(etype, _ENTITY_DEFAULT_COLOR)
+
+        row = QWidget()
+        row.setStyleSheet(f"border-left: 3px solid {color}; background: #0d1b2a;")
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(14, 4, 14, 4)
+
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        # Name + type badge
+        name_lbl = QLabel(
+            f'<b style="color:#e6edf3;">{_html.escape(entity["name"])}</b>'
+            f'  <span style="background:{color}; color:white; padding:1px 6px; '
+            f'border-radius:8px; font-size:10px;">{_html.escape(etype or "entity")}</span>'
+        )
+        name_lbl.setTextFormat(Qt.TextFormat.RichText)
+        info.addWidget(name_lbl)
+        # Observation preview + task count
+        parts = []
+        if entity.get("obs_preview"):
+            parts.append(_html.escape(entity["obs_preview"][:60]))
+        tc = entity.get("task_count", 0)
+        if tc:
+            parts.append(f"{tc} task{'s' if tc != 1 else ''}")
+        if parts:
+            sub = QLabel(
+                f'<span style="color:#8b949e; font-size:11px; font-style:italic;">'
+                f"{' · '.join(parts)}</span>"
+            )
+            sub.setTextFormat(Qt.TextFormat.RichText)
+            info.addWidget(sub)
+        hl.addLayout(info)
+        hl.addStretch()
+
+        eid = entity["entity_id"]
+        row.mousePressEvent = lambda _ev, _eid=eid: EntityDetailDialog(
+            self.db, _eid, self
+        ).exec()
+        return row
+
+    def _on_entity_results(self, entities: list, seq_id: int):
+        """Inject async entity results into existing task layout."""
+        if seq_id != self._entity_seq_id:
+            return
+        if not entities or not self._search_text:
+            return
+        # Remove existing entity widgets (tagged with _is_entity_row)
+        for i in range(self.task_layout.count() - 1, -1, -1):
+            item = self.task_layout.itemAt(i)
+            if (
+                item
+                and item.widget()
+                and getattr(item.widget(), "_is_entity_row", False)
+            ):
+                self.task_layout.takeAt(i)
+                item.widget().deleteLater()
+        # Remove trailing stretch
+        last = self.task_layout.count() - 1
+        if last >= 0:
+            item = self.task_layout.itemAt(last)
+            if item and item.spacerItem():
+                self.task_layout.takeAt(last)
+        # Append entity widgets
+        for ent in entities:
+            row = self._make_entity_row(ent)
+            row._is_entity_row = True
+            self.task_layout.addWidget(row)
         self.task_layout.addStretch()
 
     def _make_task_row(self, task):
@@ -1632,7 +1960,7 @@ class EntityLinkDialog(QDialog):
         if len(query.strip()) < 2:
             return
 
-        results = self.db.search_entities(query)
+        results = self.db.search_entities_fast(query, limit=10)
         current_ids: set[int] = set()
         for i in range(self._current_list.count()):
             eid = self._current_list.item(i).data(Qt.ItemDataRole.UserRole)
@@ -1640,11 +1968,12 @@ class EntityLinkDialog(QDialog):
                 current_ids.add(eid)
 
         for r in results:
-            if r["rowid"] in current_ids:
+            if r["entity_id"] in current_ids:
                 continue
-            text = f"{r['name']}  ({r['entity_type']})  — {r['obs_count']} obs"
+            tc = r.get("task_count", 0)
+            text = f"{r['name']}  ({r['entity_type']})  — {r['obs_count']} obs  · {tc} task{'s' if tc != 1 else ''}"
             item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, r["rowid"])
+            item.setData(Qt.ItemDataRole.UserRole, r["entity_id"])
             self._results_list.addItem(item)
 
         if self._results_list.count() == 0:
@@ -1673,6 +2002,164 @@ class EntityLinkDialog(QDialog):
             return
         if self.db.unlink_task_entity(self.task_id, entity_id):
             self._load_current_links()
+
+
+class EntityDetailDialog(QDialog):
+    """Detail popup for a knowledge graph entity — observations, relations, linked tasks."""
+
+    def __init__(self, db, entity_id: int, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.entity_id = entity_id
+        self.setWindowTitle("Entity Detail")
+        self.setMinimumSize(520, 420)
+        self.resize(600, 520)
+        self.setStyleSheet(
+            "QDialog { background: #0d1117; color: #e6edf3; }"
+            "QScrollArea { border: none; background: #0d1117; }"
+            "QLabel { background: transparent; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._content = QLabel()
+        self._content.setWordWrap(True)
+        self._content.setTextFormat(Qt.TextFormat.RichText)
+        self._content.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._content.setContentsMargins(20, 16, 20, 16)
+        self._content.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self._content.linkActivated.connect(self._on_link_click)
+        scroll.setWidget(self._content)
+        layout.addWidget(scroll)
+
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(
+            "QPushButton { padding: 8px 24px; background: #21262d; color: #e6edf3; "
+            "border: 1px solid #30363d; border-radius: 4px; margin: 8px 20px 12px; }"
+            "QPushButton:hover { background: #30363d; }"
+        )
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self._load_data()
+
+    def _load_data(self):
+        conn = self.db._conn
+        eid = self.entity_id
+
+        # Entity info
+        ent = conn.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+        if not ent:
+            self._content.setText("<h3>Entity not found</h3>")
+            return
+
+        name = _html.escape(ent["name"])
+        etype = (ent["entity_type"] or "").lower()
+        color = _ENTITY_TYPE_COLORS.get(etype, _ENTITY_DEFAULT_COLOR)
+        badge = (
+            f'<span style="background:{color}; color:white; padding:3px 10px; '
+            f'border-radius:12px; font-size:11px;">{_html.escape(etype or "entity")}</span>'
+        )
+
+        html_parts = [
+            f'<h2 style="margin:0 0 8px 0; color:#e6edf3;">{name} {badge}</h2>'
+        ]
+
+        # Observations
+        obs_rows = conn.execute(
+            "SELECT content, created_at FROM observations WHERE entity_id = ? ORDER BY id",
+            (eid,),
+        ).fetchall()
+        if obs_rows:
+            html_parts.append(
+                '<div style="margin-top:12px; font-weight:bold; color:#8b949e; '
+                'font-size:12px; text-transform:uppercase;">Observations</div>'
+            )
+            for obs in obs_rows:
+                ts = obs["created_at"] or ""
+                if ts:
+                    ts = f' <span style="color:#484f58; font-size:11px;">{_html.escape(ts[:16])}</span>'
+                html_parts.append(
+                    f'<p style="margin:6px 0; padding:8px 12px; background:#161b22; '
+                    f"border-left:3px solid {color}; border-radius:2px; font-size:13px; "
+                    f'color:#c9d1d9;">{_html.escape(obs["content"])}{ts}</p>'
+                )
+
+        # Relations
+        rel_rows = conn.execute(
+            "SELECT r.relation_type, e1.name AS from_name, e1.id AS from_id, "
+            "e2.name AS to_name, e2.id AS to_id "
+            "FROM relations r JOIN entities e1 ON e1.id = r.from_id "
+            "JOIN entities e2 ON e2.id = r.to_id "
+            "WHERE r.from_id = ? OR r.to_id = ?",
+            (eid, eid),
+        ).fetchall()
+        if rel_rows:
+            html_parts.append(
+                '<div style="margin-top:16px; font-weight:bold; color:#8b949e; '
+                'font-size:12px; text-transform:uppercase;">Relations</div>'
+            )
+            for rel in rel_rows:
+                fn = _html.escape(rel["from_name"])
+                tn = _html.escape(rel["to_name"])
+                rt = _html.escape(rel["relation_type"])
+                fid, tid = rel["from_id"], rel["to_id"]
+                other_id = tid if fid == eid else fid
+                html_parts.append(
+                    f'<p style="margin:4px 0; font-size:13px; color:#c9d1d9;">'
+                    f'{fn} <span style="color:#58a6ff;">─{rt}→</span> {tn} '
+                    f'<a href="entity:{other_id}" style="color:#58a6ff; font-size:11px;">[open]</a></p>'
+                )
+
+        # Linked tasks
+        try:
+            task_rows = TaskDAO.get_entity_tasks(conn, eid)
+        except Exception:
+            task_rows = []
+        if task_rows:
+            html_parts.append(
+                '<div style="margin-top:16px; font-weight:bold; color:#8b949e; '
+                'font-size:12px; text-transform:uppercase;">Linked Tasks</div>'
+            )
+            for t in task_rows:
+                status = t.get("status", "")
+                s_color = (
+                    "#3fb950"
+                    if status == "done"
+                    else "#d29922"
+                    if status == "in_progress"
+                    else "#8b949e"
+                )
+                s_badge = (
+                    f'<span style="background:{s_color}; color:white; padding:1px 6px; '
+                    f'border-radius:8px; font-size:10px;">{_html.escape(status)}</span>'
+                )
+                title = _html.escape(t.get("title", ""))
+                tid = t.get("id", "")
+                html_parts.append(
+                    f'<p style="margin:4px 0; font-size:13px; color:#c9d1d9;">'
+                    f"{s_badge} {title} "
+                    f'<a href="task:{tid}" style="color:#58a6ff; font-size:11px;">[open]</a></p>'
+                )
+
+        self._content.setText("".join(html_parts))
+
+    def _on_link_click(self, url: str):
+        if url.startswith("entity:"):
+            eid = int(url.split(":", 1)[1])
+            EntityDetailDialog(self.db, eid, self.parent()).exec()
+        elif url.startswith("task:"):
+            tid = url.split(":", 1)[1]
+            task_row = self.db._conn.execute(
+                f"SELECT {_UI_COLS} FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            if task_row:
+                TaskReaderDialog(dict(task_row), self.db, self.parent()).exec()
 
 
 class TaskReaderDialog(QDialog):
@@ -1850,16 +2337,11 @@ class TaskReaderDialog(QDialog):
         # Linked entities section
         links = self.db.get_task_links(self.task.get("id", ""))
         if links:
-            _type_colors = {
-                "concept": "#1a3a5c",
-                "tool": "#2d6a2e",
-                "person": "#8b4513",
-                "project": "#4a148c",
-                "technology": "#00695c",
-            }
             badges = []
             for lk in links:
-                c = _type_colors.get((lk.get("entity_type") or "").lower(), "#555")
+                c = _ENTITY_TYPE_COLORS.get(
+                    (lk.get("entity_type") or "").lower(), _ENTITY_DEFAULT_COLOR
+                )
                 b = (
                     f'<span style="display:inline-block; background:{c}; color:white; '
                     f"padding:3px 10px; border-radius:12px; font-size:11px; "
@@ -1986,12 +2468,16 @@ class TaskListWidget(QListWidget):
 
         self.blockSignals(False)
 
-    def load_smart_grouped(self, tasks):
+    def load_smart_grouped(self, tasks, entities=None):
         """Load tasks with smart grouping: Overdue → Urgent → By Project → Rest."""
         fp = self._fingerprint(tasks)
-        if fp == self._last_fp:
+        ent_fp = (
+            tuple((e["entity_id"], e["name"]) for e in entities) if entities else ()
+        )
+        combined_fp = (fp, ent_fp)
+        if combined_fp == self._last_fp:
             return
-        self._last_fp = fp
+        self._last_fp = combined_fp
         self._tasks = tasks
         self.blockSignals(True)
         self.clear()
@@ -2028,6 +2514,33 @@ class TaskListWidget(QListWidget):
                     item.setToolTip(tip)
                 _apply_task_item_colors(item, task)
                 self.addItem(item)
+        # Append entity results after task groups
+        if entities:
+            sep = QListWidgetItem("── Related Knowledge ──")
+            sep.setFlags(Qt.ItemFlag.NoItemFlags)
+            sep.setBackground(_CLR_HEADER_BG)
+            sep.setForeground(QColor("#607080"))
+            font = sep.font()
+            font.setBold(True)
+            sep.setFont(font)
+            self.addItem(sep)
+            for ent in entities:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, f"entity:{ent['entity_id']}")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                etype = (ent.get("entity_type") or "").lower()
+                parts = [ent["name"]]
+                if etype:
+                    parts.append(f"[{etype}]")
+                if ent.get("obs_preview"):
+                    parts.append(f"— {ent['obs_preview'][:60]}")
+                tc = ent.get("task_count", 0)
+                if tc:
+                    parts.append(f"({tc} task{'s' if tc != 1 else ''})")
+                item.setText("  ".join(parts))
+                item.setBackground(QColor("#0d1b2a"))
+                item.setForeground(QColor("#a0cfff"))
+                self.addItem(item)
         self.blockSignals(False)
 
     def _open_reader(self, task_id):
@@ -2039,18 +2552,33 @@ class TaskListWidget(QListWidget):
             dlg.exec()
 
     def _on_double_click(self, item):
-        task_id = item.data(Qt.ItemDataRole.UserRole)
-        if not task_id:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
             return
-        self._open_reader(task_id)
+        if isinstance(data, str) and data.startswith("entity:"):
+            entity_id = int(data.split(":", 1)[1])
+            EntityDetailDialog(self.db, entity_id, self).exec()
+            return
+        self._open_reader(data)
 
     def _context_menu(self, pos):
         item = self.itemAt(pos)
         if not item:
             return
-        task_id = item.data(Qt.ItemDataRole.UserRole)
-        if not task_id:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
             return
+        # Entity items get a simplified context menu
+        if isinstance(data, str) and data.startswith("entity:"):
+            entity_id = int(data.split(":", 1)[1])
+            menu = QMenu(self)
+            menu.setStyleSheet(_build_menu_style())
+            view_action = menu.addAction("View Entity")
+            action = menu.exec(self.mapToGlobal(pos))
+            if action == view_action:
+                EntityDetailDialog(self.db, entity_id, self).exec()
+            return
+        task_id = data
         menu = QMenu(self)
         menu.setStyleSheet(_build_menu_style())
         view_action = menu.addAction("View")
@@ -2473,6 +3001,7 @@ class FullWindow(QMainWindow):
     _bridge_progress = pyqtSignal(int, str)  # (percent, step_label)
     _enrich_done = pyqtSignal(str)
     _enrich_running = pyqtSignal(str)
+    _entity_search_done = pyqtSignal(list, int)  # (entity_results, seq_id)
 
     # Sort modes cycle: priority → due → created → priority ...
     _SORT_MODES = ("priority", "due", "created", "project")
@@ -2488,6 +3017,8 @@ class FullWindow(QMainWindow):
         self.db = db
         self._sort_mode = "priority"
         self._search_text = ""
+        self._entity_results: list[dict] = []
+        self._entity_seq_id = 0
         self._pre_search_tab: int | None = None  # tab to restore after search clears
         self._active_filters = {"priority": set(), "due": set(), "project": set()}
         self._excluded_filters = {"priority": set(), "due": set(), "project": set()}
@@ -2803,6 +3334,7 @@ class FullWindow(QMainWindow):
         self._enrich_in_progress = False
         self._enrich_running.connect(lambda msg: self.status.showMessage(msg, 30000))
         self._enrich_done.connect(self._on_enrich_done)
+        self._entity_search_done.connect(self._on_entity_results)
 
         # Auto-refresh every 30s
         self._refresh_timer = QTimer(self)
@@ -3193,6 +3725,18 @@ class FullWindow(QMainWindow):
         self._enrich_in_progress = False  # reset on GUI thread via signal
         is_error = msg.startswith("Enrich error")
         self.status.showMessage(msg, 10000 if is_error else 5000)
+
+    def _on_entity_results(self, entities: list, seq_id: int):
+        """Handle async entity search results. Discard if stale."""
+        if seq_id != self._entity_seq_id:
+            return  # stale — user typed new query
+        self._entity_results = entities
+        # Re-render only the current tab if it shows entities
+        idx = self.tabs.currentIndex()
+        if 0 <= idx < len(self._tab_keys):
+            key = self._tab_keys[idx]
+            if key == "suggested" and self._search_text:
+                self._load_tab(key)
 
     def _patch_ui_profile(self):
         """Write own UI profile into shared.json (persisted on next sync cycle)."""
@@ -3621,6 +4165,17 @@ class FullWindow(QMainWindow):
             global_results = self._search_engine.search(
                 self._search_text, all_tasks, conn=self.db._conn, use_vector=False
             )
+            # Async entity search — tasks render immediately, entities arrive via signal
+            self._entity_results = []
+            self._entity_seq_id += 1
+            _seq = self._entity_seq_id
+            _q = self._search_text
+
+            def _entity_worker(seq_id=_seq, query=_q):
+                results = self.db.search_entities_fast(query, limit=10)
+                self._entity_search_done.emit(results, seq_id)
+
+            threading.Thread(target=_entity_worker, daemon=True).start()
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
                 if key == "suggested":
@@ -3634,6 +4189,7 @@ class FullWindow(QMainWindow):
                 else:
                     self._filtered_cache[key] = self._sort_tasks(source)
         else:
+            self._entity_results = []
             for key in self._tab_keys:
                 if key in self._tab_views:
                     v = self._tab_views[key]
@@ -3745,9 +4301,14 @@ class FullWindow(QMainWindow):
             cap_msg = f"── {len(tasks) - _TAB_PAGE_SIZE} more items... ──"
             tasks = tasks[:_TAB_PAGE_SIZE]
 
+        # Entity results only shown in "suggested" tab during search
+        entities = (
+            self._entity_results if (self._search_text and key == "suggested") else []
+        )
+
         lw = self.tab_lists[key]
         if key == "suggested":
-            lw.load_smart_grouped(tasks)
+            lw.load_smart_grouped(tasks, entities=entities)
         elif key == "projects":
             proj_sorted = sorted(tasks, key=lambda t: t.get("project") or "zzz_none")
             lw.load_grouped_by_project(proj_sorted)
@@ -3763,6 +4324,9 @@ class FullWindow(QMainWindow):
     def _on_item_changed(self, item):
         task_id = item.data(Qt.ItemDataRole.UserRole)
         if not task_id:
+            return
+        # Skip entity items (no checkbox behavior)
+        if isinstance(task_id, str) and task_id.startswith("entity:"):
             return
         checked = item.checkState() == Qt.CheckState.Checked
         # Defer DB write out of signal handler — immediate clear() during
@@ -3845,6 +4409,15 @@ class TaskTrayApp:
         self.db = TaskDB()
         self.db.on_change = self._refresh_all
         self.app.aboutToQuit.connect(self._on_quit)
+
+        # Periodic entity enrichment cache refresh (60s safety net for external writes)
+        self._enrich_timer = QTimer()
+        self._enrich_timer.timeout.connect(
+            lambda: threading.Thread(
+                target=self.db._refresh_enrich_cache, daemon=True
+            ).start()
+        )
+        self._enrich_timer.start(60_000)
 
         # Tray icon
         self.tray = QSystemTrayIcon()
@@ -3945,6 +4518,8 @@ class TaskTrayApp:
 
     def _refresh_all(self):
         """Update tray icon badge + tooltip after any change."""
+        self.db._invalidate_enrich_cache()
+        threading.Thread(target=self.db._refresh_enrich_cache, daemon=True).start()
         summary = self.db.get_summary()
         self._update_icon(summary)
         self.tray.setToolTip(self._tooltip(summary))
