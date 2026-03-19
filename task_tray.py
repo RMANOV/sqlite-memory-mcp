@@ -1841,12 +1841,15 @@ class EditTaskDialog(QDialog):
 class EntityLinkDialog(QDialog):
     """Dialog for searching and linking knowledge graph entities to a task."""
 
-    def __init__(self, db: TaskDB, task_id: str, parent=None):
+    _search_done = pyqtSignal(list, str)
+
+    def __init__(self, db, task_id: str, parent=None):
         super().__init__(parent)
         self.db = db
         self.task_id = task_id
         self._debounce_timer: int | None = None
         self._pending_query = ""
+        self._search_done.connect(self._on_search_done)
         self.setWindowTitle("Link to Entity")
         self.setMinimumSize(500, 450)
         self.setModal(True)
@@ -1965,7 +1968,18 @@ class EntityLinkDialog(QDialog):
         if len(query.strip()) < 2:
             return
 
-        results = self.db.search_entities_fast(query, limit=10)
+        def _worker(q=query):
+            res = self.db.search_entities_fast(q, limit=10)
+            self._search_done.emit(res, q)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_search_done(self, results: list, query: str):
+        # In case the user typed more while we were searching
+        if query != self._pending_query:
+            return
+
+        self._results_list.clear()
         current_ids: set[int] = set()
         for i in range(self._current_list.count()):
             eid = self._current_list.item(i).data(Qt.ItemDataRole.UserRole)
