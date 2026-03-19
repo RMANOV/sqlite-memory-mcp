@@ -1122,7 +1122,7 @@ class TrayPopup(QWidget):
             all_tasks = self.db.get_all_active() + self.db.get_done_tasks()
             self._search_engine.rebuild_index(all_tasks)
             tasks = self._search_engine.search(
-                q, all_tasks, limit=20, conn=self.db._conn
+                q, all_tasks, limit=20, conn=self.db._conn, use_vector=False
             )
         else:
             tasks = self.db.get_suggested_tasks(limit=8)
@@ -3477,7 +3477,9 @@ class FullWindow(QMainWindow):
         q = self._search_text
         if q:
             # SmartKey fuzzy search (falls back to substring if unavailable)
-            return self._search_engine.search(q, tasks, conn=self.db._conn)
+            return self._search_engine.search(
+                q, tasks, conn=self.db._conn, use_vector=False
+            )
 
         af = active_filters if active_filters is not None else self._active_filters
         ef = (
@@ -3574,7 +3576,7 @@ class FullWindow(QMainWindow):
             # Global search: search ALL tasks, then distribute into tabs
             all_tasks = all_active + done
             global_results = self._search_engine.search(
-                self._search_text, all_tasks, conn=self.db._conn
+                self._search_text, all_tasks, conn=self.db._conn, use_vector=False
             )
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:

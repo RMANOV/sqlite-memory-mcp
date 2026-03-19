@@ -184,6 +184,7 @@ class TaskSearchEngine:
         tasks: list[dict],
         limit: int = 50,
         conn: sqlite3.Connection | None = None,
+        use_vector: bool = True,
     ) -> list[dict]:
         """Fuzzy search tasks. Returns scored + ranked list.
 
@@ -198,12 +199,13 @@ class TaskSearchEngine:
             vec_results = []
             if conn is not None:
                 fts_results = self._fts5_search(conn, query, tasks, limit)
-                try:
-                    from vec_search import task_vector_search, task_rrf_merge
+                if use_vector:
+                    try:
+                        from vec_search import task_vector_search, task_rrf_merge
 
-                    vec_results = task_vector_search(conn, query, limit)
-                except ImportError:
-                    pass
+                        vec_results = task_vector_search(conn, query, limit)
+                    except Exception:
+                        pass
 
             if fts_results is not None and vec_results:
                 # RRF merge FTS5 + vector, filter to task pool
