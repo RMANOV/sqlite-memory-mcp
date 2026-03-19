@@ -435,6 +435,7 @@ from PyQt6.QtWidgets import (
     QCompleter,
     QMessageBox,
     QSpinBox,
+    QStyledItemDelegate,
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import (
@@ -604,7 +605,7 @@ _THEMES = {
         "danger": "#e53e3e",
         "done": "#38a169",
         "note_bg": "#1e2d3d",
-        "overdue_bg": "#3b1c1c",
+        "overdue_bg": "#291e26",
         "overdue_fg": "#fc8181",
         "header_bg": "#1e2836",
         "urgent_bg": "#3b2c1c",
@@ -622,7 +623,7 @@ _THEMES = {
         "danger": "#e53e3e",
         "done": "#38a169",
         "note_bg": "#ebf8ff",
-        "overdue_bg": "#fff5f5",
+        "overdue_bg": "#f5e4e5",
         "overdue_fg": "#c53030",
         "header_bg": "#e2e8f0",
         "urgent_bg": "#fffbeb",
@@ -950,8 +951,30 @@ def _apply_task_item_colors(item, task):
     if task.get("type") == "note":
         item.setBackground(_CLR_NOTE_BG)
     if is_overdue(task.get("due_date")) and task["status"] != "done":
+        item.setData(_OVERDUE_ROLE, True)
         item.setBackground(_CLR_OVERDUE_BG)
         item.setForeground(_CLR_OVERDUE_FG)
+
+
+_OVERDUE_ROLE = Qt.ItemDataRole.UserRole + 10
+
+
+class _OverdueDelegate(QStyledItemDelegate):
+    """Paints a 3px red left border on overdue task items."""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.data(_OVERDUE_ROLE):
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.fillRect(
+                option.rect.x(),
+                option.rect.y(),
+                3,
+                option.rect.height(),
+                QColor(_T()["danger"]),
+            )
+            painter.restore()
 
 
 def _suggested_sort_key(t):
@@ -1863,6 +1886,7 @@ class TaskListWidget(QListWidget):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
+        self.setItemDelegate(_OverdueDelegate(self))
         self.setStyleSheet(_build_list_style())
         self.itemDoubleClicked.connect(self._on_double_click)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
