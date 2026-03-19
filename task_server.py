@@ -24,7 +24,6 @@ from db_utils import (
     MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
     validate_task_fields as _validate_task_fields,
     build_priority_order_sql,
-    fts_query as _fts_query,
     now_iso as _now,
     upsert_field_versions as _upsert_field_versions,
 )
@@ -41,6 +40,22 @@ _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 if not logger.handlers:
     logger.addHandler(_fh)
+
+# ── Unified search engine (shared across query_tasks calls) ──────────────
+from task_search import TaskSearchEngine
+
+_search_engine = TaskSearchEngine()
+
+
+def _vec_sync_task_safe(conn, task_id: str) -> None:
+    """Sync task embedding, swallowing errors for graceful degradation."""
+    try:
+        from vec_search import vec_sync_task
+
+        vec_sync_task(conn, task_id)
+    except Exception as e:
+        logger.debug("vec_sync_task(%s) skipped: %s", task_id, e)
+
 
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
@@ -128,6 +143,7 @@ def create_task(
             type=type,
         )
         _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now)
+        _vec_sync_task_safe(conn, task_id)
 
     logger.info("create_task: %s (%s)", title, task_id)
     return json.dumps(
@@ -221,6 +237,9 @@ def update_task(
             return json.dumps({"error": f"Task {task_id} not found"})
         changed = [k for k in updates if k != "updated_at"]
         _upsert_field_versions(conn, task_id, changed, updates["updated_at"])
+        # Re-embed if content fields changed
+        if {"title", "description", "notes"} & set(changed):
+            _vec_sync_task_safe(conn, task_id)
 
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
     return json.dumps({"updated": task_id, "fields": list(updates.keys())})
@@ -281,19 +300,10 @@ def query_tasks(
     else:
         cols = "t.id, t.title, t.description, t.notes, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
 
-    # FTS5 search: JOIN tasks_fts when search is provided
-    if search:
-        fts_q = _fts_query(search)
-        from_clause = "tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid"
-        conditions.append("tasks_fts MATCH ?")
-        params.append(fts_q)
-        order_clause = "tasks_fts.rank"
-    else:
-        from_clause = "tasks t"
-        order_clause = (
-            f"{build_priority_order_sql('t.')}, "
-            f"t.due_date ASC NULLS LAST, t.created_at ASC"
-        )
+    from_clause = "tasks t"
+    order_clause = (
+        f"{build_priority_order_sql('t.')}, t.due_date ASC NULLS LAST, t.created_at ASC"
+    )
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = (
@@ -308,6 +318,13 @@ def query_tasks(
         count_params = params[:-2]
         count_sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where}"
         total = conn.execute(count_sql, count_params).fetchone()[0]
+
+        # Unified search: route through TaskSearchEngine (FTS5 + vector + RRF)
+        if search and rows:
+            filtered_tasks = [dict(r) for r in rows]
+            results = _search_engine.search(search, filtered_tasks, conn=conn)
+            rows = results
+            total = len(results)
 
     if not rows:
         return json.dumps(

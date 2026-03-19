@@ -194,11 +194,27 @@ class TaskSearchEngine:
             return tasks[:limit]
 
         if not self._engine:
-            # Try FTS5 first (precise BM25 ranking)
+            fts_results = None
+            vec_results = []
             if conn is not None:
-                results = self._fts5_search(conn, query, tasks, limit)
-                if results is not None:
-                    return results
+                fts_results = self._fts5_search(conn, query, tasks, limit)
+                try:
+                    from vec_search import task_vector_search, task_rrf_merge
+
+                    vec_results = task_vector_search(conn, query, limit)
+                except ImportError:
+                    pass
+
+            if fts_results is not None and vec_results:
+                # RRF merge FTS5 + vector, filter to task pool
+                merged = task_rrf_merge(fts_results, vec_results)
+                task_ids = {t["id"] for t in tasks}
+                return [t for t in merged if t["id"] in task_ids][:limit]
+            elif fts_results is not None:
+                return fts_results
+            elif vec_results:
+                task_ids = {t["id"] for t in tasks}
+                return [t for t in vec_results if t["id"] in task_ids][:limit]
             # Final fallback: improved substring scoring
             scored = [(t, score_task(t, query)) for t in tasks]
             return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]

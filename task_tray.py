@@ -3564,7 +3564,7 @@ class FullWindow(QMainWindow):
             "next": [t for t in all_active if t.get("section") == "next"],
             "notes": notes,
             "projects": all_active,
-            "all": all_active,
+            "all": all_active + done,
             "done": done,
         }
 

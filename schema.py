@@ -829,11 +829,18 @@ def init_db(db_path: str | None = None) -> None:
 
     # Optional: initialize sqlite-vec virtual table for semantic search
     try:
-        from vec_search import VEC_AVAILABLE, init_vec_table
+        from vec_search import (
+            VEC_AVAILABLE,
+            init_vec_table,
+            init_task_vec_table,
+            backfill_task_embeddings,
+        )
 
         if VEC_AVAILABLE:
             with _get_conn(_path) as conn:
                 init_vec_table(conn)
+                init_task_vec_table(conn)
+                backfill_task_embeddings(conn)
     except Exception as e:
         logger.debug("sqlite-vec init skipped: %s", e)
 

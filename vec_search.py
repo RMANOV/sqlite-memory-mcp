@@ -245,6 +245,163 @@ def rrf_merge(
     return results
 
 
+# ── Task vector search ─────────────────────────────────────────────────
+
+
+def init_task_vec_table(conn: sqlite3.Connection) -> bool:
+    """Create the vec0 virtual table for task embeddings."""
+    if not load_vec(conn):
+        return False
+    try:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS task_embeddings "
+            f"USING vec0(embedding float[{EMBEDDING_DIM}])"
+        )
+        logger.info("task_embeddings vec0 table ready (dim=%d)", EMBEDDING_DIM)
+        return True
+    except Exception as e:
+        logger.warning("Failed to create task_embeddings: %s", e)
+        return False
+
+
+def _task_text(title: str, description: str | None, notes: str | None) -> str:
+    """Compose the text to embed for a task."""
+    parts = [title or ""]
+    if description:
+        parts.append(description[:500])
+    if notes:
+        parts.append(notes[:300])
+    return ". ".join(parts)
+
+
+def vec_sync_task(conn: sqlite3.Connection, task_id: str) -> None:
+    """Update the embedding for a task. Creates or replaces."""
+    if not VEC_AVAILABLE or not load_vec(conn):
+        return
+
+    row = conn.execute(
+        "SELECT rowid, title, description, notes FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+
+    text = _task_text(row["title"], row["description"], row["notes"])
+    emb = embed_text(text)
+    rowid = row["rowid"]
+
+    # vec0 doesn't support UPDATE — DELETE + INSERT
+    conn.execute("DELETE FROM task_embeddings WHERE rowid = ?", (rowid,))
+    conn.execute(
+        "INSERT INTO task_embeddings(rowid, embedding) VALUES (?, ?)",
+        (rowid, emb),
+    )
+
+
+def vec_remove_task(conn: sqlite3.Connection, task_id: str) -> None:
+    """Remove a task's embedding by its UUID."""
+    if not VEC_AVAILABLE:
+        return
+    try:
+        if load_vec(conn):
+            row = conn.execute(
+                "SELECT rowid FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "DELETE FROM task_embeddings WHERE rowid = ?", (row["rowid"],)
+                )
+    except Exception as e:
+        logger.debug("vec_remove_task(%s) failed: %s", task_id, e)
+
+
+def task_vector_search(
+    conn: sqlite3.Connection, query: str, limit: int = 50
+) -> list[dict]:
+    """KNN vector search over task embeddings.
+
+    Returns list of dicts with task fields + distance.
+    """
+    if not VEC_AVAILABLE or not load_vec(conn):
+        return []
+
+    emb = embed_text(query)
+    try:
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.description, t.notes, t.status, "
+            "t.priority, t.section, t.due_date, t.project, t.parent_id, "
+            "t.type, t.updated_at, te.distance "
+            "FROM task_embeddings te "
+            "JOIN tasks t ON t.rowid = te.rowid "
+            "WHERE te.embedding MATCH ? AND k = ? "
+            "ORDER BY te.distance",
+            (emb, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("task_vector_search failed: %s", e)
+        return []
+
+
+def task_rrf_merge(
+    fts_results: list[dict],
+    vec_results: list[dict],
+    k: int = 60,
+) -> list[dict]:
+    """Merge FTS5 and vector task results using Reciprocal Rank Fusion.
+
+    Keyed by task UUID (id string), not integer eid.
+    Returns combined results ordered by RRF score descending.
+    """
+    scores: dict[str, float] = {}
+    task_data: dict[str, dict] = {}
+
+    for rank, item in enumerate(fts_results):
+        tid = item["id"]
+        scores[tid] = scores.get(tid, 0.0) + 1.0 / (k + rank + 1)
+        task_data[tid] = dict(item)
+
+    for rank, item in enumerate(vec_results):
+        tid = item["id"]
+        scores[tid] = scores.get(tid, 0.0) + 1.0 / (k + rank + 1)
+        if tid not in task_data:
+            task_data[tid] = dict(item)
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [task_data[tid] for tid, _ in ranked]
+
+
+def backfill_task_embeddings(conn: sqlite3.Connection) -> int:
+    """Generate embeddings for all tasks that don't have one yet.
+
+    Returns the number of tasks backfilled.
+    """
+    if not VEC_AVAILABLE or not load_vec(conn):
+        return 0
+
+    existing = set()
+    try:
+        for row in conn.execute("SELECT rowid FROM task_embeddings"):
+            existing.add(row[0])
+    except Exception:
+        pass
+
+    all_tasks = conn.execute("SELECT id, rowid FROM tasks").fetchall()
+    missing = [r["id"] for r in all_tasks if r["rowid"] not in existing]
+
+    count = 0
+    for tid in missing:
+        try:
+            vec_sync_task(conn, tid)
+            count += 1
+        except Exception as e:
+            logger.warning("backfill failed for task %s: %s", tid, e)
+
+    if count:
+        logger.info("Backfilled embeddings for %d tasks", count)
+    return count
+
+
 # ── Backfill utility ───────────────────────────────────────────────────
 
 
