@@ -332,3 +332,21 @@ class TaskSearchEngine:
         """Load CVM personal profile from disk."""
         if self._engine:
             self._engine.import_personal(self._cvm_path)
+
+
+def merge_tasks_entities(task_results, entity_results, entity_weight=0.7, k=60):
+    """Interleave task and entity search results by RRF score.
+
+    Tasks get full 1/(k+rank) weight; entities get entity_weight/(k+rank)
+    so tasks rank slightly higher at equal relevance positions.
+    """
+    scored = []
+    for rank, t in enumerate(task_results):
+        t["_rrf"] = 1.0 / (k + rank + 1)
+        t["_is_entity"] = False
+        scored.append(t)
+    for rank, e in enumerate(entity_results):
+        e["_rrf"] = entity_weight / (k + rank + 1)
+        scored.append(e)
+    scored.sort(key=lambda x: -x["_rrf"])
+    return scored
