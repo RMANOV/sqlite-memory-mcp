@@ -2135,6 +2135,32 @@ class EntityDetailDialog(QDialog):
                     f'<a href="entity:{other_id}" style="color:#58a6ff; font-size:11px;">[open]</a></p>'
                 )
 
+        # Extracted Canonical Facts (Intelligence Graph)
+        try:
+            facts = conn.execute(
+                "SELECT predicate, object_text, confidence FROM canonical_facts "
+                "WHERE subject COLLATE NOCASE = ? OR object_text COLLATE NOCASE = ? "
+                "ORDER BY confidence DESC LIMIT 20",
+                (ent["name"], ent["name"]),
+            ).fetchall()
+            if facts:
+                html_parts.append(
+                    '<div style="margin-top:16px; font-weight:bold; color:#7ee787; '
+                    'font-size:12px; text-transform:uppercase;">Extracted Facts (AI)</div>'
+                )
+                for f in facts:
+                    subj = _html.escape(ent["name"])
+                    pred = _html.escape(f["predicate"])
+                    obj = _html.escape(f["object_text"])
+                    conf = f["confidence"] * 100
+                    html_parts.append(
+                        f'<p style="margin:4px 0; font-size:13px; color:#c9d1d9;">'
+                        f'<span style="color:#7ee787;">⚡</span> {subj} <strong style="color:#a5d6ff;">{pred}</strong> {obj} '
+                        f'<span style="color:#484f58; font-size:11px;">({conf:.0f}% conf)</span></p>'
+                    )
+        except sqlite3.OperationalError:
+            pass
+
         # Linked tasks
         try:
             task_rows = TaskDAO.get_entity_tasks(conn, eid)
@@ -2378,6 +2404,37 @@ class TaskReaderDialog(QDialog):
                 'font-size:12px;">Linked Entities</div>'
                 f"<div>{''.join(badges)}</div></div>"
             )
+
+        # AI Enrich Context (Context Packs)
+        try:
+            conn = self.db._conn
+            tid = self.task.get("id")
+            pack_row = conn.execute(
+                "SELECT body, freshness_score FROM context_packs "
+                "WHERE target_ref = ? AND pack_type = 'executor' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+
+            if not pack_row:
+                pack_row = conn.execute(
+                    "SELECT body, freshness_score FROM context_packs "
+                    "WHERE target_ref IS NULL AND pack_type = 'executor' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+
+            if pack_row and pack_row["body"].strip():
+                ai_score = pack_row.get("freshness_score", 0) * 100
+                ai_text = _html.escape(pack_row["body"]).replace("\n", "<br>")
+                body_html += (
+                    f'<div style="margin-top:25px; padding:15px; background:rgba(40, 60, 90, 0.3); '
+                    f'border-left: 4px solid #58a6ff; border-radius:3px;">'
+                    f'<div style="color:#58a6ff; font-weight:bold; font-size:12px; margin-bottom:8px; text-transform:uppercase;">'
+                    f"⬡ Intelligence Context (Relevance: {ai_score:.0f}%)</div>"
+                    f'<div style="color:#c9d1d9; font-size:13px; line-height:1.5;">{ai_text}</div></div>'
+                )
+        except Exception:
+            pass  # Schema might not have context_packs yet
 
         self._body_label.setText(body_html)
 
@@ -3676,7 +3733,7 @@ class FullWindow(QMainWindow):
             self.status.showMessage("Enrich already running...", 2000)
             return
         self._enrich_in_progress = True
-        self._enrich_running.emit(f"Enriching ({depth})...")
+        self._enrich_running.emit(f"AI Enqueue ({depth})...")
 
         def _work():
             try:
@@ -3684,56 +3741,86 @@ class FullWindow(QMainWindow):
                 from claim_graph import extract_candidate_claims as _extract
                 from context_packer import build_context_pack as _pack
                 from impact_graph import explain_impact as _impact
+                from db_utils import get_conn
+                import time
 
+                assessed = 0
+                claims = 0
+                promoted = 0
+                impacts = 0
+
+                # Fetch pending chunks (brief read-only connection)
                 with get_conn(self.db.db_path) as conn:
-                    # First: assess no_enrich chunks to unlock them
-                    pending = conn.execute(
+                    pending_rows = conn.execute(
                         "SELECT chunk_id FROM context_chunks "
-                        "WHERE state = 'no_enrich' LIMIT 50"
+                        "WHERE state = 'no_enrich' LIMIT 30"
                     ).fetchall()
-                    for row in pending:
-                        _assess(conn, row["chunk_id"])
+                    pending = [r["chunk_id"] for r in pending_rows]
 
-                    # Now fetch all enrichable chunks (including freshly unlocked)
-                    enrichable = conn.execute(
+                # Process unlocking sequentially
+                for i, chunk_id in enumerate(pending):
+                    self._enrich_running.emit(
+                        f"AI: Unlocking context ({i + 1}/{len(pending)})..."
+                    )
+                    with get_conn(self.db.db_path) as conn:
+                        _assess(conn, chunk_id)
+                    time.sleep(0.01)
+
+                # Fetch active enrichable chunks
+                with get_conn(self.db.db_path) as conn:
+                    enrich_rows = conn.execute(
                         "SELECT chunk_id FROM context_chunks "
                         "WHERE state = 'enrichable' LIMIT 20"
                     ).fetchall()
-                    assessed = 0
-                    for row in enrichable:
-                        _assess(conn, row["chunk_id"])
+                    enrichable = [r["chunk_id"] for r in enrich_rows]
+
+                for i, chunk_id in enumerate(enrichable):
+                    self._enrich_running.emit(
+                        f"AI: Assessing chunk ({i + 1}/{len(enrichable)})..."
+                    )
+                    with get_conn(self.db.db_path) as conn:
+                        _assess(conn, chunk_id)
                         assessed += 1
 
+                        if depth in ("standard", "deep"):
+                            self._enrich_running.emit(
+                                f"AI: Extracting claims ({i + 1}/{len(enrichable)})..."
+                            )
+                            cr = _extract(conn, chunk_id)
+                            extracted = cr.get("claims", [])
+                            claims += cr.get("claims_extracted", 0)
+
+                            if extracted:
+                                from claim_graph import auto_promote_layer1
+
+                                promoted_results = auto_promote_layer1(conn, extracted)
+                                promoted += len(promoted_results)
+                    time.sleep(0.01)
+
+                self._enrich_running.emit("AI: Compiling knowledge context pack...")
+                with get_conn(self.db.db_path) as conn:
                     _pack(conn, "executor")
 
-                    claims = 0
-                    promoted = 0
-                    if depth in ("standard", "deep"):
-                        from claim_graph import auto_promote_layer1
-
-                        all_claims: list = []
-                        for row in enrichable:
-                            cr = _extract(conn, row["chunk_id"])
-                            claims += cr.get("claims_extracted", 0)
-                            all_claims.extend(cr.get("claims", []))
-
-                        promoted_results = auto_promote_layer1(conn, all_claims)
-                        promoted = len(promoted_results)
-
-                    impacts = 0
                     if depth == "deep":
+                        from lazy_enrichment import run_health_sweep
+
+                        self._enrich_running.emit(
+                            "AI: Executing health sweep cross-checks..."
+                        )
+                        report = run_health_sweep(conn)
+                        promoted += len(report.get("promoted", []))
+
                         recent = conn.execute(
                             "SELECT fact_id FROM canonical_facts "
-                            "WHERE updated_at >= datetime('now', '-7 days') "
-                            "LIMIT 10"
+                            "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
                         ).fetchall()
                         for f in recent:
                             _impact(conn, "fact", f["fact_id"])
                             impacts += 1
 
                 self._enrich_done.emit(
-                    f"Enriched: {assessed} assessed, {claims} claims, "
-                    f"{promoted} promoted, {impacts} impacts"
+                    f"Intelligence Pass Complete: {assessed} chunks, {claims} candidates, "
+                    f"{promoted} facts promoted."
                 )
             except Exception as exc:
                 self._enrich_done.emit(f"Enrich error: {exc}")
