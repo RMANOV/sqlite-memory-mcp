@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,14 +20,11 @@ from db_utils import (
     get_conn as _get_conn,
     TaskDAO,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
-    TASK_SECTIONS as _TASK_SECTIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
-    TASK_STATUSES as _TASK_STATUSES,
-    TASK_TYPES as _TASK_TYPES,
     MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
-    validate_recurring as _validate_recurring,
     validate_task_fields as _validate_task_fields,
     build_priority_order_sql,
+    fts_query as _fts_query,
     now_iso as _now,
     upsert_field_versions as _upsert_field_versions,
 )
@@ -101,8 +97,14 @@ def create_task(
     task_id = str(uuid.uuid4())
     now = _now()
 
-    if err := _validate_task_fields(section=section, priority=priority, type=type,
-                                     due_date=due_date, recurring=recurring, reminder_at=reminder_at):
+    if err := _validate_task_fields(
+        section=section,
+        priority=priority,
+        type=type,
+        due_date=due_date,
+        recurring=recurring,
+        reminder_at=reminder_at,
+    ):
         return json.dumps({"error": err})
 
     with _get_conn() as conn:
@@ -194,9 +196,21 @@ def update_task(
     if not updates:
         return json.dumps({"error": "No fields to update. Pass non-empty values."})
 
-    val_fields = {k: v for k, v in updates.items()
-                  if k in ("status", "section", "priority", "type", "due_date", "recurring", "reminder_at")
-                  and v is not None}
+    val_fields = {
+        k: v
+        for k, v in updates.items()
+        if k
+        in (
+            "status",
+            "section",
+            "priority",
+            "type",
+            "due_date",
+            "recurring",
+            "reminder_at",
+        )
+        and v is not None
+    }
     if err := _validate_task_fields(**val_fields):
         return json.dumps({"error": err})
 
@@ -265,13 +279,26 @@ def query_tasks(
     if summary_only:
         cols = "t.id, t.title, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
     else:
-        cols = "t.id, t.title, t.description, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
+        cols = "t.id, t.title, t.description, t.notes, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
+
+    # FTS5 search: JOIN tasks_fts when search is provided
+    if search:
+        fts_q = _fts_query(search)
+        from_clause = "tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid"
+        conditions.append("tasks_fts MATCH ?")
+        params.append(fts_q)
+        order_clause = "tasks_fts.rank"
+    else:
+        from_clause = "tasks t"
+        order_clause = (
+            f"{build_priority_order_sql('t.')}, "
+            f"t.due_date ASC NULLS LAST, t.created_at ASC"
+        )
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = (
-        f"SELECT {cols} FROM tasks t WHERE {where} "
-        f"ORDER BY {build_priority_order_sql('t.')}, "
-        f"t.due_date ASC NULLS LAST, t.created_at ASC "
+        f"SELECT {cols} FROM {from_clause} WHERE {where} "
+        f"ORDER BY {order_clause} "
         f"LIMIT ? OFFSET ?"
     )
     params.extend([limit, offset])
@@ -279,7 +306,7 @@ def query_tasks(
     with _get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
         count_params = params[:-2]
-        count_sql = f"SELECT COUNT(*) FROM tasks t WHERE {where}"
+        count_sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where}"
         total = conn.execute(count_sql, count_params).fetchone()[0]
 
     if not rows:
@@ -288,15 +315,16 @@ def query_tasks(
         )
 
     lines = [
-        "| # | Title | Status | Priority | Section | Due | Project |",
-        "|---|-------|--------|----------|---------|-----|---------|",
+        "| # | Title | Status | Priority | Section | Due | Project | Notes |",
+        "|---|-------|--------|----------|---------|-----|---------|-------|",
     ]
     for i, r in enumerate(rows, 1):
         due = r["due_date"] or "—"
         proj = r["project"] or "—"
+        notes = (r.get("notes") or "—")[:80]
         lines.append(
             f"| {i + offset} | {r['title']} | {r['status']} | {r['priority']} "
-            f"| {r['section']} | {due} | {proj} |"
+            f"| {r['section']} | {due} | {proj} | {notes} |"
         )
 
     result = {
@@ -331,7 +359,7 @@ def task_digest(
     with _get_conn() as conn:
         ph = ",".join("?" * len(target_sections))
         active = conn.execute(
-            f"SELECT id, title, status, priority, section, due_date, project "
+            f"SELECT id, title, description, notes, status, priority, section, due_date, project "
             f"FROM tasks "
             f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') AND type = 'task' "
             f"ORDER BY CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
@@ -343,7 +371,7 @@ def task_digest(
         overdue = []
         if include_overdue:
             overdue = conn.execute(
-                "SELECT id, title, status, priority, section, due_date, project "
+                "SELECT id, title, description, notes, status, priority, section, due_date, project "
                 "FROM tasks "
                 f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) AND type = 'task' "
                 "ORDER BY due_date ASC LIMIT 10",
@@ -370,8 +398,9 @@ def task_digest(
     if overdue:
         lines.append(f"### OVERDUE ({len(overdue)})")
         for t in overdue:
+            note_hint = f" | {t['notes'][:60]}..." if t.get("notes") else ""
             lines.append(
-                f"- [{t['priority'].upper()}] {t['title']} (due: {t['due_date']})"
+                f"- [{t['priority'].upper()}] {t['title']} (due: {t['due_date']}){note_hint}"
             )
         lines.append("")
 
@@ -388,7 +417,8 @@ def task_digest(
                 prio = (
                     f"[{t['priority'].upper()}] " if t["priority"] != "medium" else ""
                 )
-                lines.append(f"- {prio}{t['title']}{due}")
+                note_hint = f" | {t['notes'][:60]}..." if t.get("notes") else ""
+                lines.append(f"- {prio}{t['title']}{due}{note_hint}")
             lines.append("")
 
     return json.dumps(

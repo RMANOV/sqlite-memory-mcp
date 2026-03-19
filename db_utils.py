@@ -435,9 +435,7 @@ def priority_sort_key(task: dict[str, Any]) -> tuple:
 
 def get_entity_id(conn: sqlite3.Connection, name: str) -> int | None:
     """Look up entity ID by name. Returns None if not found."""
-    row = conn.execute(
-        "SELECT id FROM entities WHERE name = ?", (name,)
-    ).fetchone()
+    row = conn.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
     return row["id"] if row else None
 
 
@@ -681,8 +679,8 @@ class TaskDAO:
         if not query or not query.strip():
             return []
         rows = conn.execute(
-            "SELECT t.id, t.title, t.description, t.status, t.priority, "
-            "t.section, t.due_date, t.project, t.type, t.updated_at, "
+            "SELECT t.id, t.title, t.description, t.notes, t.status, t.priority, "
+            "t.section, t.due_date, t.project, t.parent_id, t.type, t.updated_at, "
             "rank "
             "FROM tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid "
             "WHERE tasks_fts MATCH ? "
