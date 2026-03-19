@@ -84,7 +84,10 @@ def load_vec(conn: sqlite3.Connection) -> bool:
         try:
             sqlite_vec.load(conn)
         finally:
-            conn.enable_load_extension(False)
+            try:
+                conn.enable_load_extension(False)
+            except Exception:
+                pass  # don't mask the original load error
         return True
     except Exception as e:
         logger.debug("sqlite-vec load failed: %s", e)

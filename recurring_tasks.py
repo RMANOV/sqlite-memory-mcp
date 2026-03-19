@@ -47,7 +47,13 @@ def matches_schedule(config: dict, today: date) -> bool:
                 )
                 return months_elapsed >= interval
             if every == "year":
-                return elapsed >= interval * 365
+                # Calendar-accurate year comparison: add interval years to base date
+                try:
+                    target = last.replace(year=last.year + interval)
+                except ValueError:
+                    # Feb 29 edge case — clamp to Feb 28 in non-leap years
+                    target = last.replace(year=last.year + interval, day=28)
+                return today >= target
         except (ValueError, TypeError):
             pass  # fall through to legacy logic
 
@@ -135,7 +141,7 @@ def next_due_date(config: dict, today: date) -> str:
 def has_active_duplicate(conn: sqlite3.Connection, title: str) -> bool:
     """Return True if an active (not_started or in_progress) task with the same title exists."""
     row = conn.execute(
-        "SELECT id FROM tasks WHERE title = ? AND status IN ('not_started', 'in_progress') LIMIT 1",
+        "SELECT id FROM tasks WHERE title = ? COLLATE NOCASE AND status IN ('not_started', 'in_progress') LIMIT 1",
         (title,),
     ).fetchone()
     return row is not None

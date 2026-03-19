@@ -238,7 +238,8 @@ def auto_promote_claim(
                 now,
             ),
         )
-    except Exception:
+    except Exception as e:
+        logger.warning("auto_promote_claim insert failed: %s", e)
         return None
 
     conn.execute(

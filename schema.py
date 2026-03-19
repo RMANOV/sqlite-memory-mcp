@@ -28,9 +28,18 @@ def error(msg: str) -> str:
 
 
 def is_valid_timestamp(s: str) -> bool:
-    """Validate ISO 8601 timestamp: parseable and not unreasonably in the future."""
+    """Validate ISO 8601 timestamp: parseable and not unreasonably in the future.
+
+    Accepts both timezone-aware and naive ISO timestamps. Naive timestamps are
+    treated as UTC.
+    """
     try:
         dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            # Naive ISO timestamp — treat as UTC
+            return dt <= datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+                hours=24
+            )
         return dt <= datetime.now(timezone.utc) + timedelta(hours=24)
     except (ValueError, TypeError):
         return False
@@ -120,6 +129,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_type       ON tasks(type);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee   ON tasks(assignee);
+CREATE INDEX IF NOT EXISTS idx_tasks_updated_at    ON tasks(updated_at);
+CREATE INDEX IF NOT EXISTS idx_entities_updated_at ON entities(updated_at);
 
 CREATE TABLE IF NOT EXISTS pending_shared_tasks (
     id          TEXT PRIMARY KEY,
@@ -382,6 +393,58 @@ CREATE TABLE IF NOT EXISTS enrichment_runs (
     started_at          TEXT NOT NULL,
     finished_at         TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS task_field_versions (
+    task_id     TEXT NOT NULL,
+    field_name  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, field_name),
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS entity_access_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    tool_name   TEXT    NOT NULL,
+    accessed_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eal_entity ON entity_access_log(entity_id, accessed_at DESC);
+
+CREATE TABLE IF NOT EXISTS lazy_claims (
+    claim_id            TEXT PRIMARY KEY,
+    entity_id           INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    observation_id      INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    subject             TEXT NOT NULL,
+    predicate           TEXT NOT NULL,
+    object_text         TEXT NOT NULL,
+    confidence          REAL NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'candidate',
+    promoted_to_fact_id TEXT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lc_entity ON lazy_claims(entity_id, status);
+CREATE INDEX IF NOT EXISTS idx_lc_obs    ON lazy_claims(observation_id);
+CREATE INDEX IF NOT EXISTS idx_lc_status ON lazy_claims(status, confidence DESC);
+
+-- Auto-sync triggers: keep memory_fts in lockstep with entities table
+CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON entities BEGIN
+    INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+    VALUES (new.rowid, new.name, new.entity_type, '');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON entities BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, name, entity_type, observations_text)
+    VALUES ('delete', old.rowid, old.name, old.entity_type, '');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON entities BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, name, entity_type, observations_text)
+    VALUES ('delete', old.rowid, old.name, old.entity_type, '');
+    INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+    VALUES (new.rowid, new.name, new.entity_type, '');
+END;
 """
 
 
@@ -797,6 +860,16 @@ _MIGRATIONS = [
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lc_status'",
         "CREATE INDEX idx_lc_status ON lazy_claims(status, confidence DESC)",
         "idx_lc_status index (v3.1.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_updated_at'",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at)",
+        "idx_tasks_updated_at index (F8)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_entities_updated_at'",
+        "CREATE INDEX IF NOT EXISTS idx_entities_updated_at ON entities(updated_at)",
+        "idx_entities_updated_at index (F9)",
     ),
 ]
 

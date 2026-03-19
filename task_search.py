@@ -22,6 +22,15 @@ except ImportError:
 # Words shorter than this are not indexed (articles, prepositions)
 _MIN_WORD_LEN = 2
 
+
+def _scored_fallback(tasks, query, limit):
+    """Substring-scored fallback with rank=0.0 for API consistency."""
+    scored = [(t, score_task(t, query)) for t in tasks]
+    return [
+        {**t, "rank": 0.0} for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0
+    ][:limit]
+
+
 # SmartKey config: corpus IDF high, markov off, personal CVM active
 _ENGINE_CONFIG = json.dumps(
     {
@@ -73,7 +82,7 @@ def score_task(task, query):
 
     # Normalize hyphens/underscores to spaces
     q_norm = _NORMALIZE_RE.sub(" ", q).strip()
-    words = [w for w in _SPLIT_RE.split(q_norm) if len(w) > 2]
+    words = [w for w in _SPLIT_RE.split(q_norm) if len(w) >= _MIN_WORD_LEN]
 
     if not words:
         # Very short query — exact substring only
@@ -218,14 +227,12 @@ class TaskSearchEngine:
                 task_ids = {t["id"] for t in tasks}
                 return [t for t in vec_results if t["id"] in task_ids][:limit]
             # Final fallback: improved substring scoring
-            scored = [(t, score_task(t, query)) for t in tasks]
-            return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
+            return _scored_fallback(tasks, query, limit)
 
         query_words = _tokenize(query)
         if not query_words:
             # Query has no indexable words — try fallback
-            scored = [(t, score_task(t, query)) for t in tasks]
-            return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
+            return _scored_fallback(tasks, query, limit)
 
         # For each query word, fuzzy-match against trie and resolve task IDs
         task_scores: dict[str, float] = {}
@@ -252,8 +259,7 @@ class TaskSearchEngine:
 
         if not task_scores:
             # SmartKey found nothing — fallback to substring
-            scored = [(t, score_task(t, query)) for t in tasks]
-            return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
+            return _scored_fallback(tasks, query, limit)
 
         n_query_words = len(query_words)
 

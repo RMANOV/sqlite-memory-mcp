@@ -642,6 +642,8 @@ class TaskDAO:
             ),
         )
 
+    ALLOWED_UPDATE_COLUMNS: frozenset = TASK_ALLOWED_UPDATE_FIELDS
+
     @staticmethod
     def update(conn: sqlite3.Connection, task_id: str, fields: dict[str, Any]) -> int:
         """Update arbitrary fields on a task. Returns rowcount.
@@ -650,6 +652,9 @@ class TaskDAO:
         """
         if not fields:
             return 0
+        unknown = set(fields) - TaskDAO.ALLOWED_UPDATE_COLUMNS
+        if unknown:
+            raise ValueError(f"Unknown task columns: {sorted(unknown)}")
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [task_id]
         cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
