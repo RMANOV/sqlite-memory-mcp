@@ -270,21 +270,21 @@ def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict
     New code should use merge_import_tasks() from db_utils (UUID-based LWW).
     """
     remote_tasks = existing_data.get("tasks", [])
-    local_titles = {t["title"] for t in tasks_out}
+    local_ids = {t["id"] for t in tasks_out}
 
     # Keep remote tasks missing locally
     for rt in remote_tasks:
-        if rt.get("title") and rt["title"] not in local_titles:
+        if rt.get("id") and rt["id"] not in local_ids:
             tasks_out.append(rt)
-            local_titles.add(rt["title"])
+            local_ids.add(rt["id"])
 
     # Update existing tasks where remote has newer updated_at
-    local_by_title = {t["title"]: t for t in tasks_out}
+    local_by_id = {t["id"]: t for t in tasks_out}
     for rt in remote_tasks:
-        title = rt.get("title")
-        if not title or title not in local_by_title:
+        rt_id = rt.get("id")
+        if not rt_id or rt_id not in local_by_id:
             continue
-        lt = local_by_title[title]
+        lt = local_by_id[rt_id]
         r_upd = rt.get("updated_at", "")
         l_upd = lt.get("updated_at", "")
         if r_upd > l_upd:

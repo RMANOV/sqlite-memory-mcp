@@ -169,9 +169,11 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
                 shared_tasks[t["id"]] = t
         existing["shared_tasks"] = list(shared_tasks.values())
 
-        shared_path.write_text(
+        tmp_path = shared_path.with_suffix(".tmp")
+        tmp_path.write_text(
             json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        os.replace(tmp_path, shared_path)
 
         subprocess.run(
             ["git", "-C", tmpdir, "add", "shared.json"],
@@ -327,9 +329,11 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
             current[entry["sourceHash"]] = entry
         existing["shared_knowledge"] = list(current.values())
 
-        shared_path.write_text(
+        tmp_path = shared_path.with_suffix(".tmp")
+        tmp_path.write_text(
             json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        os.replace(tmp_path, shared_path)
 
         subprocess.run(
             ["git", "-C", tmpdir, "add", "shared.json"],
@@ -600,14 +604,14 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             existing = _json_loads(shared_path.read_text(encoding="utf-8"))
 
             if not index_exists:
-                # Legacy merge: keep remote tasks that don't exist locally (by title)
-                local_titles = {t["title"] for t in tasks_out}
+                # Legacy merge: keep remote tasks that don't exist locally (by id)
+                local_ids = {t["id"] for t in tasks_out}
                 remote_tasks = existing.get("tasks", [])
                 merged_count = 0
                 for rt in remote_tasks:
-                    if rt.get("title") and rt["title"] not in local_titles:
+                    if rt.get("id") and rt["id"] not in local_ids:
                         tasks_out.append(rt)
-                        local_titles.add(rt["title"])
+                        local_ids.add(rt["id"])
                         merged_count += 1
                 if merged_count:
                     payload["tasks"] = tasks_out
@@ -617,13 +621,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                     )
 
                 # Update existing tasks where remote has newer updated_at
-                local_by_title = {t["title"]: t for t in tasks_out}
+                local_by_id = {t["id"]: t for t in tasks_out}
                 updated_count = 0
                 for rt in remote_tasks:
-                    title = rt.get("title")
-                    if not title or title not in local_by_title:
+                    rt_id = rt.get("id")
+                    if not rt_id or rt_id not in local_by_id:
                         continue
-                    lt = local_by_title[title]
+                    lt = local_by_id[rt_id]
                     r_upd = rt.get("updated_at", "")
                     l_upd = lt.get("updated_at", "")
                     if r_upd > l_upd:
@@ -673,7 +677,9 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         except (json.JSONDecodeError, OSError):
             pass
 
-    shared_path.write_text(_json_dumps(payload), encoding="utf-8")
+    tmp_path = shared_path.with_suffix(".tmp")
+    tmp_path.write_text(_json_dumps(payload), encoding="utf-8")
+    os.replace(tmp_path, shared_path)
 
     # Cross-account push: send assigned tasks to other users' repos
     by_assignee: dict[str, list] = {}
@@ -732,13 +738,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     )
 
     _git("add", "shared.json", "index.json", "tasks/")
+    # Use --porcelain to check staged changes without locale-dependent text parsing
+    status_result = _git("status", "--porcelain")
+    if not status_result.stdout.strip():
+        logger.info("bridge_push: no changes to commit")
+        return json.dumps({"pushed": 0, "message": "No changes — already up to date"})
     commit_result = _git("commit", "-m", msg)
     if commit_result.returncode != 0:
-        if "nothing to commit" in (commit_result.stdout + commit_result.stderr):
-            logger.info("bridge_push: no changes to commit")
-            return json.dumps(
-                {"pushed": 0, "message": "No changes — already up to date"}
-            )
         logger.error("bridge_push: commit failed: %s", commit_result.stderr)
         return _error(f"git commit failed: {commit_result.stderr.strip()}")
 
@@ -841,7 +847,8 @@ def bridge_pull() -> str:
         return _error(f"Bridge repo not found at {BRIDGE_REPO}")
 
     pull_result = _git("pull", "--rebase", "--autostash")
-    if pull_result.returncode != 0:
+    git_pull_failed = pull_result.returncode != 0
+    if git_pull_failed:
         logger.warning("bridge_pull: git pull failed, proceeding with local copy")
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
@@ -1208,6 +1215,8 @@ def bridge_pull() -> str:
         "source_machine": payload.get("machine_id", "unknown"),
         "pushed_at": payload.get("pushed_at", "unknown"),
     }
+    if git_pull_failed:
+        result["git_pull_failed"] = True
     if staged_count:
         result["staged_shared_tasks"] = staged_count
         result["review_required"] = (

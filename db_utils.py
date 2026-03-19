@@ -6,6 +6,7 @@ utilities used by server.py, task_tray.py, and utility scripts.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -224,7 +225,7 @@ def validate_task_fields(**kwargs: str | None) -> str | None:
 # ── Bridge Sync v2: Per-field LWW conflict resolver ─────────────────────
 
 MACHINE_ID = socket.gethostname()
-_write_counter = 0  # monotonic counter for same-microsecond tie-breaking
+_write_counter = itertools.count(1)  # atomic in CPython; no lock needed
 
 
 def _next_machine_id() -> str:
@@ -233,9 +234,7 @@ def _next_machine_id() -> str:
     Two writes in the same microsecond on the same machine get different IDs:
     DESKTOP:0001, DESKTOP:0002 → lexicographic comparison picks the later write.
     """
-    global _write_counter
-    _write_counter += 1
-    return f"{MACHINE_ID}:{_write_counter:06d}"
+    return f"{MACHINE_ID}:{next(_write_counter):06d}"
 
 
 METADATA_FIELDS = (
@@ -339,7 +338,8 @@ def get_conn(db_path: str | None = None):
             pass  # ROLLBACK failed — original exception is more important
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @contextmanager
@@ -362,7 +362,10 @@ def bulk_conn(db_path: str | None = None):
         conn.execute("COMMIT;")
         conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
     except Exception:
-        conn.execute("ROLLBACK;")
+        try:
+            conn.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()

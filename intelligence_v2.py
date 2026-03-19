@@ -321,7 +321,7 @@ def assess_context(
             conn,
             "assess_context",
             "blocked",
-            chunk_id,
+            input_signature=source_hash,
             chunk_id=chunk_id,
             session_id=session_id,
             reason_code="frozen",
@@ -405,8 +405,10 @@ def assess_context(
             new_state = "enrichable"
 
     # Skip logic: awaiting_human + same source_hash → skip
+    # But bypass skip if signals would change the entity's state
     if (
         current_state == "awaiting_human"
+        and new_state == current_state
         and config["skip_same_unresolved_source"]
         and not force
     ):

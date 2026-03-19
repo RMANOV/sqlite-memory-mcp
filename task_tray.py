@@ -4,6 +4,7 @@ System tray widget with dual mode: compact popup + full window.
 Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
+import atexit
 import base64
 import copy
 import faulthandler
@@ -24,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 _log_dir = os.path.expanduser("~/.claude/mcp_servers/sqlite_kb")
 os.makedirs(_log_dir, exist_ok=True)
 _crash_log = open(os.path.join(_log_dir, "crash.log"), "a")
+atexit.register(_crash_log.close)
 faulthandler.enable(file=_crash_log)
 logging.basicConfig(
     filename=os.path.join(_log_dir, "task_tray.log"),
@@ -78,7 +80,7 @@ class TaskDB:
         self._last_promote_time: float = 0.0
         self.search_engine = TaskSearchEngine()
 
-        self._wal_timer = QTimer()
+        self._wal_timer = QTimer(QApplication.instance())
         self._wal_timer.timeout.connect(self._wal_checkpoint)
         self._wal_timer.start(300_000)  # 5 minutes
 
@@ -845,7 +847,10 @@ def _recurring_label(raw: str | None) -> str:
     except (json.JSONDecodeError, TypeError):
         return ""
     every = cfg.get("every", "").lower()
-    interval = int(cfg.get("interval", 1))
+    try:
+        interval = int(cfg.get("interval", 1))
+    except (ValueError, TypeError):
+        interval = 1
     if every == "day":
         return "Daily" if interval == 1 else f"Every {interval} days"
     if every == "week":
@@ -867,7 +872,10 @@ def _recurring_label(raw: str | None) -> str:
         if month:
             import calendar
 
-            parts.append(calendar.month_name[int(month)])
+            try:
+                parts.append(calendar.month_name[int(month)])
+            except (ValueError, TypeError, IndexError):
+                parts.append(str(month))
         if day:
             parts.append(str(day))
         suffix = " ".join(parts) if parts else ""
@@ -1036,6 +1044,7 @@ class TrayPopup(QWidget):
         )
         self.db = db
         self.on_open_full = on_open_full
+        self._tasks = []
         self.setFixedWidth(380)
         self.setMaximumHeight(500)
         self.setStyleSheet(self._stylesheet())
@@ -2030,13 +2039,18 @@ class TaskListWidget(QListWidget):
             dlg.exec()
 
     def _on_double_click(self, item):
-        self._open_reader(item.data(Qt.ItemDataRole.UserRole))
+        task_id = item.data(Qt.ItemDataRole.UserRole)
+        if not task_id:
+            return
+        self._open_reader(task_id)
 
     def _context_menu(self, pos):
         item = self.itemAt(pos)
         if not item:
             return
         task_id = item.data(Qt.ItemDataRole.UserRole)
+        if not task_id:
+            return
         menu = QMenu(self)
         menu.setStyleSheet(_build_menu_style())
         view_action = menu.addAction("View")
@@ -2312,7 +2326,7 @@ class ReminderDateTimeDialog(QDialog):
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)
         self.dt_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
-        now = QDateTime.currentDateTimeUtc()
+        now = QDateTime.currentDateTime()
         self.dt_edit.setMinimumDateTime(now)
         if existing_reminder:
             try:
@@ -3172,12 +3186,11 @@ class FullWindow(QMainWindow):
                 )
             except Exception as exc:
                 self._enrich_done.emit(f"Enrich error: {exc}")
-            finally:
-                self._enrich_in_progress = False
 
         threading.Thread(target=_work, daemon=True).start()
 
     def _on_enrich_done(self, msg):
+        self._enrich_in_progress = False  # reset on GUI thread via signal
         is_error = msg.startswith("Enrich error")
         self.status.showMessage(msg, 10000 if is_error else 5000)
 
@@ -3221,7 +3234,10 @@ class FullWindow(QMainWindow):
 
     def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""
-        conn = conn or self.db._conn
+        _owned = conn is None
+        if _owned:
+            conn = sqlite3.connect(self.db.db_path, isolation_level=None, timeout=10)
+            conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         try:
             for e in remote_entities:
@@ -3248,13 +3264,16 @@ class FullWindow(QMainWindow):
                         "VALUES (?, ?, ?)",
                         (eid, o["content"], o.get("createdAt", now)),
                     )
-            conn.commit()
+            conn.execute("COMMIT")
         except Exception:
             try:
-                conn.rollback()
+                conn.execute("ROLLBACK")
             except Exception:
                 pass
             raise
+        finally:
+            if _owned:
+                conn.close()
 
     def _sort_tasks(self, tasks, sort_mode=None):
         """Sort tasks by given sort mode (or current working sort mode)."""
@@ -3604,12 +3623,16 @@ class FullWindow(QMainWindow):
             )
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
-                matched = [t for t in raw[key] if t["id"] in global_ids]
+                if key == "suggested":
+                    # Use full search results, not the pre-limited top-20 list
+                    source = global_results
+                else:
+                    source = [t for t in raw[key] if t["id"] in global_ids]
                 if key in self._tab_views:
                     v = self._tab_views[key]
-                    self._filtered_cache[key] = self._sort_tasks(matched, v["sort"])
+                    self._filtered_cache[key] = self._sort_tasks(source, v["sort"])
                 else:
-                    self._filtered_cache[key] = self._sort_tasks(matched)
+                    self._filtered_cache[key] = self._sort_tasks(source)
         else:
             for key in self._tab_keys:
                 if key in self._tab_views:
@@ -3793,6 +3816,8 @@ class FullWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._refresh_timer.start(_REFRESH_INTERVAL_MS)
+        self._purge_timer.start(_PURGE_INTERVAL_MS)
+        self._auto_sync_timer.start()
         self.refresh()
 
     def closeEvent(self, event):
@@ -3800,6 +3825,10 @@ class FullWindow(QMainWindow):
         self._save_ui_state()
         self._search_engine.save()
         self._refresh_timer.stop()
+        self._purge_timer.stop()
+        self._auto_sync_timer.stop()
+        self._db_refresh_debounce.stop()
+        self._search_timer.stop()
         event.ignore()
         self.hide()
 
@@ -3842,16 +3871,17 @@ class TaskTrayApp:
         self.full_window = None
 
         # Reminder timer — check every 60s for due reminders
-        self._reminder_timer = QTimer()
+        self._reminder_timer = QTimer(self.app)
         self._reminder_timer.timeout.connect(self._check_reminders)
         self._reminder_timer.start(60_000)
         self._shown_reminder_ids: dict[str, float] = {}  # task_id → monotonic ts
+        self._active_reminder_dlgs: list = []  # keep dialogs alive until closed
         QTimer.singleShot(5000, self._check_reminders)  # initial check after startup
 
         # Single-instance socket polling
         self._instance_socket = instance_socket
         if instance_socket:
-            self._instance_timer = QTimer()
+            self._instance_timer = QTimer(self.app)
             self._instance_timer.timeout.connect(self._poll_instance_socket)
             self._instance_timer.start(500)
 
@@ -3975,6 +4005,14 @@ class TaskTrayApp:
                 )
                 dlg.snoozed.connect(self._snooze_reminder)
                 dlg.dismissed.connect(self._dismiss_reminder)
+                self._active_reminder_dlgs.append(dlg)
+                dlg.finished.connect(
+                    lambda _, d=dlg: (
+                        self._active_reminder_dlgs.remove(d)
+                        if d in self._active_reminder_dlgs
+                        else None
+                    )
+                )
                 dlg.show()
             else:
                 self.tray.showMessage(

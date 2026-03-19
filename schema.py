@@ -408,12 +408,12 @@ _MIGRATIONS = [
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_type'",
-        "CREATE INDEX idx_tasks_type ON tasks(type)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks(type)",
         "idx_tasks_type index",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_assignee'",
-        "CREATE INDEX idx_tasks_assignee ON tasks(assignee)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee)",
         "idx_tasks_assignee index",
     ),
     (
@@ -563,21 +563,21 @@ _MIGRATIONS = [
         "task_field_versions table (v2.0.0)",
     ),
     (
-        "SELECT 1 FROM task_field_versions LIMIT 1",
+        "SELECT 1 FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) LIMIT 1",
         "INSERT OR IGNORE INTO task_field_versions (task_id, field_name, updated_at, updated_by) "
-        "SELECT id, 'title', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'status', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'priority', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'section', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'due_date', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'project', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'parent_id', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'recurring', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'type', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'assignee', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'shared_by', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'description', updated_at, '' FROM tasks "
-        "UNION ALL SELECT id, 'notes', updated_at, '' FROM tasks",
+        "SELECT id, 'title', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'status', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'priority', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'section', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'due_date', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'project', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'parent_id', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'recurring', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'type', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'assignee', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'shared_by', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'description', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
+        "UNION ALL SELECT id, 'notes', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions)",
         "seed task_field_versions from existing tasks (v2.0.0)",
     ),
     (
@@ -809,8 +809,18 @@ def init_db(db_path: str | None = None) -> None:
     _path = db_path or DB_PATH
     Path(_path).parent.mkdir(parents=True, exist_ok=True)
     raw = sqlite3.connect(_path, isolation_level=None)
-    raw.executescript(_SCHEMA_SQL)
-    raw.close()
+    raw.execute("BEGIN EXCLUSIVE;")
+    try:
+        for stmt in _SCHEMA_SQL.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                raw.execute(stmt)
+        raw.execute("COMMIT;")
+    except Exception:
+        raw.execute("ROLLBACK;")
+        raise
+    finally:
+        raw.close()
 
     with _get_conn(_path) as conn:
         for check_q, migrate_q, desc in _MIGRATIONS:

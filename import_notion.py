@@ -291,9 +291,19 @@ def _map_notion_page(page: dict) -> dict:
     if raw_type and raw_type.lower() in ("note", "notes"):
         task_type = "note"
 
-    # Timestamps
-    created_at = page.get("created_time", now_iso())
-    updated_at = page.get("last_edited_time", now_iso())
+    # Timestamps — normalize Notion format (e.g. "2024-03-01T10:00:00.000Z")
+    # to match now_iso() format for correct ORDER BY comparisons
+    def _norm_ts(ts: str | None) -> str:
+        if not ts:
+            return now_iso()
+        # Strip milliseconds and normalize trailing Z to +00:00
+        ts = ts.split(".")[0]
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return ts
+
+    created_at = _norm_ts(page.get("created_time"))
+    updated_at = _norm_ts(page.get("last_edited_time"))
 
     # Dedup hash based on title + created_time
     dedup_key = hashlib.sha256(f"{title}:{created_at}".encode()).hexdigest()[:12]
@@ -365,22 +375,30 @@ def import_pages(
 
     # Fetch content for each page (block children)
     if fetch_content:
+        clean_tasks = []
         for i, task in enumerate(tasks_to_insert):
-            page_id = task.pop("notion_page_id", None)
+            page_id = task.get("notion_page_id")
+            task_without_page_id = {
+                k: v for k, v in task.items() if k != "notion_page_id"
+            }
+            clean_tasks.append(task_without_page_id)
             if not page_id:
                 continue
             try:
                 blocks = _fetch_page_blocks(page_id)
                 md = _blocks_to_markdown(blocks)
                 if md.strip():
-                    content_map[task["id"]] = md
+                    content_map[task_without_page_id["id"]] = md
                 if (i + 1) % 50 == 0:
                     log.info("Content fetched: %d/%d", i + 1, len(tasks_to_insert))
             except Exception as exc:
-                log.warning("Failed to fetch blocks for %s: %s", task["title"], exc)
+                log.warning("Failed to fetch blocks for %s: %s", task.get("title"), exc)
+        tasks_to_insert = clean_tasks
     else:
-        for task in tasks_to_insert:
-            task.pop("notion_page_id", None)
+        tasks_to_insert = [
+            {k: v for k, v in task.items() if k != "notion_page_id"}
+            for task in tasks_to_insert
+        ]
 
     if dry_run:
         log.info("DRY RUN — would import %d tasks", len(tasks_to_insert))

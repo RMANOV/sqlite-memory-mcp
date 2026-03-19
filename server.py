@@ -161,7 +161,7 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
             project = ent.get("project")
             observations = ent.get("observations", [])
             vis = ent.get("visibility", "private")
-            if vis not in _VISIBILITY_LEVELS or vis != "private":
+            if vis not in _VISIBILITY_LEVELS:
                 vis = "private"
 
             cur = conn.execute(

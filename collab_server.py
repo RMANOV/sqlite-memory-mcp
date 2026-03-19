@@ -496,7 +496,7 @@ def review_shared_knowledge(
                         o["content"] if isinstance(o, dict) else o for o in pending_obs
                     }
                     local_etype = conn.execute(
-                        "SELECT entity_type FROM entities WHERE id = ?", (local["id"],)
+                        "SELECT entity_type FROM entities WHERE id = ?", (local_id,)
                     ).fetchone()["entity_type"]
                     diffs.append(
                         {
@@ -580,7 +580,7 @@ def review_shared_knowledge(
                 r = dict(rel)
                 if (
                     r["from_entity"] not in approved_names
-                    and r["to_entity"] not in approved_names
+                    or r["to_entity"] not in approved_names
                 ):
                     continue
                 from_id = _get_entity_id(conn, r["from_entity"])

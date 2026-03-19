@@ -15,7 +15,7 @@ def dry_run(conn: sqlite3.Connection, days: int) -> None:
     rows = conn.execute(
         "SELECT id, title, status, updated_at FROM tasks "
         "WHERE status = 'done' "
-        "AND updated_at < datetime('now', ? || ' days')",
+        "AND updated_at < datetime('now', 'localtime', ? || ' days')",
         (f"-{days}",),
     ).fetchall()
 
@@ -25,7 +25,9 @@ def dry_run(conn: sqlite3.Connection, days: int) -> None:
 
     print(f"[dry-run] {len(rows)} task(s) would be archived (older than {days} days):")
     for row in rows:
-        print(f"  id={row['id']}  status={row['status']}  updated_at={row['updated_at']}  title={row['title']}")
+        print(
+            f"  id={row['id']}  status={row['status']}  updated_at={row['updated_at']}  title={row['title']}"
+        )
 
 
 def archive(conn: sqlite3.Connection, days: int) -> None:
@@ -33,7 +35,7 @@ def archive(conn: sqlite3.Connection, days: int) -> None:
     cur = conn.execute(
         "UPDATE tasks SET status = 'archived', updated_at = ? "
         "WHERE status = 'done' "
-        "AND updated_at < datetime('now', ? || ' days')",
+        "AND updated_at < datetime('now', 'localtime', ? || ' days')",
         (iso_now, f"-{days}"),
     )
     # conn.commit() removed — get_conn() context manager handles commit/rollback
@@ -41,10 +43,18 @@ def archive(conn: sqlite3.Connection, days: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Archive done tasks older than N days.")
+    parser = argparse.ArgumentParser(
+        description="Archive done tasks older than N days."
+    )
     parser.add_argument("--db", default=DB_PATH, help="Path to the SQLite DB")
-    parser.add_argument("--days", type=int, default=7, help="Threshold in days (default: 7)")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be archived without modifying")
+    parser.add_argument(
+        "--days", type=int, default=7, help="Threshold in days (default: 7)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be archived without modifying",
+    )
     args = parser.parse_args()
 
     with get_conn(args.db) as conn:

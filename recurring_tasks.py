@@ -41,7 +41,11 @@ def matches_schedule(config: dict, today: date) -> bool:
                 day_num = config.get("day")
                 if day_num is not None and today.day != int(day_num):
                     return False
-                return elapsed >= interval * 28
+                # Approximate months elapsed using calendar arithmetic
+                months_elapsed = (today.year - last.year) * 12 + (
+                    today.month - last.month
+                )
+                return months_elapsed >= interval
             if every == "year":
                 return elapsed >= interval * 365
         except (ValueError, TypeError):
