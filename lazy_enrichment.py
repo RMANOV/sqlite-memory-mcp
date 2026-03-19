@@ -13,7 +13,10 @@ import sqlite3
 import uuid
 from typing import Any
 
-from db_utils import now_iso, tokenize_for_similarity as _tokenize, STOPWORDS as _STOPWORDS
+from db_utils import (
+    now_iso,
+    tokenize_for_similarity as _tokenize,
+)
 
 # ── Adaptive confidence per predicate ──────────────────────────────────────
 
@@ -45,18 +48,67 @@ def _get_patterns() -> list[tuple[re.Pattern, str]]:
         return _PATTERNS
     try:
         from claim_graph import _RELATION_PATTERNS
+
         _PATTERNS = _RELATION_PATTERNS
     except Exception:
         # Standalone fallback — same patterns without import dependency
         _PATTERNS = [
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:uses?|използва)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "uses"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:depends?\s+on|зависи\s+от)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "depends_on"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:is|е|са)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "is"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:requires?|изисква)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "requires"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:produces?|генерира|създава)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "produces"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:validates?|валидира)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "validates"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:contains?|съдържа)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "contains"),
-            (re.compile(r"(\b\w[\w\s]{1,40}?)\s+(?:replaces?|замества|заменя)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)", re.I), "replaces"),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:uses?|използва)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "uses",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:depends?\s+on|зависи\s+от)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "depends_on",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:is|е|са)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "is",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:requires?|изисква)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "requires",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:produces?|генерира|създава)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "produces",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:validates?|валидира)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "validates",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:contains?|съдържа)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "contains",
+            ),
+            (
+                re.compile(
+                    r"(\b\w[\w\s]{1,40}?)\s+(?:replaces?|замества|заменя)\s+(\b\w[\w\s]{1,40}?)(?:\.|,|$)",
+                    re.I,
+                ),
+                "replaces",
+            ),
         ]
     return _PATTERNS
 
@@ -107,12 +159,14 @@ def extract_inline_claims(
                     ).fetchone()["cnt"]
                     confidence = max(0.0, base - REJECTION_PENALTY * rej_count)
                 else:
-                    # Evidence accumulation
-                    confidence = min(
-                        1.0,
-                        existing["confidence"]
-                        + min(EVIDENCE_BOOST_CAP, EVIDENCE_BOOST_PER),
-                    )
+                    # Evidence accumulation — count prior evidence for cap
+                    evidence_count = conn.execute(
+                        "SELECT COUNT(*) AS cnt FROM lazy_claims "
+                        "WHERE subject = ? AND predicate = ? AND object_text = ?",
+                        (subject, predicate, object_text),
+                    ).fetchone()["cnt"]
+                    boost = min(EVIDENCE_BOOST_CAP, evidence_count * EVIDENCE_BOOST_PER)
+                    confidence = min(1.0, base + boost)
                 # Update existing claim
                 conn.execute(
                     "UPDATE lazy_claims SET confidence = ?, updated_at = ? "
@@ -129,8 +183,17 @@ def extract_inline_claims(
                     "(claim_id, entity_id, observation_id, subject, predicate, "
                     "object_text, confidence, status, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?, ?)",
-                    (claim_id, entity_id, observation_id, subject, predicate,
-                     object_text, confidence, now, now),
+                    (
+                        claim_id,
+                        entity_id,
+                        observation_id,
+                        subject,
+                        predicate,
+                        object_text,
+                        confidence,
+                        now,
+                        now,
+                    ),
                 )
             count += 1
 
@@ -188,6 +251,7 @@ def auto_promote_claim(
 
 # ── L2b: Periodic health sweep ─────────────────────────────────────────────
 
+
 def detect_near_duplicates(conn: sqlite3.Connection) -> list[dict]:
     """Find near-duplicate observations within the same entity (Jaccard >= 0.7)."""
     results: list[dict] = []
@@ -206,22 +270,24 @@ def detect_near_duplicates(conn: sqlite3.Connection) -> list[dict]:
         for i, (id_a, text_a, tokens_a) in enumerate(tokenized):
             if not tokens_a:
                 continue
-            for id_b, text_b, tokens_b in tokenized[i + 1:]:
+            for id_b, text_b, tokens_b in tokenized[i + 1 :]:
                 if not tokens_b:
                     continue
                 intersection = tokens_a & tokens_b
                 union = tokens_a | tokens_b
                 jaccard = len(intersection) / len(union) if union else 0.0
                 if jaccard >= 0.7:
-                    results.append({
-                        "entity": ent["name"],
-                        "entity_id": ent["id"],
-                        "obs_a_id": id_a,
-                        "obs_b_id": id_b,
-                        "jaccard": round(jaccard, 3),
-                        "text_a": text_a[:100],
-                        "text_b": text_b[:100],
-                    })
+                    results.append(
+                        {
+                            "entity": ent["name"],
+                            "entity_id": ent["id"],
+                            "obs_a_id": id_a,
+                            "obs_b_id": id_b,
+                            "jaccard": round(jaccard, 3),
+                            "text_a": text_a[:100],
+                            "text_b": text_b[:100],
+                        }
+                    )
     return results
 
 
@@ -255,21 +321,23 @@ def detect_contradictions(conn: sqlite3.Connection) -> list[dict]:
             opposite = _OPPOSING_PREDICATES.get(ca["predicate"])
             if not opposite:
                 continue
-            for cb in entity_claims[i + 1:]:
+            for cb in entity_claims[i + 1 :]:
                 if (
                     cb["predicate"] == opposite
                     and ca["subject"] == cb["subject"]
                     and ca["object_text"] == cb["object_text"]
                 ):
-                    results.append({
-                        "entity_id": eid,
-                        "claim_a": ca["claim_id"],
-                        "claim_b": cb["claim_id"],
-                        "subject": ca["subject"],
-                        "predicate_a": ca["predicate"],
-                        "predicate_b": cb["predicate"],
-                        "object": ca["object_text"],
-                    })
+                    results.append(
+                        {
+                            "entity_id": eid,
+                            "claim_a": ca["claim_id"],
+                            "claim_b": cb["claim_id"],
+                            "subject": ca["subject"],
+                            "predicate_a": ca["predicate"],
+                            "predicate_b": cb["predicate"],
+                            "object": ca["object_text"],
+                        }
+                    )
     return results
 
 
@@ -298,17 +366,28 @@ def detect_stale_entities(
         except Exception:
             last_access = None
 
-        if last_access and last_access > r["updated_at"]:
-            continue  # Recently accessed, not stale
+        if last_access:
+            from datetime import datetime
 
-        results.append({
-            "entity_id": r["id"],
-            "name": r["name"],
-            "entity_type": r["entity_type"],
-            "project": r["project"],
-            "last_updated": r["updated_at"],
-            "last_accessed": last_access,
-        })
+            try:
+                if datetime.fromisoformat(last_access) > datetime.fromisoformat(
+                    r["updated_at"]
+                ):
+                    continue  # Recently accessed, not stale
+            except (ValueError, TypeError):
+                if last_access > r["updated_at"]:
+                    continue
+
+        results.append(
+            {
+                "entity_id": r["id"],
+                "name": r["name"],
+                "entity_type": r["entity_type"],
+                "project": r["project"],
+                "last_updated": r["updated_at"],
+                "last_accessed": last_access,
+            }
+        )
     return results
 
 
@@ -327,11 +406,13 @@ def promote_ready_claims(conn: sqlite3.Connection) -> list[dict]:
     for row in ready:
         fact_id = auto_promote_claim(conn, row["claim_id"], row["confidence"])
         if fact_id:
-            results.append({
-                "claim_id": row["claim_id"],
-                "fact_id": fact_id,
-                "confidence": row["confidence"],
-            })
+            results.append(
+                {
+                    "claim_id": row["claim_id"],
+                    "fact_id": fact_id,
+                    "confidence": row["confidence"],
+                }
+            )
     return results
 
 
@@ -360,8 +441,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Knowledge health sweep")
     parser.add_argument("--db", default=DB_PATH, help="Path to SQLite database")
-    parser.add_argument("--dry-run", action="store_true", help="Report only, no promotions")
-    parser.add_argument("--json", action="store_true", dest="json_output", help="JSON output")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Report only, no promotions"
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="JSON output"
+    )
     args = parser.parse_args()
 
     with get_conn(args.db) as conn:

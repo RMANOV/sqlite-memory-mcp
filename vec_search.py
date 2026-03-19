@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from typing import Any
 
 logger = logging.getLogger("sqlite-kb")
@@ -44,17 +45,20 @@ VEC_AVAILABLE: bool = _HAS_VEC and _HAS_ST
 # ── Model singleton (lazy loaded) ─────────────────────────────────────
 
 _model: SentenceTransformer | None = None
+_model_lock = threading.Lock()
 _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 MAX_OBS_FOR_EMBEDDING = 20  # MiniLM-L6-v2 has 256-token limit; cap observations to fit
 
 
 def _get_model() -> SentenceTransformer:
-    """Lazy-load the embedding model on first use."""
+    """Lazy-load the embedding model on first use (thread-safe)."""
     global _model
     if _model is None:
-        _model = SentenceTransformer(_MODEL_NAME)
-        logger.info("Loaded embedding model: %s", _MODEL_NAME)
+        with _model_lock:
+            if _model is None:
+                _model = SentenceTransformer(_MODEL_NAME)
+                logger.info("Loaded embedding model: %s", _MODEL_NAME)
     return _model
 
 
@@ -77,8 +81,10 @@ def load_vec(conn: sqlite3.Connection) -> bool:
         pass
     try:
         conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        try:
+            sqlite_vec.load(conn)
+        finally:
+            conn.enable_load_extension(False)
         return True
     except Exception as e:
         logger.debug("sqlite-vec load failed: %s", e)
