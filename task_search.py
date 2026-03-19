@@ -1,13 +1,15 @@
 """SmartKey-powered fuzzy task search with CVM personal frequency.
 
 Word-level inverted index + SmartKey ensemble scoring.
-Gracefully falls back to substring matching if smartkey_py is unavailable.
+Search priority: SmartKey > FTS5 (BM25) > improved substring fallback.
 """
 
 import json
+import logging
 import math
 import os
 import re
+import sqlite3
 
 _SMARTKEY_AVAILABLE = False
 try:
@@ -46,34 +48,65 @@ def _tokenize(text: str) -> list[str]:
     return [w.lower() for w in _WORD_RE.findall(text) if len(w) >= _MIN_WORD_LEN]
 
 
+log = logging.getLogger(__name__)
+
+
 def score_task(task, query):
-    """Substring scorer for task relevance. 0 = no match."""
+    """Field-weighted substring scorer. 0 = no match.
+
+    Scoring hierarchy:
+      Title exact phrase  → 200
+      Title all words     → 100
+      Desc exact phrase   → 80
+      Desc all words      → 50
+      Notes all words     → 30
+      Other fields        → 5  (tiebreaker only)
+
+    ALL query words (len>2) must appear in title+desc+notes to score > 0.
+    This eliminates false positives from project/status field leakage.
+    """
     q = query.lower()
     title = (task.get("title") or "").lower()
-    combined = (
-        f"{title} {(task.get('description') or '').lower()} "
-        f"{(task.get('notes') or '').lower()} "
-        f"{task.get('priority', '')} {task.get('project', '')} "
-        f"{task.get('due_date', '')} {task.get('section', '')} {task.get('status', '')}"
-    )
-    # Normalize hyphens/underscores to spaces for substring matching
-    q_normalized = _NORMALIZE_RE.sub(" ", q).strip()
-    if q_normalized and q_normalized in title:
+    desc = (task.get("description") or "").lower()
+    notes = (task.get("notes") or "").lower()
+    core = f"{title} {desc} {notes}"
+
+    # Normalize hyphens/underscores to spaces
+    q_norm = _NORMALIZE_RE.sub(" ", q).strip()
+    words = [w for w in _SPLIT_RE.split(q_norm) if len(w) > 2]
+
+    if not words:
+        # Very short query — exact substring only
+        if q_norm and q_norm in title:
+            return 200
+        if q_norm and q_norm in core:
+            return 50
+        return 0
+
+    # Gate: ALL significant words must appear in core fields
+    if not all(w in core for w in words):
+        return 0
+
+    # Exact phrase match
+    if q_norm in title:
+        return 200
+    if q_norm in desc:
+        return 80
+
+    # All words in title
+    if all(w in title for w in words):
         return 100
-    if q_normalized != q and q in title:
-        return 100
-    if q_normalized and q_normalized in combined:
+
+    # All words in description
+    if all(w in desc for w in words):
         return 50
-    if q_normalized != q and q in combined:
-        return 50
-    words = [w for w in _SPLIT_RE.split(q) if w]
-    if len(words) > 1:
-        matched = sum(1 for w in words if w in combined)
-        if matched == len(words):
-            return 30
-        if matched > 0:
-            return 10 * matched
-    return 0
+
+    # All words in notes
+    if all(w in notes for w in words):
+        return 30
+
+    # Words spread across core fields (already passed the gate)
+    return 20
 
 
 class TaskSearchEngine:
@@ -145,13 +178,28 @@ class TaskSearchEngine:
             freq = max(1, int(idf * 100))
             self._engine.load_word(word, freq)
 
-    def search(self, query: str, tasks: list[dict], limit: int = 50) -> list[dict]:
-        """Fuzzy search tasks. Returns scored + ranked list."""
+    def search(
+        self,
+        query: str,
+        tasks: list[dict],
+        limit: int = 50,
+        conn: sqlite3.Connection | None = None,
+    ) -> list[dict]:
+        """Fuzzy search tasks. Returns scored + ranked list.
+
+        Priority: SmartKey (fuzzy) > FTS5 (BM25) > substring fallback.
+        Pass *conn* to enable FTS5 path when SmartKey is unavailable.
+        """
         if not query:
             return tasks[:limit]
 
         if not self._engine:
-            # Fallback to substring matching
+            # Try FTS5 first (precise BM25 ranking)
+            if conn is not None:
+                results = self._fts5_search(conn, query, tasks, limit)
+                if results is not None:
+                    return results
+            # Final fallback: improved substring scoring
             scored = [(t, score_task(t, query)) for t in tasks]
             return [t for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0][:limit]
 
@@ -200,6 +248,54 @@ class TaskSearchEngine:
         # Sort by score descending
         ranked_ids = sorted(task_scores, key=lambda tid: -task_scores[tid])[:limit]
         return [self._task_map[tid] for tid in ranked_ids if tid in self._task_map]
+
+    @staticmethod
+    def _fts5_search(
+        conn: sqlite3.Connection,
+        query: str,
+        tasks: list[dict],
+        limit: int,
+    ) -> list[dict] | None:
+        """FTS5 BM25 search. Returns ranked results or None on failure."""
+        tokens = query.split()
+        if not tokens:
+            return None
+        # AND logic: all tokens must match for precise results
+        escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
+        fts_q = " AND ".join(escaped)
+        try:
+            rows = conn.execute(
+                "SELECT t.id, t.title, t.description, t.notes, t.status, "
+                "t.priority, t.section, t.due_date, t.project, t.parent_id, "
+                "t.type, t.updated_at, rank "
+                "FROM tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid "
+                "WHERE tasks_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (fts_q, limit),
+            ).fetchall()
+        except Exception:
+            log.debug("FTS5 search failed for %r, falling back", query, exc_info=True)
+            return None
+        if not rows:
+            # FTS5 found nothing with AND — try OR as broadening
+            fts_q_or = " OR ".join(escaped)
+            try:
+                rows = conn.execute(
+                    "SELECT t.id, t.title, t.description, t.notes, t.status, "
+                    "t.priority, t.section, t.due_date, t.project, t.parent_id, "
+                    "t.type, t.updated_at, rank "
+                    "FROM tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid "
+                    "WHERE tasks_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (fts_q_or, limit),
+                ).fetchall()
+            except Exception:
+                return None
+        if not rows:
+            return None
+        # Filter to only tasks in the current view
+        task_ids = {t["id"] for t in tasks}
+        return [dict(r) for r in rows if r["id"] in task_ids][:limit]
 
     def record_open(self, task: dict) -> None:
         """Record that a task was opened (boosts future ranking via CVM)."""
