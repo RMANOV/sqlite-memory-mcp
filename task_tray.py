@@ -39,7 +39,6 @@ from db_utils import (
     DB_PATH,
     MERGEABLE_FIELDS,
     PRIORITY_COLORS,
-    TASK_ALLOWED_UPDATE_FIELDS as ALLOWED_FIELDS,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
     TaskDAO,
@@ -98,6 +97,7 @@ class TaskDB:
         self._enrich_cache_tc: dict[int, int] = {}
         self._enrich_cache_valid = False
         self._enrich_cache_lock = threading.Lock()
+        self._enrich_refresh_lock = threading.Lock()
         threading.Thread(target=self._refresh_enrich_cache, daemon=True).start()
 
         self._wal_timer = QTimer(QApplication.instance())
@@ -150,8 +150,8 @@ class TaskDB:
                     logging.getLogger("task_tray").warning(
                         "Repaired corrupted FTS index: %s", fts_table
                     )
-                except Exception:
-                    pass  # FTS table may not exist yet
+                except Exception as e:
+                    logger.warning("FTS rebuild failed: %s", e)
 
     def _ensure_table(self):
         """Create tasks table if missing; migrate existing table to v0.5.0 schema."""
@@ -332,9 +332,6 @@ class TaskDB:
         """Update arbitrary fields on a task."""
         if not fields:
             return
-        invalid = set(fields) - ALLOWED_FIELDS
-        if invalid:
-            raise ValueError(f"Unknown task fields: {invalid}")
         now = now_iso()
         changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
         fields["updated_at"] = now
@@ -479,29 +476,35 @@ class TaskDB:
 
     def _refresh_enrich_cache(self):
         """Bulk-load obs preview + task count for all entities. Thread-safe."""
+        if not self._enrich_refresh_lock.acquire(blocking=False):
+            return
         try:
             conn = sqlite3.connect(self.db_path, timeout=5)
             conn.row_factory = sqlite3.Row
-            obs = {}
-            for row in conn.execute(
-                "SELECT entity_id, content FROM observations GROUP BY entity_id"
-            ).fetchall():
-                obs[row["entity_id"]] = row["content"][:80]
-            tc = {}
             try:
+                obs = {}
                 for row in conn.execute(
-                    "SELECT entity_id, COUNT(*) as cnt FROM task_entity_links GROUP BY entity_id"
+                    "SELECT entity_id, content FROM observations GROUP BY entity_id"
                 ).fetchall():
-                    tc[row["entity_id"]] = row["cnt"]
-            except Exception:
-                pass
-            conn.close()
-            with self._enrich_cache_lock:
-                self._enrich_cache_obs = obs
-                self._enrich_cache_tc = tc
-                self._enrich_cache_valid = True
-        except Exception:
-            pass
+                    obs[row["entity_id"]] = row["content"][:80]
+                tc = {}
+                try:
+                    for row in conn.execute(
+                        "SELECT entity_id, COUNT(*) as cnt FROM task_entity_links GROUP BY entity_id"
+                    ).fetchall():
+                        tc[row["entity_id"]] = row["cnt"]
+                except Exception:
+                    pass
+                with self._enrich_cache_lock:
+                    self._enrich_cache_obs = obs
+                    self._enrich_cache_tc = tc
+                    self._enrich_cache_valid = True
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("Enrich cache refresh failed: %s", e)
+        finally:
+            self._enrich_refresh_lock.release()
 
     def _invalidate_enrich_cache(self):
         """Mark cache stale. Next refresh will reload."""
@@ -1134,12 +1137,14 @@ def _batch_truth_scores(db_path=None):
     try:
         conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=5)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT entity_name, AVG(specificity * 0.35 + falsifiability * 0.25 + "
-            "internal_consistency * 0.25 + novelty * 0.15) as iq "
-            "FROM knowledge_ratings GROUP BY entity_name"
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT entity_name, AVG(specificity * 0.35 + falsifiability * 0.25 + "
+                "internal_consistency * 0.25 + novelty * 0.15) as iq "
+                "FROM knowledge_ratings GROUP BY entity_name"
+            ).fetchall()
+        finally:
+            conn.close()
         result = {}
         for r in rows:
             avg = r["iq"] or 0.0
@@ -4411,7 +4416,7 @@ class TaskTrayApp:
         self.app.aboutToQuit.connect(self._on_quit)
 
         # Periodic entity enrichment cache refresh (60s safety net for external writes)
-        self._enrich_timer = QTimer()
+        self._enrich_timer = QTimer(self.app)
         self._enrich_timer.timeout.connect(
             lambda: threading.Thread(
                 target=self.db._refresh_enrich_cache, daemon=True
@@ -4584,7 +4589,8 @@ class TaskTrayApp:
                 dlg.finished.connect(
                     lambda _, d=dlg: (
                         self._active_reminder_dlgs.remove(d)
-                        if d in self._active_reminder_dlgs
+                        if hasattr(self, "_active_reminder_dlgs")
+                        and d in self._active_reminder_dlgs
                         else None
                     )
                 )
@@ -4609,6 +4615,7 @@ class TaskTrayApp:
         self._shown_reminder_ids.pop(task_id, None)
 
     def _on_quit(self):
+        self._enrich_timer.stop()
         self._reminder_timer.stop()
         if self._instance_socket:
             self._instance_socket.close()

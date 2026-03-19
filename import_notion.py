@@ -454,11 +454,8 @@ def import_pages(
                 log.warning("Insert failed for %s: %s", task["title"], exc)
                 stats["errors"] += 1
 
-        # Rebuild FTS index within the same transaction
-        if stats["imported"] > 0:
-            log.info("Rebuilding tasks_fts index...")
-            conn.execute("INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')")
-            log.info("FTS rebuild complete")
+        # FTS triggers on tasks table handle index sync automatically;
+        # no manual rebuild needed here.
 
     return stats
 

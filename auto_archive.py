@@ -8,14 +8,14 @@ Usage:
 import argparse
 import sqlite3
 
-from db_utils import DB_PATH, get_conn, now_iso
+from db_utils import DB_PATH, get_conn, now_iso, upsert_field_versions, MERGEABLE_FIELDS
 
 
 def dry_run(conn: sqlite3.Connection, days: int) -> None:
     rows = conn.execute(
         "SELECT id, title, status, updated_at FROM tasks "
         "WHERE status = 'done' "
-        "AND updated_at < datetime('now', 'localtime', ? || ' days')",
+        "AND updated_at < datetime('now', ? || ' days')",
         (f"-{days}",),
     ).fetchall()
 
@@ -32,12 +32,23 @@ def dry_run(conn: sqlite3.Connection, days: int) -> None:
 
 def archive(conn: sqlite3.Connection, days: int) -> None:
     iso_now = now_iso()
+    # Collect IDs before updating so we can write field versions
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'done' "
+        "AND updated_at < datetime('now', ? || ' days')",
+        (f"-{days}",),
+    ).fetchall()
+    ids = [r["id"] for r in rows]
+
     cur = conn.execute(
         "UPDATE tasks SET status = 'archived', updated_at = ? "
         "WHERE status = 'done' "
-        "AND updated_at < datetime('now', 'localtime', ? || ' days')",
+        "AND updated_at < datetime('now', ? || ' days')",
         (iso_now, f"-{days}"),
     )
+    # Update task_field_versions for each archived task
+    for task_id in ids:
+        upsert_field_versions(conn, task_id, MERGEABLE_FIELDS, timestamp=iso_now)
     # conn.commit() removed — get_conn() context manager handles commit/rollback
     print(f"Archived {cur.rowcount} tasks (older than {days} days).")
 
