@@ -229,6 +229,21 @@ class TaskDB:
             "PRIMARY KEY (task_id, field_name), "
             "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE)"
         )
+        # v3.2.0: add audit trail columns
+        _fv_cols = {
+            r[1]
+            for r in self._conn.execute(
+                "PRAGMA table_info('task_field_versions')"
+            ).fetchall()
+        }
+        if "old_value" not in _fv_cols:
+            self._conn.execute(
+                "ALTER TABLE task_field_versions ADD COLUMN old_value TEXT DEFAULT NULL"
+            )
+        if "new_value" not in _fv_cols:
+            self._conn.execute(
+                "ALTER TABLE task_field_versions ADD COLUMN new_value TEXT DEFAULT NULL"
+            )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS task_entity_links ("
             "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
