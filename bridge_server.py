@@ -750,6 +750,9 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     commit_result = _git("commit", "-m", msg)
     if commit_result.returncode != 0:
         logger.error("bridge_push: commit failed: %s", commit_result.stderr)
+        # Restore shared.json to last committed state to prevent dirty file
+        # from being overwritten by a future bridge_pull --rebase
+        _git("checkout", "--", "shared.json")
         return _error(f"git commit failed: {commit_result.stderr.strip()}")
 
     push_result = _git("push")

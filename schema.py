@@ -876,6 +876,36 @@ _MIGRATIONS = [
 ]
 
 
+def _split_schema_sql(sql: str) -> list[str]:
+    """Split SQL schema into statements, respecting BEGIN...END trigger blocks.
+
+    Naive split(";") breaks CREATE TRIGGER bodies that contain semicolons
+    inside BEGIN...END.  This function accumulates lines and only emits a
+    statement when a top-level semicolon is reached (i.e. NOT inside a
+    BEGIN...END block).
+    """
+    stmts: list[str] = []
+    current: list[str] = []
+    in_trigger = False
+    for line in sql.split("\n"):
+        stripped = line.strip().upper()
+        if stripped.startswith("CREATE TRIGGER"):
+            in_trigger = True
+        current.append(line)
+        if in_trigger and stripped == "END;":
+            stmts.append("\n".join(current))
+            current = []
+            in_trigger = False
+        elif not in_trigger and ";" in line:
+            stmts.append("\n".join(current))
+            current = []
+    if current:
+        remaining = "\n".join(current).strip()
+        if remaining:
+            stmts.append(remaining)
+    return [s.strip() for s in stmts if s.strip()]
+
+
 def init_db(db_path: str | None = None) -> None:
     """Create tables if they don't exist, run migrations, set WAL mode.
 
@@ -886,10 +916,8 @@ def init_db(db_path: str | None = None) -> None:
     raw = sqlite3.connect(_path, isolation_level=None)
     raw.execute("BEGIN EXCLUSIVE;")
     try:
-        for stmt in _SCHEMA_SQL.split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                raw.execute(stmt)
+        for stmt in _split_schema_sql(_SCHEMA_SQL):
+            raw.execute(stmt)
         raw.execute("COMMIT;")
     except Exception:
         raw.execute("ROLLBACK;")

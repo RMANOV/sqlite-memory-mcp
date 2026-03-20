@@ -147,7 +147,8 @@ def extract_inline_claims(
             base = _PREDICATE_BASE_CONFIDENCE.get(predicate, 0.5)
             existing = conn.execute(
                 "SELECT claim_id, confidence, status FROM lazy_claims "
-                "WHERE subject = ? AND predicate = ? AND object_text = ?",
+                "WHERE subject = ? AND predicate = ? AND object_text = ? "
+                "ORDER BY rowid DESC LIMIT 1",
                 (subject, predicate, object_text),
             ).fetchone()
 

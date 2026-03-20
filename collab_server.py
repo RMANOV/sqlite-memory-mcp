@@ -560,7 +560,13 @@ def review_shared_knowledge(
                 eid = _get_entity_id(conn, p["name"])
                 if eid:
                     for obs in pending_obs:
-                        content = obs["content"] if isinstance(obs, dict) else obs
+                        content = (
+                            obs.get("content") or obs.get("text")
+                            if isinstance(obs, dict)
+                            else obs
+                        )
+                        if not content:
+                            continue
                         created = (
                             obs.get("createdAt", now) if isinstance(obs, dict) else now
                         )

@@ -296,7 +296,7 @@ def query_tasks(
         params.extend(_TASK_ACTIVE_EXCLUSIONS)
 
     if summary_only:
-        cols = "t.id, t.title, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
+        cols = "t.id, t.title, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id, t.notes"
     else:
         cols = "t.id, t.title, t.description, t.notes, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
 
@@ -306,25 +306,29 @@ def query_tasks(
     )
 
     where = " AND ".join(conditions) if conditions else "1=1"
-    sql = (
-        f"SELECT {cols} FROM {from_clause} WHERE {where} "
-        f"ORDER BY {order_clause} "
-        f"LIMIT ? OFFSET ?"
-    )
-    params.extend([limit, offset])
 
     with _get_conn() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        count_params = params[:-2]
-        count_sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where}"
-        total = conn.execute(count_sql, count_params).fetchone()[0]
-
-        # Unified search: route through TaskSearchEngine (FTS5 + vector + RRF)
-        if search and rows:
-            filtered_tasks = [dict(r) for r in rows]
-            results = _search_engine.search(search, filtered_tasks, conn=conn)
-            rows = results
+        if search:
+            # Fetch ALL matching rows first, then search, then paginate in Python
+            sql = (
+                f"SELECT {cols} FROM {from_clause} WHERE {where} "
+                f"ORDER BY {order_clause}"
+            )
+            all_rows = conn.execute(sql, params).fetchall()
+            results = _search_engine.search(
+                search, [dict(r) for r in all_rows], conn=conn
+            )
             total = len(results)
+            rows = results[offset : offset + limit]
+        else:
+            sql = (
+                f"SELECT {cols} FROM {from_clause} WHERE {where} "
+                f"ORDER BY {order_clause} "
+                f"LIMIT ? OFFSET ?"
+            )
+            rows = conn.execute(sql, params + [limit, offset]).fetchall()
+            count_sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where}"
+            total = conn.execute(count_sql, params).fetchone()[0]
 
     rows = [dict(r) if not isinstance(r, dict) else r for r in rows] if rows else []
 
@@ -340,7 +344,7 @@ def query_tasks(
     for i, r in enumerate(rows, 1):
         due = r["due_date"] or "—"
         proj = r["project"] or "—"
-        notes = (r.get("notes") or "—")[:80]
+        notes = (r["notes"] or "—")[:80]
         lines.append(
             f"| {i + offset} | {r['title']} | {r['status']} | {r['priority']} "
             f"| {r['section']} | {due} | {proj} | {notes} |"
@@ -417,7 +421,7 @@ def task_digest(
     if overdue:
         lines.append(f"### OVERDUE ({len(overdue)})")
         for t in overdue:
-            note_hint = f" | {t['notes'][:60]}..." if t.get("notes") else ""
+            note_hint = f" | {t['notes'][:60]}..." if t["notes"] else ""
             lines.append(
                 f"- [{t['priority'].upper()}] {t['title']} (due: {t['due_date']}){note_hint}"
             )
@@ -436,7 +440,7 @@ def task_digest(
                 prio = (
                     f"[{t['priority'].upper()}] " if t["priority"] != "medium" else ""
                 )
-                note_hint = f" | {t['notes'][:60]}..." if t.get("notes") else ""
+                note_hint = f" | {t['notes'][:60]}..." if t["notes"] else ""
                 lines.append(f"- {prio}{t['title']}{due}{note_hint}")
             lines.append("")
 
