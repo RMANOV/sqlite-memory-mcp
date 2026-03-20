@@ -459,8 +459,8 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 elif vec_rows and not rows:
                     # Vector found results that FTS5 missed (semantic match)
                     rows = _rrf_merge([], vec_rows)
-            except Exception:
-                pass  # Fall through to FTS5-only
+            except Exception as e:
+                logger.debug("Vector search failed: %s", e)
 
         if not rows:
             return json.dumps({"entities": [], "query": query})
@@ -477,8 +477,8 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 query_entity_ids=None,
                 limit=50,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Rerank failed: %s", e)
 
         if reranked:
             eids = [r["eid"] for r in reranked]
@@ -527,8 +527,8 @@ def search_nodes(query: str, project: str | None = None) -> str:
                     "VALUES (?, 'search_nodes', ?)",
                     (eid, now),
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Access log write failed: %s", e)
 
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
     return json.dumps({"entities": results, "query": query})

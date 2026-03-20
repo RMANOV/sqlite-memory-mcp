@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sqlite3
 import uuid
 from typing import Any
+
+logger = logging.getLogger("lazy_enrichment")
 
 from db_utils import (
     now_iso,

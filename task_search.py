@@ -313,7 +313,8 @@ class TaskSearchEngine:
                     "ORDER BY rank LIMIT ?",
                     (fts_q_or, limit),
                 ).fetchall()
-            except Exception:
+            except Exception as e:
+                log.debug("FTS5 fallback failed: %s", e)
                 return None
         if not rows:
             return None

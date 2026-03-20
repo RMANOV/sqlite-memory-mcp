@@ -326,6 +326,8 @@ def query_tasks(
             rows = results
             total = len(results)
 
+    rows = [dict(r) if not isinstance(r, dict) else r for r in rows] if rows else []
+
     if not rows:
         return json.dumps(
             {"tasks": [], "count": 0, "total": total, "message": "No tasks match"}

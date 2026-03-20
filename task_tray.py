@@ -32,6 +32,7 @@ logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+logger = logging.getLogger("task_tray")
 
 from task_search import TaskSearchEngine
 
@@ -283,7 +284,7 @@ class TaskDB:
         """Return dict with total, overdue counts. Accepts pre-fetched tasks."""
         if tasks is None:
             tasks = self.get_all_active()
-        overdue = sum(1 for t in tasks if is_overdue(t.get("due_date")))
+        overdue = sum(1 for t in tasks if is_overdue(t["due_date"]))
         return {"total": len(tasks), "overdue": overdue}
 
     def add_task(
@@ -609,10 +610,8 @@ class TaskDB:
         """Create a manual link between a task and an entity."""
         now = now_iso()
         try:
-            TaskDAO.link_entity(
-                self._conn, task_id, entity_id, link_type, created_at=now
-            )
-            self._conn.commit()
+            with self._transact() as conn:
+                TaskDAO.link_entity(conn, task_id, entity_id, link_type, created_at=now)
             return True
         except Exception:
             return False
@@ -626,8 +625,8 @@ class TaskDB:
 
     def unlink_task_entity(self, task_id: str, entity_id: int) -> bool:
         """Remove a link between a task and an entity."""
-        removed = TaskDAO.unlink_entity(self._conn, task_id, entity_id)
-        self._conn.commit()
+        with self._transact() as conn:
+            removed = TaskDAO.unlink_entity(conn, task_id, entity_id)
         return removed > 0
 
 
@@ -1096,10 +1095,8 @@ def _recurring_label(raw: str | None) -> str:
         day = cfg.get("day")
         parts = []
         if month:
-            import calendar
-
             try:
-                parts.append(calendar.month_name[int(month)])
+                parts.append(_cal_mod.month_name[int(month)])
             except (ValueError, TypeError, IndexError):
                 parts.append(str(month))
         if day:
@@ -1386,7 +1383,7 @@ class TrayPopup(QWidget):
             all_tasks = self.db.get_all_active() + self.db.get_done_tasks()
             self._search_engine.rebuild_index(all_tasks)
             tasks = self._search_engine.search(
-                q, all_tasks, limit=20, conn=self.db._conn, use_vector=False
+                q, all_tasks, limit=20, conn=None, use_vector=False
             )
             # Show tasks immediately, entities arrive async
             merged = [{**t, "_is_entity": False} for t in tasks]
@@ -1411,12 +1408,11 @@ class TrayPopup(QWidget):
 
         if q and merged:
             # Flat interleaved list when searching
-            if merged:
-                for item in merged:
-                    if item.get("_is_entity"):
-                        self.task_layout.addWidget(self._make_entity_row(item))
-                    else:
-                        self.task_layout.addWidget(self._make_task_row(item))
+            for item in merged:
+                if item.get("_is_entity"):
+                    self.task_layout.addWidget(self._make_entity_row(item))
+                else:
+                    self.task_layout.addWidget(self._make_task_row(item))
             else:
                 lbl = QLabel("No matches")
                 lbl.setObjectName("section-header")
@@ -2068,7 +2064,8 @@ class EntityDetailDialog(QDialog):
         self._load_data()
 
     def _load_data(self):
-        conn = self.db._conn
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
         eid = self.entity_id
 
         # Entity info
@@ -2200,7 +2197,9 @@ class EntityDetailDialog(QDialog):
             EntityDetailDialog(self.db, eid, self.parent()).exec()
         elif url.startswith("task:"):
             tid = url.split(":", 1)[1]
-            task_row = self.db._conn.execute(
+            _conn = sqlite3.connect(self.db.db_path)
+            _conn.row_factory = sqlite3.Row
+            task_row = _conn.execute(
                 f"SELECT {_UI_COLS} FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
             if task_row:
@@ -2407,7 +2406,8 @@ class TaskReaderDialog(QDialog):
 
         # AI Enrich Context (Context Packs)
         try:
-            conn = self.db._conn
+            conn = sqlite3.connect(self.db.db_path)
+            conn.row_factory = sqlite3.Row
             tid = self.task.get("id")
             pack_row = conn.execute(
                 "SELECT body, freshness_score FROM context_packs "
@@ -2424,7 +2424,7 @@ class TaskReaderDialog(QDialog):
                 ).fetchone()
 
             if pack_row and pack_row["body"].strip():
-                ai_score = pack_row.get("freshness_score", 0) * 100
+                ai_score = (pack_row["freshness_score"] or 0) * 100
                 ai_text = _html.escape(pack_row["body"]).replace("\n", "<br>")
                 body_html += (
                     f'<div style="margin-top:25px; padding:15px; background:rgba(40, 60, 90, 0.3); '
@@ -2820,9 +2820,7 @@ class RecurringDialog(QDialog):
         layout.addRow(self._interval_label, self.interval_spin)
 
         self.month_combo = QComboBox()
-        import calendar
-
-        self.month_combo.addItems([calendar.month_name[i] for i in range(1, 13)])
+        self.month_combo.addItems([_cal_mod.month_name[i] for i in range(1, 13)])
         self._month_label = QLabel("Month:")
         layout.addRow(self._month_label, self.month_combo)
 
@@ -2934,9 +2932,7 @@ class ReminderDateTimeDialog(QDialog):
         self.dt_edit.setMinimumDateTime(now)
         if existing_reminder:
             try:
-                from datetime import datetime as _dt
-
-                parsed = _dt.fromisoformat(existing_reminder)
+                parsed = datetime.fromisoformat(existing_reminder)
                 self.dt_edit.setDateTime(
                     QDateTime(
                         QDate(parsed.year, parsed.month, parsed.day),
@@ -2960,21 +2956,19 @@ class ReminderDateTimeDialog(QDialog):
         now = QDateTime.currentDateTimeUtc()
         if minutes == -1:  # Tomorrow 9:00
             tomorrow = now.addDays(1)
-            tomorrow.setTime(QTime(9, 0))
-            self.dt_edit.setDateTime(tomorrow)
+            self.dt_edit.setDateTime(QDateTime(tomorrow.date(), QTime(9, 0)))
         elif minutes == -2:  # Next Monday 9:00
             days_until_monday = (8 - now.date().dayOfWeek()) % 7
             if days_until_monday == 0:
                 days_until_monday = 7
             monday = now.addDays(days_until_monday)
-            monday.setTime(QTime(9, 0))
-            self.dt_edit.setDateTime(monday)
+            self.dt_edit.setDateTime(QDateTime(monday.date(), QTime(9, 0)))
         else:
             self.dt_edit.setDateTime(now.addSecs(minutes * 60))
 
     def get_reminder_at(self) -> str:
         """Return ISO datetime string (UTC)."""
-        qdt = self.dt_edit.dateTime()
+        qdt = self.dt_edit.dateTime().toUTC()
         return datetime(
             qdt.date().year(),
             qdt.date().month(),
@@ -3229,10 +3223,7 @@ class FullWindow(QMainWindow):
             self._restore_profile_from_bridge()
 
         # Restore saved active tab
-        if hasattr(self, "_saved_active_tab"):
-            self.tabs.setCurrentIndex(
-                min(self._saved_active_tab, len(self._tab_keys) - 1)
-            )
+        self.tabs.setCurrentIndex(min(self._saved_active_tab, len(self._tab_keys) - 1))
         self._current_tab_idx = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -3444,8 +3435,7 @@ class FullWindow(QMainWindow):
         self._auto_sync_timer.start()  # 60s bridge sync debounce
         self._db_refresh_debounce.start()  # 500ms UI refresh debounce
         # Re-add path (Qt removes watched files after change notification)
-        if not self._db_watcher.files():
-            self._db_watcher.addPath(path)
+        self._db_watcher.addPath(path)
 
     def _auto_sync_triggered(self):
         """Debounce elapsed — run bridge sync."""
@@ -3681,8 +3671,6 @@ class FullWindow(QMainWindow):
         QTimer.singleShot(hide_ms, self._show_last_sync_time)
         self.status.showMessage(msg, hide_ms)
         if not is_error:
-            from datetime import datetime
-
             self._last_sync_at = datetime.now()
             self._process_recurring()
             self.refresh()
@@ -4004,8 +3992,7 @@ class FullWindow(QMainWindow):
             btn.setChecked(excluded or pri in self._active_filters["priority"])
             used_color = t["danger"] if excluded else color
             btn.setStyleSheet(
-                btn.styleSheet()
-                + f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
+                f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
             )
             btn.clicked.connect(
                 lambda checked, p=pri: self._toggle_filter("priority", p)
@@ -4029,8 +4016,7 @@ class FullWindow(QMainWindow):
             btn.setChecked(excluded or value in self._active_filters["due"])
             used_color = t["danger"] if excluded else color
             btn.setStyleSheet(
-                btn.styleSheet()
-                + f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
+                f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
             )
             btn.clicked.connect(lambda checked, v=value: self._toggle_filter("due", v))
             self._filter_bar.addWidget(btn)
@@ -4063,8 +4049,7 @@ class FullWindow(QMainWindow):
             btn.setChecked(excluded or proj in self._active_filters["project"])
             used_color = t["danger"] if excluded else t["accent"]
             btn.setStyleSheet(
-                btn.styleSheet()
-                + f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
+                f"QToolButton:checked {{ background: {used_color}; border-color: {used_color}; color: #fff; }}"
             )
             btn.clicked.connect(
                 lambda checked, p=proj: self._toggle_filter("project", p)

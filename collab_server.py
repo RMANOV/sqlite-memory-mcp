@@ -473,7 +473,10 @@ def review_shared_knowledge(
                     diffs.append({"id": iid, "error": "not found"})
                     continue
                 p = dict(pending)
-                pending_obs = json.loads(p["observations"])
+                raw_obs = json.loads(p["observations"])
+                if not isinstance(raw_obs, list):
+                    raw_obs = []
+                pending_obs = raw_obs[:1000]
                 local_id = _get_entity_id(conn, p["name"])
                 if not local_id:
                     diffs.append(

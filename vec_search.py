@@ -97,20 +97,25 @@ def load_vec(conn: sqlite3.Connection) -> bool:
 # ── Table management ───────────────────────────────────────────────────
 
 
-def init_vec_table(conn: sqlite3.Connection) -> bool:
-    """Create the vec0 virtual table if it doesn't exist."""
+def _init_vec_table(conn: sqlite3.Connection, table_name: str) -> bool:
+    """Create a vec0 virtual table if it doesn't exist."""
     if not load_vec(conn):
         return False
     try:
         conn.execute(
-            f"CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings "
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {table_name} "
             f"USING vec0(embedding float[{EMBEDDING_DIM}])"
         )
-        logger.info("entity_embeddings vec0 table ready (dim=%d)", EMBEDDING_DIM)
+        logger.info("%s vec0 table ready (dim=%d)", table_name, EMBEDDING_DIM)
         return True
     except Exception as e:
-        logger.warning("Failed to create entity_embeddings: %s", e)
+        logger.warning("Failed to create %s: %s", table_name, e)
         return False
+
+
+def init_vec_table(conn: sqlite3.Connection) -> bool:
+    """Create the vec0 virtual table for entity embeddings."""
+    return _init_vec_table(conn, "entity_embeddings")
 
 
 # ── Embedding generation ───────────────────────────────────────────────
@@ -259,18 +264,7 @@ def rrf_merge(
 
 def init_task_vec_table(conn: sqlite3.Connection) -> bool:
     """Create the vec0 virtual table for task embeddings."""
-    if not load_vec(conn):
-        return False
-    try:
-        conn.execute(
-            f"CREATE VIRTUAL TABLE IF NOT EXISTS task_embeddings "
-            f"USING vec0(embedding float[{EMBEDDING_DIM}])"
-        )
-        logger.info("task_embeddings vec0 table ready (dim=%d)", EMBEDDING_DIM)
-        return True
-    except Exception as e:
-        logger.warning("Failed to create task_embeddings: %s", e)
-        return False
+    return _init_vec_table(conn, "task_embeddings")
 
 
 def _task_text(title: str, description: str | None, notes: str | None) -> str:

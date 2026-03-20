@@ -508,8 +508,8 @@ def main(
                             "imported_updated": upd_t,
                             "skipped": True,
                         }
-        except Exception:
-            pass  # bridge_meta may not exist yet — push normally
+        except (sqlite3.OperationalError, AttributeError) as e:
+            log.warning("Sync skip-check error: %s", e)
 
     # Phase 3b: Export (read-only, separate short transaction)
     with get_conn(_db_path) as conn:
