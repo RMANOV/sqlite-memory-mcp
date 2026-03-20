@@ -69,10 +69,10 @@ mcp = FastMCP(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Tool 1: create_task
+# Tool 1: create_task_or_note
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
-def create_task(
+def create_task_or_note(
     title: str,
     type: str = "task",
     description: str = "",
@@ -145,7 +145,7 @@ def create_task(
         _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now)
         _vec_sync_task_safe(conn, task_id)
 
-    logger.info("create_task: %s (%s)", title, task_id)
+    logger.info("create_task_or_note: %s (%s)", title, task_id)
     return json.dumps(
         {"task_id": task_id, "title": title, "type": type, "status": "not_started"}
     )
