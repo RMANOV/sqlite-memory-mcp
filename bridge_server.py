@@ -427,7 +427,11 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                     "  (SELECT COUNT(*) FROM entities WHERE visibility = 'pending_public') AS pending_pub",
                     (last_push_at, last_push_at),
                 ).fetchone()
-                if row[0] == 0 and row[1] == 0 and row[2] == 0:
+                if (
+                    row["changed_tasks"] == 0
+                    and row["changed_ents"] == 0
+                    and row["pending_pub"] == 0
+                ):
                     logger.info(
                         "bridge_push: no changes since %s, skipping", last_push_at
                     )
@@ -862,8 +866,8 @@ def bridge_pull() -> str:
     payload: dict = {}
     if shared_path.exists():
         try:
-            payload = json.loads(shared_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            payload = _json_loads(shared_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
             if not _has_index:
                 return _error(f"Failed to read shared.json: {exc}")
             logger.warning("bridge_pull: shared.json parse failed: %s", exc)
@@ -1296,7 +1300,7 @@ def bridge_status() -> str:
     repo_meta = {}
     if shared_path.exists():
         try:
-            payload = json.loads(shared_path.read_text(encoding="utf-8"))
+            payload = _json_loads(shared_path.read_text(encoding="utf-8"))
             remote_names = {e["name"] for e in payload.get("entities", [])}
             remote_task_count = len(payload.get("tasks", []))
             repo_meta = {

@@ -439,6 +439,8 @@ CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON entities BEGIN
     VALUES ('delete', old.rowid, old.name, old.entity_type, '');
 END;
 
+-- NOTE: observations_text is always '' because triggers cannot aggregate child rows.
+-- Full-text search on observations relies on name/entity_type columns only.
 CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON entities BEGIN
     INSERT INTO memory_fts(memory_fts, rowid, name, entity_type, observations_text)
     VALUES ('delete', old.rowid, old.name, old.entity_type, '');

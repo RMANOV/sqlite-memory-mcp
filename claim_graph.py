@@ -9,11 +9,14 @@ Phase 2 of Intelligence v2:
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from typing import Any
 
 from db_utils import now_iso
+
+_log = logging.getLogger("claim_graph")
 from intelligence_v2 import (
     _new_id,
     load_config,
@@ -451,8 +454,8 @@ def promote_candidate(
             impact_score=row["confidence"],
             rationale=f"Claim {claim_id} promoted via {mode}",
         )
-    except Exception:
-        pass  # impact_graph is optional enhancement
+    except Exception as e:
+        _log.debug("impact_graph link failed: %s", e)
 
     log_enrichment_run(
         conn, "promote_candidate", "success", claim_id, started_at=started

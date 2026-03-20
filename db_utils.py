@@ -830,8 +830,6 @@ class TaskDAO:
             "AND updated_at < ?",
             (cutoff_iso,),
         )
-        if cur.rowcount:
-            conn.commit()
         return cur.rowcount
 
     @staticmethod
@@ -881,8 +879,6 @@ class TaskDAO:
             "WHERE due_date <= date('now') AND section IN ('inbox', 'next') "
             "AND status <> 'done' AND type = 'task'"
         )
-        if cur.rowcount:
-            conn.commit()
         return cur.rowcount
 
 
@@ -1232,7 +1228,7 @@ def merge_import_tasks(
                     f"SELECT {content_field} FROM tasks WHERE id = ?",
                     (local_id,),
                 ).fetchone()
-                if local_val and not local_val[0]:
+                if local_val and local_val[0] is None:
                     fields_to_update[content_field] = remote_val
                     updated_fields += 1
 
