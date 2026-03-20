@@ -9,6 +9,7 @@ Phase 3 of Intelligence v2:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Any
 
@@ -18,6 +19,122 @@ from intelligence_v2 import (
     load_config,
     log_enrichment_run,
 )
+
+logger = logging.getLogger("sqlite-kb")
+
+
+# ── Task-Relevant Helpers ────────────────────────────────────────────────
+
+
+def _format_ts(iso_str: str | None) -> str:
+    """Format ISO timestamp as [YYYY-MM-DD HH:MM] prefix, or empty string."""
+    if not iso_str:
+        return ""
+    try:
+        return f"[{iso_str[:16].replace('T', ' ')}] "
+    except (ValueError, TypeError):
+        return ""
+
+
+def _build_task_query(conn: sqlite3.Connection, task_id: str) -> tuple[str, list[int]]:
+    """Extract search query text and linked entity IDs from a task."""
+    task = conn.execute(
+        "SELECT title, project, description, notes FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not task:
+        return "", []
+    parts = [task["title"] or ""]
+    if task["project"]:
+        parts.append(task["project"])
+    if task["description"]:
+        parts.append(task["description"][:500])
+    if task["notes"]:
+        parts.append(task["notes"][:300])
+    query = " ".join(parts)
+
+    linked = conn.execute(
+        "SELECT entity_id FROM task_entity_links WHERE task_id = ?", (task_id,)
+    ).fetchall()
+    return query, [r["entity_id"] for r in linked]
+
+
+def _find_relevant_entities(
+    conn: sqlite3.Connection,
+    query: str,
+    linked_ids: list[int],
+    session_id: str | None,
+    limit: int = 50,
+) -> dict[str, float]:
+    """Return {entity_name: relevance_score} for entities relevant to query."""
+    # Tokenize, build FTS5 OR query
+    words = [w for w in query.strip().split() if len(w) > 2]
+    if not words:
+        # Fallback: linked entities only
+        scores: dict[str, float] = {}
+        for eid in linked_ids:
+            row = conn.execute(
+                "SELECT name FROM entities WHERE id = ?", (eid,)
+            ).fetchone()
+            if row:
+                scores[row["name"]] = 1.0
+        return scores
+
+    escaped = ['"' + w.replace('"', '""') + '"' for w in words[:20]]
+    fts_q = " OR ".join(escaped)
+
+    try:
+        fts_rows = conn.execute(
+            "SELECT memory_fts.rowid AS eid, memory_fts.name, "
+            "memory_fts.entity_type, e.project, memory_fts.rank "
+            "FROM memory_fts JOIN entities e ON e.id = memory_fts.rowid "
+            "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT ?",
+            (fts_q, 100),
+        ).fetchall()
+    except Exception:
+        fts_rows = []
+
+    # Optional vector search + RRF merge
+    try:
+        from vec_search import VEC_AVAILABLE, rrf_merge, vector_search
+
+        if VEC_AVAILABLE:
+            vec_rows = vector_search(conn, query, 100)
+            if fts_rows and vec_rows:
+                fts_rows = rrf_merge(fts_rows, vec_rows)
+            elif vec_rows:
+                fts_rows = vec_rows
+    except ImportError:
+        pass
+
+    if not fts_rows and not linked_ids:
+        return {}
+
+    # 6-signal reranking
+    reranked: list[dict] = []
+    if fts_rows:
+        try:
+            from smart_retrieval import rerank_entities
+
+            reranked = rerank_entities(
+                conn, fts_rows, None, session_id, linked_ids, limit
+            )
+        except Exception as exc:
+            logger.warning("rerank_entities failed, using raw FTS: %s", exc)
+            reranked = [{"name": r["name"], "_score": 0.1} for r in fts_rows[:limit]]
+
+    scores = {}
+    for item in reranked:
+        scores[item["name"]] = item.get("_score", 0.1)
+
+    # Add linked entities not already in search results
+    for eid in linked_ids:
+        row = conn.execute("SELECT name FROM entities WHERE id = ?", (eid,)).fetchone()
+        if row and row["name"] not in scores:
+            scores[row["name"]] = 0.5
+
+    return scores
+
 
 # ── Pack Type Definitions ────────────────────────────────────────────────
 
@@ -97,36 +214,64 @@ def build_context_pack(
     budget = token_budget or config.get("context_pack_token_budget_default", 4000)
     priorities = _PACK_PRIORITIES[pack_type]
 
+    # Task-relevant filtering: when target_ref is a task ID, scope to relevant entities
+    relevant_names: dict[str, float] = {}
+    is_task_scoped = False
+    if target_ref:
+        try:
+            task_query, linked_ids = _build_task_query(conn, target_ref)
+            if task_query:
+                relevant_names = _find_relevant_entities(
+                    conn, task_query, linked_ids, session_id
+                )
+                is_task_scoped = bool(relevant_names)
+        except Exception as exc:
+            logger.warning(
+                "Task-scoped filtering failed, falling back to global: %s", exc
+            )
+
     # Gather available items
     items: list[dict[str, Any]] = []
 
     # 1. Canonical facts (highest trust)
     facts = conn.execute(
-        "SELECT fact_id, subject, predicate, object_text, fact_scope, confidence "
-        "FROM canonical_facts ORDER BY confidence DESC"
+        "SELECT fact_id, subject, predicate, object_text, fact_scope, confidence, "
+        "created_at FROM canonical_facts ORDER BY confidence DESC"
     ).fetchall()
     for f in facts:
-        text = f"[FACT] {f['subject']} {f['predicate']} {f['object_text']} (scope: {f['fact_scope']})"
+        rel = 1.0
+        if is_task_scoped:
+            rel = relevant_names.get(f["subject"], 0.0)
+            if rel < 0.01:
+                continue
+        ts = _format_ts(f["created_at"])
+        text = f"{ts}[FACT] {f['subject']} {f['predicate']} {f['object_text']} (scope: {f['fact_scope']})"
         items.append(
             {
                 "type": "fact",
                 "id": f["fact_id"],
                 "text": text,
                 "tokens": _estimate_tokens(text),
-                "score": f["confidence"] * priorities["fact_weight"],
+                "score": f["confidence"] * priorities["fact_weight"] * rel,
                 "provisional": False,
             }
         )
 
     # 2. Candidate claims (provisional)
     claims = conn.execute(
-        "SELECT claim_id, subject, predicate, object_text, claim_scope, confidence "
-        "FROM candidate_claims WHERE status = 'candidate' "
+        "SELECT claim_id, subject, predicate, object_text, claim_scope, confidence, "
+        "created_at FROM candidate_claims WHERE status = 'candidate' "
         "ORDER BY confidence DESC LIMIT 50"
     ).fetchall()
     for c in claims:
+        rel = 1.0
+        if is_task_scoped:
+            rel = relevant_names.get(c["subject"], 0.0)
+            if rel < 0.01:
+                continue
+        ts = _format_ts(c["created_at"])
         text = (
-            f"[PROVISIONAL] {c['subject']} {c['predicate']} {c['object_text']} "
+            f"{ts}[PROVISIONAL] {c['subject']} {c['predicate']} {c['object_text']} "
             f"(scope: {c['claim_scope']}, confidence: {c['confidence']:.2f})"
         )
         items.append(
@@ -135,7 +280,7 @@ def build_context_pack(
                 "id": c["claim_id"],
                 "text": text,
                 "tokens": _estimate_tokens(text),
-                "score": c["confidence"] * priorities["claim_weight"],
+                "score": c["confidence"] * priorities["claim_weight"] * rel,
                 "provisional": True,
             }
         )
@@ -144,46 +289,83 @@ def build_context_pack(
     if priorities["question_weight"] > 0.3:
         questions = conn.execute(
             "SELECT q.question_id, q.question_text, q.question_type, q.priority_score, "
-            "c.title AS chunk_title "
+            "q.created_at, c.title AS chunk_title "
             "FROM context_questions q "
             "LEFT JOIN context_chunks c ON q.chunk_id = c.chunk_id "
             "WHERE q.state = 'open' "
             "ORDER BY q.priority_score DESC LIMIT 20"
         ).fetchall()
         for q in questions:
+            if is_task_scoped:
+                # Filter: keep question if its chunk title overlaps with relevant entities
+                title = (q["chunk_title"] or "") + " " + q["question_text"]
+                max_rel = max(
+                    (
+                        sc
+                        for name, sc in relevant_names.items()
+                        if name.lower() in title.lower()
+                    ),
+                    default=0.0,
+                )
+                if max_rel < 0.01:
+                    continue
+            else:
+                max_rel = 1.0
+            ts = _format_ts(q["created_at"])
             ctx = f" (re: {q['chunk_title']})" if q["chunk_title"] else ""
-            text = f"[QUESTION] {q['question_text']}{ctx}"
+            text = f"{ts}[QUESTION] {q['question_text']}{ctx}"
             items.append(
                 {
                     "type": "question",
                     "id": q["question_id"],
                     "text": text,
                     "tokens": _estimate_tokens(text),
-                    "score": q["priority_score"] * priorities["question_weight"],
+                    "score": q["priority_score"]
+                    * priorities["question_weight"]
+                    * max_rel,
                     "provisional": False,
                 }
             )
 
     # 4. Enrichable/uncertain chunks (raw context)
     if priorities["chunk_weight"] > 0.2:
+        chunk_limit = 100 if is_task_scoped else 30
         chunks = conn.execute(
-            "SELECT chunk_id, title, body, materiality_score, state "
+            "SELECT chunk_id, title, body, materiality_score, state, created_at "
             "FROM context_chunks "
             "WHERE state IN ('enrichable', 'uncertain', 'awaiting_human') "
-            "ORDER BY materiality_score DESC LIMIT 30"
+            "ORDER BY materiality_score DESC LIMIT ?",
+            (chunk_limit,),
         ).fetchall()
         for ch in chunks:
+            if is_task_scoped:
+                haystack = ((ch["title"] or "") + " " + ch["body"][:500]).lower()
+                max_rel = max(
+                    (
+                        sc
+                        for name, sc in relevant_names.items()
+                        if name.lower() in haystack
+                    ),
+                    default=0.0,
+                )
+                if max_rel < 0.01:
+                    continue
+            else:
+                max_rel = 1.0
+            ts = _format_ts(ch["created_at"])
             label = f"[CONTEXT:{ch['state'].upper()}]"
             title_part = f" {ch['title']} —" if ch["title"] else ""
             body_preview = ch["body"][:300] + ("..." if len(ch["body"]) > 300 else "")
-            text = f"{label}{title_part} {body_preview}"
+            text = f"{ts}{label}{title_part} {body_preview}"
             items.append(
                 {
                     "type": "chunk",
                     "id": ch["chunk_id"],
                     "text": text,
                     "tokens": _estimate_tokens(text),
-                    "score": ch["materiality_score"] * priorities["chunk_weight"],
+                    "score": ch["materiality_score"]
+                    * priorities["chunk_weight"]
+                    * max_rel,
                     "provisional": ch["state"] != "enrichable",
                 }
             )
