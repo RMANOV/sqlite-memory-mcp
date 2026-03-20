@@ -873,6 +873,16 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_entities_updated_at ON entities(updated_at)",
         "idx_entities_updated_at index (F9)",
     ),
+    (
+        "SELECT 1 FROM pragma_table_info('task_field_versions') WHERE name='old_value'",
+        "ALTER TABLE task_field_versions ADD COLUMN old_value TEXT DEFAULT NULL",
+        "task_field_versions.old_value column (v3.2.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('task_field_versions') WHERE name='new_value'",
+        "ALTER TABLE task_field_versions ADD COLUMN new_value TEXT DEFAULT NULL",
+        "task_field_versions.new_value column (v3.2.0)",
+    ),
 ]
 
 

@@ -233,12 +233,31 @@ def update_task(
     updates["updated_at"] = _now()
 
     with _get_conn() as conn:
+        # Read old values before updating (for field version audit trail)
+        changed_keys = [k for k in updates if k != "updated_at"]
+        old_row = (
+            conn.execute(
+                f"SELECT {', '.join(changed_keys)} FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if changed_keys
+            else None
+        )
+        old_values = {k: old_row[k] for k in changed_keys} if old_row else {}
+
         if TaskDAO.update(conn, task_id, updates) == 0:
             return json.dumps({"error": f"Task {task_id} not found"})
-        changed = [k for k in updates if k != "updated_at"]
-        _upsert_field_versions(conn, task_id, changed, updates["updated_at"])
+        new_values = {k: updates[k] for k in changed_keys}
+        _upsert_field_versions(
+            conn,
+            task_id,
+            changed_keys,
+            updates["updated_at"],
+            old_values=old_values,
+            new_values=new_values,
+        )
         # Re-embed if content fields changed
-        if {"title", "description", "notes"} & set(changed):
+        if {"title", "description", "notes"} & set(changed_keys):
             _vec_sync_task_safe(conn, task_id)
 
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))

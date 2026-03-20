@@ -259,6 +259,25 @@ METADATA_FIELDS = (
 
 CONTENT_FIELDS = ("description", "notes")
 
+# Fields that enrichment pipelines must NEVER modify — only user/bridge can write these.
+# Invariant: enrichment = add new records (facts, claims, chunks), never modify existing content.
+ENRICHMENT_PROTECTED_FIELDS = frozenset({"title", "description", "notes"})
+
+
+def assert_enrichment_safe(fields: dict[str, Any] | set[str] | list[str]) -> None:
+    """Raise ValueError if any enrichment-protected field is in the update set.
+
+    Call this from any enrichment code path that touches tasks.
+    """
+    keys = set(fields) if isinstance(fields, dict) else set(fields)
+    violation = keys & ENRICHMENT_PROTECTED_FIELDS
+    if violation:
+        raise ValueError(
+            f"Enrichment invariant violation: cannot modify protected fields {sorted(violation)}. "
+            "Enrichment must be additive-only (new facts/claims/chunks)."
+        )
+
+
 # Fields eligible for per-field LWW merge (excludes id, created_at, updated_at)
 MERGEABLE_FIELDS = (
     "title",
@@ -903,15 +922,30 @@ def upsert_field_versions(
     fields: tuple | list,
     timestamp: str | None = None,
     machine_id: str | None = None,
+    old_values: dict[str, Any] | None = None,
+    new_values: dict[str, Any] | None = None,
 ) -> None:
-    """Upsert field versions for the given fields."""
+    """Upsert field versions for the given fields.
+
+    Args:
+        old_values: {field_name: previous_value} — truncated to 500 chars.
+        new_values: {field_name: new_value} — truncated to 500 chars.
+    """
     ts = timestamp or now_iso()
     mid = machine_id or _next_machine_id()
+    _old = old_values or {}
+    _new = new_values or {}
     for field in fields:
+        ov = _old.get(field)
+        nv = _new.get(field)
+        # Truncate to 500 chars to avoid bloat
+        ov_str = str(ov)[:500] if ov is not None else None
+        nv_str = str(nv)[:500] if nv is not None else None
         conn.execute(
             "INSERT OR REPLACE INTO task_field_versions "
-            "(task_id, field_name, updated_at, updated_by) VALUES (?, ?, ?, ?)",
-            (task_id, field, ts, mid),
+            "(task_id, field_name, updated_at, updated_by, old_value, new_value) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, field, ts, mid, ov_str, nv_str),
         )
 
 

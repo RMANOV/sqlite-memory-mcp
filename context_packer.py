@@ -22,6 +22,9 @@ from intelligence_v2 import (
 
 logger = logging.getLogger("sqlite-kb")
 
+# Minimum relevance score — fragments below this threshold are excluded
+_MIN_RELEVANCE_THRESHOLD = 0.20
+
 
 # ── Task-Relevant Helpers ────────────────────────────────────────────────
 
@@ -216,6 +219,7 @@ def build_context_pack(
 
     # Task-relevant filtering: when target_ref is a task ID, scope to relevant entities
     relevant_names: dict[str, float] = {}
+    task_keywords: list[str] = []
     is_task_scoped = False
     if target_ref:
         try:
@@ -224,7 +228,11 @@ def build_context_pack(
                 relevant_names = _find_relevant_entities(
                     conn, task_query, linked_ids, session_id
                 )
-                is_task_scoped = bool(relevant_names)
+                # Extract keywords for fallback text-matching (words > 3 chars)
+                task_keywords = [
+                    w.lower() for w in task_query.split() if len(w) > 3 and w.isalpha()
+                ]
+                is_task_scoped = bool(relevant_names) or bool(task_keywords)
         except Exception as exc:
             logger.warning(
                 "Task-scoped filtering failed, falling back to global: %s", exc
@@ -242,7 +250,13 @@ def build_context_pack(
         rel = 1.0
         if is_task_scoped:
             rel = relevant_names.get(f["subject"], 0.0)
-            if rel < 0.01:
+            # Keyword fallback: check if any task keyword appears in subject/predicate/object
+            if rel < _MIN_RELEVANCE_THRESHOLD and task_keywords:
+                haystack = f"{f['subject']} {f['predicate']} {f['object_text']}".lower()
+                kw_hits = sum(1 for kw in task_keywords if kw in haystack)
+                if kw_hits:
+                    rel = max(rel, min(0.5, kw_hits * 0.15))
+            if rel < _MIN_RELEVANCE_THRESHOLD:
                 continue
         ts = _format_ts(f["created_at"])
         text = f"{ts}[FACT] {f['subject']} {f['predicate']} {f['object_text']} (scope: {f['fact_scope']})"
@@ -267,7 +281,12 @@ def build_context_pack(
         rel = 1.0
         if is_task_scoped:
             rel = relevant_names.get(c["subject"], 0.0)
-            if rel < 0.01:
+            if rel < _MIN_RELEVANCE_THRESHOLD and task_keywords:
+                haystack = f"{c['subject']} {c['predicate']} {c['object_text']}".lower()
+                kw_hits = sum(1 for kw in task_keywords if kw in haystack)
+                if kw_hits:
+                    rel = max(rel, min(0.5, kw_hits * 0.15))
+            if rel < _MIN_RELEVANCE_THRESHOLD:
                 continue
         ts = _format_ts(c["created_at"])
         text = (
@@ -299,15 +318,21 @@ def build_context_pack(
             if is_task_scoped:
                 # Filter: keep question if its chunk title overlaps with relevant entities
                 title = (q["chunk_title"] or "") + " " + q["question_text"]
+                title_lower = title.lower()
                 max_rel = max(
                     (
                         sc
                         for name, sc in relevant_names.items()
-                        if name.lower() in title.lower()
+                        if name.lower() in title_lower
                     ),
                     default=0.0,
                 )
-                if max_rel < 0.01:
+                # Keyword fallback for questions
+                if max_rel < _MIN_RELEVANCE_THRESHOLD and task_keywords:
+                    kw_hits = sum(1 for kw in task_keywords if kw in title_lower)
+                    if kw_hits:
+                        max_rel = max(max_rel, min(0.5, kw_hits * 0.15))
+                if max_rel < _MIN_RELEVANCE_THRESHOLD:
                     continue
             else:
                 max_rel = 1.0
@@ -348,7 +373,12 @@ def build_context_pack(
                     ),
                     default=0.0,
                 )
-                if max_rel < 0.01:
+                # Keyword fallback for chunks
+                if max_rel < _MIN_RELEVANCE_THRESHOLD and task_keywords:
+                    kw_hits = sum(1 for kw in task_keywords if kw in haystack)
+                    if kw_hits:
+                        max_rel = max(max_rel, min(0.5, kw_hits * 0.15))
+                if max_rel < _MIN_RELEVANCE_THRESHOLD:
                     continue
             else:
                 max_rel = 1.0
