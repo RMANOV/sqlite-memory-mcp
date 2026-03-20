@@ -1413,11 +1413,11 @@ class TrayPopup(QWidget):
                     self.task_layout.addWidget(self._make_entity_row(item))
                 else:
                     self.task_layout.addWidget(self._make_task_row(item))
-            else:
-                lbl = QLabel("No matches")
-                lbl.setObjectName("section-header")
-                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.task_layout.addWidget(lbl)
+        elif q:
+            lbl = QLabel("No matches")
+            lbl.setObjectName("section-header")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.task_layout.addWidget(lbl)
         elif tasks:
             groups = _smart_group(tasks)
             for group_label, group_tasks in groups:
@@ -2066,6 +2066,12 @@ class EntityDetailDialog(QDialog):
     def _load_data(self):
         conn = sqlite3.connect(self.db.db_path)
         conn.row_factory = sqlite3.Row
+        try:
+            self._load_data_inner(conn)
+        finally:
+            conn.close()
+
+    def _load_data_inner(self, conn):
         eid = self.entity_id
 
         # Entity info
@@ -2199,11 +2205,14 @@ class EntityDetailDialog(QDialog):
             tid = url.split(":", 1)[1]
             _conn = sqlite3.connect(self.db.db_path)
             _conn.row_factory = sqlite3.Row
-            task_row = _conn.execute(
-                f"SELECT {_UI_COLS} FROM tasks WHERE id = ?", (tid,)
-            ).fetchone()
-            if task_row:
-                TaskReaderDialog(dict(task_row), self.db, self.parent()).exec()
+            try:
+                task_row = _conn.execute(
+                    f"SELECT {_UI_COLS} FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                if task_row:
+                    TaskReaderDialog(dict(task_row), self.db, self.parent()).exec()
+            finally:
+                _conn.close()
 
 
 class TaskReaderDialog(QDialog):
@@ -2405,6 +2414,7 @@ class TaskReaderDialog(QDialog):
             )
 
         # AI Enrich Context (Context Packs)
+        conn = None
         try:
             conn = sqlite3.connect(self.db.db_path)
             conn.row_factory = sqlite3.Row
@@ -2435,6 +2445,9 @@ class TaskReaderDialog(QDialog):
                 )
         except Exception:
             pass  # Schema might not have context_packs yet
+        finally:
+            if conn is not None:
+                conn.close()
 
         self._body_label.setText(body_html)
 

@@ -15,14 +15,14 @@ import sqlite3
 from typing import Any
 
 from db_utils import now_iso
-
-_log = logging.getLogger("claim_graph")
 from intelligence_v2 import (
     _new_id,
     load_config,
     log_enrichment_run,
 )
 from lazy_enrichment import _PREDICATE_BASE_CONFIDENCE
+
+_log = logging.getLogger("claim_graph")
 
 # ── Claim Extraction Heuristics ──────────────────────────────────────────
 
