@@ -452,6 +452,7 @@ def serialize_entity(
         entity_row: Row from entities table (needs id, name, entity_type; optionally project, created_at, updated_at).
         include_timestamps: If True, observations include createdAt and entity includes createdAt/updatedAt.
     """
+    entity_row = dict(entity_row)
     eid = entity_row["id"]
     if include_timestamps:
         obs = conn.execute(
