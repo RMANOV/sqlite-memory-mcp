@@ -1295,6 +1295,24 @@ def merge_import_tasks(
             # Note: cancelled tasks still exist as rows (soft-delete), so they're
             # handled by the `if existing:` branch above — LWW field versioning
             # prevents remote from overwriting the newer local cancelled status.
+
+            # Dedup guard: skip if same title was recently cancelled/archived
+            remote_title = remote.get("title")
+            if remote_title:
+                dedup = conn.execute(
+                    "SELECT id FROM tasks "
+                    "WHERE title = ? AND status IN ('cancelled', 'archived') "
+                    "AND updated_at > datetime('now', '-14 days') LIMIT 1",
+                    (remote_title,),
+                ).fetchone()
+                if dedup:
+                    _log.info(
+                        "Dedup guard: skipping new task '%s' — same title "
+                        "cancelled/archived recently (task %s)",
+                        remote_title[:50], dedup["id"][:12],
+                    )
+                    continue
+
             desc = remote.get("description") if import_content else None
             notes = remote.get("notes") if import_content else None
             conn.execute(

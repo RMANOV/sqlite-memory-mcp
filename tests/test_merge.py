@@ -605,3 +605,31 @@ def test_lww_content_overwrite_when_remote_has_value(conn):
 
     row = conn.execute("SELECT description FROM tasks WHERE id=?", (tid,)).fetchone()
     assert row["description"] == "New better content"  # Remote wins
+
+
+# ── Test 11: Dedup Guard ─────────────────────────────────────────────────
+
+
+def test_dedup_guard_blocks_recently_cancelled_title(conn):
+    """New remote task with same title as recently cancelled local should be skipped."""
+    _insert_task(conn, "old-1", title="Weekly review", status="cancelled",
+                 updated_at=now_iso())
+    upsert_field_versions(conn, "old-1", ["status"], now_iso())
+
+    remote = [{"id": "new-uuid-dedup", "title": "Weekly review", "status": "not_started",
+               "updated_at": now_iso(), "_field_ts": {}}]
+    new_count, _ = merge_import_tasks(conn, remote, import_content=False)
+    assert new_count == 0  # Blocked by dedup
+    assert conn.execute("SELECT id FROM tasks WHERE id='new-uuid-dedup'").fetchone() is None
+
+
+def test_dedup_guard_allows_different_title(conn):
+    """Dedup guard should not block tasks with different titles."""
+    _insert_task(conn, "old-2", title="Weekly review", status="cancelled",
+                 updated_at=now_iso())
+
+    remote = [{"id": "new-uuid-diff", "title": "Daily standup", "status": "not_started",
+               "updated_at": now_iso(), "_field_ts": {}}]
+    new_count, _ = merge_import_tasks(conn, remote, import_content=False)
+    assert new_count == 1
+    assert conn.execute("SELECT id FROM tasks WHERE id='new-uuid-diff'").fetchone() is not None
