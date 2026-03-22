@@ -44,6 +44,8 @@ CREATE TABLE task_field_versions (
     field_name  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     updated_by  TEXT NOT NULL,
+    old_value   TEXT DEFAULT NULL,
+    new_value   TEXT DEFAULT NULL,
     PRIMARY KEY (task_id, field_name)
 );
 

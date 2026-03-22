@@ -242,7 +242,7 @@ def auto_promote_claim(
                 now,
             ),
         )
-    except Exception as e:
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as e:
         logger.warning("auto_promote_claim insert failed: %s", e)
         return None
 
@@ -313,7 +313,7 @@ def detect_contradictions(conn: sqlite3.Connection) -> list[dict]:
             "SELECT claim_id, entity_id, subject, predicate, object_text, confidence "
             "FROM lazy_claims WHERE status != 'rejected' ORDER BY entity_id"
         ).fetchall()
-    except Exception:
+    except sqlite3.OperationalError:
         return results
 
     # Group by entity
@@ -368,7 +368,7 @@ def detect_stale_entities(
                 (r["id"],),
             ).fetchone()
             last_access = access["last_access"] if access else None
-        except Exception:
+        except sqlite3.OperationalError:
             last_access = None
 
         if last_access:
@@ -405,7 +405,7 @@ def promote_ready_claims(conn: sqlite3.Connection) -> list[dict]:
             "WHERE status = 'candidate' AND confidence >= ?",
             (AUTO_PROMOTE_THRESHOLD,),
         ).fetchall()
-    except Exception:
+    except sqlite3.OperationalError:
         return results
 
     for row in ready:

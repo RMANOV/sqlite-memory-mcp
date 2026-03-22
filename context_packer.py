@@ -94,7 +94,7 @@ def _find_relevant_entities(
             "WHERE memory_fts MATCH ? ORDER BY memory_fts.rank LIMIT ?",
             (fts_q, 100),
         ).fetchall()
-    except Exception:
+    except sqlite3.OperationalError:
         fts_rows = []
 
     # Optional vector search + RRF merge
@@ -122,7 +122,7 @@ def _find_relevant_entities(
             reranked = rerank_entities(
                 conn, fts_rows, None, session_id, linked_ids, limit
             )
-        except Exception as exc:
+        except (ImportError, sqlite3.OperationalError) as exc:
             logger.warning("rerank_entities failed, using raw FTS: %s", exc)
             reranked = [{"name": r["name"], "_score": 0.1} for r in fts_rows[:limit]]
 
@@ -233,7 +233,7 @@ def build_context_pack(
                     w.lower() for w in task_query.split() if len(w) > 3 and w.isalpha()
                 ]
                 is_task_scoped = bool(relevant_names) or bool(task_keywords)
-        except Exception as exc:
+        except (sqlite3.OperationalError, KeyError) as exc:
             logger.warning(
                 "Task-scoped filtering failed, falling back to global: %s", exc
             )

@@ -181,7 +181,7 @@ def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
                 )
             fts_sync_entity(conn, eid)
             imported += 1
-        except Exception as exc:
+        except (sqlite3.OperationalError, sqlite3.IntegrityError, KeyError) as exc:
             log.warning("Entity import failed for %s: %s", e.get("name"), exc)
             continue
     return imported
@@ -258,7 +258,7 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
             "rated_at FROM knowledge_ratings ORDER BY rated_at"
         ).fetchall()
         return [dict(r) for r in rows] if rows else []
-    except Exception:
+    except sqlite3.OperationalError:
         return []
 
 
@@ -425,7 +425,7 @@ def main(
                     conn, remote_tasks, import_content=True
                 )
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
-            except Exception as exc:
+            except (sqlite3.OperationalError, sqlite3.IntegrityError, json.JSONDecodeError, ValueError) as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
             try:
@@ -434,7 +434,7 @@ def main(
                     conn, remote_data.get("tasks", []), import_content=True
                 )
                 log.info("Imported %d new, updated %d from remote", new_t, upd_t)
-            except Exception as exc:
+            except (sqlite3.OperationalError, sqlite3.IntegrityError, json.JSONDecodeError, ValueError) as exc:
                 log.warning("Task merge from shared.json failed: %s", exc)
     # Task import transaction closed — DB lock released
 

@@ -47,6 +47,7 @@ def conn(tmp_path):
         CREATE TABLE task_field_versions (
             task_id TEXT NOT NULL, field_name TEXT NOT NULL,
             updated_at TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '',
+            old_value TEXT DEFAULT NULL, new_value TEXT DEFAULT NULL,
             PRIMARY KEY (task_id, field_name),
             FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );

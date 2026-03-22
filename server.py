@@ -202,7 +202,7 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
 
                         for obs_id, obs_text in new_obs_ids:
                             extract_inline_claims(conn, eid, obs_id, obs_text)
-                    except Exception:
+                    except (ImportError, sqlite3.OperationalError):
                         pass
 
     logger.info(
@@ -258,7 +258,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                         ).fetchone()
                         if obs_row:
                             extract_inline_claims(conn, eid, obs_row["id"], content)
-                except Exception:
+                except (ImportError, sqlite3.OperationalError):
                     pass
 
     logger.info("add_observations: %d observations added", added)
@@ -438,7 +438,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 from smart_retrieval import RERANKING_POOL_SIZE
 
                 pool_size = RERANKING_POOL_SIZE
-            except Exception:
+            except ImportError:
                 pool_size = 50
 
             rows = conn.execute(
@@ -477,7 +477,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 query_entity_ids=None,
                 limit=50,
             )
-        except Exception as e:
+        except (ImportError, sqlite3.OperationalError) as e:
             logger.warning("Rerank failed: %s", e)
 
         if reranked:
@@ -527,7 +527,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                     "VALUES (?, 'search_nodes', ?)",
                     (eid, now),
                 )
-        except Exception as e:
+        except sqlite3.OperationalError as e:
             logger.debug("Access log write failed: %s", e)
 
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
@@ -573,7 +573,7 @@ def open_nodes(names: list[str]) -> str:
                         "VALUES (?, 'open_nodes', ?)",
                         (eid, now),
                     )
-            except Exception:
+            except sqlite3.OperationalError:
                 pass
 
     return json.dumps({"entities": entities_out, "relations": relations_out})

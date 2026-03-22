@@ -302,6 +302,22 @@ class TaskDB:
         overdue = sum(1 for t in tasks if is_overdue(t["due_date"]))
         return {"total": len(tasks), "overdue": overdue}
 
+    def get_tasks(self, section=None):
+        """Return tasks excluding archived/cancelled, optionally filtered by section."""
+        rows = self._conn.execute(
+            f"SELECT {_UI_COLS} FROM tasks "
+            "WHERE status NOT IN ('archived', 'cancelled') "
+            "ORDER BY created_at"
+        ).fetchall()
+        result = [dict(r) for r in rows]
+        if section:
+            result = [t for t in result if t.get("section") == section]
+        return result
+
+    def get_overdue(self):
+        """Return active tasks with past due_date."""
+        return [t for t in self.get_tasks() if is_overdue(t.get("due_date"))]
+
     def add_task(
         self,
         title,
@@ -628,14 +644,14 @@ class TaskDB:
             with self._transact() as conn:
                 TaskDAO.link_entity(conn, task_id, entity_id, link_type, created_at=now)
             return True
-        except Exception:
+        except (sqlite3.OperationalError, sqlite3.IntegrityError):
             return False
 
     def get_task_links(self, task_id: str) -> list[dict]:
         """Get all entities linked to a task."""
         try:
             return TaskDAO.get_task_links(self._conn, task_id)
-        except Exception:
+        except sqlite3.OperationalError:
             return []
 
     def unlink_task_entity(self, task_id: str, entity_id: int) -> bool:
