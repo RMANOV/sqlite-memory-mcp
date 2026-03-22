@@ -552,3 +552,56 @@ def test_new_task_field_ts_fallback_to_updated_at(conn):
     assert fv_title is not None
     assert fv_title[0] == task_ts
     assert fv_title[1] == original_machine_id
+
+
+# ── Test 10: LWW Content Protection ──────────────────────────────────────
+
+
+def test_lww_content_protection_no_nullify(conn):
+    """LWW must not overwrite non-NULL local content with NULL remote."""
+    tid = "test-content-protect"
+    old_ts = "2026-01-01T00:00:00"
+    new_ts = "2026-01-02T00:00:00"
+
+    _insert_task(conn, tid, description="Important content", updated_at=old_ts)
+    upsert_field_versions(conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A")
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Test",
+            "status": "not_started",
+            "description": None,  # Remote has NULL
+            "_field_ts": {"description": [new_ts, "machine-B"]},  # But newer timestamp
+            "updated_at": new_ts,
+        }
+    ]
+    merge_import_tasks(conn, remote, import_content=True)
+
+    row = conn.execute("SELECT description FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["description"] == "Important content"  # Local preserved
+
+
+def test_lww_content_overwrite_when_remote_has_value(conn):
+    """LWW should still overwrite when remote has actual new content."""
+    tid = "test-content-overwrite"
+    old_ts = "2026-01-01T00:00:00"
+    new_ts = "2026-01-02T00:00:00"
+
+    _insert_task(conn, tid, description="Old content", updated_at=old_ts)
+    upsert_field_versions(conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A")
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Test",
+            "status": "not_started",
+            "description": "New better content",  # Remote has actual content
+            "_field_ts": {"description": [new_ts, "machine-B"]},
+            "updated_at": new_ts,
+        }
+    ]
+    merge_import_tasks(conn, remote, import_content=True)
+
+    row = conn.execute("SELECT description FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["description"] == "New better content"  # Remote wins

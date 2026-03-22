@@ -346,7 +346,22 @@ class TaskDB:
                 project=project,
                 type=type,
             )
-            upsert_field_versions(self._conn, task_id, MERGEABLE_FIELDS, now)
+            upsert_field_versions(
+                self._conn,
+                task_id,
+                MERGEABLE_FIELDS,
+                now,
+                new_values={
+                    "title": title,
+                    "description": description,
+                    "status": status,
+                    "section": section,
+                    "priority": priority,
+                    "due_date": due_date,
+                    "project": project,
+                    "type": type,
+                },
+            )
         if self.on_change:
             self.on_change()
         return task_id
@@ -355,8 +370,19 @@ class TaskDB:
         """Set status=done."""
         now = now_iso()
         with self._transact(self._conn):
+            old_row = self._conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            old_status = old_row["status"] if old_row else None
             TaskDAO.update(self._conn, task_id, {"status": "done", "updated_at": now})
-            upsert_field_versions(self._conn, task_id, ("status",), now)
+            upsert_field_versions(
+                self._conn,
+                task_id,
+                ("status",),
+                now,
+                old_values={"status": old_status},
+                new_values={"status": "done"},
+            )
         if self.on_change:
             self.on_change()
 
@@ -368,9 +394,24 @@ class TaskDB:
         changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
         fields["updated_at"] = now
         with self._transact(self._conn):
+            if changed:
+                old_row = self._conn.execute(
+                    f"SELECT {', '.join(changed)} FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                old_values = {k: old_row[k] for k in changed} if old_row else {}
+            else:
+                old_values = {}
             TaskDAO.update(self._conn, task_id, fields)
             if changed:
-                upsert_field_versions(self._conn, task_id, changed, now)
+                upsert_field_versions(
+                    self._conn,
+                    task_id,
+                    changed,
+                    now,
+                    old_values=old_values,
+                    new_values={k: fields[k] for k in changed},
+                )
         if self.on_change:
             self.on_change()
 
@@ -380,12 +421,20 @@ class TaskDB:
         now = now_iso()
         with self._transact(self._conn):
             # Read task metadata before cancelling
-            row = TaskDAO.get_by_id(self._conn, task_id, "title, recurring, project")
+            row = TaskDAO.get_by_id(self._conn, task_id, "title, recurring, project, status")
+            old_status = row["status"] if row else None
             # Cancel the target task
             TaskDAO.update(
                 self._conn, task_id, {"status": "cancelled", "updated_at": now}
             )
-            upsert_field_versions(self._conn, task_id, ("status",), now)
+            upsert_field_versions(
+                self._conn,
+                task_id,
+                ("status",),
+                now,
+                old_values={"status": old_status},
+                new_values={"status": "cancelled"},
+            )
             # For recurring tasks: cancel all done siblings to break spawn cycle
             if row and row["recurring"]:
                 sibling_ids = [
@@ -404,7 +453,14 @@ class TaskDB:
                         [now, *sibling_ids],
                     )
                     for sid in sibling_ids:
-                        upsert_field_versions(self._conn, sid, ("status",), now)
+                        upsert_field_versions(
+                            self._conn,
+                            sid,
+                            ("status",),
+                            now,
+                            old_values={"status": "done"},
+                            new_values={"status": "cancelled"},
+                        )
         if self.on_change:
             self.on_change()
 

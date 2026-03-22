@@ -972,6 +972,21 @@ def bridge_pull() -> str:
                 ).fetchone()
                 if existing:
                     if task.get("updated_at", "") > existing["updated_at"]:
+                        # Content protection: don't overwrite non-NULL local with NULL remote
+                        local_content = conn.execute(
+                            "SELECT description, notes FROM tasks WHERE id=?", (tid,)
+                        ).fetchone()
+                        safe_desc = task.get("description") if task.get("description") is not None else (
+                            local_content["description"] if local_content else None
+                        )
+                        safe_notes = task.get("notes") if task.get("notes") is not None else (
+                            local_content["notes"] if local_content else None
+                        )
+                        old_row = conn.execute(
+                            f"SELECT {', '.join(_MERGEABLE_FIELDS)} FROM tasks WHERE id = ?",
+                            (tid,),
+                        ).fetchone()
+                        old_values = dict(old_row) if old_row else {}
                         conn.execute(
                             "UPDATE tasks SET title=?, description=?, status=?, "
                             "priority=?, section=?, due_date=?, project=?, "
@@ -979,14 +994,14 @@ def bridge_pull() -> str:
                             "assignee=?, shared_by=?, updated_at=? WHERE id=?",
                             (
                                 task["title"],
-                                task.get("description"),
+                                safe_desc,
                                 task["status"],
                                 task["priority"],
                                 task["section"],
                                 task.get("due_date"),
                                 task.get("project"),
                                 task.get("parent_id"),
-                                task.get("notes"),
+                                safe_notes,
                                 task.get("recurring"),
                                 task.get("type", "task"),
                                 task.get("assignee"),
@@ -995,8 +1010,16 @@ def bridge_pull() -> str:
                                 tid,
                             ),
                         )
+                        new_values = {f: task.get(f) for f in _MERGEABLE_FIELDS}
+                        new_values["description"] = safe_desc
+                        new_values["notes"] = safe_notes
                         _upsert_field_versions(
-                            conn, tid, _MERGEABLE_FIELDS, task.get("updated_at", now)
+                            conn,
+                            tid,
+                            _MERGEABLE_FIELDS,
+                            task.get("updated_at", now),
+                            old_values=old_values,
+                            new_values=new_values,
                         )
                         updated_tasks += 1
                 else:
@@ -1364,10 +1387,13 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
     now = _now()
     with _get_conn() as conn:
         existing = conn.execute(
-            "SELECT id FROM tasks WHERE id = ?", (task_id,)
+            "SELECT id, assignee, shared_by FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not existing:
             return _error(f"Task {task_id} not found")
+
+        old_assignee = existing["assignee"]
+        old_shared_by = existing["shared_by"]
 
         shared_by = None
         if assignee:
@@ -1387,7 +1413,14 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
             "UPDATE tasks SET assignee = ?, shared_by = ?, updated_at = ? WHERE id = ?",
             (assignee, shared_by, now, task_id),
         )
-        _upsert_field_versions(conn, task_id, ("assignee", "shared_by"), now)
+        _upsert_field_versions(
+            conn,
+            task_id,
+            ("assignee", "shared_by"),
+            now,
+            old_values={"assignee": old_assignee, "shared_by": old_shared_by},
+            new_values={"assignee": assignee, "shared_by": shared_by},
+        )
 
     action = f"assigned to {assignee}" if assignee else "unassigned"
     logger.info("assign_task: %s %s", task_id, action)
@@ -1456,6 +1489,21 @@ def review_shared_tasks(
                         _is_valid_timestamp(remote_ts)
                         and remote_ts > existing["updated_at"]
                     ):
+                        # Content protection: don't overwrite non-NULL local with NULL remote
+                        local_content = conn.execute(
+                            "SELECT description, notes FROM tasks WHERE id=?", (tid,)
+                        ).fetchone()
+                        safe_desc = t.get("description") if t.get("description") is not None else (
+                            local_content["description"] if local_content else None
+                        )
+                        safe_notes = t.get("notes") if t.get("notes") is not None else (
+                            local_content["notes"] if local_content else None
+                        )
+                        old_row = conn.execute(
+                            f"SELECT {', '.join(_MERGEABLE_FIELDS)} FROM tasks WHERE id = ?",
+                            (tid,),
+                        ).fetchone()
+                        old_values = dict(old_row) if old_row else {}
                         conn.execute(
                             "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
                             "section=?, due_date=?, project=?, parent_id=?, notes=?, "
@@ -1463,14 +1511,14 @@ def review_shared_tasks(
                             "WHERE id=?",
                             (
                                 t["title"],
-                                t.get("description"),
+                                safe_desc,
                                 t["status"],
                                 t["priority"],
                                 t["section"],
                                 t.get("due_date"),
                                 t.get("project"),
                                 t.get("parent_id"),
-                                t.get("notes"),
+                                safe_notes,
                                 t.get("recurring"),
                                 t.get("type", "task"),
                                 t.get("assignee"),
@@ -1479,8 +1527,16 @@ def review_shared_tasks(
                                 tid,
                             ),
                         )
+                        new_values = {f: t.get(f) for f in _MERGEABLE_FIELDS}
+                        new_values["description"] = safe_desc
+                        new_values["notes"] = safe_notes
                         _upsert_field_versions(
-                            conn, tid, _MERGEABLE_FIELDS, t.get("updated_at", _now())
+                            conn,
+                            tid,
+                            _MERGEABLE_FIELDS,
+                            t.get("updated_at", _now()),
+                            old_values=old_values,
+                            new_values=new_values,
                         )
                         imported += 1
                 else:

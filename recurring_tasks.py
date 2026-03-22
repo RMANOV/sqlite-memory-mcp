@@ -230,7 +230,12 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
                 """,
                 new_task,
             )
-            upsert_field_versions(conn, new_task["id"], MERGEABLE_FIELDS)
+            upsert_field_versions(
+                conn,
+                new_task["id"],
+                MERGEABLE_FIELDS,
+                new_values={f: new_task.get(f) for f in MERGEABLE_FIELDS},
+            )
             # Track last_spawned in source task's recurring config for interval scheduling
             config["last_spawned"] = today.isoformat()
             conn.execute(

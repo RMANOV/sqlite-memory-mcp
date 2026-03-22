@@ -1239,6 +1239,18 @@ def merge_import_tasks(
 
                 # Lexicographic: (timestamp, machine_id) — higher wins
                 if (remote_ts, remote_by) > (local_ts, local_by):
+                    # Content protection: never overwrite non-NULL local with NULL remote
+                    if field in CONTENT_FIELDS and remote_val is None:
+                        local_content = conn.execute(
+                            f"SELECT {field} FROM tasks WHERE id = ?", (local_id,)
+                        ).fetchone()
+                        if local_content and local_content[0]:
+                            _log.warning(
+                                "LWW content protection: keeping local %s for task %s "
+                                "(remote is NULL but local has %d chars)",
+                                field, local_id, len(str(local_content[0]))
+                            )
+                            continue  # Skip — don't nullify content
                     fields_to_update[field] = remote_val
                     conn.execute(
                         "INSERT OR REPLACE INTO task_field_versions "

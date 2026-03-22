@@ -446,7 +446,22 @@ def import_pages(
                     ),
                 )
                 if cur.rowcount > 0:
-                    upsert_field_versions(conn, task_id, MERGEABLE_FIELDS)
+                    upsert_field_versions(
+                        conn,
+                        task_id,
+                        MERGEABLE_FIELDS,
+                        new_values={
+                            "title": task["title"],
+                            "description": description,
+                            "status": task["status"],
+                            "priority": task["priority"],
+                            "section": task["section"],
+                            "due_date": task["due_date"],
+                            "project": task["project"],
+                            "type": task["type"],
+                            "notes": notes,
+                        },
+                    )
                     stats["imported"] += 1
                 else:
                     stats["skipped"] += 1
