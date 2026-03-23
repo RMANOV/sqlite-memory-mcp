@@ -12,6 +12,7 @@ import html as _html
 import json
 import logging
 import os
+import shutil
 import socket as _socket
 import sqlite3
 import subprocess
@@ -777,6 +778,37 @@ class _ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
+_wl_copy_proc = None  # Track wl-copy PID to prevent ghost windows
+
+
+def _clipboard_write(text):
+    """Write to clipboard. Wayland-aware with wl-copy fallback."""
+    global _wl_copy_proc
+    # Always try Qt clipboard (works on X11, some Wayland setups)
+    QApplication.clipboard().setText(text)
+
+    # On Wayland, also use wl-copy (reliable — creates its own data source)
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        if _wl_copy_proc and _wl_copy_proc.poll() is None:
+            _wl_copy_proc.terminate()
+            try:
+                _wl_copy_proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                _wl_copy_proc.kill()
+        _wl_copy_proc = subprocess.Popen(
+            ["wl-copy", "--", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+@atexit.register
+def _cleanup_wl_copy():
+    global _wl_copy_proc
+    if _wl_copy_proc and _wl_copy_proc.poll() is None:
+        _wl_copy_proc.terminate()
+
+
 class _TooltipCopyFilter(QObject):
     """Copies full task summary to clipboard when tooltip is about to show."""
 
@@ -791,7 +823,7 @@ class _TooltipCopyFilter(QObject):
             t = self._task
             tid = t.get("id")
             if tid != _TooltipCopyFilter._last_copied_id:
-                QApplication.clipboard().setText(_build_copy_text(t))
+                _clipboard_write(_build_copy_text(t))
                 _TooltipCopyFilter._last_copied_id = tid
         return False  # let tooltip show normally
 
@@ -820,6 +852,8 @@ def _build_copy_text(task):
     parts = [task["title"]]
     if task.get("description"):
         parts.append(task["description"])
+    if task.get("notes"):
+        parts.append(f"Notes: {task['notes']}")
     if task.get("priority"):
         parts.append(f"Priority: {task['priority']}")
     if task.get("due_date"):
@@ -828,6 +862,8 @@ def _build_copy_text(task):
         parts.append(f"Project: {task['project']}")
     if task.get("section"):
         parts.append(f"Section: {task['section']}")
+    if task.get("assignee"):
+        parts.append(f"Assignee: {task['assignee']}")
     return "\n".join(parts)
 
 
@@ -850,7 +886,7 @@ class _ListTooltipCopyFilter(QObject):
                         None,
                     )
                     if task:
-                        QApplication.clipboard().setText(_build_copy_text(task))
+                        _clipboard_write(_build_copy_text(task))
                         self._last_copied_id = task_id
         return False
 
