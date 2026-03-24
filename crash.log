@@ -1,0 +1,9 @@
+Windows fatal exception: code 0x8001010d
+
+Current thread 0x000048d4 (most recent call first):
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 3495 in run
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 3500 in main
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 3504 in <module>
+
+Current thread's C stack trace (most recent call first):
+  <cannot get C stack on this system>

@@ -1,0 +1,45 @@
+2026-03-10 17:04:12,566 ERROR Error toggling task e55b74f8-17f5-47fe-931e-dd0cd5cba553: Traceback (most recent call last):
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 3247, in _apply_check_change
+    self.db.mark_done(task_id)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 278, in mark_done
+    self._conn.execute(
+    ~~~~~~~~~~~~~~~~~~^
+        "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        (now, task_id),
+        ^^^^^^^^^^^^^^^
+    )
+    ^
+sqlite3.DatabaseError: database disk image is malformed
+
+2026-03-10 17:33:50,996 ERROR Error toggling task e55b74f8-17f5-47fe-931e-dd0cd5cba553: Traceback (most recent call last):
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 3252, in _apply_check_change
+    self.db.mark_done(task_id)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 278, in mark_done
+    self._conn.execute(
+    ~~~~~~~~~~~~~~~~~~^
+        "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        (now, task_id),
+        ^^^^^^^^^^^^^^^
+    )
+    ^
+sqlite3.DatabaseError: database disk image is malformed
+
+2026-03-10 17:42:14,259 ERROR Error toggling task e55b74f8-17f5-47fe-931e-dd0cd5cba553: Traceback (most recent call last):
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 3285, in _apply_check_change
+    self.db.mark_done(task_id)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\rmanov\.claude\mcp_servers\sqlite_memory\task_tray.py", line 278, in mark_done
+    self._conn.execute(
+    ~~~~~~~~~~~~~~~~~~^
+        "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        (now, task_id),
+        ^^^^^^^^^^^^^^^
+    )
+    ^
+sqlite3.DatabaseError: database disk image is malformed
+
