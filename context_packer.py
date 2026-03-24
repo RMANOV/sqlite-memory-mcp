@@ -17,6 +17,11 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
+from advanced_context import (
+    build_strategy as _build_advanced_strategy,
+    compute_strategy_match as _compute_advanced_task_match,
+    select_context_items as _select_advanced_items,
+)
 from db_utils import now_iso
 from intelligence_v2 import (
     _new_id,
@@ -153,6 +158,66 @@ def _chunk_group_key(chunk: sqlite3.Row) -> str:
         if value:
             return str(value).lower()
     return chunk["chunk_id"]
+
+
+def _make_coverage_keys(
+    *texts: str | None,
+    extras: list[str] | None = None,
+    limit: int = 6,
+) -> list[str]:
+    """Build compact coverage keys for the optional advanced selector."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for extra in extras or []:
+        norm = str(extra).strip().lower()
+        if norm and norm not in seen:
+            keys.append(norm)
+            seen.add(norm)
+        if len(keys) >= limit:
+            return keys[:limit]
+    for text in texts:
+        for keyword in _extract_task_keywords(text or ""):
+            marker = f"kw:{keyword}"
+            if marker not in seen:
+                keys.append(marker)
+                seen.add(marker)
+            if len(keys) >= limit:
+                return keys[:limit]
+    return keys[:limit]
+
+
+def _greedy_select_items(
+    items: list[dict[str, Any]],
+    budget: int,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+    """Baseline deterministic selector used when advanced mode is disabled."""
+    items.sort(key=lambda x: x["score"], reverse=True)
+
+    selected: list[dict[str, Any]] = []
+    tokens_used = 0
+    type_counts: dict[str, int] = defaultdict(int)
+    chunk_group_counts: dict[str, int] = defaultdict(int)
+    seen_texts: set[str] = set()
+    for item in items:
+        if tokens_used + item["tokens"] > budget:
+            continue
+        if type_counts[item["type"]] >= _MAX_ITEMS_BY_TYPE[item["type"]]:
+            continue
+        if item["type"] == "chunk":
+            group_key = item.get("group_key")
+            if group_key and chunk_group_counts[group_key] >= _MAX_CHUNKS_PER_GROUP:
+                continue
+        dedupe_key = " ".join(item["text"].lower().split())
+        if dedupe_key in seen_texts:
+            continue
+        selected.append(item)
+        tokens_used += item["tokens"]
+        type_counts[item["type"]] += 1
+        if item["type"] == "chunk" and item.get("group_key"):
+            chunk_group_counts[item["group_key"]] += 1
+        seen_texts.add(dedupe_key)
+
+    return selected, tokens_used, {"selection_strategy": "greedy"}
 
 
 def _prune_context_pack_history(
@@ -379,6 +444,16 @@ def build_context_pack(
     relevant_entity_ids: dict[int, float] = {}
     task_keywords: list[str] = []
     is_task_scoped = bool(target_ref)
+    advanced_strategy: dict[str, Any] = {
+        "enabled": False,
+        "query_expansion_used": False,
+        "submodular_enabled": False,
+        "metadata": {
+            "seed_entities": 0,
+            "expanded_entities": 0,
+            "expansion_keywords": 0,
+        },
+    }
     if target_ref:
         try:
             task_query, linked_ids = _build_task_query(conn, target_ref)
@@ -389,6 +464,17 @@ def build_context_pack(
                 )
                 relevant_names = relevant_entities["by_name"]
                 relevant_entity_ids = relevant_entities["by_id"]
+                if config.get("advanced_context_enabled"):
+                    advanced_strategy = _build_advanced_strategy(
+                        conn,
+                        target_ref=target_ref,
+                        task_query=task_query,
+                        linked_ids=linked_ids,
+                        task_keywords=task_keywords,
+                        relevant_names=relevant_names,
+                        relevant_entity_ids=relevant_entity_ids,
+                        config=config,
+                    )
         except (sqlite3.OperationalError, KeyError) as exc:
             logger.warning(
                 "Task-scoped filtering failed, falling back to no-context: %s", exc
@@ -416,6 +502,15 @@ def build_context_pack(
         if joined:
             best = max(best, _keyword_score(joined, task_keywords))
             best = max(best, _entity_name_overlap_score(joined, relevant_names))
+            best = max(
+                best,
+                _compute_advanced_task_match(
+                    advanced_strategy,
+                    *texts,
+                    entity_id=entity_id,
+                    entity_name=entity_name,
+                ),
+            )
         return best
 
     # 1. Canonical facts (highest trust)
@@ -453,6 +548,16 @@ def build_context_pack(
                     priorities["fact_weight"],
                 ),
                 "provisional": False,
+                "coverage_keys": _make_coverage_keys(
+                    f["subject"],
+                    f["predicate"],
+                    f["object_text"],
+                    extras=[
+                        f"subject:{(f['subject'] or '').lower()}",
+                        f"predicate:{(f['predicate'] or '').lower()}",
+                        f"scope:{(f['fact_scope'] or '').lower()}",
+                    ],
+                ),
             }
         )
 
@@ -495,6 +600,16 @@ def build_context_pack(
                     priorities["claim_weight"],
                 ),
                 "provisional": True,
+                "coverage_keys": _make_coverage_keys(
+                    c["subject"],
+                    c["predicate"],
+                    c["object_text"],
+                    extras=[
+                        f"subject:{(c['subject'] or '').lower()}",
+                        f"predicate:{(c['predicate'] or '').lower()}",
+                        f"scope:{(c['claim_scope'] or '').lower()}",
+                    ],
+                ),
             }
         )
 
@@ -534,6 +649,11 @@ def build_context_pack(
                         priorities["question_weight"],
                     ),
                     "provisional": False,
+                    "coverage_keys": _make_coverage_keys(
+                        q["question_text"],
+                        q["chunk_title"],
+                        extras=[f"question:{(q['question_type'] or '').lower()}"],
+                    ),
                 }
             )
 
@@ -583,35 +703,39 @@ def build_context_pack(
                         priorities["chunk_weight"],
                     ),
                     "provisional": True,
+                    "coverage_keys": _make_coverage_keys(
+                        ch["title"],
+                        ch["source_ref"],
+                        ch["body"][:240],
+                        extras=[
+                            f"chunk_state:{(ch['state'] or '').lower()}",
+                            f"source:{_chunk_group_key(ch)}",
+                        ],
+                    ),
                 }
             )
 
-    # Greedy coverage: sort by score, fill budget
-    items.sort(key=lambda x: x["score"], reverse=True)
-
-    selected: list[dict[str, Any]] = []
-    tokens_used = 0
-    type_counts: dict[str, int] = defaultdict(int)
-    chunk_group_counts: dict[str, int] = defaultdict(int)
-    seen_texts: set[str] = set()
-    for item in items:
-        if tokens_used + item["tokens"] > budget:
-            continue
-        if type_counts[item["type"]] >= _MAX_ITEMS_BY_TYPE[item["type"]]:
-            continue
-        if item["type"] == "chunk":
-            group_key = item.get("group_key")
-            if group_key and chunk_group_counts[group_key] >= _MAX_CHUNKS_PER_GROUP:
-                continue
-        dedupe_key = " ".join(item["text"].lower().split())
-        if dedupe_key in seen_texts:
-            continue
-        selected.append(item)
-        tokens_used += item["tokens"]
-        type_counts[item["type"]] += 1
-        if item["type"] == "chunk" and item.get("group_key"):
-            chunk_group_counts[item["group_key"]] += 1
-        seen_texts.add(dedupe_key)
+    selection_meta = {"selection_strategy": "greedy"}
+    if advanced_strategy.get("enabled") and advanced_strategy.get("submodular_enabled"):
+        try:
+            selection = _select_advanced_items(
+                items,
+                budget=budget,
+                max_items_by_type=_MAX_ITEMS_BY_TYPE,
+                max_chunks_per_group=_MAX_CHUNKS_PER_GROUP,
+                strategy=advanced_strategy,
+            )
+            selected = selection["selected"]
+            tokens_used = selection["tokens_used"]
+            selection_meta = selection["metadata"]
+        except (sqlite3.OperationalError, ValueError, KeyError) as exc:
+            logger.warning(
+                "Advanced context selector failed, using greedy fallback: %s", exc
+            )
+            selected, tokens_used, selection_meta = _greedy_select_items(items, budget)
+            selection_meta["selector_error"] = str(exc)
+    else:
+        selected, tokens_used, selection_meta = _greedy_select_items(items, budget)
 
     # Build pack body
     sections: dict[str, list[str]] = {
@@ -713,6 +837,21 @@ def build_context_pack(
         "freshness_score": round(freshness_score, 3),
         "relevance_score": round(relevance_score, 3),
         "quality_score": round(quality_score, 3),
+        "advanced_context": {
+            "enabled": bool(advanced_strategy.get("enabled")),
+            "query_expansion_used": bool(advanced_strategy.get("query_expansion_used")),
+            "submodular_used": selection_meta.get("selection_strategy") == "submodular",
+            "selection_strategy": selection_meta.get("selection_strategy", "greedy"),
+            "seed_entities": advanced_strategy.get("metadata", {}).get(
+                "seed_entities", 0
+            ),
+            "expanded_entities": advanced_strategy.get("metadata", {}).get(
+                "expanded_entities", 0
+            ),
+            "expansion_keywords": advanced_strategy.get("metadata", {}).get(
+                "expansion_keywords", 0
+            ),
+        },
         "sections": {k: len(v) for k, v in sections.items()},
         "body": pack_body,
     }

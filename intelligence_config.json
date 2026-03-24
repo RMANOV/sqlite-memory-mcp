@@ -8,5 +8,10 @@
   "human_required_scopes": ["mapping", "validation", "bridge", "export"],
   "context_pack_token_budget_default": 4000,
   "conflict_detection_enabled": false,
-  "query_expansion_enabled": false
+  "query_expansion_enabled": true,
+  "advanced_context_enabled": true,
+  "advanced_context_submodular_enabled": true,
+  "advanced_context_max_seed_entities": 8,
+  "advanced_context_max_related_entities": 12,
+  "advanced_context_max_expansion_keywords": 24
 }

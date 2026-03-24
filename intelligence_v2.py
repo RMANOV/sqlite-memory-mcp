@@ -40,6 +40,11 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "context_pack_token_budget_default": 4000,
     "conflict_detection_enabled": False,
     "query_expansion_enabled": False,
+    "advanced_context_enabled": False,
+    "advanced_context_submodular_enabled": True,
+    "advanced_context_max_seed_entities": 8,
+    "advanced_context_max_related_entities": 12,
+    "advanced_context_max_expansion_keywords": 24,
 }
 
 
