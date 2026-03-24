@@ -818,22 +818,18 @@ class _ClickableLabel(QLabel):
 
 
 _wl_copy_proc = None  # Track wl-copy PID to prevent ghost windows
+_HAS_WL_COPY = bool(os.environ.get("WAYLAND_DISPLAY")) and shutil.which("wl-copy") is not None
 
 
 def _clipboard_write(text):
     """Write to clipboard. Wayland-aware with wl-copy fallback."""
     global _wl_copy_proc
-    # Always try Qt clipboard (works on X11, some Wayland setups)
     QApplication.clipboard().setText(text)
 
-    # On Wayland, also use wl-copy (reliable — creates its own data source)
-    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+    if _HAS_WL_COPY:
         if _wl_copy_proc and _wl_copy_proc.poll() is None:
-            _wl_copy_proc.terminate()
-            try:
-                _wl_copy_proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                _wl_copy_proc.kill()
+            _wl_copy_proc.kill()
+            _wl_copy_proc.wait()
         _wl_copy_proc = subprocess.Popen(
             ["wl-copy", "--", text],
             stdout=subprocess.DEVNULL,
@@ -851,8 +847,7 @@ def _cleanup_wl_copy():
 class _TooltipCopyFilter(QObject):
     """Copies full task summary to clipboard when tooltip is about to show."""
 
-    _last_copied_id = None  # class-level debounce
-    _last_copied_text = None
+    _last_copied_text = None  # class-level debounce
 
     def __init__(self, task, parent=None):
         super().__init__(parent)
@@ -860,25 +855,10 @@ class _TooltipCopyFilter(QObject):
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.ToolTip:
-            t = self._task
-            tid = t.get("id")
-            copy_text = _build_copy_text(t)
-            if (
-                tid != _TooltipCopyFilter._last_copied_id
-                or QApplication.clipboard().text() != copy_text
-                or _TooltipCopyFilter._last_copied_text != copy_text
-            ):
+            copy_text = _build_copy_text(self._task)
+            if copy_text != _TooltipCopyFilter._last_copied_text:
                 _clipboard_write(copy_text)
-                _TooltipCopyFilter._last_copied_id = tid
                 _TooltipCopyFilter._last_copied_text = copy_text
-        elif event.type() in (
-            QEvent.Type.Leave,
-            QEvent.Type.Hide,
-            QEvent.Type.WindowDeactivate,
-        ):
-            if self._task.get("id") == _TooltipCopyFilter._last_copied_id:
-                _TooltipCopyFilter._last_copied_id = None
-                _TooltipCopyFilter._last_copied_text = None
         return False  # let tooltip show normally
 
 
@@ -927,7 +907,6 @@ class _ListTooltipCopyFilter(QObject):
     def __init__(self, list_widget, parent=None):
         super().__init__(parent)
         self._list = list_widget
-        self._last_copied_id = None
         self._last_copied_text = None
 
     def eventFilter(self, obj, event):
@@ -947,24 +926,9 @@ class _ListTooltipCopyFilter(QObject):
                     )
                     if task:
                         copy_text = _build_copy_text(task)
-                        if (
-                            task_id != self._last_copied_id
-                            or QApplication.clipboard().text() != copy_text
-                            or self._last_copied_text != copy_text
-                        ):
+                        if copy_text != self._last_copied_text:
                             _clipboard_write(copy_text)
-                            self._last_copied_id = task_id
                             self._last_copied_text = copy_text
-            else:
-                self._last_copied_id = None
-                self._last_copied_text = None
-        elif event.type() in (
-            QEvent.Type.Leave,
-            QEvent.Type.Hide,
-            QEvent.Type.WindowDeactivate,
-        ):
-            self._last_copied_id = None
-            self._last_copied_text = None
         return False
 
 
@@ -3719,13 +3683,19 @@ class FullWindow(QMainWindow):
         self._purge_timer.timeout.connect(self._run_purge)
         self._purge_timer.start(_PURGE_INTERVAL_MS)
 
-        # Auto-sync: watch memory.db for changes
+        # Auto-sync: watch memory.db for changes (push on local change)
         self._db_watcher = QFileSystemWatcher([str(Path(self.db.db_path))], self)
         self._db_watcher.fileChanged.connect(self._on_db_changed)
         self._auto_sync_timer = QTimer(self)
         self._auto_sync_timer.setSingleShot(True)
         self._auto_sync_timer.setInterval(60_000)  # 60s debounce
         self._auto_sync_timer.timeout.connect(self._auto_sync_triggered)
+
+        # Periodic pull: import remote changes even without local edits
+        self._periodic_pull_timer = QTimer(self)
+        self._periodic_pull_timer.setInterval(5 * 60_000)  # 5 minutes
+        self._periodic_pull_timer.timeout.connect(self._periodic_pull)
+        self._periodic_pull_timer.start()
         self._db_refresh_debounce = QTimer(self)
         self._db_refresh_debounce.setSingleShot(True)
         self._db_refresh_debounce.setInterval(500)  # 500ms UI debounce
@@ -3746,6 +3716,34 @@ class FullWindow(QMainWindow):
     def _auto_sync_triggered(self):
         """Debounce elapsed — run bridge sync."""
         self._sync_bridge()
+
+    def _periodic_pull(self):
+        """Periodic pull from remote — catches changes from other machines."""
+        if not os.path.isdir(self._BRIDGE_DIR):
+            return
+
+        def _run():
+            try:
+                import bridge_sync_worker
+
+                stats = bridge_sync_worker.main(
+                    progress_callback=lambda pct, label: self._bridge_progress.emit(
+                        pct, label
+                    )
+                )
+                imported = stats.get("imported_new", 0) + stats.get(
+                    "imported_updated", 0
+                )
+                if imported:
+                    self._bridge_done.emit(
+                        f"Pulled {imported} updates from remote"
+                    )
+                    # Refresh UI after importing remote changes
+                    self._db_refresh_debounce.start()
+            except Exception as exc:
+                logger.warning("Periodic pull failed: %s", exc)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)

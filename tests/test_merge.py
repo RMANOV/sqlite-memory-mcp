@@ -668,6 +668,52 @@ def test_dedup_guard_blocks_recently_cancelled_title(conn):
     )
 
 
+def test_dedup_guard_blocks_active_duplicate_title(conn):
+    """New remote task with same title as existing active local should be skipped."""
+    _insert_task(
+        conn, "active-1", title="Deploy pipeline", status="not_started", updated_at=now_iso()
+    )
+
+    remote = [
+        {
+            "id": "new-uuid-active-dup",
+            "title": "Deploy pipeline",
+            "status": "not_started",
+            "updated_at": now_iso(),
+            "_field_ts": {},
+        }
+    ]
+    new_count, _ = merge_import_tasks(conn, remote, import_content=False)
+    assert new_count == 0  # Blocked — same title exists locally
+    assert (
+        conn.execute("SELECT id FROM tasks WHERE id='new-uuid-active-dup'").fetchone()
+        is None
+    )
+
+
+def test_dedup_guard_blocks_done_duplicate_title(conn):
+    """New remote task with same title as done local should be skipped."""
+    _insert_task(
+        conn, "done-1", title="Fix auth bug", status="done", updated_at=now_iso()
+    )
+
+    remote = [
+        {
+            "id": "new-uuid-done-dup",
+            "title": "Fix auth bug",
+            "status": "not_started",
+            "updated_at": now_iso(),
+            "_field_ts": {},
+        }
+    ]
+    new_count, _ = merge_import_tasks(conn, remote, import_content=False)
+    assert new_count == 0  # Blocked — same title exists (done)
+    assert (
+        conn.execute("SELECT id FROM tasks WHERE id='new-uuid-done-dup'").fetchone()
+        is None
+    )
+
+
 def test_dedup_guard_allows_different_title(conn):
     """Dedup guard should not block tasks with different titles."""
     _insert_task(
