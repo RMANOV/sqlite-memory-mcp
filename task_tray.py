@@ -852,6 +852,7 @@ class _TooltipCopyFilter(QObject):
     """Copies full task summary to clipboard when tooltip is about to show."""
 
     _last_copied_id = None  # class-level debounce
+    _last_copied_text = None
 
     def __init__(self, task, parent=None):
         super().__init__(parent)
@@ -861,9 +862,23 @@ class _TooltipCopyFilter(QObject):
         if event.type() == QEvent.Type.ToolTip:
             t = self._task
             tid = t.get("id")
-            if tid != _TooltipCopyFilter._last_copied_id:
-                _clipboard_write(_build_copy_text(t))
+            copy_text = _build_copy_text(t)
+            if (
+                tid != _TooltipCopyFilter._last_copied_id
+                or QApplication.clipboard().text() != copy_text
+                or _TooltipCopyFilter._last_copied_text != copy_text
+            ):
+                _clipboard_write(copy_text)
                 _TooltipCopyFilter._last_copied_id = tid
+                _TooltipCopyFilter._last_copied_text = copy_text
+        elif event.type() in (
+            QEvent.Type.Leave,
+            QEvent.Type.Hide,
+            QEvent.Type.WindowDeactivate,
+        ):
+            if self._task.get("id") == _TooltipCopyFilter._last_copied_id:
+                _TooltipCopyFilter._last_copied_id = None
+                _TooltipCopyFilter._last_copied_text = None
         return False  # let tooltip show normally
 
 
@@ -913,20 +928,43 @@ class _ListTooltipCopyFilter(QObject):
         super().__init__(parent)
         self._list = list_widget
         self._last_copied_id = None
+        self._last_copied_text = None
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.ToolTip:
-            item = self._list.itemAt(event.pos())
+            pos = event.pos()
+            if obj is self._list:
+                pos = self._list.viewport().mapFrom(self._list, pos)
+            elif obj is not self._list.viewport():
+                pos = self._list.viewport().mapFrom(obj, pos)
+            item = self._list.itemAt(pos)
             if item:
                 task_id = item.data(Qt.ItemDataRole.UserRole)
-                if task_id and task_id != self._last_copied_id:
+                if task_id:
                     task = next(
                         (t for t in self._list._tasks if t["id"] == task_id),
                         None,
                     )
                     if task:
-                        _clipboard_write(_build_copy_text(task))
-                        self._last_copied_id = task_id
+                        copy_text = _build_copy_text(task)
+                        if (
+                            task_id != self._last_copied_id
+                            or QApplication.clipboard().text() != copy_text
+                            or self._last_copied_text != copy_text
+                        ):
+                            _clipboard_write(copy_text)
+                            self._last_copied_id = task_id
+                            self._last_copied_text = copy_text
+            else:
+                self._last_copied_id = None
+                self._last_copied_text = None
+        elif event.type() in (
+            QEvent.Type.Leave,
+            QEvent.Type.Hide,
+            QEvent.Type.WindowDeactivate,
+        ):
+            self._last_copied_id = None
+            self._last_copied_text = None
         return False
 
 
@@ -2676,7 +2714,9 @@ class TaskListWidget(QListWidget):
         self._tasks = []
         self._last_fp = None  # fingerprint for skip-if-unchanged
         self._open_dialogs = []
-        self.installEventFilter(_ListTooltipCopyFilter(self, self))
+        self._tooltip_copy_filter = _ListTooltipCopyFilter(self, self)
+        self.installEventFilter(self._tooltip_copy_filter)
+        self.viewport().installEventFilter(self._tooltip_copy_filter)
 
     @staticmethod
     def _build_tooltip(task):
