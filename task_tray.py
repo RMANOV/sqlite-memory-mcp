@@ -1435,6 +1435,7 @@ class TrayPopup(QWidget):
         self.on_open_full = on_open_full
         self._tasks = []
         self._entity_seq_id = 0
+        self._open_dialogs = []
         self._entity_search_done.connect(self._on_entity_results)
         self.setFixedWidth(380)
         self.setMaximumHeight(500)
@@ -1637,9 +1638,7 @@ class TrayPopup(QWidget):
         hl.addStretch()
 
         eid = entity["entity_id"]
-        row.mousePressEvent = lambda _ev, _eid=eid: EntityDetailDialog(
-            self.db, _eid, self
-        ).exec()
+        row.mousePressEvent = lambda _ev, _eid=eid: self._open_entity_detail(_eid)
         return row
 
     def _on_entity_results(self, entities: list, seq_id: int):
@@ -1723,11 +1722,52 @@ class TrayPopup(QWidget):
         else:
             self.db.update_task(task_id, status="not_started")
 
+    def _track_dialog(self, dlg):
+        self._open_dialogs.append(dlg)
+
+        def _cleanup(*_args):
+            self._open_dialogs = [d for d in self._open_dialogs if d is not dlg]
+
+        dlg.destroyed.connect(_cleanup)
+
+    def _show_dialog_deferred(self, factory, *, label: str):
+        """Open dialogs after the tray input cycle to avoid Windows COM crashes."""
+
+        def _open():
+            try:
+                self.hide()
+                dlg = factory()
+                if dlg is None:
+                    return
+                dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                self._track_dialog(dlg)
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                import traceback
+
+                logger.error(
+                    "Failed to open %s from popup: %s", label, traceback.format_exc()
+                )
+
+        QTimer.singleShot(0, _open)
+
     def _open_reader(self, task_id):
-        task = next((t for t in self._tasks if t["id"] == task_id), None)
+        task = TaskDAO.get_by_id(self.db._conn, task_id, columns=_UI_COLS)
+        if not task:
+            task = next((t for t in self._tasks if t["id"] == task_id), None)
         if task:
-            dlg = TaskReaderDialog(task, self.db, self)
-            dlg.exec()
+            self._show_dialog_deferred(
+                lambda task=task: TaskReaderDialog(task, self.db, None),
+                label=f"task reader for {task_id}",
+            )
+
+    def _open_entity_detail(self, entity_id: int):
+        self._show_dialog_deferred(
+            lambda entity_id=entity_id: EntityDetailDialog(self.db, entity_id, None),
+            label=f"entity detail for {entity_id}",
+        )
 
     def _toggle_add_form(self):
         visible = not self._add_form.isVisible()
@@ -2635,6 +2675,7 @@ class TaskListWidget(QListWidget):
         self.customContextMenuRequested.connect(self._context_menu)
         self._tasks = []
         self._last_fp = None  # fingerprint for skip-if-unchanged
+        self._open_dialogs = []
         self.installEventFilter(_ListTooltipCopyFilter(self, self))
 
     @staticmethod
@@ -2794,13 +2835,63 @@ class TaskListWidget(QListWidget):
                 self.addItem(item)
         self.blockSignals(False)
 
+    def _dialog_parent(self):
+        """Use a stable top-level parent; popup-launched readers should stand alone."""
+        host = self.window()
+        if isinstance(host, TrayPopup):
+            host.hide()
+            return None
+        return host if isinstance(host, QWidget) else None
+
+    def _track_dialog(self, dlg):
+        self._open_dialogs.append(dlg)
+
+        def _cleanup(*_args):
+            self._open_dialogs = [d for d in self._open_dialogs if d is not dlg]
+
+        dlg.destroyed.connect(_cleanup)
+
+    def _show_dialog_deferred(self, factory, *, label: str):
+        """Open dialogs outside the immediate Qt input signal to avoid tray crashes."""
+
+        def _open():
+            try:
+                dlg = factory()
+                if dlg is None:
+                    return
+                dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                self._track_dialog(dlg)
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                import traceback
+
+                logger.error("Failed to open %s: %s", label, traceback.format_exc())
+
+        QTimer.singleShot(0, _open)
+
     def _open_reader(self, task_id):
-        task = next((t for t in self._tasks if t["id"] == task_id), None)
-        if task:
-            if hasattr(self, "_search_engine"):
-                self._search_engine.record_open(task)
-            dlg = TaskReaderDialog(task, self.db, self)
-            dlg.exec()
+        task = TaskDAO.get_by_id(self.db._conn, task_id, columns=_UI_COLS)
+        if not task:
+            task = next((t for t in self._tasks if t["id"] == task_id), None)
+        if not task:
+            logger.warning("Double-click open skipped; task not found: %s", task_id)
+            return
+        if hasattr(self, "_search_engine"):
+            self._search_engine.record_open(task)
+        self._show_dialog_deferred(
+            lambda task=task: TaskReaderDialog(task, self.db, self._dialog_parent()),
+            label=f"task reader for {task_id}",
+        )
+
+    def _open_entity_detail(self, entity_id: int):
+        self._show_dialog_deferred(
+            lambda entity_id=entity_id: EntityDetailDialog(
+                self.db, entity_id, self._dialog_parent()
+            ),
+            label=f"entity detail for {entity_id}",
+        )
 
     def _on_double_click(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -2808,7 +2899,7 @@ class TaskListWidget(QListWidget):
             return
         if isinstance(data, str) and data.startswith("entity:"):
             entity_id = int(data.split(":", 1)[1])
-            EntityDetailDialog(self.db, entity_id, self).exec()
+            self._open_entity_detail(entity_id)
             return
         self._open_reader(data)
 
@@ -2827,7 +2918,7 @@ class TaskListWidget(QListWidget):
             view_action = menu.addAction("View Entity")
             action = menu.exec(self.mapToGlobal(pos))
             if action == view_action:
-                EntityDetailDialog(self.db, entity_id, self).exec()
+                self._open_entity_detail(entity_id)
             return
         task_id = data
         menu = QMenu(self)
