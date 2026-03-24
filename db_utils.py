@@ -398,6 +398,26 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_iso_datetime_for_compare(value: str | None) -> datetime:
+    """Parse ISO datetime defensively for ordering comparisons.
+
+    Accepts `Z`, offset-aware, and naive timestamps. Invalid or missing values sort
+    as the minimum UTC datetime.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def parse_iso_date(s: str | None) -> date | None:
     """Parse YYYY-MM-DD to date, or None on invalid/missing input."""
     if not s:
@@ -1248,7 +1268,9 @@ def merge_import_tasks(
                             _log.warning(
                                 "LWW content protection: keeping local %s for task %s "
                                 "(remote is NULL but local has %d chars)",
-                                field, local_id, len(str(local_content[0]))
+                                field,
+                                local_id,
+                                len(str(local_content[0])),
                             )
                             continue  # Skip — don't nullify content
                     fields_to_update[field] = remote_val
@@ -1309,7 +1331,8 @@ def merge_import_tasks(
                     _log.info(
                         "Dedup guard: skipping new task '%s' — same title "
                         "cancelled/archived recently (task %s)",
-                        remote_title[:50], dedup["id"][:12],
+                        remote_title[:50],
+                        dedup["id"][:12],
                     )
                     continue
 

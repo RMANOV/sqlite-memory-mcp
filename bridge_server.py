@@ -34,6 +34,7 @@ from db_utils import (
     MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
     _NOWIN,
     now_iso as _now,
+    parse_iso_datetime_for_compare as _parse_iso_dt,
     sanitize_task_enums as _sanitize_task_enums,
     upsert_field_versions as _upsert_field_versions,
     merge_import_tasks as _merge_import_tasks,
@@ -163,8 +164,8 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
         # Merge into shared_tasks array (upsert by id, last-write-wins)
         shared_tasks = {t["id"]: t for t in existing.get("shared_tasks", [])}
         for t in tasks:
-            if t.get("updated_at", "") >= shared_tasks.get(t["id"], {}).get(
-                "updated_at", ""
+            if _parse_iso_dt(t.get("updated_at")) >= _parse_iso_dt(
+                shared_tasks.get(t["id"], {}).get("updated_at")
             ):
                 shared_tasks[t["id"]] = t
         existing["shared_tasks"] = list(shared_tasks.values())
@@ -976,11 +977,17 @@ def bridge_pull() -> str:
                         local_content = conn.execute(
                             "SELECT description, notes FROM tasks WHERE id=?", (tid,)
                         ).fetchone()
-                        safe_desc = task.get("description") if task.get("description") is not None else (
-                            local_content["description"] if local_content else None
+                        safe_desc = (
+                            task.get("description")
+                            if task.get("description") is not None
+                            else (
+                                local_content["description"] if local_content else None
+                            )
                         )
-                        safe_notes = task.get("notes") if task.get("notes") is not None else (
-                            local_content["notes"] if local_content else None
+                        safe_notes = (
+                            task.get("notes")
+                            if task.get("notes") is not None
+                            else (local_content["notes"] if local_content else None)
                         )
                         old_row = conn.execute(
                             f"SELECT {', '.join(_MERGEABLE_FIELDS)} FROM tasks WHERE id = ?",
@@ -1493,11 +1500,17 @@ def review_shared_tasks(
                         local_content = conn.execute(
                             "SELECT description, notes FROM tasks WHERE id=?", (tid,)
                         ).fetchone()
-                        safe_desc = t.get("description") if t.get("description") is not None else (
-                            local_content["description"] if local_content else None
+                        safe_desc = (
+                            t.get("description")
+                            if t.get("description") is not None
+                            else (
+                                local_content["description"] if local_content else None
+                            )
                         )
-                        safe_notes = t.get("notes") if t.get("notes") is not None else (
-                            local_content["notes"] if local_content else None
+                        safe_notes = (
+                            t.get("notes")
+                            if t.get("notes") is not None
+                            else (local_content["notes"] if local_content else None)
                         )
                         old_row = conn.execute(
                             f"SELECT {', '.join(_MERGEABLE_FIELDS)} FROM tasks WHERE id = ?",

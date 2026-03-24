@@ -138,11 +138,19 @@ def next_due_date(config: dict, today: date) -> str:
     return today.isoformat()
 
 
-def has_active_duplicate(conn: sqlite3.Connection, title: str) -> bool:
-    """Return True if an active (not_started or in_progress) task with the same title exists."""
+def has_active_duplicate(
+    conn: sqlite3.Connection,
+    title: str,
+    project: str | None = None,
+    parent_id: str | None = None,
+    task_type: str = "task",
+) -> bool:
+    """Return True if an active task exists in the same logical recurring series."""
     row = conn.execute(
-        "SELECT id FROM tasks WHERE title = ? COLLATE NOCASE AND status IN ('not_started', 'in_progress') LIMIT 1",
-        (title,),
+        "SELECT id FROM tasks WHERE title = ? COLLATE NOCASE AND project IS ? "
+        "AND parent_id IS ? AND type = ? "
+        "AND status IN ('not_started', 'in_progress') LIMIT 1",
+        (title, project, parent_id, task_type),
     ).fetchone()
     return row is not None
 
@@ -200,7 +208,13 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
         if not matches_schedule(config, today):
             continue
 
-        if has_active_duplicate(conn, task["title"]):
+        if has_active_duplicate(
+            conn,
+            task["title"],
+            task["project"],
+            task["parent_id"],
+            task["type"] or "task",
+        ):
             print(
                 f"  [skip] '{task['title']}' — active task already exists",
             )
@@ -234,13 +248,23 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
                 conn,
                 new_task["id"],
                 MERGEABLE_FIELDS,
+                timestamp=timestamp,
                 new_values={f: new_task.get(f) for f in MERGEABLE_FIELDS},
             )
             # Track last_spawned in source task's recurring config for interval scheduling
             config["last_spawned"] = today.isoformat()
+            updated_recurring = json.dumps(config)
             conn.execute(
-                "UPDATE tasks SET recurring = ? WHERE id = ?",
-                (json.dumps(config), task["id"]),
+                "UPDATE tasks SET recurring = ?, updated_at = ? WHERE id = ?",
+                (updated_recurring, timestamp, task["id"]),
+            )
+            upsert_field_versions(
+                conn,
+                task["id"],
+                ("recurring",),
+                timestamp=timestamp,
+                old_values={"recurring": raw_recurring},
+                new_values={"recurring": updated_recurring},
             )
             print(
                 f"  Created: title='{new_task['title']}'"

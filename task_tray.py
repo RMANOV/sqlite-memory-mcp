@@ -367,6 +367,21 @@ class TaskDB:
             self.on_change()
         return task_id
 
+    @staticmethod
+    def _recurring_series_key(raw: str | None) -> str | None:
+        """Normalize recurring config for sibling matching."""
+        if not raw:
+            return None
+        try:
+            config = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw
+        if not isinstance(config, dict):
+            return raw
+        config = dict(config)
+        config.pop("last_spawned", None)
+        return json.dumps(config, sort_keys=True, separators=(",", ":"))
+
     def mark_done(self, task_id):
         """Set status=done."""
         now = now_iso()
@@ -375,7 +390,11 @@ class TaskDB:
                 "SELECT status FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             old_status = old_row["status"] if old_row else None
-            TaskDAO.update(self._conn, task_id, {"status": "done", "updated_at": now})
+            updated = TaskDAO.update(
+                self._conn, task_id, {"status": "done", "updated_at": now}
+            )
+            if updated == 0:
+                return False
             upsert_field_versions(
                 self._conn,
                 task_id,
@@ -386,11 +405,12 @@ class TaskDB:
             )
         if self.on_change:
             self.on_change()
+        return True
 
     def update_task(self, task_id, **fields):
         """Update arbitrary fields on a task."""
         if not fields:
-            return
+            return False
         now = now_iso()
         changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
         fields["updated_at"] = now
@@ -403,7 +423,9 @@ class TaskDB:
                 old_values = {k: old_row[k] for k in changed} if old_row else {}
             else:
                 old_values = {}
-            TaskDAO.update(self._conn, task_id, fields)
+            updated = TaskDAO.update(self._conn, task_id, fields)
+            if updated == 0:
+                return False
             if changed:
                 upsert_field_versions(
                     self._conn,
@@ -415,6 +437,7 @@ class TaskDB:
                 )
         if self.on_change:
             self.on_change()
+        return True
 
     def delete_task(self, task_id):
         """Soft-delete: cancel task (creates tombstone for bridge sync).
@@ -422,12 +445,18 @@ class TaskDB:
         now = now_iso()
         with self._transact(self._conn):
             # Read task metadata before cancelling
-            row = TaskDAO.get_by_id(self._conn, task_id, "title, recurring, project, status")
+            row = TaskDAO.get_by_id(
+                self._conn,
+                task_id,
+                "title, recurring, project, parent_id, type, status",
+            )
             old_status = row["status"] if row else None
             # Cancel the target task
-            TaskDAO.update(
+            updated = TaskDAO.update(
                 self._conn, task_id, {"status": "cancelled", "updated_at": now}
             )
+            if updated == 0:
+                return False
             upsert_field_versions(
                 self._conn,
                 task_id,
@@ -438,13 +467,22 @@ class TaskDB:
             )
             # For recurring tasks: cancel all done siblings to break spawn cycle
             if row and row["recurring"]:
+                series_key = self._recurring_series_key(row["recurring"])
                 sibling_ids = [
                     s["id"]
                     for s in self._conn.execute(
-                        "SELECT id FROM tasks WHERE title=? AND status='done' "
-                        "AND recurring IS NOT NULL AND id!=? AND project IS ?",
-                        (row["title"], task_id, row["project"]),
+                        "SELECT id, recurring FROM tasks WHERE title=? AND status='done' "
+                        "AND recurring IS NOT NULL AND id!=? AND project IS ? "
+                        "AND parent_id IS ? AND type=?",
+                        (
+                            row["title"],
+                            task_id,
+                            row["project"],
+                            row["parent_id"],
+                            row["type"],
+                        ),
                     ).fetchall()
+                    if self._recurring_series_key(s["recurring"]) == series_key
                 ]
                 if sibling_ids:
                     ph = ",".join("?" * len(sibling_ids))
@@ -464,6 +502,7 @@ class TaskDB:
                         )
         if self.on_change:
             self.on_change()
+        return True
 
     # ── Entity Link helpers (v2.2.0) ─────────────────────────────────
 
@@ -698,7 +737,7 @@ class TaskDB:
         """Create a manual link between a task and an entity."""
         now = now_iso()
         try:
-            with self._transact() as conn:
+            with self._transact(self._conn) as conn:
                 TaskDAO.link_entity(conn, task_id, entity_id, link_type, created_at=now)
             return True
         except (sqlite3.OperationalError, sqlite3.IntegrityError):
@@ -713,7 +752,7 @@ class TaskDB:
 
     def unlink_task_entity(self, task_id: str, entity_id: int) -> bool:
         """Remove a link between a task and an entity."""
-        with self._transact() as conn:
+        with self._transact(self._conn) as conn:
             removed = TaskDAO.unlink_entity(conn, task_id, entity_id)
         return removed > 0
 

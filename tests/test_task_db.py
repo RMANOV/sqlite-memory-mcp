@@ -110,3 +110,59 @@ class TestTaskDB:
         db.update_task(db.get_tasks()[0]["id"], title="Changed")
         db.delete_task(db.get_tasks()[0]["id"])
         assert len(calls) == 4
+
+    def test_link_and_unlink_entity(self, db):
+        tid = db.add_task("Task with link")
+        db._conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL, created_at TEXT, updated_at TEXT)"
+        )
+        db._conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))",
+            ("EntityA", "concept"),
+        )
+        entity_id = db._conn.execute(
+            "SELECT id FROM entities WHERE name = ?", ("EntityA",)
+        ).fetchone()[0]
+
+        assert db.link_task_entity(tid, entity_id) is True
+        links = db.get_task_links(tid)
+        assert len(links) == 1
+        assert links[0]["entity_name"] == "EntityA"
+
+        assert db.unlink_task_entity(tid, entity_id) is True
+        assert db.get_task_links(tid) == []
+
+    def test_missing_task_mutations_do_not_create_audit_rows(self, db):
+        assert db.mark_done("ghost") is False
+        assert db.update_task("ghost", title="Updated") is False
+        assert db.delete_task("ghost") is False
+        count = db._conn.execute(
+            "SELECT COUNT(*) FROM task_field_versions WHERE task_id = 'ghost'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_delete_task_only_cancels_matching_recurring_series(self, db):
+        recurring_weekly = '{"every":"week","day":"monday"}'
+        recurring_monthly = '{"every":"month","day":15}'
+
+        target_id = db.add_task("Recurring Review", project="ops", status="done")
+        db.update_task(target_id, recurring=recurring_weekly)
+
+        same_series_id = db.add_task("Recurring Review", project="ops", status="done")
+        db.update_task(same_series_id, recurring=recurring_weekly)
+
+        other_series_id = db.add_task("Recurring Review", project="ops", status="done")
+        db.update_task(other_series_id, recurring=recurring_monthly)
+
+        assert db.delete_task(target_id) is True
+
+        rows = {
+            row["id"]: row["status"]
+            for row in db._conn.execute(
+                "SELECT id, status FROM tasks WHERE id IN (?, ?, ?)",
+                (target_id, same_series_id, other_series_id),
+            ).fetchall()
+        }
+        assert rows[target_id] == "cancelled"
+        assert rows[same_series_id] == "cancelled"
+        assert rows[other_series_id] == "done"
