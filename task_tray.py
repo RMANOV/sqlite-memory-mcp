@@ -2581,28 +2581,28 @@ class TaskReaderDialog(QDialog):
             conn = sqlite3.connect(self.db.db_path)
             conn.row_factory = sqlite3.Row
             tid = self.task.get("id")
-            pack_row = conn.execute(
-                "SELECT body, freshness_score FROM context_packs "
-                "WHERE target_ref = ? AND pack_type = 'executor' "
-                "ORDER BY created_at DESC LIMIT 1",
-                (tid,),
-            ).fetchone()
+            from context_packer import build_context_pack as _build_context_pack
 
-            if not pack_row:
-                pack_row = conn.execute(
-                    "SELECT body, freshness_score FROM context_packs "
-                    "WHERE target_ref IS NULL AND pack_type = 'executor' "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()
-
-            if pack_row and pack_row["body"].strip():
-                ai_score = (pack_row["freshness_score"] or 0) * 100
-                ai_text = _html.escape(pack_row["body"]).replace("\n", "<br>")
+            pack_result = _build_context_pack(
+                conn,
+                "executor",
+                target_ref=tid,
+                token_budget=1600,
+                persist=False,
+            )
+            if (
+                pack_result.get("items_included", 0) > 0
+                and pack_result.get("body", "").strip()
+            ):
+                match_score = (pack_result.get("relevance_score") or 0.0) * 100
+                trust_score = (pack_result.get("quality_score") or 0.0) * 100
+                freshness_score = (pack_result.get("freshness_score") or 0.0) * 100
+                ai_text = _html.escape(pack_result["body"]).replace("\n", "<br>")
                 body_html += (
                     f'<div style="margin-top:25px; padding:15px; background:rgba(40, 60, 90, 0.3); '
                     f'border-left: 4px solid #58a6ff; border-radius:3px;">'
                     f'<div style="color:#58a6ff; font-weight:bold; font-size:12px; margin-bottom:8px; text-transform:uppercase;">'
-                    f"⬡ Intelligence Context (Relevance: {ai_score:.0f}%)</div>"
+                    f"⬡ Intelligence Context (Match: {match_score:.0f}% • Trust: {trust_score:.0f}% • Fresh: {freshness_score:.0f}%)</div>"
                     f'<div style="color:#c9d1d9; font-size:13px; line-height:1.5;">{ai_text}</div></div>'
                 )
         except Exception:
@@ -3902,7 +3902,10 @@ class FullWindow(QMainWindow):
             try:
                 from intelligence_v2 import assess_context as _assess
                 from claim_graph import extract_candidate_claims as _extract
-                from context_packer import build_context_pack as _pack
+                from context_packer import (
+                    build_context_pack as _pack,
+                    warm_recent_task_packs as _warm_task_packs,
+                )
                 from impact_graph import explain_impact as _impact
                 from db_utils import get_conn
                 import time
@@ -3911,6 +3914,7 @@ class FullWindow(QMainWindow):
                 claims = 0
                 promoted = 0
                 impacts = 0
+                task_packs = 0
 
                 # Fetch pending chunks (brief read-only connection)
                 with get_conn(self.db.db_path) as conn:
@@ -3963,6 +3967,11 @@ class FullWindow(QMainWindow):
                 self._enrich_running.emit("AI: Compiling knowledge context pack...")
                 with get_conn(self.db.db_path) as conn:
                     _pack(conn, "executor")
+                    self._enrich_running.emit("AI: Warming task-specific packs...")
+                    task_pack_stats = _warm_task_packs(
+                        conn, pack_type="executor", limit=8
+                    )
+                    task_packs = task_pack_stats.get("task_packs_with_context", 0)
 
                     if depth == "deep":
                         from lazy_enrichment import run_health_sweep
@@ -3983,7 +3992,7 @@ class FullWindow(QMainWindow):
 
                 self._enrich_done.emit(
                     f"Intelligence Pass Complete: {assessed} chunks, {claims} candidates, "
-                    f"{promoted} facts promoted."
+                    f"{promoted} facts promoted, {task_packs} task packs warmed."
                 )
             except Exception as exc:
                 self._enrich_done.emit(f"Enrich error: {exc}")

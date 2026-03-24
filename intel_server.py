@@ -29,6 +29,7 @@ from claim_graph import (
 )
 from context_packer import (
     build_context_pack as _build_pack,
+    warm_recent_task_packs as _warm_task_packs,
 )
 from impact_graph import explain_impact as _explain_impact
 
@@ -274,9 +275,13 @@ def enrich_context(depth: str = "quick") -> str:
             {
                 "pack": pack.get("pack_id"),
                 "tokens": pack.get("token_usage", 0),
+                "relevance": pack.get("relevance_score", 0.0),
+                "quality": pack.get("quality_score", 0.0),
             }
         )
         results["pack_body"] = pack.get("body", "")
+        task_pack_stats = _warm_task_packs(conn, pack_type="executor", limit=8)
+        results["steps"].append(task_pack_stats)
 
         if depth in ("standard", "deep"):
             # Step 3: Extract claims from enrichable chunks
