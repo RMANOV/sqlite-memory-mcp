@@ -259,9 +259,38 @@ METADATA_FIELDS = (
 
 CONTENT_FIELDS = ("description", "notes")
 
+CONTENT_SHRINK_GUARD_MIN_CHARS = 1000
+CONTENT_SHRINK_GUARD_RATIO = 0.5
+
 # Fields that enrichment pipelines must NEVER modify — only user/bridge can write these.
 # Invariant: enrichment = add new records (facts, claims, chunks), never modify existing content.
 ENRICHMENT_PROTECTED_FIELDS = frozenset({"title", "description", "notes"})
+
+
+def content_length(value: Any) -> int:
+    """Return trimmed length for text-like content, else 0."""
+    if value is None:
+        return 0
+    return len(str(value).strip())
+
+
+def has_meaningful_content(value: Any) -> bool:
+    """True when a content field has non-whitespace text."""
+    return content_length(value) > 0
+
+
+def is_suspicious_content_shrink(
+    old_value: Any,
+    new_value: Any,
+    *,
+    min_chars: int = CONTENT_SHRINK_GUARD_MIN_CHARS,
+    ratio: float = CONTENT_SHRINK_GUARD_RATIO,
+) -> bool:
+    """Flag likely data loss when substantial content collapses to a much shorter value."""
+    old_len = content_length(old_value)
+    if old_len < min_chars:
+        return False
+    return content_length(new_value) < (old_len * ratio)
 
 
 def assert_enrichment_safe(fields: dict[str, Any] | set[str] | list[str]) -> None:
@@ -1259,20 +1288,33 @@ def merge_import_tasks(
 
                 # Lexicographic: (timestamp, machine_id) — higher wins
                 if (remote_ts, remote_by) > (local_ts, local_by):
-                    # Content protection: never overwrite non-NULL local with NULL remote
-                    if field in CONTENT_FIELDS and remote_val is None:
+                    # Content protection: never nullify or drastically shrink local content
+                    if field in CONTENT_FIELDS:
                         local_content = conn.execute(
                             f"SELECT {field} FROM tasks WHERE id = ?", (local_id,)
                         ).fetchone()
-                        if local_content and local_content[0]:
+                        local_val = local_content[0] if local_content else None
+                        if has_meaningful_content(
+                            local_val
+                        ) and not has_meaningful_content(remote_val):
                             _log.warning(
                                 "LWW content protection: keeping local %s for task %s "
-                                "(remote is NULL but local has %d chars)",
+                                "(remote is empty but local has %d chars)",
                                 field,
                                 local_id,
-                                len(str(local_content[0])),
+                                content_length(local_val),
                             )
-                            continue  # Skip — don't nullify content
+                            continue
+                        if is_suspicious_content_shrink(local_val, remote_val):
+                            _log.warning(
+                                "LWW shrink guard: keeping local %s for task %s "
+                                "(remote would shrink %d -> %d chars)",
+                                field,
+                                local_id,
+                                content_length(local_val),
+                                content_length(remote_val),
+                            )
+                            continue
                     fields_to_update[field] = remote_val
                     conn.execute(
                         "INSERT OR REPLACE INTO task_field_versions "

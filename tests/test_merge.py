@@ -564,7 +564,9 @@ def test_lww_content_protection_no_nullify(conn):
     new_ts = "2026-01-02T00:00:00"
 
     _insert_task(conn, tid, description="Important content", updated_at=old_ts)
-    upsert_field_versions(conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A")
+    upsert_field_versions(
+        conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A"
+    )
 
     remote = [
         {
@@ -582,6 +584,36 @@ def test_lww_content_protection_no_nullify(conn):
     assert row["description"] == "Important content"  # Local preserved
 
 
+def test_lww_content_protection_blocks_drastic_shrink(conn):
+    """LWW must not overwrite substantial local content with a tiny remote value."""
+    tid = "test-content-shrink"
+    old_ts = "2026-01-01T00:00:00"
+    new_ts = "2026-01-02T00:00:00"
+    local_desc = "L" * 2400
+
+    _insert_task(conn, tid, description=local_desc, updated_at=old_ts)
+    upsert_field_versions(
+        conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A"
+    )
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Test",
+            "status": "not_started",
+            "description": "tiny remote summary",
+            "_field_ts": {"description": [new_ts, "machine-B"]},
+            "updated_at": new_ts,
+        }
+    ]
+    _, updated = merge_import_tasks(conn, remote, import_content=True)
+
+    row = conn.execute("SELECT description FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["description"] == local_desc
+    assert _fv(conn, tid, "description") == (old_ts, "machine-A")
+    assert updated >= 0
+
+
 def test_lww_content_overwrite_when_remote_has_value(conn):
     """LWW should still overwrite when remote has actual new content."""
     tid = "test-content-overwrite"
@@ -589,7 +621,9 @@ def test_lww_content_overwrite_when_remote_has_value(conn):
     new_ts = "2026-01-02T00:00:00"
 
     _insert_task(conn, tid, description="Old content", updated_at=old_ts)
-    upsert_field_versions(conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A")
+    upsert_field_versions(
+        conn, tid, ["description"], timestamp=old_ts, machine_id="machine-A"
+    )
 
     remote = [
         {
@@ -612,24 +646,46 @@ def test_lww_content_overwrite_when_remote_has_value(conn):
 
 def test_dedup_guard_blocks_recently_cancelled_title(conn):
     """New remote task with same title as recently cancelled local should be skipped."""
-    _insert_task(conn, "old-1", title="Weekly review", status="cancelled",
-                 updated_at=now_iso())
+    _insert_task(
+        conn, "old-1", title="Weekly review", status="cancelled", updated_at=now_iso()
+    )
     upsert_field_versions(conn, "old-1", ["status"], now_iso())
 
-    remote = [{"id": "new-uuid-dedup", "title": "Weekly review", "status": "not_started",
-               "updated_at": now_iso(), "_field_ts": {}}]
+    remote = [
+        {
+            "id": "new-uuid-dedup",
+            "title": "Weekly review",
+            "status": "not_started",
+            "updated_at": now_iso(),
+            "_field_ts": {},
+        }
+    ]
     new_count, _ = merge_import_tasks(conn, remote, import_content=False)
     assert new_count == 0  # Blocked by dedup
-    assert conn.execute("SELECT id FROM tasks WHERE id='new-uuid-dedup'").fetchone() is None
+    assert (
+        conn.execute("SELECT id FROM tasks WHERE id='new-uuid-dedup'").fetchone()
+        is None
+    )
 
 
 def test_dedup_guard_allows_different_title(conn):
     """Dedup guard should not block tasks with different titles."""
-    _insert_task(conn, "old-2", title="Weekly review", status="cancelled",
-                 updated_at=now_iso())
+    _insert_task(
+        conn, "old-2", title="Weekly review", status="cancelled", updated_at=now_iso()
+    )
 
-    remote = [{"id": "new-uuid-diff", "title": "Daily standup", "status": "not_started",
-               "updated_at": now_iso(), "_field_ts": {}}]
+    remote = [
+        {
+            "id": "new-uuid-diff",
+            "title": "Daily standup",
+            "status": "not_started",
+            "updated_at": now_iso(),
+            "_field_ts": {},
+        }
+    ]
     new_count, _ = merge_import_tasks(conn, remote, import_content=False)
     assert new_count == 1
-    assert conn.execute("SELECT id FROM tasks WHERE id='new-uuid-diff'").fetchone() is not None
+    assert (
+        conn.execute("SELECT id FROM tasks WHERE id='new-uuid-diff'").fetchone()
+        is not None
+    )

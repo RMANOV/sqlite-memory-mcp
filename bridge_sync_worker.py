@@ -35,6 +35,9 @@ from db_utils import (
     export_index_json,
     load_task_content,
     CONTENT_FIELDS,
+    content_length,
+    has_meaningful_content,
+    is_suspicious_content_shrink,
     merge_import_tasks,
     migrate_to_per_task_files,
     get_conn,  # I3: managed connection — handles PRAGMAs, BEGIN/COMMIT/ROLLBACK, close
@@ -104,9 +107,12 @@ def _check_sync_safety(
     stats = {
         "descriptions_added": 0,
         "descriptions_removed": 0,
+        "descriptions_shrunk": 0,
         "notes_added": 0,
         "notes_removed": 0,
+        "notes_shrunk": 0,
         "tasks_removed": 0,
+        "examples": [],
     }
 
     for task_file in tasks_dir.glob("*.json"):
@@ -129,19 +135,53 @@ def _check_sync_safety(
 
         bridge_desc = bridge_task.get("description")
         local_desc = local["description"]
-        if bridge_desc and not local_desc:
+        if has_meaningful_content(bridge_desc) and not has_meaningful_content(
+            local_desc
+        ):
             stats["descriptions_removed"] += 1
-        elif not bridge_desc and local_desc:
+        elif not has_meaningful_content(bridge_desc) and has_meaningful_content(
+            local_desc
+        ):
             stats["descriptions_added"] += 1
+        elif is_suspicious_content_shrink(bridge_desc, local_desc):
+            stats["descriptions_shrunk"] += 1
+            if len(stats["examples"]) < 5:
+                stats["examples"].append(
+                    {
+                        "task_id": tid,
+                        "field": "description",
+                        "bridge_len": content_length(bridge_desc),
+                        "local_len": content_length(local_desc),
+                    }
+                )
 
         bridge_notes = bridge_task.get("notes")
         local_notes = local["notes"]
-        if bridge_notes and not local_notes:
+        if has_meaningful_content(bridge_notes) and not has_meaningful_content(
+            local_notes
+        ):
             stats["notes_removed"] += 1
-        elif not bridge_notes and local_notes:
+        elif not has_meaningful_content(bridge_notes) and has_meaningful_content(
+            local_notes
+        ):
             stats["notes_added"] += 1
+        elif is_suspicious_content_shrink(bridge_notes, local_notes):
+            stats["notes_shrunk"] += 1
+            if len(stats["examples"]) < 5:
+                stats["examples"].append(
+                    {
+                        "task_id": tid,
+                        "field": "notes",
+                        "bridge_len": content_length(bridge_notes),
+                        "local_len": content_length(local_notes),
+                    }
+                )
 
-    stats["is_safe"] = stats["descriptions_removed"] < threshold
+    stats["is_safe"] = (
+        stats["descriptions_removed"] < threshold
+        and stats["descriptions_shrunk"] == 0
+        and stats["notes_shrunk"] == 0
+    )
     return stats
 
 
@@ -425,7 +465,12 @@ def main(
                     conn, remote_tasks, import_content=True
                 )
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
-            except (sqlite3.OperationalError, sqlite3.IntegrityError, json.JSONDecodeError, ValueError) as exc:
+            except (
+                sqlite3.OperationalError,
+                sqlite3.IntegrityError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as exc:
                 log.warning("index.json merge failed: %s", exc)
         elif shared_path.exists():
             try:
@@ -434,7 +479,12 @@ def main(
                     conn, remote_data.get("tasks", []), import_content=True
                 )
                 log.info("Imported %d new, updated %d from remote", new_t, upd_t)
-            except (sqlite3.OperationalError, sqlite3.IntegrityError, json.JSONDecodeError, ValueError) as exc:
+            except (
+                sqlite3.OperationalError,
+                sqlite3.IntegrityError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as exc:
                 log.warning("Task merge from shared.json failed: %s", exc)
     # Task import transaction closed — DB lock released
 
@@ -444,9 +494,12 @@ def main(
             safety = _check_sync_safety(conn, bridge_dir)
         if not safety["is_safe"]:
             log.warning(
-                "SAFETY VALVE: %d descriptions would be removed, %d notes would be removed",
+                "SAFETY VALVE: %d descriptions removed, %d notes removed, "
+                "%d descriptions shrunk, %d notes shrunk",
                 safety["descriptions_removed"],
                 safety["notes_removed"],
+                safety["descriptions_shrunk"],
+                safety["notes_shrunk"],
             )
             # Write notification for hook to surface to user
             _notify_path = (
@@ -457,15 +510,19 @@ def main(
                     f.write(
                         f"{now_iso()} WARN safety_valve_block: "
                         f"{safety['descriptions_removed']} descriptions, "
-                        f"{safety['notes_removed']} notes would be deleted\n"
+                        f"{safety['notes_removed']} notes deleted, "
+                        f"{safety['descriptions_shrunk']} descriptions shrunk, "
+                        f"{safety['notes_shrunk']} notes shrunk\n"
                     )
             except OSError:
                 pass
             _progress(
                 progress_callback,
                 -1,
-                f"BLOCKED: {safety['descriptions_removed']} descriptions + "
-                f"{safety['notes_removed']} notes would be deleted. "
+                f"BLOCKED: {safety['descriptions_removed']} descriptions removed, "
+                f"{safety['notes_removed']} notes removed, "
+                f"{safety['descriptions_shrunk']} descriptions shrunk, "
+                f"{safety['notes_shrunk']} notes shrunk. "
                 f"Run with --force to override.",
             )
             return {
