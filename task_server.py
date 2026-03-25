@@ -142,12 +142,24 @@ def create_task_or_note(
             reminder_at=reminder_at,
             type=type,
         )
-        _upsert_field_versions(conn, task_id, _MERGEABLE_FIELDS, now,
-            new_values={"title": title, "description": description,
-                        "priority": priority, "section": section,
-                        "due_date": due_date, "project": project,
-                        "parent_id": parent_id, "notes": notes,
-                        "recurring": recurring, "type": type})
+        _upsert_field_versions(
+            conn,
+            task_id,
+            _MERGEABLE_FIELDS,
+            now,
+            new_values={
+                "title": title,
+                "description": description,
+                "priority": priority,
+                "section": section,
+                "due_date": due_date,
+                "project": project,
+                "parent_id": parent_id,
+                "notes": notes,
+                "recurring": recurring,
+                "type": type,
+            },
+        )
         _vec_sync_task_safe(conn, task_id)
 
     logger.info("create_task_or_note: %s (%s)", title, task_id)
@@ -320,9 +332,9 @@ def query_tasks(
         params.extend(_TASK_ACTIVE_EXCLUSIONS)
 
     if summary_only:
-        cols = "t.id, t.title, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id, t.notes"
+        cols = "t.id, t.title, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id, t.notes, t.created_at, t.updated_at"
     else:
-        cols = "t.id, t.title, t.description, t.notes, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id"
+        cols = "t.id, t.title, t.description, t.notes, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id, t.created_at, t.updated_at"
 
     from_clause = "tasks t"
     order_clause = (
@@ -362,16 +374,17 @@ def query_tasks(
         )
 
     lines = [
-        "| # | Title | Status | Priority | Section | Due | Project | Notes |",
-        "|---|-------|--------|----------|---------|-----|---------|-------|",
+        "| # | Title | Status | Priority | Section | Due | Project | Created | Notes |",
+        "|---|-------|--------|----------|---------|-----|---------|---------|-------|",
     ]
     for i, r in enumerate(rows, 1):
         due = r["due_date"] or "—"
         proj = r["project"] or "—"
+        created = (r.get("created_at") or "—")[:16]
         notes = (r["notes"] or "—")[:80]
         lines.append(
             f"| {i + offset} | {r['title']} | {r['status']} | {r['priority']} "
-            f"| {r['section']} | {due} | {proj} | {notes} |"
+            f"| {r['section']} | {due} | {proj} | {created} | {notes} |"
         )
 
     result = {
@@ -493,9 +506,14 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
         now = _now()
         affected_ids = TaskDAO.archive_done(conn, older_than_days)
         for tid in affected_ids:
-            _upsert_field_versions(conn, tid, ("status",), now,
+            _upsert_field_versions(
+                conn,
+                tid,
+                ("status",),
+                now,
                 old_values={"status": "done"},
-                new_values={"status": "archived"})
+                new_values={"status": "archived"},
+            )
 
     logger.info(
         "archive_done_tasks: %d archived (older than %d days)",
@@ -543,9 +561,16 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
             TaskDAO.update(
                 conn, row["id"], {"priority": target_priority, "updated_at": now}
             )
-            _upsert_field_versions(conn, row["id"], ("priority",), now,
-                old_values={"priority": old_priority["priority"] if old_priority else None},
-                new_values={"priority": target_priority})
+            _upsert_field_versions(
+                conn,
+                row["id"],
+                ("priority",),
+                now,
+                old_values={
+                    "priority": old_priority["priority"] if old_priority else None
+                },
+                new_values={"priority": target_priority},
+            )
             bumped += 1
 
     logger.info("bump_overdue_priority: %d bumped to %s", bumped, target_priority)
