@@ -406,14 +406,24 @@ def main(
                 f.write(f"{now_iso()} git_pull_failed: {pull_result.stderr.strip()}\n")
         except OSError:
             pass
-        _progress(progress_callback, 100, "Done (pull failed)")
-        return {
-            "entities": 0,
-            "tasks": 0,
-            "pushed": False,
-            "imported_new": 0,
-            "imported_updated": 0,
-        }
+        # Auto-recover from merge conflicts: DB is source of truth, export will re-create
+        _stderr = pull_result.stderr or ""
+        if any(kw in _stderr for kw in ("unmerged", "conflict", "CONFLICT")):
+            log.warning(
+                "Merge conflict detected — aborting rebase and resetting to remote"
+            )
+            _git("rebase", "--abort", bridge_dir=bridge_dir)
+            _git("reset", "--hard", "origin/main", bridge_dir=bridge_dir)
+            log.warning("Reset to origin/main; export phase will re-create shared.json")
+        else:
+            _progress(progress_callback, 100, "Done (pull failed)")
+            return {
+                "entities": 0,
+                "tasks": 0,
+                "pushed": False,
+                "imported_new": 0,
+                "imported_updated": 0,
+            }
 
     # Phase 3a-1: Import entities (own transaction — survives task merge failures)
     shared_path = Path(bridge_dir) / "shared.json"

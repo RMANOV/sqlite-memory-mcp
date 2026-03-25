@@ -400,6 +400,17 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     pull_result = _git("pull", "--rebase", "--autostash")
     if pull_result.returncode != 0:
         logger.warning("bridge_push: git pull failed: %s", pull_result.stderr.strip())
+        # Auto-recover from merge conflicts: DB is source of truth, export will re-create
+        _stderr = pull_result.stderr or ""
+        if any(kw in _stderr for kw in ("unmerged", "conflict", "CONFLICT")):
+            logger.warning(
+                "bridge_push: merge conflict — aborting rebase, resetting to origin/main"
+            )
+            _git("rebase", "--abort")
+            _git("reset", "--hard", "origin/main")
+            logger.warning(
+                "bridge_push: reset to origin/main; export will re-create shared.json"
+            )
 
     # v2.0.0: One-time migration shared.json → per-task files
     _migrate_to_per_task_files(BRIDGE_REPO)
