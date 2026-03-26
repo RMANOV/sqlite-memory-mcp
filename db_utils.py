@@ -439,20 +439,22 @@ def bulk_conn(db_path: str | None = None):
 log = logging.getLogger(__name__)
 
 
-def git_run(repo_dir: str, *args: str) -> subprocess.CompletedProcess:
+def git_run(
+    repo_dir: str, *args: str, timeout: int = 30
+) -> subprocess.CompletedProcess:
     """Run git command in specified repo directory."""
     return subprocess.run(
         ["git", *args],
         cwd=repo_dir,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=timeout,
         **_NOWIN,
     )
 
 
 def git_retry(
-    repo_dir: str, *args: str, max_retries: int = 3
+    repo_dir: str, *args: str, max_retries: int = 3, timeout: int = 30
 ) -> subprocess.CompletedProcess:
     """Git command with exponential backoff retry."""
     import time
@@ -460,7 +462,7 @@ def git_retry(
     delays = [2, 4, 8]
     last_result = None
     for attempt in range(max_retries):
-        last_result = git_run(repo_dir, *args)
+        last_result = git_run(repo_dir, *args, timeout=timeout)
         if last_result.returncode == 0:
             return last_result
         if attempt < max_retries - 1:

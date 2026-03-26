@@ -19,12 +19,12 @@ from db_utils import (
     fts_query as _fts_query,
     tokenize_for_similarity as _tokenize,
     fts_sync_entity as _fts_sync,
+    setup_logger,
     TaskDAO,
 )
 from schema import init_db, error as _error
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-entity", "entity_server.log")
 

@@ -12,7 +12,10 @@ import json
 
 from fastmcp import FastMCP
 
-from db_utils import get_conn as _get_conn
+from db_utils import (
+    get_conn as _get_conn,
+    setup_logger,
+)
 from schema import init_db
 from intelligence_v2 import (
     assess_context as _assess_context,
@@ -32,7 +35,6 @@ from context_packer import (
 from impact_graph import explain_impact as _explain_impact
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-intel", "intel_server.log")
 

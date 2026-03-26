@@ -34,6 +34,7 @@ from db_utils import (
     now_iso as _now,
     parse_iso_datetime_for_compare as _parse_iso_dt,
     sanitize_task_enums as _sanitize_task_enums,
+    setup_logger,
     upsert_field_versions as _upsert_field_versions,
     merge_import_tasks as _merge_import_tasks,
     export_task_files as _export_task_files,
@@ -54,7 +55,6 @@ from schema import (
 init_db()
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-bridge", "bridge_server.log")
 

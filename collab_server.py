@@ -34,6 +34,7 @@ from db_utils import (
     VERIFICATION_WEIGHTS as _VERIFICATION_WEIGHTS,
     RATING_BURST_THRESHOLD as _RATING_BURST_THRESHOLD,
     RATING_BURST_WINDOW_HOURS as _RATING_BURST_WINDOW_HOURS,
+    setup_logger,
 )
 from schema import (
     init_db,
@@ -41,7 +42,6 @@ from schema import (
 )
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-collab", "collab_server.log")
 

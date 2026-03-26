@@ -25,6 +25,7 @@ from db_utils import (
     now_iso as _now,
     fts_sync_entity as _fts_sync,
     serialize_entity as _serialize_entity,
+    setup_logger,
     export_relations as _export_relations,
 )
 from schema import init_db
@@ -43,7 +44,6 @@ except ImportError:
 
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-kb", "server.log")
 

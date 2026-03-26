@@ -23,6 +23,7 @@ from db_utils import (
     validate_task_fields as _validate_task_fields,
     build_priority_order_sql,
     now_iso as _now,
+    setup_logger,
     upsert_field_versions as _upsert_field_versions,
 )
 
@@ -30,7 +31,6 @@ from db_utils import (
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-tasks", "task_server.log")
 

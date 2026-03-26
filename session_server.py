@@ -17,11 +17,11 @@ from db_utils import (
     get_conn as _get_conn,
     fts_query as _fts_query,
     now_iso as _now,
+    setup_logger,
 )
 from schema import init_db, error as _error
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-from db_utils import setup_logger
 
 logger = setup_logger("sqlite-session", "session_server.log")
 

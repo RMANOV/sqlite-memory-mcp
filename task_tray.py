@@ -35,8 +35,6 @@ from task_search import TaskSearchEngine
 from db_utils import (
     DB_PATH,
     MERGEABLE_FIELDS,
-    PRIORITY_COLORS,
-    TASK_PRIORITIES,
     TaskDAO,
     get_conn,
     is_overdue,
@@ -45,29 +43,8 @@ from db_utils import (
     upsert_field_versions,
 )
 
-PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
-
-# Upper-case priority colors for UI lookups
-_PRIORITY_COLORS_UPPER = {k.upper(): v for k, v in PRIORITY_COLORS.items()}
-
-# Columns needed by UI rendering (excludes parent_id, notes, assignee, shared_by, publish_requested_at)
-_UI_COLS = "id, title, description, notes, status, section, priority, due_date, project, type, recurring, reminder_at, visibility, updated_at, created_at"
-
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200
-
-# Entity type → badge color (shared between TaskReaderDialog + entity search cards)
-_ENTITY_TYPE_COLORS = {
-    "concept": "#1a3a5c",
-    "tool": "#2d6a2e",
-    "person": "#8b4513",
-    "project": "#4a148c",
-    "technology": "#00695c",
-    "fact": "#555",
-    "claim": "#8b6914",
-    "process": "#2e4057",
-}
-_ENTITY_DEFAULT_COLOR = "#555"
 
 
 class TaskDB:
