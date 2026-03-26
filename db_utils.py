@@ -1648,11 +1648,13 @@ def migrate_to_per_task_files(bridge_dir: str) -> bool:
 # ── Per-Entity File Export/Import ─────────────────────────────────────
 
 
-def export_entity_files(conn: sqlite3.Connection, bridge_dir: str) -> list[int]:
+def export_entity_files(
+    conn: sqlite3.Connection, bridge_dir: str
+) -> tuple[list[int], list[sqlite3.Row]]:
     """Export shared entities to per-entity JSON files in entities/ directory.
 
     Each file: entities/{id}.json with full observations.
-    Returns list of exported entity IDs.
+    Returns (exported_ids, entity_rows) — pass rows to export_entities_index().
     """
     entities_dir = Path(bridge_dir) / "entities"
     entities_dir.mkdir(exist_ok=True)
@@ -1663,7 +1665,7 @@ def export_entity_files(conn: sqlite3.Connection, bridge_dir: str) -> list[int]:
     ).fetchall()
 
     if not rows:
-        return []
+        return [], []
 
     # Batch-fetch all observations for shared entities (avoid N+1)
     eids = [r["id"] for r in rows]
@@ -1703,15 +1705,21 @@ def export_entity_files(conn: sqlite3.Connection, bridge_dir: str) -> list[int]:
         if f.stem not in active_ids:
             f.unlink()
 
-    return exported
+    return exported, list(rows)
 
 
-def export_entities_index(conn: sqlite3.Connection, bridge_dir: str) -> int:
-    """Write entities_index.json — metadata only, no observations."""
-    rows = conn.execute(
-        f"SELECT {ENTITY_EXPORT_COLS} FROM entities "
-        "WHERE project LIKE 'shared%' ORDER BY name"
-    ).fetchall()
+def export_entities_index(
+    conn: sqlite3.Connection, bridge_dir: str, rows: list | None = None
+) -> int:
+    """Write entities_index.json — metadata only, no observations.
+
+    Pass rows from export_entity_files() to avoid a redundant query.
+    """
+    if rows is None:
+        rows = conn.execute(
+            f"SELECT {ENTITY_EXPORT_COLS} FROM entities "
+            "WHERE project LIKE 'shared%' ORDER BY name"
+        ).fetchall()
 
     # Batch-fetch observation counts
     eids = [r["id"] for r in rows]
@@ -1764,6 +1772,29 @@ def load_entity_content(entity_id: int | str, bridge_dir: str) -> dict | None:
         return json_loads(fpath.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
+
+
+def load_entities_from_files(bridge_dir: str) -> list[dict]:
+    """Read entities from per-entity files using entities_index.json as manifest.
+
+    Returns list of entity dicts (with observations). Falls back to index
+    metadata if per-entity file is missing.
+    """
+    index_path = Path(bridge_dir) / "entities_index.json"
+    if not index_path.exists():
+        return []
+    try:
+        index_data = json_loads(index_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    entities = []
+    for meta in index_data.get("entities", []):
+        eid = meta.get("id")
+        if eid is None:
+            continue
+        content = load_entity_content(eid, bridge_dir)
+        entities.append(content if content else meta)
+    return entities
 
 
 def migrate_entities_to_per_files(bridge_dir: str) -> bool:

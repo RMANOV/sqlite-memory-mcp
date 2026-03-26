@@ -42,7 +42,7 @@ from db_utils import (
     migrate_to_per_task_files as _migrate_to_per_task_files,
     export_entity_files as _export_entity_files,
     export_entities_index as _export_entities_index,
-    load_entity_content as _load_entity_content,
+    load_entities_from_files as _load_entities_from_files,
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     BRIDGE_REPO,
     git_run as _git_run,
@@ -527,8 +527,8 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         _export_task_files(conn, BRIDGE_REPO, changed_since=last_push_at)
         _export_index_json(conn, BRIDGE_REPO)
         # v4: Export per-entity files + entities_index.json
-        _export_entity_files(conn, BRIDGE_REPO)
-        _export_entities_index(conn, BRIDGE_REPO)
+        _, _entity_rows = _export_entity_files(conn, BRIDGE_REPO)
+        _export_entities_index(conn, BRIDGE_REPO, rows=_entity_rows)
 
         # v0.7.0: Export public entities + tasks as public_knowledge
         pub_ent_rows = conn.execute(
@@ -878,23 +878,11 @@ def bridge_pull() -> str:
                 return _error(f"Failed to read shared.json: {exc}")
             logger.warning("bridge_pull: shared.json parse failed: %s", exc)
 
-    # v4: load entities from per-entity files when entities_index.json exists
+    # v4: load entities from per-entity files, fall back to shared.json
     _eidx_path = Path(BRIDGE_REPO) / "entities_index.json"
     if _eidx_path.exists():
-        try:
-            _eidx = _json_loads(_eidx_path.read_text(encoding="utf-8"))
-            entities = []
-            for emeta in _eidx.get("entities", []):
-                eid = emeta.get("id")
-                if eid is None:
-                    continue
-                econtent = _load_entity_content(eid, BRIDGE_REPO)
-                entities.append(econtent if econtent else emeta)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("bridge_pull: entities_index read failed: %s", exc)
-            entities = payload.get("entities", [])
+        entities = _load_entities_from_files(BRIDGE_REPO)
     else:
-        # Legacy fallback: entities embedded in shared.json
         entities = payload.get("entities", [])
     relations = payload.get("relations", [])
     # Stage shared_tasks for review (never auto-import from other accounts)
@@ -1351,19 +1339,17 @@ def bridge_status() -> str:
     remote_names: set[str] = set()
     remote_task_count = 0
     repo_meta = {}
+    # v4: entity names from entities_index.json (independent of shared.json)
+    if _status_eidx_path.exists():
+        try:
+            _eidx = _json_loads(_status_eidx_path.read_text(encoding="utf-8"))
+            remote_names = {e["name"] for e in _eidx.get("entities", []) if "name" in e}
+        except (json.JSONDecodeError, OSError):
+            pass
     if shared_path.exists():
         try:
             payload = _json_loads(shared_path.read_text(encoding="utf-8"))
-            # v4: entity names come from entities_index.json, not shared.json
-            if _status_eidx_path.exists():
-                try:
-                    _eidx = _json_loads(_status_eidx_path.read_text(encoding="utf-8"))
-                    remote_names = {
-                        e["name"] for e in _eidx.get("entities", []) if "name" in e
-                    }
-                except (json.JSONDecodeError, OSError):
-                    remote_names = {e["name"] for e in payload.get("entities", [])}
-            else:
+            if not remote_names:
                 remote_names = {e["name"] for e in payload.get("entities", [])}
             remote_task_count = len(payload.get("tasks", []))
             repo_meta = {

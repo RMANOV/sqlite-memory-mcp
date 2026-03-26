@@ -46,7 +46,7 @@ from db_utils import (
     fts_sync_entity,
     export_entity_files,
     export_entities_index,
-    load_entity_content,
+    load_entities_from_files,
     migrate_entities_to_per_files,
 )
 
@@ -272,25 +272,6 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
         return []
 
 
-def _load_remote_entities_from_files(bridge_dir: str) -> list[dict]:
-    """Read entities from per-entity files using entities_index.json as manifest."""
-    index_path = Path(bridge_dir) / "entities_index.json"
-    if not index_path.exists():
-        return []
-    try:
-        index_data = _json_loads(index_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return []
-    entities = []
-    for meta in index_data.get("entities", []):
-        eid = meta.get("id")
-        if eid is None:
-            continue
-        content = load_entity_content(eid, bridge_dir)
-        entities.append(content if content else meta)
-    return entities
-
-
 def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict]:
     """Merge remote tasks: keep missing-locally, newer-wins update.
 
@@ -424,16 +405,14 @@ def main(
 
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 10, "Importing remote entities...")
-        entities_index_path = Path(bridge_dir) / "entities_index.json"
-        if entities_index_path.exists():
-            remote_entities = _load_remote_entities_from_files(bridge_dir)
-            if remote_entities:
-                n_ent_imported = _import_remote_entities(conn, remote_entities)
-                if n_ent_imported:
-                    log.info(
-                        "Imported %d remote entities (from per-entity files)",
-                        n_ent_imported,
-                    )
+        remote_entities = load_entities_from_files(bridge_dir)
+        if remote_entities:
+            n_ent_imported = _import_remote_entities(conn, remote_entities)
+            if n_ent_imported:
+                log.info(
+                    "Imported %d remote entities (from per-entity files)",
+                    n_ent_imported,
+                )
         elif shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
@@ -592,8 +571,8 @@ def main(
         export_index_json(conn, bridge_dir)
 
         _progress(progress_callback, 25, "Exporting per-entity files...")
-        export_entity_files(conn, bridge_dir)
-        export_entities_index(conn, bridge_dir)
+        _, entity_rows = export_entity_files(conn, bridge_dir)
+        export_entities_index(conn, bridge_dir, rows=entity_rows)
 
         _progress(progress_callback, 50, "Exporting public knowledge...")
         pub_entities, pub_tasks = _export_public_knowledge(conn)
