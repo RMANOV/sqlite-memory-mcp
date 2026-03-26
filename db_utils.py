@@ -1238,7 +1238,7 @@ def merge_import_tasks(
         # Handle tombstones — only merge status field
         if remote.get("_tombstone"):
             existing = conn.execute(
-                "SELECT id FROM tasks WHERE id = ?", (tid,)
+                "SELECT id, updated_at FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
             if existing:
                 remote_ts, remote_by = _parse_field_ts(
@@ -1251,7 +1251,24 @@ def merge_import_tasks(
                 ).fetchone()
                 local_ts = local_fv["updated_at"] if local_fv else ""
                 local_by = local_fv["updated_by"] if local_fv else ""
-                if (remote_ts, remote_by) > (local_ts, local_by):
+
+                tombstone_wins = (remote_ts, remote_by) > (local_ts, local_by)
+
+                # Fallback: if field timestamps are equal, tombstone wins
+                # when its updated_at is newer (archival may not update field_versions)
+                if not tombstone_wins and remote_ts == local_ts:
+                    remote_updated = remote.get("updated_at", "")
+                    local_updated = existing["updated_at"] or ""
+                    if remote_updated > local_updated:
+                        tombstone_wins = True
+                        _log.info(
+                            "Tombstone fallback: %s wins via updated_at (%s > %s)",
+                            tid[:12],
+                            remote_updated[:19],
+                            local_updated[:19],
+                        )
+
+                if tombstone_wins:
                     conn.execute(
                         "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                         (remote["status"], now, tid),
@@ -1260,7 +1277,7 @@ def merge_import_tasks(
                         "INSERT OR REPLACE INTO task_field_versions "
                         "(task_id, field_name, updated_at, updated_by) "
                         "VALUES (?, ?, ?, ?)",
-                        (tid, "status", remote_ts, remote_by),
+                        (tid, "status", remote_ts or fallback_ts, remote_by or _MACHINE_ID),
                     )
                     updated_fields += 1
             continue

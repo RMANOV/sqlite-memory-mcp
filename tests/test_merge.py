@@ -285,6 +285,33 @@ def test_tombstone_older_does_not_overwrite_local(conn):
     assert _task(conn, tid)["status"] == "done"
 
 
+def test_tombstone_wins_when_field_ts_equal_but_updated_at_newer(conn):
+    """Tombstone with equal _field_ts but newer updated_at should win.
+
+    This covers the blind-audit-trail bug: archival updates updated_at but
+    not field_versions, so _field_ts[status] is stale. Fallback to updated_at.
+    """
+    tid = "tomb-fallback"
+    same_ts = "2026-03-09T08:00:00"
+    _insert_task(conn, tid, title="Old task", status="done", updated_at=same_ts)
+    upsert_field_versions(conn, tid, ["status"], timestamp=same_ts, machine_id="fedora")
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Old task",
+            "status": "archived",
+            "updated_at": "2026-03-19T06:00:00",  # Much newer
+            "_tombstone": True,
+            "_field_ts": {"status": [same_ts, "fedora"]},  # Same as local!
+        }
+    ]
+    _, updated = merge_import_tasks(conn, remote, import_content=False)
+    assert updated > 0
+    row = _task(conn, tid)
+    assert row["status"] == "archived"
+
+
 def test_tombstone_nonexistent_task_skipped(conn):
     """Tombstone for a task that doesn't exist locally → silently skipped."""
     remote = [
