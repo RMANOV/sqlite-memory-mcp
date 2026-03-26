@@ -756,6 +756,7 @@ from pathlib import Path
 
 from tray_filters import FilterMixin
 from tray_sync import BridgeSyncMixin
+import tray_dialogs as _td
 from tray_dialogs import (
     # Theme system
     _THEMES,
@@ -837,13 +838,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if geometry:
             self.restoreGeometry(geometry)
 
-        # Restore appearance settings
-        global _theme_name, _font_size, _bold
-        _theme_name = self._settings.value("theme", "blue")
-        if _theme_name not in _THEMES:
-            _theme_name = "blue"
-        _font_size = int(self._settings.value("font_size", 13))
-        _bold = self._settings.value("bold", "false") == "true"
+        # Restore appearance settings (mutate tray_dialogs module globals)
+        _td._theme_name = self._settings.value("theme", "blue")
+        if _td._theme_name not in _THEMES:
+            _td._theme_name = "blue"
+        _td._font_size = int(self._settings.value("font_size", 13))
+        _td._bold = self._settings.value("bold", "false") == "true"
         _update_theme_colors()
 
         # First-run recovery: if QSettings has no tab_views, try bridge profile
@@ -1194,9 +1194,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         for lw in self.tab_lists.values():
             lw.setStyleSheet(_build_list_style())
             lw.viewport().update()
-        self._settings.setValue("theme", _theme_name)
-        self._settings.setValue("font_size", _font_size)
-        self._settings.setValue("bold", "true" if _bold else "false")
+        self._settings.setValue("theme", _td._theme_name)
+        self._settings.setValue("font_size", _td._font_size)
+        self._settings.setValue("bold", "true" if _td._bold else "false")
         self._build_filter_chips()
         self._save_ui_state()
         self.refresh()
@@ -1226,27 +1226,23 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._settings.setValue("active_tab", self.tabs.currentIndex())
 
     def _font_down(self):
-        global _font_size
-        if _font_size > 10:
-            _font_size -= 1
+        if _td._font_size > 10:
+            _td._font_size -= 1
             self._apply_appearance()
 
     def _font_up(self):
-        global _font_size
-        if _font_size < 20:
-            _font_size += 1
+        if _td._font_size < 20:
+            _td._font_size += 1
             self._apply_appearance()
 
     def _toggle_bold(self, checked):
-        global _bold
-        _bold = checked
+        _td._bold = checked
         if hasattr(self, "_bold_action"):
-            self._bold_action.setChecked(_bold)
+            self._bold_action.setChecked(_td._bold)
         self._apply_appearance()
 
     def _set_theme(self, name):
-        global _theme_name
-        _theme_name = name
+        _td._theme_name = name
         if hasattr(self, "_theme_actions") and name in self._theme_actions:
             self._theme_actions[name].setChecked(True)
         self._apply_appearance()
@@ -1283,10 +1279,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _reset_view(self):
         """Reset theme=blue, font=13, bold=off."""
-        global _theme_name, _font_size, _bold
-        _theme_name = "blue"
-        _font_size = 13
-        _bold = False
+        _td._theme_name = "blue"
+        _td._font_size = 13
+        _td._bold = False
         if hasattr(self, "_theme_actions") and "blue" in self._theme_actions:
             self._theme_actions["blue"].setChecked(True)
         if hasattr(self, "_bold_action"):
