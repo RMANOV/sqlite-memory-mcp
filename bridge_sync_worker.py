@@ -44,6 +44,10 @@ from db_utils import (
     migrate_to_per_task_files,
     get_conn,  # I3: managed connection — handles PRAGMAs, BEGIN/COMMIT/ROLLBACK, close
     fts_sync_entity,
+    export_entity_files,
+    export_entities_index,
+    load_entity_content,
+    migrate_entities_to_per_files,
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -268,6 +272,25 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
         return []
 
 
+def _load_remote_entities_from_files(bridge_dir: str) -> list[dict]:
+    """Read entities from per-entity files using entities_index.json as manifest."""
+    index_path = Path(bridge_dir) / "entities_index.json"
+    if not index_path.exists():
+        return []
+    try:
+        index_data = _json_loads(index_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    entities = []
+    for meta in index_data.get("entities", []):
+        eid = meta.get("id")
+        if eid is None:
+            continue
+        content = load_entity_content(eid, bridge_dir)
+        entities.append(content if content else meta)
+    return entities
+
+
 def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict]:
     """Merge remote tasks: keep missing-locally, newer-wins update.
 
@@ -397,10 +420,21 @@ def main(
     new_t, upd_t = 0, 0
 
     migrate_to_per_task_files(bridge_dir)
+    migrate_entities_to_per_files(bridge_dir)
 
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 10, "Importing remote entities...")
-        if shared_path.exists():
+        entities_index_path = Path(bridge_dir) / "entities_index.json"
+        if entities_index_path.exists():
+            remote_entities = _load_remote_entities_from_files(bridge_dir)
+            if remote_entities:
+                n_ent_imported = _import_remote_entities(conn, remote_entities)
+                if n_ent_imported:
+                    log.info(
+                        "Imported %d remote entities (from per-entity files)",
+                        n_ent_imported,
+                    )
+        elif shared_path.exists():
             try:
                 remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
                 n_ent_imported = _import_remote_entities(
@@ -557,6 +591,10 @@ def main(
         export_task_files(conn, bridge_dir)
         export_index_json(conn, bridge_dir)
 
+        _progress(progress_callback, 25, "Exporting per-entity files...")
+        export_entity_files(conn, bridge_dir)
+        export_entities_index(conn, bridge_dir)
+
         _progress(progress_callback, 50, "Exporting public knowledge...")
         pub_entities, pub_tasks = _export_public_knowledge(conn)
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
@@ -566,10 +604,10 @@ def main(
     # Phase 4: Build payload + write files + git ops (no transaction)
     _progress(progress_callback, 60, "Merging tasks...")
     payload = {
-        "version": 3,
+        "version": 4,
         "pushed_at": now_iso(),
         "machine_id": socket.gethostname(),
-        "entities": entities_out,
+        "entities": [],  # backward compat — per-entity files are authoritative
         "relations": relations_out,
         "tasks": tasks_out,
     }
@@ -588,9 +626,10 @@ def main(
             if not index_path.exists():
                 _merge_remote_tasks(tasks_out, existing)
 
-            # Preserve remote-only entities (e.g. pushed by another machine
-            # but not yet imported locally)
-            _merge_remote_entities(entities_out, existing)
+            # Preserve remote-only entities only when per-entity files are not active
+            entities_index_exists = (Path(bridge_dir) / "entities_index.json").exists()
+            if not entities_index_exists:
+                _merge_remote_entities(entities_out, existing)
 
             if "ui_profiles" in existing:
                 payload["ui_profiles"] = existing["ui_profiles"]
@@ -601,7 +640,15 @@ def main(
     shared_path.write_text(_json_dumps(payload), encoding="utf-8")
 
     _progress(progress_callback, 80, "git add...")
-    git_run(bridge_dir, "add", "shared.json", "index.json", "tasks/")
+    git_run(
+        bridge_dir,
+        "add",
+        "shared.json",
+        "index.json",
+        "tasks/",
+        "entities/",
+        "entities_index.json",
+    )
 
     _progress(progress_callback, 90, "git commit...")
     n_ent = len(entities_out)

@@ -332,6 +332,7 @@ _TOMBSTONE_DAYS = 30
 
 # Path traversal defense: task IDs must be UUID-safe (alphanumeric + hyphens)
 _SAFE_TASK_ID = re.compile(r"^[a-zA-Z0-9\-]+$")
+_SAFE_ENTITY_ID = re.compile(r"^[1-9][0-9]*$")
 
 
 def setup_logger(name: str, log_file: str = "server.log") -> logging.Logger:
@@ -1071,6 +1072,10 @@ TASK_EXPORT_COLS = (
     "visibility, publish_requested_at, created_at, updated_at"
 )
 
+ENTITY_EXPORT_COLS = (
+    "id, name, entity_type, project, visibility, created_at, updated_at"
+)
+
 
 def export_task_files(
     conn: sqlite3.Connection,
@@ -1637,4 +1642,143 @@ def migrate_to_per_task_files(bridge_dir: str) -> bool:
         raise
 
     _log.info("Migrated %d tasks from shared.json to per-task files", count)
+    return True
+
+
+# ── Per-Entity File Export/Import ─────────────────────────────────────
+
+
+def export_entity_files(conn: sqlite3.Connection, bridge_dir: str) -> list[int]:
+    """Export shared entities to per-entity JSON files in entities/ directory.
+
+    Each file: entities/{id}.json with full observations.
+    Returns list of exported entity IDs.
+    """
+    entities_dir = Path(bridge_dir) / "entities"
+    entities_dir.mkdir(exist_ok=True)
+
+    rows = conn.execute(
+        f"SELECT {ENTITY_EXPORT_COLS} FROM entities "
+        "WHERE project LIKE 'shared%' ORDER BY name"
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    # Batch-fetch all observations for shared entities (avoid N+1)
+    eids = [r["id"] for r in rows]
+    ph = ",".join("?" * len(eids))
+    obs_rows = conn.execute(
+        f"SELECT entity_id, content, created_at FROM observations "
+        f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+        eids,
+    ).fetchall()
+
+    # Group observations by entity_id
+    obs_by_eid: dict[int, list] = {}
+    for o in obs_rows:
+        obs_by_eid.setdefault(o["entity_id"], []).append(
+            {"content": o["content"], "createdAt": o["created_at"]}
+        )
+
+    exported = []
+    for r in rows:
+        eid = r["id"]
+        entity = {
+            "id": eid,
+            "name": r["name"],
+            "entityType": r["entity_type"],
+            "project": r["project"],
+            "observations": obs_by_eid.get(eid, []),
+            "createdAt": r["created_at"],
+            "updatedAt": r["updated_at"],
+        }
+        fpath = entities_dir / f"{eid}.json"
+        fpath.write_text(json_dumps(entity), encoding="utf-8")
+        exported.append(eid)
+
+    # Clean stale files (entities no longer in DB)
+    active_ids = {str(eid) for eid in exported}
+    for f in entities_dir.glob("*.json"):
+        if f.stem not in active_ids:
+            f.unlink()
+
+    return exported
+
+
+def export_entities_index(conn: sqlite3.Connection, bridge_dir: str) -> int:
+    """Write entities_index.json — metadata only, no observations."""
+    rows = conn.execute(
+        f"SELECT {ENTITY_EXPORT_COLS} FROM entities "
+        "WHERE project LIKE 'shared%' ORDER BY name"
+    ).fetchall()
+
+    # Batch-fetch observation counts
+    eids = [r["id"] for r in rows]
+    obs_counts: dict[int, int] = {}
+    if eids:
+        ph = ",".join("?" * len(eids))
+        for row in conn.execute(
+            f"SELECT entity_id, COUNT(*) as cnt FROM observations "
+            f"WHERE entity_id IN ({ph}) GROUP BY entity_id",
+            eids,
+        ):
+            obs_counts[row["entity_id"]] = row["cnt"]
+
+    entries = []
+    for r in rows:
+        entries.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "entityType": r["entity_type"],
+                "project": r["project"],
+                "visibility": r["visibility"],
+                "createdAt": r["created_at"],
+                "updatedAt": r["updated_at"],
+                "observation_count": obs_counts.get(r["id"], 0),
+            }
+        )
+
+    index = {
+        "version": 1,
+        "format": "entity_bridge_v1",
+        "pushed_at": now_iso(),
+        "machine_id": socket.gethostname(),
+        "entities": entries,
+    }
+    index_path = Path(bridge_dir) / "entities_index.json"
+    index_path.write_text(json_dumps(index), encoding="utf-8")
+    return len(entries)
+
+
+def load_entity_content(entity_id: int | str, bridge_dir: str) -> dict | None:
+    """Load full entity (with observations) from per-entity file."""
+    eid_str = str(entity_id)
+    if not _SAFE_ENTITY_ID.match(eid_str):
+        return None
+    fpath = Path(bridge_dir) / "entities" / f"{eid_str}.json"
+    if not fpath.exists():
+        return None
+    try:
+        return json_loads(fpath.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
+def migrate_entities_to_per_files(bridge_dir: str) -> bool:
+    """Signal that entity migration to per-file format is needed.
+
+    Unlike tasks (which have UUID filenames in shared.json), entities
+    use integer DB IDs not present in shared.json. Actual file creation
+    happens during the first export_entity_files() call.
+    Returns True if migration marker was created.
+    """
+    entities_dir = Path(bridge_dir) / "entities"
+    index_path = Path(bridge_dir) / "entities_index.json"
+    if index_path.exists() or (
+        entities_dir.exists() and any(entities_dir.glob("*.json"))
+    ):
+        return False
+    entities_dir.mkdir(exist_ok=True)
     return True
