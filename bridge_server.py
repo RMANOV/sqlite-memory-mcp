@@ -39,6 +39,8 @@ from db_utils import (
     merge_import_tasks as _merge_import_tasks,
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
+    load_task_content as _load_task_content,
+    CONTENT_FIELDS as _CONTENT_FIELDS,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     export_entity_files as _export_entity_files,
     export_entities_index as _export_entities_index,
@@ -46,6 +48,7 @@ from db_utils import (
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     BRIDGE_REPO,
     git_run as _git_run,
+    ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
     source_hash as _source_hash,
 )
 from schema import (
@@ -119,6 +122,25 @@ def _validate_github_user(username: str) -> None:
     """Raise ValueError if username is not a valid GitHub username."""
     if not _GITHUB_USER_RE.match(username):
         raise ValueError(f"Invalid GitHub username: {username!r}")
+
+
+def _bridge_repo_blocked_error(message: str) -> str:
+    """Return a structured bridge repo preflight error."""
+    return json.dumps({"error": message, "blocked_by_repo_state": True})
+
+
+def _write_shared_js(shared_path: Path, payload_text: str | None = None) -> None:
+    """Write shared.js wrapper next to shared.json for file:// consumers."""
+    try:
+        raw = payload_text
+        if raw is None:
+            raw = shared_path.read_text(encoding="utf-8")
+        shared_path.with_name("shared.js").write_text(
+            f"window.__BRIDGE_DATA__ = {raw};",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("bridge shared.js generation failed: %s", exc)
 
 
 def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
@@ -379,6 +401,11 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "Run: mkdir -p {BRIDGE_REPO} && git -C {BRIDGE_REPO} init"
             }
         )
+
+    repo_ok, repo_msg = _ensure_bridge_repo_ready(BRIDGE_REPO)
+    if not repo_ok:
+        logger.warning("bridge_push: preflight blocked push: %s", repo_msg)
+        return _bridge_repo_blocked_error(repo_msg or "bridge repo is not ready")
 
     # v2.0.0: Pull before push (prevents overwriting remote changes)
     pull_result = _git("pull", "--rebase", "--autostash")
@@ -682,9 +709,11 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         except (json.JSONDecodeError, OSError):
             pass
 
+    payload_json = _json_dumps(payload)
     tmp_path = shared_path.with_suffix(".tmp")
-    tmp_path.write_text(_json_dumps(payload), encoding="utf-8")
+    tmp_path.write_text(payload_json, encoding="utf-8")
     os.replace(tmp_path, shared_path)
+    _write_shared_js(shared_path, payload_text=payload_json)
 
     # Cross-account push: send assigned tasks to other users' repos
     by_assignee: dict[str, list] = {}
@@ -743,7 +772,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     )
 
     _git(
-        "add", "shared.json", "index.json", "tasks/", "entities/", "entities_index.json"
+        "add",
+        "shared.json",
+        "shared.js",
+        "index.json",
+        "tasks/",
+        "entities/",
+        "entities_index.json",
     )
     # Use --porcelain to check staged changes without locale-dependent text parsing
     status_result = _git("status", "--porcelain")
@@ -755,7 +790,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         logger.error("bridge_push: commit failed: %s", commit_result.stderr)
         # Restore shared.json to last committed state to prevent dirty file
         # from being overwritten by a future bridge_pull --rebase
-        _git("checkout", "--", "shared.json")
+        _git("checkout", "--", "shared.json", "shared.js")
         return _error(f"git commit failed: {commit_result.stderr.strip()}")
 
     push_result = _git("push")
@@ -856,6 +891,11 @@ def bridge_pull() -> str:
     if not Path(BRIDGE_REPO).is_dir():
         return _error(f"Bridge repo not found at {BRIDGE_REPO}")
 
+    repo_ok, repo_msg = _ensure_bridge_repo_ready(BRIDGE_REPO)
+    if not repo_ok:
+        logger.warning("bridge_pull: preflight blocked pull: %s", repo_msg)
+        return _bridge_repo_blocked_error(repo_msg or "bridge repo is not ready")
+
     pull_result = _git("pull", "--rebase", "--autostash")
     git_pull_failed = pull_result.returncode != 0
     if git_pull_failed:
@@ -946,10 +986,33 @@ def bridge_pull() -> str:
         if _has_index:
             try:
                 _idx_data = _json_loads(_pull_index_path.read_text(encoding="utf-8"))
+                remote_tasks = _idx_data.get("tasks", [])
+                enriched = 0
+                for task in remote_tasks:
+                    if task.get("_tombstone"):
+                        continue
+                    content = _load_task_content(task.get("id", ""), BRIDGE_REPO)
+                    if content:
+                        for content_field in _CONTENT_FIELDS:
+                            if content_field in content:
+                                task[content_field] = content[content_field]
+                        if content.get("description") or content.get("notes"):
+                            enriched += 1
+                if enriched:
+                    logger.info(
+                        "bridge_pull: enriched %d tasks with content from per-task files",
+                        enriched,
+                    )
                 new_tasks, updated_tasks = _merge_import_tasks(
-                    conn, _idx_data.get("tasks", [])
+                    conn, remote_tasks, import_content=True
                 )
-            except (json.JSONDecodeError, OSError) as exc:
+            except (
+                sqlite3.OperationalError,
+                sqlite3.IntegrityError,
+                json.JSONDecodeError,
+                OSError,
+                ValueError,
+            ) as exc:
                 logger.warning("bridge_pull: index.json read failed: %s", exc)
                 new_tasks, updated_tasks = 0, 0
         else:

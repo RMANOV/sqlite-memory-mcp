@@ -265,26 +265,6 @@ def main(progress_callback=None):
             result_str = fn(tag="shared")
 
         logging.info("bridge_push result: %s", result_str)
-        _progress(55, "Writing shared.js...")
-
-        # Generate shared.js wrapper for file:// compatibility
-        shared_json = os.path.join(BRIDGE_REPO, "shared.json")
-        shared_js = os.path.join(BRIDGE_REPO, "shared.js")
-        try:
-            with open(shared_json, encoding="utf-8") as f:
-                raw = f.read()
-            with open(shared_js, "w", encoding="utf-8") as f:
-                f.write("window.__BRIDGE_DATA__ = ")
-                f.write(raw)
-                f.write(";")
-        except OSError as e:
-            logging.warning("shared.js generation failed: %s", e)
-
-        # Commit shared.js locally — no separate push (fix_remote_ahead carries it)
-        git_run("add", "shared.js")
-        ok, porcelain = git_run("status", "--porcelain")
-        if ok and porcelain.strip():
-            git_run("commit", "-m", "chore: update shared.js wrapper")
 
         # Parse result to check pushed_to_remote
         try:

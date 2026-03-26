@@ -226,8 +226,8 @@ Share knowledge graph entities between machines (e.g., personal laptop + work co
 ### How it works
 
 1. Tag entities for sharing by setting `project` to any value starting with `"shared"` (e.g., `"shared"`, `"shared:trading"`, `"shared:hooks"`)
-2. `bridge_push()` exports all shared entities + their observations and inter-relations to `shared.json` in a local git repo, then commits and pushes. The v2 payload also includes shared tasks.
-3. `bridge_pull()` on the other machine does `git pull` + imports new entities/observations/relations (UNIQUE constraints handle dedup). Tasks use last-write-wins based on `updated_at` comparison.
+2. `bridge_push()` first runs a bridge repo safety preflight, then exports shared data to `shared.json`, `shared.js`, `index.json`, `tasks/`, and `entities/`, and finally commits and pushes. The v2 payload also includes shared tasks.
+3. `bridge_pull()` on the other machine also runs the same repo safety preflight, does `git pull`, and imports new entities/observations/relations. Task metadata comes from `index.json`, while `description` and `notes` are hydrated from per-task files before the LWW merge.
 4. `bridge_status()` shows what's in sync vs only-local vs only-remote
 
 Auto-sync only overwrites bridge-generated artifacts (`shared.json`, `index.json`, `tasks/`, `entities/`, `public_knowledge/`, `shared.js`). If the bridge repo contains user-managed dirty files such as `index.html`, sync now blocks instead of discarding them.
