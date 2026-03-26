@@ -8,9 +8,7 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 
 from __future__ import annotations
 
-import hashlib
 import json
-import logging
 import os
 import re
 import socket
@@ -42,6 +40,8 @@ from db_utils import (
     export_index_json as _export_index_json,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     BRIDGE_REPO,
+    git_run as _git_run,
+    source_hash as _source_hash,
 )
 from schema import (
     init_db,
@@ -54,14 +54,9 @@ from schema import (
 init_db()
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-LOG_PATH = Path.home() / ".claude" / "memory" / "bridge_server.log"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-logger = logging.getLogger("sqlite-bridge")
-logger.setLevel(logging.DEBUG)
-_fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-if not logger.handlers:
-    logger.addHandler(_fh)
+from db_utils import setup_logger
+
+logger = setup_logger("sqlite-bridge", "bridge_server.log")
 
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
@@ -109,17 +104,8 @@ def _run_bridge_sync():
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
-    """Run a git command in the bridge repo. Never prints to stdout."""
-    result = subprocess.run(
-        ["git", "-C", BRIDGE_REPO, *args],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        **_NOWIN,
-    )
-    if result.returncode != 0:
-        logger.warning("git %s failed: %s", " ".join(args), result.stderr.strip())
-    return result
+    """Run git in BRIDGE_REPO. Thin wrapper around db_utils.git_run."""
+    return _git_run(BRIDGE_REPO, *args)
 
 
 _GITHUB_USER_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
@@ -209,12 +195,6 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
                     assignee,
                     push.stderr.strip(),
                 )
-
-
-def _source_hash(name: str, entity_type: str, observations: list) -> str:
-    """SHA256 hash for deduplication of shared entities."""
-    raw = json.dumps({"n": name, "t": entity_type, "o": observations}, sort_keys=True)
-    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:

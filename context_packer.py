@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from advanced_context import (
+    _keyword_score,
     build_strategy as _build_advanced_strategy,
     compute_strategy_match as _compute_advanced_task_match,
     select_context_items as _select_advanced_items,
@@ -80,19 +81,6 @@ def _extract_task_keywords(text: str) -> list[str]:
                 keywords.append(part)
                 seen.add(part)
     return keywords[:40]
-
-
-def _keyword_score(text: str, keywords: list[str]) -> float:
-    """Return 0..1 score for keyword overlap against arbitrary text."""
-    if not text or not keywords:
-        return 0.0
-    haystack = text.lower()
-    matched = {kw for kw in keywords if kw in haystack}
-    if not matched:
-        return 0.0
-    coverage = len(matched) / max(1, min(len(set(keywords)), 8))
-    specificity = min(1.0, max(len(kw) for kw in matched) / 24.0)
-    return min(1.0, 0.15 + (coverage * 0.7) + (specificity * 0.15))
 
 
 def _entity_name_overlap_score(text: str, name_scores: dict[str, float]) -> float:

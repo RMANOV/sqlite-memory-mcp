@@ -5,6 +5,17 @@ Spawned by bridge_auto_sync.py hook. Runs detached from Claude session.
 Pull imports remote tasks into local DB, then push exports merged state.
 Handles: remote-ahead (auto-rebase), conflicts, network errors.
 Writes notifications for the hook to pick up on next tool call.
+
+ARCHITECTURE NOTE — NOT a duplicate of ../bridge_sync_worker.py (authoritative sync engine):
+  - THIS file: orchestration wrapper — locking, failure counter, notifications,
+    calls bridge_server.bridge_pull / bridge_push (MCP tools) via asyncio
+  - ../bridge_sync_worker.py: low-level sync engine — called by task_tray.py's Sync
+    button, imports db_utils directly, no MCP server dependency
+
+These two files serve different layers and must NOT be merged or replaced with
+a thin delegate. Fix bugs in each independently; keep this comment updated.
+Deployed copy lives at ~/.claude/hooks/bridge_sync_worker.py (WORKER_SCRIPT in
+bridge_auto_sync.py). After changes here, copy to that location.
 """
 
 import json

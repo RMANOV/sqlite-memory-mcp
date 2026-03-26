@@ -6,6 +6,7 @@ utilities used by server.py, task_tray.py, and utility scripts.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import logging
@@ -332,6 +333,20 @@ _TOMBSTONE_DAYS = 30
 # Path traversal defense: task IDs must be UUID-safe (alphanumeric + hyphens)
 _SAFE_TASK_ID = re.compile(r"^[a-zA-Z0-9\-]+$")
 
+
+def setup_logger(name: str, log_file: str = "server.log") -> logging.Logger:
+    """Configure file logger. Idempotent — safe to call multiple times."""
+    log_path = Path.home() / ".claude" / "memory" / log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(fh)
+    return logger
+
+
 _log = logging.getLogger("sqlite-kb")
 
 # ── DB connection ────────────────────────────────────────────────────────
@@ -417,6 +432,54 @@ def bulk_conn(db_path: str | None = None):
         raise
     finally:
         conn.close()
+
+
+# ── Git helpers ──────────────────────────────────────────────────────────
+
+log = logging.getLogger(__name__)
+
+
+def git_run(repo_dir: str, *args: str) -> subprocess.CompletedProcess:
+    """Run git command in specified repo directory."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        **_NOWIN,
+    )
+
+
+def git_retry(
+    repo_dir: str, *args: str, max_retries: int = 3
+) -> subprocess.CompletedProcess:
+    """Git command with exponential backoff retry."""
+    import time
+
+    delays = [2, 4, 8]
+    last_result = None
+    for attempt in range(max_retries):
+        last_result = git_run(repo_dir, *args)
+        if last_result.returncode == 0:
+            return last_result
+        if attempt < max_retries - 1:
+            log.warning(
+                "git %s attempt %d/%d failed: %s — retrying in %ds",
+                " ".join(args),
+                attempt + 1,
+                max_retries,
+                last_result.stderr.strip(),
+                delays[attempt],
+            )
+            time.sleep(delays[attempt])
+    return last_result
+
+
+def source_hash(name: str, entity_type: str, observations: list) -> str:
+    """SHA256 hash for entity deduplication."""
+    raw = json.dumps({"n": name, "t": entity_type, "o": observations}, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 # ── Timestamp helpers ────────────────────────────────────────────────────
@@ -1277,7 +1340,12 @@ def merge_import_tasks(
                         "INSERT OR REPLACE INTO task_field_versions "
                         "(task_id, field_name, updated_at, updated_by) "
                         "VALUES (?, ?, ?, ?)",
-                        (tid, "status", remote_ts or fallback_ts, remote_by or _MACHINE_ID),
+                        (
+                            tid,
+                            "status",
+                            remote_ts or fallback_ts,
+                            remote_by or _MACHINE_ID,
+                        ),
                     )
                     updated_fields += 1
             continue
@@ -1381,8 +1449,7 @@ def merge_import_tasks(
             remote_title = remote.get("title")
             if remote_title:
                 dedup = conn.execute(
-                    "SELECT id, status FROM tasks "
-                    "WHERE title = ? LIMIT 1",
+                    "SELECT id, status FROM tasks WHERE title = ? LIMIT 1",
                     (remote_title,),
                 ).fetchone()
                 if dedup:

@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import os
 import socket
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -43,14 +41,9 @@ from schema import (
 )
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-LOG_PATH = Path.home() / ".claude" / "memory" / "collab_server.log"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-logger = logging.getLogger("sqlite-collab")
-logger.setLevel(logging.DEBUG)
-_fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-if not logger.handlers:
-    logger.addHandler(_fh)
+from db_utils import setup_logger
+
+logger = setup_logger("sqlite-collab", "collab_server.log")
 
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
@@ -69,12 +62,6 @@ init_db()
 # ═══════════════════════════════════════════════════════════════════════════
 # Private helpers (used only by collab tools)
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-def _source_hash(name: str, entity_type: str, observations: list) -> str:
-    """SHA256 hash for deduplication of shared entities."""
-    raw = json.dumps({"n": name, "t": entity_type, "o": observations}, sort_keys=True)
-    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _content_hash(entity_name: str, observations: list[str]) -> str:

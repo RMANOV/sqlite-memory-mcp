@@ -23,6 +23,8 @@ from db_utils import (
     DB_PATH,
     PUBLISH_STANDBY_MINUTES,
     TASK_EXPORT_COLS,
+    git_run,
+    git_retry,
     _NOWIN,
     serialize_entity,
     export_relations,
@@ -56,42 +58,6 @@ _SAFETY_THRESHOLD = 10  # Block sync if this many descriptions would be removed
 def _progress(cb: Callable[[int, str], None] | None, pct: int, label: str) -> None:
     if cb is not None:
         cb(pct, label)
-
-
-def _git(*args: str, bridge_dir: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=bridge_dir,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        **_NOWIN,
-    )
-
-
-def _git_retry(
-    *args: str, bridge_dir: str, max_retries: int = 3
-) -> subprocess.CompletedProcess:
-    """Git command with exponential backoff retry for push/pull failures."""
-    import time
-
-    delays = [2, 4, 8]  # exponential backoff
-    last_result = None
-    for attempt in range(max_retries):
-        last_result = _git(*args, bridge_dir=bridge_dir)
-        if last_result.returncode == 0:
-            return last_result
-        if attempt < max_retries - 1:
-            log.warning(
-                "git %s attempt %d/%d failed: %s — retrying in %ds",
-                " ".join(args),
-                attempt + 1,
-                max_retries,
-                last_result.stderr.strip(),
-                delays[attempt],
-            )
-            time.sleep(delays[attempt])
-    return last_result
 
 
 def _check_sync_safety(
@@ -396,7 +362,7 @@ def main(
 
     # Phase 2: Git pull (no transaction held)
     _progress(progress_callback, 5, "git pull...")
-    pull_result = _git_retry("pull", "--rebase", "--autostash", bridge_dir=bridge_dir)
+    pull_result = git_retry(bridge_dir, "pull", "--rebase", "--autostash")
     if pull_result.returncode != 0:
         log.error("git pull failed: %s", pull_result.stderr)
         # Log conflict for debugging
@@ -412,8 +378,8 @@ def main(
             log.warning(
                 "Merge conflict detected — aborting rebase and resetting to remote"
             )
-            _git("rebase", "--abort", bridge_dir=bridge_dir)
-            _git("reset", "--hard", "origin/main", bridge_dir=bridge_dir)
+            git_run(bridge_dir, "rebase", "--abort")
+            git_run(bridge_dir, "reset", "--hard", "origin/main")
             log.warning("Reset to origin/main; export phase will re-create shared.json")
         else:
             _progress(progress_callback, 100, "Done (pull failed)")
@@ -635,13 +601,13 @@ def main(
     shared_path.write_text(_json_dumps(payload), encoding="utf-8")
 
     _progress(progress_callback, 80, "git add...")
-    _git("add", "shared.json", "index.json", "tasks/", bridge_dir=bridge_dir)
+    git_run(bridge_dir, "add", "shared.json", "index.json", "tasks/")
 
     _progress(progress_callback, 90, "git commit...")
     n_ent = len(entities_out)
     n_tasks = len(payload["tasks"])
     msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {socket.gethostname()}"
-    result = _git("commit", "-m", msg, bridge_dir=bridge_dir)
+    result = git_run(bridge_dir, "commit", "-m", msg)
 
     if result.returncode != 0:
         if "nothing to commit" not in (result.stdout + result.stderr):
@@ -656,7 +622,7 @@ def main(
             }
 
     _progress(progress_callback, 95, "git push...")
-    push_result = _git_retry("push", bridge_dir=bridge_dir)
+    push_result = git_retry(bridge_dir, "push")
     pushed = push_result.returncode == 0
 
     # Record last_push_at so incremental check can skip next time

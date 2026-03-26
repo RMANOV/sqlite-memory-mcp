@@ -12,7 +12,6 @@ entity, intel) to stay under Claude Code's ~9 tool visibility limit.
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -44,15 +43,9 @@ except ImportError:
 
 
 # ── Logging setup (file-only, NEVER stdout — breaks MCP stdio) ──────────
-LOG_PATH = Path.home() / ".claude" / "memory" / "server.log"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+from db_utils import setup_logger
 
-logger = logging.getLogger("sqlite-kb")
-logger.setLevel(logging.DEBUG)
-_fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-if not logger.handlers:
-    logger.addHandler(_fh)
+logger = setup_logger("sqlite-kb", "server.log")
 
 # ── FastMCP app ──────────────────────────────────────────────────────────
 

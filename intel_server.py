@@ -9,8 +9,6 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 from __future__ import annotations
 
 import json
-import logging
-from pathlib import Path
 
 from fastmcp import FastMCP
 
@@ -34,14 +32,9 @@ from context_packer import (
 from impact_graph import explain_impact as _explain_impact
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-LOG_PATH = Path.home() / ".claude" / "memory" / "intel_server.log"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-logger = logging.getLogger("sqlite-intel")
-logger.setLevel(logging.DEBUG)
-_fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-if not logger.handlers:
-    logger.addHandler(_fh)
+from db_utils import setup_logger
+
+logger = setup_logger("sqlite-intel", "intel_server.log")
 
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
