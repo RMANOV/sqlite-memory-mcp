@@ -107,16 +107,18 @@ def _pid_alive(pid):
 
 
 def fix_remote_ahead():
-    """Handle remote-ahead: pull --rebase, then push again."""
+    """Handle remote-ahead: pull --rebase, then push again.
+
+    On conflict: reset to origin/main (DB is source of truth, export will re-create).
+    """
     ok, out = git_run("pull", "--rebase", "--autostash", "origin", "main")
     if not ok:
-        if "CONFLICT" in out:
+        if "CONFLICT" in out or "unmerged" in out:
             git_run("rebase", "--abort")
-            notify(
-                "error",
-                f"BRIDGE CONFLICT: auto-rebase failed. Manual resolve needed.\n{out[:200]}",
-            )
-            return False
+            git_run("fetch", "origin")
+            git_run("reset", "--hard", "origin/main")
+            notify("warning", "BRIDGE: conflict auto-resolved (reset to origin/main)")
+            return True  # continue — export will re-create from DB
         notify("warning", f"BRIDGE: pull --rebase failed: {out[:200]}")
         return False
 
@@ -147,8 +149,9 @@ def preflight_git_check():
     if has_conflicts:
         git_run("rebase", "--abort")
         git_run("merge", "--abort")
-        git_run("reset", "--hard", "HEAD")
-        logging.warning("Preflight: cleared merge/rebase conflicts")
+        git_run("fetch", "origin")
+        git_run("reset", "--hard", "origin/main")
+        logging.warning("Preflight: cleared conflicts (reset to origin/main)")
         # Re-check only after conflict resolution
         ok, status = git_run("status", "--porcelain")
         if not ok:
