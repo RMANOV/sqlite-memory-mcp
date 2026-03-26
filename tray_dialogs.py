@@ -54,7 +54,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate,
     QDateTimeEdit,
 )
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont, QPainter, QPixmap
 from PyQt6.QtCore import (
     QDate,
     QDateTime,
@@ -116,6 +116,37 @@ def _clipboard_write(text):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def create_tray_icon_pixmap(overdue_count=0):
+    """Generate a 64x64 tray icon with optional overdue badge."""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Base: dark navy circle
+    p.setBrush(QColor("#1a2332"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(4, 4, 56, 56)
+
+    # Checkmark
+    p.setPen(QColor("#ffffff"))
+    p.setFont(QFont("Segoe UI", 28, QFont.Weight.Bold))
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "\u2713")
+
+    # Overdue badge (red circle top-right)
+    if overdue_count > 0:
+        p.setBrush(QColor("#e53e3e"))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(38, 0, 26, 26)
+        p.setPen(QColor("#ffffff"))
+        p.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        text = str(overdue_count) if overdue_count < 10 else "9+"
+        p.drawText(38, 0, 26, 26, Qt.AlignmentFlag.AlignCenter, text)
+
+    p.end()
+    return pm
 
 
 # ── Theme System ─────────────────────────────────────────────────────
