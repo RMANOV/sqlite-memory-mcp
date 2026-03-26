@@ -776,6 +776,7 @@ from tray_dialogs import (
     ReminderPopupDialog,
     TaskListWidget,
     create_tray_icon_pixmap,
+    _suggested_sort_key,
 )
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour

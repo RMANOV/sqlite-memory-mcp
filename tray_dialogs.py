@@ -17,7 +17,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from db_utils import (
     DB_PATH,
@@ -27,6 +27,7 @@ from db_utils import (
     TaskDAO,
     is_overdue,
     now_iso,
+    priority_sort_key,
 )
 
 from PyQt6.QtWidgets import (
@@ -579,6 +580,18 @@ def _build_copy_text(task):
     if task.get("assignee"):
         parts.append(f"Assignee: {task['assignee']}")
     return "\n".join(parts)
+
+
+def _suggested_sort_key(t):
+    """Python sort key replicating get_suggested_tasks() SQL ordering."""
+    dd = t.get("due_date")
+    today_str = date.today().isoformat()
+    return (
+        0 if (dd and dd < today_str) else 1,  # overdue first
+        priority_sort_key(t)[0],  # priority (critical first)
+        0 if dd else 1,  # has due date first
+        dd or "9999-99-99",  # due date ascending
+    )
 
 
 def _smart_group(tasks):
