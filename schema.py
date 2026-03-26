@@ -435,15 +435,13 @@ CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON entities BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON entities BEGIN
-    INSERT INTO memory_fts(memory_fts, rowid, name, entity_type, observations_text)
-    VALUES ('delete', old.rowid, old.name, old.entity_type, '');
+    DELETE FROM memory_fts WHERE rowid = old.rowid;
 END;
 
 -- NOTE: observations_text is always '' because triggers cannot aggregate child rows.
 -- Full-text search on observations relies on name/entity_type columns only.
 CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON entities BEGIN
-    INSERT INTO memory_fts(memory_fts, rowid, name, entity_type, observations_text)
-    VALUES ('delete', old.rowid, old.name, old.entity_type, '');
+    DELETE FROM memory_fts WHERE rowid = old.rowid;
     INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
     VALUES (new.rowid, new.name, new.entity_type, '');
 END;
@@ -886,6 +884,49 @@ _MIGRATIONS = [
 ]
 
 
+def _repair_memory_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Replace legacy FTS triggers that used invalid delete syntax."""
+    expected = {
+        "memory_fts_ad": (
+            "CREATE TRIGGER memory_fts_ad AFTER DELETE ON entities BEGIN "
+            "DELETE FROM memory_fts WHERE rowid = old.rowid; END"
+        ),
+        "memory_fts_au": (
+            "CREATE TRIGGER memory_fts_au AFTER UPDATE ON entities BEGIN "
+            "DELETE FROM memory_fts WHERE rowid = old.rowid; "
+            "INSERT INTO memory_fts(rowid, name, entity_type, observations_text) "
+            "VALUES (new.rowid, new.name, new.entity_type, ''); END"
+        ),
+    }
+    for name, expected_sql in expected.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?", (name,)
+        ).fetchone()
+        sql = " ".join((row[0] or "").split()) if row and row[0] else ""
+        if sql == expected_sql:
+            continue
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        if name == "memory_fts_ad":
+            conn.execute(
+                """
+                CREATE TRIGGER memory_fts_ad AFTER DELETE ON entities BEGIN
+                    DELETE FROM memory_fts WHERE rowid = old.rowid;
+                END
+                """
+            )
+        else:
+            conn.execute(
+                """
+                CREATE TRIGGER memory_fts_au AFTER UPDATE ON entities BEGIN
+                    DELETE FROM memory_fts WHERE rowid = old.rowid;
+                    INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+                    VALUES (new.rowid, new.name, new.entity_type, '');
+                END
+                """
+            )
+        logger.info("Migration applied: repaired %s trigger", name)
+
+
 def _split_schema_sql(sql: str) -> list[str]:
     """Split SQL schema into statements, respecting BEGIN...END trigger blocks.
 
@@ -940,6 +981,7 @@ def init_db(db_path: str | None = None) -> None:
             if not conn.execute(check_q).fetchone():
                 conn.execute(migrate_q)
                 logger.info("Migration applied: %s", desc)
+        _repair_memory_fts_triggers(conn)
 
     with _get_conn(_path) as conn:
         task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]

@@ -42,6 +42,7 @@ from db_utils import (
     priority_sort_key,
     upsert_field_versions,
 )
+from schema import init_db
 
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200
@@ -53,6 +54,8 @@ class TaskDB:
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
         self.on_change = None
+        # Run shared schema migrations before opening the long-lived GUI connection.
+        init_db(self.db_path)
         self._conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")

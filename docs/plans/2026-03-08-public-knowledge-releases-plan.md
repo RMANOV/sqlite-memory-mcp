@@ -1,5 +1,7 @@
 # Public Knowledge & Release Notifications — Implementation Plan
 
+> Historical note: this plan predates the current micro-server split. File references to `server.py` are historical and now typically map to `schema.py`, `bridge_server.py`, `collab_server.py`, `session_server.py`, or shared helpers in `db_utils.py`.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Enable marking entities as public/searchable, expose a public search tool, export public knowledge via bridge, and auto-create GitHub releases on the public repo for discoverability.

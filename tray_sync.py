@@ -95,8 +95,25 @@ class BridgeSyncMixin:
                 # Patch UI profile into shared.json (tray-specific, no extra commit)
                 self._patch_ui_profile()
 
-                if stats.get("skipped"):
+                if stats.get("blocked_by_repo_state"):
+                    self._bridge_done.emit(
+                        f"Sync blocked: {stats.get('message', 'bridge repo needs attention')}"
+                    )
+                elif stats.get("blocked_by_safety"):
+                    safety = stats.get("safety", {})
+                    self._bridge_done.emit(
+                        "Sync blocked by safety valve: "
+                        f"{safety.get('descriptions_removed', 0)} descriptions removed, "
+                        f"{safety.get('notes_removed', 0)} notes removed, "
+                        f"{safety.get('descriptions_shrunk', 0)} descriptions shrunk, "
+                        f"{safety.get('notes_shrunk', 0)} notes shrunk"
+                    )
+                elif stats.get("skipped"):
                     self._bridge_done.emit("Already in sync — no changes to push")
+                elif not stats.get("pushed", False):
+                    self._bridge_done.emit(
+                        "Sync incomplete — pull/import finished but push did not"
+                    )
                 else:
                     n_ent = stats.get("entities", 0)
                     n_tasks = stats.get("tasks", 0)

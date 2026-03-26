@@ -114,9 +114,6 @@ class TestTaskDB:
     def test_link_and_unlink_entity(self, db):
         tid = db.add_task("Task with link")
         db._conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL, created_at TEXT, updated_at TEXT)"
-        )
-        db._conn.execute(
             "INSERT INTO entities (name, entity_type, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))",
             ("EntityA", "concept"),
         )

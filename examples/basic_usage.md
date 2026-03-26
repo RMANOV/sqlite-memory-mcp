@@ -4,8 +4,9 @@ Quick start examples for the SQLite Memory MCP Server.
 
 ## Prerequisites
 
-1. Server is running via Claude Code MCP integration (see README for setup).
+1. The MCP servers are running via Claude Code MCP integration (see README for the multi-server setup).
 2. All tool calls below are made through Claude Code's MCP interface.
+3. `sqlite_memory` exposes the core graph tools below; `sqlite_session` exposes the session tools near the end of this guide.
 
 ## Creating Entities
 

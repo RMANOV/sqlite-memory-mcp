@@ -1,8 +1,8 @@
 # SQLite Memory MCP Server
 
-A production-quality SQLite-backed MCP Memory server with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, and a native system tray task manager.
+A production-quality SQLite-backed MCP Memory stack with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system tray task manager.
 
-Drop-in compatible with `@modelcontextprotocol/server-memory` (9/9 tools) plus 12 additional tools for session tracking, task management, cross-project search, and cross-machine bridge sync. Includes a PyQt6 desktop app for visual task management and five standalone automation scripts.
+Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 41 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (50 tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
 
 ## Why SQLite?
 
@@ -30,8 +30,8 @@ SQLite hits the sweet spot:
 - **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
-- **Drop-in compatible** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically, plus 12 new tools
-- **Zero required dependencies beyond stdlib** -- Only `fastmcp` for MCP protocol; `sqlite3` is Python stdlib. Optional `sqlite-vec` + `sentence-transformers` unlock semantic search
+- **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with 41 more tools available from companion servers
+- **Zero required dependencies beyond stdlib** -- Only `fastmcp` is required for MCP protocol; `sqlite3` is Python stdlib. Optional `orjson`, `sqlite-vec`, and `sentence-transformers` add speed and semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
 
@@ -58,53 +58,74 @@ SQLite hits the sweet spot:
 git clone https://github.com/rmanov/sqlite-memory-mcp.git
 cd sqlite-memory-mcp
 
-# Install dependencies
-pip install fastmcp
+# Install from source
+pip install -e .
 
-# Add to Claude Code
-claude mcp add sqlite_memory python3 /path/to/server.py
+# Optional extras
+# pip install -e ".[gui,vector,speed]"
+
+# Add the core drop-in server
+claude mcp add sqlite_memory python /path/to/server.py
+
+# Add companion servers for the full 50-tool stack
+claude mcp add sqlite_tasks python /path/to/task_server.py
+claude mcp add sqlite_session python /path/to/session_server.py
+claude mcp add sqlite_bridge python /path/to/bridge_server.py
+claude mcp add sqlite_collab python /path/to/collab_server.py
+claude mcp add sqlite_entity python /path/to/entity_server.py
+claude mcp add sqlite_intel python /path/to/intel_server.py
+```
+
+If you install the package instead of running from a checkout, the same servers are available as console scripts:
+
+```bash
+claude mcp add sqlite_memory sqlite-memory-core
+claude mcp add sqlite_tasks sqlite-memory-tasks
+claude mcp add sqlite_session sqlite-memory-session
+claude mcp add sqlite_bridge sqlite-memory-bridge
+claude mcp add sqlite_collab sqlite-memory-collab
+claude mcp add sqlite_entity sqlite-memory-entity
+claude mcp add sqlite_intel sqlite-memory-intel
 ```
 
 ### Manual Configuration
 
-Add to your `~/.claude/settings.json` under `mcpServers`:
+Add these server/file pairs to your `~/.claude/settings.json` under `mcpServers`:
+
+| MCP server name | Python entry file | Purpose |
+|---|---|---|
+| `sqlite_memory` | `server.py` | Core 9 drop-in memory tools |
+| `sqlite_tasks` | `task_server.py` | Task CRUD, digest, archive, overdue bump |
+| `sqlite_session` | `session_server.py` | Session recall, project search, health, resume |
+| `sqlite_bridge` | `bridge_server.py` | Cross-machine bridge sync, sharing review |
+| `sqlite_collab` | `collab_server.py` | Collaborator and public-knowledge workflows |
+| `sqlite_entity` | `entity_server.py` | Task-entity linking and merge helpers |
+| `sqlite_intel` | `intel_server.py` | Context assessment and enrichment tools |
+
+Each server should share the same environment values:
 
 ```json
-"sqlite_memory": {
-  "command": "python3",
-  "args": ["/path/to/sqlite-memory-mcp/server.py"],
-  "env": {
-    "SQLITE_MEMORY_DB": "/home/user/.claude/memory/memory.db"
-  }
+"env": {
+  "SQLITE_MEMORY_DB": "/home/user/.claude/memory/memory.db",
+  "BRIDGE_REPO": "/home/user/.claude/memory/bridge"
 }
 ```
 
-The `SQLITE_MEMORY_DB` environment variable controls where the database is stored. If omitted, it defaults to `~/.claude/memory/memory.db`.
+The `SQLITE_MEMORY_DB` environment variable controls where the database is stored. If omitted, it defaults to `~/.claude/memory/memory.db`. `BRIDGE_REPO` is only needed for bridge/collab flows.
 
 ## Architecture
 
-```
-┌──────────────┐     stdio      ┌──────────────────┐
-│  Claude Code  │◄──────────────►│  FastMCP Server   │
-│  (session N)  │               │  server.py         │
-├──────────────┤               │  21 MCP Tools      │
-│  Task Tray    │──── direct ──►│  ┌──────────────┐ │
-│  (PyQt6 GUI)  │   sqlite3     │  │  SQLite WAL   │ │
-├──────────────┤               │  │  memory.db    │ │
-│  Utility      │──── direct ──►│  │  FTS5 index   │ │
-│  Scripts      │   sqlite3     │  └──────────────┘ │
-└──────────────┘               └──────────────────┘
-                                        │
-                                   db_utils.py
-                               (shared constants,
-                                connection, helpers)
-```
+The system is intentionally split into micro-servers because Claude Code exposes only a limited number of tools per MCP server.
 
-Each Claude Code session spawns its own `server.py` process via stdio. The Task Tray GUI and utility scripts connect directly to the same `memory.db`. All consumers share `db_utils.py` for consistent DB access. SQLite WAL mode handles concurrency between all processes.
+- `server.py` exposes the 9 drop-in knowledge-graph tools.
+- `task_server.py`, `session_server.py`, `bridge_server.py`, `collab_server.py`, `entity_server.py`, and `intel_server.py` expose the remaining 41 tools.
+- All MCP servers, the Task Tray GUI, and the automation scripts share the same `memory.db`.
+- `db_utils.py` and `schema.py` are the shared source of truth for connections, migrations, and common helpers.
+- SQLite WAL mode handles concurrency across all of these processes.
 
 ## Schema
 
-The database has 5 tables and 1 FTS5 virtual table:
+The core schema includes the tables below, plus additional tables for task field-version tracking, bridge sync metadata, collaborators, public knowledge review, context packing, ratings, and entity/task links:
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -186,46 +207,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 
 ## Tool Reference
 
-### Knowledge Graph Tools (drop-in compatible)
+The 50 tools are grouped by MCP server:
 
-| # | Tool | Description |
-|---|------|-------------|
-| 1 | `create_entities` | Create new entities with observations. Accepts a list of `{name, entityType, observations}` objects. Deduplicates by name. |
-| 2 | `add_observations` | Add observations to existing entities. Accepts `{entityName, contents}` pairs. Deduplicates by content. |
-| 3 | `create_relations` | Create directed relations between entities. Accepts `{from, to, relationType}` triples. |
-| 4 | `delete_entities` | Delete entities by name. Cascades to observations and relations. |
-| 5 | `delete_observations` | Remove specific observations from an entity by content text. |
-| 6 | `delete_relations` | Remove specific relations by `{from, to, relationType}`. |
-| 7 | `read_graph` | Full knowledge graph dump. Returns all entities, observations, and relations. |
-| 8 | `search_nodes` | FTS5 BM25 ranked search across entity names, types, and observations. |
-| 9 | `open_nodes` | Retrieve specific entities by name, including their observations and inter-relations. |
-
-### Extended Tools (new)
-
-| # | Tool | Description |
-|---|------|-------------|
-| 10 | `session_save` | Save a session snapshot with session ID, project, summary, and active files. |
-| 11 | `session_recall` | Recall the N most recent sessions, ordered by start time. |
-| 12 | `search_by_project` | FTS5 BM25 search scoped to a specific project. |
-
-### Task Management Tools
-
-| # | Tool | Description |
-|---|------|-------------|
-| 13 | `create_task` | Create a new task. Params: `title` (required), `description`, `section` (inbox/today/next/someday/waiting), `priority` (low/medium/high/critical), `due_date` (YYYY-MM-DD), `project`, `parent_id`, `notes`, `recurring`. Returns UUID. |
-| 14 | `update_task` | Update a task's fields by UUID. All fields optional except `task_id`. Partial update -- only provided fields are changed. |
-| 15 | `query_tasks` | Query tasks with optional filters: `section`, `status`, `priority`, `project`, `parent_id`, `overdue_only`, `limit`. Filters combined with AND. Returns markdown table + JSON. |
-| 16 | `task_digest` | Generate a formatted session-start digest. Shows pending/in-progress tasks grouped by section plus overdue tasks highlighted separately. Params: `sections`, `include_overdue`, `limit`. |
-| 17 | `archive_done_tasks` | Archive completed tasks older than N days. Param: `older_than_days` (default 7). Moves `status='done'` tasks to `status='archived'`. |
-| 18 | `bump_overdue_priority` | Escalate priority of overdue tasks. Param: `target_priority` (default `high`). Only bumps tasks whose current priority is lower than the target. |
-
-### Bridge Tools (cross-machine sync)
-
-| # | Tool | Description |
-|---|------|-------------|
-| 19 | `bridge_push` | Push entities tagged with `project LIKE 'shared%'` to a bridge git repo as JSON. Payload v2 includes tasks. Git commit + push. |
-| 20 | `bridge_pull` | Pull shared entities and tasks from the bridge git repo. Git pull + import with dedup via UNIQUE constraints. Last-write-wins for tasks (compared by `updated_at`). |
-| 21 | `bridge_status` | Show sync status -- local shared entities vs repo contents, with diff summary. |
+| MCP server | Tool count | Tools |
+|---|---:|---|
+| `sqlite_memory` | 9 | `create_entities`, `add_observations`, `create_relations`, `delete_entities`, `delete_observations`, `delete_relations`, `read_graph`, `search_nodes`, `open_nodes` |
+| `sqlite_session` | 5 | `session_save`, `session_recall`, `search_by_project`, `knowledge_health`, `resume_context` |
+| `sqlite_tasks` | 6 | `create_task_or_note`, `update_task`, `query_tasks`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority` |
+| `sqlite_bridge` | 6 | `bridge_push`, `bridge_pull`, `bridge_status`, `assign_task`, `review_shared_tasks`, `process_recurring_tasks` |
+| `sqlite_collab` | 9 | `manage_collaborators`, `share_knowledge`, `review_shared_knowledge`, `request_publish`, `cancel_publish`, `search_public_knowledge`, `rate_public_knowledge`, `get_knowledge_ratings`, `update_verification` |
+| `sqlite_entity` | 7 | `link_task_entity`, `unlink_task_entity`, `get_task_links`, `get_entity_tasks`, `suggest_task_links`, `find_entity_overlaps`, `merge_entities` |
+| `sqlite_intel` | 8 | `assess_context`, `queue_clarification`, `record_human_answer`, `extract_candidate_claims`, `promote_candidate`, `build_context_pack`, `explain_impact`, `enrich_context` |
 
 ## Bridge Sync (Cross-Machine)
 
@@ -237,6 +229,8 @@ Share knowledge graph entities between machines (e.g., personal laptop + work co
 2. `bridge_push()` exports all shared entities + their observations and inter-relations to `shared.json` in a local git repo, then commits and pushes. The v2 payload also includes shared tasks.
 3. `bridge_pull()` on the other machine does `git pull` + imports new entities/observations/relations (UNIQUE constraints handle dedup). Tasks use last-write-wins based on `updated_at` comparison.
 4. `bridge_status()` shows what's in sync vs only-local vs only-remote
+
+Auto-sync only overwrites bridge-generated artifacts (`shared.json`, `index.json`, `tasks/`, `entities/`, `public_knowledge/`, `shared.js`). If the bridge repo contains user-managed dirty files such as `index.html`, sync now blocks instead of discarding them.
 
 ### Setup
 
@@ -263,12 +257,12 @@ On the second machine, clone instead of init:
 git clone https://github.com/YOUR_USER/memory-bridge.git ~/.claude/memory/bridge
 ```
 
-Add `BRIDGE_REPO` to your MCP server config in `~/.claude/settings.json`:
+Add `BRIDGE_REPO` to the MCP servers that participate in sharing (`sqlite_bridge`, `sqlite_collab`, and usually the rest of the stack so they all see the same paths):
 
 ```json
-"sqlite_memory": {
-  "command": "python3",
-  "args": ["/path/to/server.py"],
+"sqlite_bridge": {
+  "command": "python",
+  "args": ["/path/to/bridge_server.py"],
   "env": {
     "SQLITE_MEMORY_DB": "/home/user/.claude/memory/memory.db",
     "BRIDGE_REPO": "/home/user/.claude/memory/bridge"
@@ -348,7 +342,7 @@ Results are ranked by BM25 relevance score. The FTS5 index covers entity names, 
 
 ## Session Tracking
 
-Session tracking enables context continuity across Claude Code restarts.
+Session tracking lives on the `sqlite_session` MCP server and enables context continuity across Claude Code restarts.
 
 ### Saving a session
 
@@ -382,7 +376,7 @@ You can extend your Claude Code session hook (`~/.claude/hooks/session_context.p
 
 ## Task Management
 
-Structured task tracking built directly into the memory server. No external service required.
+Structured task tracking lives on the `sqlite_tasks` MCP server. No external service required.
 
 ### Section-based workflow
 
@@ -408,7 +402,7 @@ Four priority levels: `low`, `medium` (default), `high`, `critical`. The `query_
 
 ```python
 # Create a task
-create_task(
+create_task_or_note(
     title="Review pull request #42",
     section="today",
     priority="high",
@@ -437,10 +431,10 @@ bump_overdue_priority(target_priority="high")
 Link a task to a parent via `parent_id`:
 
 ```python
-parent = create_task(title="Implement feature X")
+parent = create_task_or_note(title="Implement feature X")
 # parent returns {"task_id": "<parent-uuid>", ...}
 
-create_task(
+create_task_or_note(
     title="Write tests for feature X",
     parent_id="<parent-uuid>"
 )
@@ -453,7 +447,7 @@ Query subtasks with `query_tasks(parent_id="<parent-uuid>")`.
 Pass a JSON recurrence config in the `recurring` field:
 
 ```python
-create_task(
+create_task_or_note(
     title="Weekly review",
     section="today",
     recurring='{"every": "week", "day": "monday"}'

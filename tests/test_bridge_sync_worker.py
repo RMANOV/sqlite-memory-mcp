@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from bridge_sync_worker import _check_sync_safety
+import db_utils
 
 
 @pytest.fixture
@@ -61,3 +63,90 @@ def test_check_sync_safety_flags_drastic_description_shrink(setup):
     assert safety["is_safe"] is False
     assert safety["descriptions_shrunk"] == 1
     assert safety["examples"][0]["task_id"] == task_id
+
+
+def _cp(args, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
+
+
+def test_bridge_repo_ready_blocks_user_managed_dirty_files(monkeypatch):
+    calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _cp(args, stdout="main\n")
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout=" M index.html\n")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready("bridge")
+
+    assert ok is False
+    assert "index.html" in msg
+    assert (
+        "checkout",
+        "--",
+        "shared.json",
+        "shared.js",
+        "index.json",
+        "entities_index.json",
+        "tasks",
+        "entities",
+        "public_knowledge",
+    ) not in calls
+
+
+def test_bridge_repo_ready_discards_generated_artifacts(monkeypatch):
+    calls = []
+    statuses = iter(
+        [
+            _cp(
+                ("status", "--porcelain"), stdout=" M shared.json\n?? tasks/new.json\n"
+            ),
+            _cp(("status", "--porcelain"), stdout=""),
+        ]
+    )
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _cp(args, stdout="main\n")
+        if args == ("status", "--porcelain"):
+            return next(statuses)
+        if args[:2] in {("checkout", "--"), ("clean", "-fd")}:
+            return _cp(args)
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready("bridge")
+
+    assert ok is True
+    assert msg is None
+    assert any(args[:2] == ("checkout", "--") for args in calls)
+    assert any(args[:2] == ("clean", "-fd") for args in calls)
+
+
+def test_bridge_repo_ready_recovers_detached_head(monkeypatch):
+    calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _cp(args, stdout="HEAD\n")
+        if args == ("checkout", "main"):
+            return _cp(args)
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout="")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready("bridge")
+
+    assert ok is True
+    assert msg is None
+    assert ("checkout", "main") in calls

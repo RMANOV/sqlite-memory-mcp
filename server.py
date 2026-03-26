@@ -12,6 +12,7 @@ entity, intel) to stay under Claude Code's ~9 tool visibility limit.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 

@@ -131,37 +131,22 @@ def fix_remote_ahead():
 
 
 def preflight_git_check():
-    """Ensure bridge repo is in a clean, syncable state."""
-    # 1. Detached HEAD → checkout main
-    ok, branch = git_run("rev-parse", "--abbrev-ref", "HEAD")
-    if ok and branch.strip() == "HEAD":
-        git_run("checkout", "main")
-        logging.warning("Preflight: fixed detached HEAD → main")
+    """Ensure bridge repo is safe to sync without discarding user-managed files."""
+    if SERVER_DIR not in sys.path:
+        sys.path.insert(0, SERVER_DIR)
+    try:
+        from db_utils import ensure_bridge_repo_ready
+    except Exception as exc:
+        msg = f"cannot load bridge preflight helper: {exc}"
+        logging.warning("Preflight blocked: %s", msg)
+        return False, msg
 
-    # 2. Single git status check for conflicts AND dirty state
-    ok, status = git_run("status", "--porcelain")
-    if not ok:
-        return
+    ok, msg = ensure_bridge_repo_ready(BRIDGE_REPO)
+    if ok:
+        return True, None
 
-    lines = [ln for ln in status.strip().split("\n") if ln]
-    has_conflicts = any(ln[:2] in ("UU", "AA", "DD", "DU", "UD") for ln in lines)
-
-    if has_conflicts:
-        git_run("rebase", "--abort")
-        git_run("merge", "--abort")
-        git_run("fetch", "origin")
-        git_run("reset", "--hard", "origin/main")
-        logging.warning("Preflight: cleared conflicts (reset to origin/main)")
-        # Re-check only after conflict resolution
-        ok, status = git_run("status", "--porcelain")
-        if not ok:
-            return
-        lines = [ln for ln in status.strip().split("\n") if ln]
-
-    # 3. Dirty working tree → discard (all files in bridge repo are generated from DB)
-    if lines:
-        git_run("checkout", "--", ".")
-        logging.info("Preflight: discarded dirty working tree")
+    logging.warning("Preflight blocked: %s", msg)
+    return False, msg
 
 
 def acquire_lock():
@@ -252,7 +237,10 @@ def main(progress_callback=None):
     try:
         # Pre-flight: ensure bridge git repo is in clean state
         _progress(2, "Preflight check...")
-        preflight_git_check()
+        ok, msg = preflight_git_check()
+        if not ok:
+            notify("warning", f"BRIDGE: sync blocked — {msg}")
+            return
 
         sys.path.insert(0, SERVER_DIR)
         from bridge_server import bridge_pull, bridge_push

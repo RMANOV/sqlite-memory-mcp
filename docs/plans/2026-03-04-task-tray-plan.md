@@ -1,5 +1,7 @@
 # Task Tray Implementation Plan
 
+> Historical note: this plan was written before the current micro-server split. References to single-file layouts or `server.py` ownership are historical and may now map to `task_server.py`, `schema.py`, `bridge_server.py`, or shared helpers in `db_utils.py`.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** System tray task manager with dual mode — compact popup (daily) + full window (planning) — reading/writing directly to SQLite Memory DB.

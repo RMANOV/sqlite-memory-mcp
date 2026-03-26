@@ -48,6 +48,7 @@ from db_utils import (
     export_entities_index,
     load_entities_from_files,
     migrate_entities_to_per_files,
+    ensure_bridge_repo_ready,
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -347,6 +348,20 @@ def main(
     """
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
+
+    repo_ok, repo_msg = ensure_bridge_repo_ready(bridge_dir)
+    if not repo_ok:
+        log.warning("Bridge repo preflight blocked sync: %s", repo_msg)
+        _progress(progress_callback, -1, f"BLOCKED: {repo_msg}")
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "imported_new": 0,
+            "imported_updated": 0,
+            "blocked_by_repo_state": True,
+            "message": repo_msg,
+        }
 
     # Phase 1: Promote pending_public (short transaction)
     with get_conn(_db_path) as conn:

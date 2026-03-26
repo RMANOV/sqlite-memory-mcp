@@ -1,5 +1,7 @@
 # Task Tray — SQLite Task Manager
 
+> Historical note: this design doc predates the later split into `task_tray.py`, `tray_sync.py`, and the shared `schema.py`/micro-server architecture. Treat line counts and direct `server.py` references here as historical context, not current file maps.
+
 > System tray widget with dual mode: compact popup (daily) + full window (planning)
 
 ## Use Case
