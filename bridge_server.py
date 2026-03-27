@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp_compat import FastMCP
 
 from db_utils import (
     json_dumps as _json_dumps,
@@ -398,7 +398,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         return json.dumps(
             {
                 "error": f"Bridge repo not found at {BRIDGE_REPO}. "
-                "Run: mkdir -p {BRIDGE_REPO} && git -C {BRIDGE_REPO} init"
+                f"Run: mkdir -p {BRIDGE_REPO} && git -C {BRIDGE_REPO} init"
             }
         )
 

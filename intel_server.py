@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from fastmcp import FastMCP
+from fastmcp_compat import FastMCP
 
 from db_utils import (
     get_conn as _get_conn,

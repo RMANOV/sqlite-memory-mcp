@@ -121,6 +121,16 @@ def test_bridge_push_blocks_when_bridge_repo_is_not_safe(tmp_path, monkeypatch):
     assert git_calls == []
 
 
+def test_bridge_push_missing_repo_error_includes_real_path(tmp_path, monkeypatch):
+    missing_repo = tmp_path / "missing-bridge"
+    monkeypatch.setattr(bridge_server, "BRIDGE_REPO", str(missing_repo))
+
+    result = json.loads(bridge_server.bridge_push.fn())
+
+    assert str(missing_repo) in result["error"]
+    assert "{BRIDGE_REPO}" not in result["error"]
+
+
 def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     _, bridge_dir = bridge_env
     git_calls = []

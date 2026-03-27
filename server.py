@@ -16,7 +16,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp_compat import FastMCP
 
 from db_utils import (
     get_conn as _get_conn,
