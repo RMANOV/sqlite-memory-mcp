@@ -1418,6 +1418,38 @@ def merge_import_tasks(
         key=lambda t: (t.get("parent_id") is not None, t.get("created_at", "")),
     )
 
+    # Pre-fetch: collect remote IDs that exist locally + their field versions
+    remote_ids = [r.get("id") for r in tasks_sorted if r.get("id")]
+    if remote_ids:
+        placeholders = ",".join("?" * len(remote_ids))
+        existing_rows = conn.execute(
+            f"SELECT id, updated_at FROM tasks WHERE id IN ({placeholders})",
+            remote_ids,
+        ).fetchall()
+        existing_map = {r["id"]: r for r in existing_rows}
+
+        fv_rows = conn.execute(
+            f"SELECT task_id, field_name, updated_at, updated_by "
+            f"FROM task_field_versions WHERE task_id IN ({placeholders})",
+            remote_ids,
+        ).fetchall()
+        fv_map: dict[str, dict[str, tuple[str, str]]] = {}
+        for r in fv_rows:
+            fv_map.setdefault(r["task_id"], {})[r["field_name"]] = (
+                r["updated_at"],
+                r["updated_by"],
+            )
+
+        # Pre-fetch full task rows for content field checks
+        task_rows = conn.execute(
+            f"SELECT * FROM tasks WHERE id IN ({placeholders})", remote_ids
+        ).fetchall()
+        task_content_map = {r["id"]: dict(r) for r in task_rows}
+    else:
+        existing_map = {}
+        fv_map = {}
+        task_content_map = {}
+
     for remote in tasks_sorted:
         tid = remote.get("id")
         if not tid or not _SAFE_TASK_ID.match(tid):
@@ -1446,20 +1478,14 @@ def merge_import_tasks(
 
         # Handle tombstones — only merge status field
         if remote.get("_tombstone"):
-            existing = conn.execute(
-                "SELECT id, updated_at FROM tasks WHERE id = ?", (tid,)
-            ).fetchone()
+            existing = existing_map.get(tid)
             if existing:
                 remote_ts, remote_by = _parse_field_ts(
                     remote_fts, "status", fallback_ts
                 )
-                local_fv = conn.execute(
-                    "SELECT updated_at, updated_by FROM task_field_versions "
-                    "WHERE task_id = ? AND field_name = 'status'",
-                    (tid,),
-                ).fetchone()
-                local_ts = local_fv["updated_at"] if local_fv else ""
-                local_by = local_fv["updated_by"] if local_fv else ""
+                local_fv_data = fv_map.get(tid, {}).get("status")
+                local_ts = local_fv_data[0] if local_fv_data else ""
+                local_by = local_fv_data[1] if local_fv_data else ""
 
                 tombstone_wins = (remote_ts, remote_by) > (local_ts, local_by)
 
@@ -1497,13 +1523,11 @@ def merge_import_tasks(
             continue
 
         # Match by UUID only — authoritative in LWW model
-        existing = conn.execute(
-            "SELECT id, updated_at FROM tasks WHERE id = ?", (tid,)
-        ).fetchone()
+        existing = existing_map.get(tid)
 
         if existing:
             local_id = existing["id"]
-            local_fvs = get_field_versions(conn, local_id)
+            local_fvs = fv_map.get(local_id, {})
 
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
@@ -1521,10 +1545,7 @@ def merge_import_tasks(
                 if (remote_ts, remote_by) > (local_ts, local_by):
                     # Content protection: never nullify or drastically shrink local content
                     if field in CONTENT_FIELDS:
-                        local_content = conn.execute(
-                            f"SELECT {field} FROM tasks WHERE id = ?", (local_id,)
-                        ).fetchone()
-                        local_val = local_content[0] if local_content else None
+                        local_val = task_content_map.get(local_id, {}).get(field)
                         if has_meaningful_content(
                             local_val
                         ) and not has_meaningful_content(remote_val):
@@ -1565,11 +1586,8 @@ def merge_import_tasks(
                 remote_val = remote.get(content_field)
                 if not remote_val:
                     continue
-                local_val = conn.execute(
-                    f"SELECT {content_field} FROM tasks WHERE id = ?",
-                    (local_id,),
-                ).fetchone()
-                if local_val and local_val[0] is None:
+                local_content = task_content_map.get(local_id, {})
+                if local_id in task_content_map and local_content.get(content_field) is None:
                     fields_to_update[content_field] = remote_val
                     updated_fields += 1
 
@@ -1638,15 +1656,17 @@ def merge_import_tasks(
                     remote.get("updated_at", now),
                 ),
             )
-            # Seed field versions from remote _field_ts
+            # Seed field versions from remote _field_ts (batch insert)
+            fv_batch = []
             for field in MERGEABLE_FIELDS:
                 fts, fby = _parse_field_ts(remote_fts, field, fallback_ts)
-                conn.execute(
-                    "INSERT OR IGNORE INTO task_field_versions "
-                    "(task_id, field_name, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?)",
-                    (tid, field, fts, fby),
-                )
+                fv_batch.append((tid, field, fts, fby))
+            conn.executemany(
+                "INSERT OR IGNORE INTO task_field_versions "
+                "(task_id, field_name, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?)",
+                fv_batch,
+            )
             new_count += 1
 
     # Import task-entity links from remote tasks (reuse `now` from above)

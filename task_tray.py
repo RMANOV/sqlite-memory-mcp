@@ -580,9 +580,7 @@ class TaskDB:
         if not self._enrich_refresh_lock.acquire(blocking=False):
             return
         try:
-            conn = sqlite3.connect(self.db_path, timeout=5)
-            conn.row_factory = sqlite3.Row
-            try:
+            with get_conn(self.db_path) as conn:
                 obs = {}
                 for row in conn.execute(
                     "SELECT entity_id, content FROM observations GROUP BY entity_id"
@@ -600,8 +598,6 @@ class TaskDB:
                     self._enrich_cache_obs = obs
                     self._enrich_cache_tc = tc
                     self._enrich_cache_valid = True
-            finally:
-                conn.close()
         except Exception as e:
             logger.warning("Enrich cache refresh failed: %s", e)
         finally:
@@ -628,63 +624,59 @@ class TaskDB:
         fts_q = " OR ".join(f'"{w}"' for w in words if w)
         if not fts_q:
             return []
-        conn = sqlite3.connect(self.db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                "SELECT rowid, name, entity_type, "
-                "(SELECT COUNT(*) FROM observations WHERE entity_id = memory_fts.rowid) AS obs_count "
-                "FROM memory_fts WHERE memory_fts MATCH ? LIMIT ?",
-                (fts_q, limit),
-            ).fetchall()
-        except Exception:
-            conn.close()
-            return []
-        fts_results = [dict(r) for r in rows]
+        with get_conn(self.db_path) as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT rowid, name, entity_type, "
+                    "(SELECT COUNT(*) FROM observations WHERE entity_id = memory_fts.rowid) AS obs_count "
+                    "FROM memory_fts WHERE memory_fts MATCH ? LIMIT ?",
+                    (fts_q, limit),
+                ).fetchall()
+            except Exception:
+                return []
+            fts_results = [dict(r) for r in rows]
 
-        # Vector search (ALWAYS enabled) — graceful degradation if deps missing
-        try:
-            from vec_search import vector_search, rrf_merge, load_vec
+            # Vector search (ALWAYS enabled) — graceful degradation if deps missing
+            try:
+                from vec_search import vector_search, rrf_merge, load_vec
 
-            if load_vec(conn):
-                vec_results = vector_search(conn, query, limit)
-                if vec_results and fts_results:
-                    fts_for_rrf = [
-                        {
-                            "eid": r["rowid"],
-                            "name": r["name"],
-                            "entity_type": r.get("entity_type", ""),
-                            "project": None,
-                        }
-                        for r in fts_results
-                    ]
-                    merged = rrf_merge(fts_for_rrf, vec_results, k=60)
-                    by_id = {r["rowid"]: r for r in fts_results}
-                    for vr in vec_results:
-                        if vr["eid"] not in by_id:
-                            by_id[vr["eid"]] = {
+                if load_vec(conn):
+                    vec_results = vector_search(conn, query, limit)
+                    if vec_results and fts_results:
+                        fts_for_rrf = [
+                            {
+                                "eid": r["rowid"],
+                                "name": r["name"],
+                                "entity_type": r.get("entity_type", ""),
+                                "project": None,
+                            }
+                            for r in fts_results
+                        ]
+                        merged = rrf_merge(fts_for_rrf, vec_results, k=60)
+                        by_id = {r["rowid"]: r for r in fts_results}
+                        for vr in vec_results:
+                            if vr["eid"] not in by_id:
+                                by_id[vr["eid"]] = {
+                                    "rowid": vr["eid"],
+                                    "name": vr["name"],
+                                    "entity_type": vr.get("entity_type", ""),
+                                    "obs_count": 0,
+                                }
+                        fts_results = [
+                            by_id[m["eid"]] for m in merged if m["eid"] in by_id
+                        ][:limit]
+                    elif vec_results and not fts_results:
+                        fts_results = [
+                            {
                                 "rowid": vr["eid"],
                                 "name": vr["name"],
                                 "entity_type": vr.get("entity_type", ""),
                                 "obs_count": 0,
                             }
-                    fts_results = [
-                        by_id[m["eid"]] for m in merged if m["eid"] in by_id
-                    ][:limit]
-                elif vec_results and not fts_results:
-                    fts_results = [
-                        {
-                            "rowid": vr["eid"],
-                            "name": vr["name"],
-                            "entity_type": vr.get("entity_type", ""),
-                            "obs_count": 0,
-                        }
-                        for vr in vec_results[:limit]
-                    ]
-        except Exception:
-            pass  # Graceful degradation to FTS5-only
-
-        conn.close()
+                            for vr in vec_results[:limit]
+                        ]
+            except Exception:
+                pass  # Graceful degradation to FTS5-only
 
         # Apply cached enrichment (zero SQL queries)
         results = []
@@ -1426,46 +1418,38 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""
-        _owned = conn is None
-        if _owned:
-            conn = sqlite3.connect(self.db.db_path, isolation_level=None, timeout=10)
-            conn.row_factory = sqlite3.Row
-        conn.execute("BEGIN")
-        try:
-            for e in remote_entities:
-                existing = conn.execute(
-                    "SELECT id FROM entities WHERE name = ?", (e["name"],)
-                ).fetchone()
-                if existing:
-                    continue
-                now = now_iso()
-                eid = conn.execute(
-                    "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        e["name"],
-                        e["entityType"],
-                        e.get("project") or "shared:bridge",
-                        now,
-                        now,
-                    ),
-                ).lastrowid
-                for o in e.get("observations", []):
-                    conn.execute(
-                        "INSERT INTO observations (entity_id, content, created_at) "
-                        "VALUES (?, ?, ?)",
-                        (eid, o["content"], o.get("createdAt", now)),
-                    )
-            conn.execute("COMMIT")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        finally:
-            if _owned:
-                conn.close()
+        if conn is not None:
+            self._import_remote_entities_inner(conn, remote_entities)
+        else:
+            with get_conn(self.db.db_path) as conn:
+                self._import_remote_entities_inner(conn, remote_entities)
+
+    @staticmethod
+    def _import_remote_entities_inner(conn, remote_entities):
+        for e in remote_entities:
+            existing = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (e["name"],)
+            ).fetchone()
+            if existing:
+                continue
+            now = now_iso()
+            eid = conn.execute(
+                "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    e["name"],
+                    e["entityType"],
+                    e.get("project") or "shared:bridge",
+                    now,
+                    now,
+                ),
+            ).lastrowid
+            for o in e.get("observations", []):
+                conn.execute(
+                    "INSERT INTO observations (entity_id, content, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (eid, o["content"], o.get("createdAt", now)),
+                )
 
     def _sort_tasks(self, tasks, sort_mode=None):
         """Sort tasks by given sort mode (or current working sort mode)."""
@@ -1928,18 +1912,13 @@ class TaskTrayApp:
 
         try:
             now_str = datetime.now(timezone.utc).isoformat()
-            conn = sqlite3.connect(self.db.db_path, isolation_level=None, timeout=5)
-            try:
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout=5000")
+            with get_conn(self.db.db_path) as conn:
                 rows = conn.execute(
                     "SELECT id, title, description, priority, reminder_at FROM tasks "
                     "WHERE reminder_at IS NOT NULL AND reminder_at <= ? "
                     "AND status NOT IN ('done', 'archived', 'cancelled')",
                     (now_str,),
                 ).fetchall()
-            finally:
-                conn.close()
         except Exception as exc:
             logging.getLogger("task_tray").warning("reminder check: %s", exc)
             return
