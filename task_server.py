@@ -338,12 +338,39 @@ def query_tasks(
 
     with _get_conn() as conn:
         if search:
-            # Fetch ALL matching rows first, then search, then paginate in Python
+            # FTS5 pre-filter: narrow rows before search engine re-ranks
+            fts_tokens = search.split()
+            fts_where = where
+            fts_params = list(params)
+            if fts_tokens:
+                # Prefix match (token*) so pre-filter is broader than
+                # the search engine's fuzzy/substring matching
+                escaped = []
+                for t in fts_tokens:
+                    clean = "".join(c for c in t if c.isalnum() or c == "_")
+                    if clean:
+                        escaped.append(clean + "*")
+                fts_match = " OR ".join(escaped) if escaped else None
+                if fts_match:
+                    try:
+                        # Verify FTS5 query is valid before using it
+                        conn.execute(
+                            "SELECT 1 FROM tasks_fts WHERE tasks_fts MATCH ? LIMIT 1",
+                            (fts_match,),
+                        )
+                        fts_where = (
+                            f"{where} AND t.rowid IN "
+                            f"(SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH ?)"
+                        )
+                        fts_params.append(fts_match)
+                    except Exception:
+                        pass  # FTS5 failed — fall back to unfiltered scan
+
             sql = (
-                f"SELECT {cols} FROM {from_clause} WHERE {where} "
+                f"SELECT {cols} FROM {from_clause} WHERE {fts_where} "
                 f"ORDER BY {order_clause}"
             )
-            all_rows = conn.execute(sql, params).fetchall()
+            all_rows = conn.execute(sql, fts_params).fetchall()
             results = _search_engine.search(
                 search, [dict(r) for r in all_rows], conn=conn
             )
@@ -381,7 +408,7 @@ def query_tasks(
         )
 
     result = {
-        "tasks": [dict(r) for r in rows],
+        "tasks": rows,
         "count": len(rows),
         "total": total,
         "offset": offset,

@@ -231,21 +231,30 @@ def _export_public_knowledge(conn: sqlite3.Connection) -> tuple[list, list]:
         "SELECT id, name, entity_type, project, created_at, updated_at "
         "FROM entities WHERE visibility='public' ORDER BY name"
     ).fetchall()
+
+    # Batch-load all observations for public entities (eliminates N+1 query)
+    obs_map: dict[int, list] = {}
+    if ent_rows:
+        ent_ids = [pe["id"] for pe in ent_rows]
+        placeholders = ",".join("?" * len(ent_ids))
+        obs_rows = conn.execute(
+            f"SELECT entity_id, content, created_at FROM observations "
+            f"WHERE entity_id IN ({placeholders}) ORDER BY entity_id, id",
+            ent_ids,
+        ).fetchall()
+        for o in obs_rows:
+            obs_map.setdefault(o["entity_id"], []).append(
+                {"content": o["content"], "createdAt": o["created_at"]}
+            )
+
     pub_entities = []
     for pe in ent_rows:
-        obs = conn.execute(
-            "SELECT content, created_at FROM observations "
-            "WHERE entity_id = ? ORDER BY id",
-            (pe["id"],),
-        ).fetchall()
         pub_entities.append(
             {
                 "name": pe["name"],
                 "entityType": pe["entity_type"],
                 "project": pe["project"],
-                "observations": [
-                    {"content": o["content"], "createdAt": o["created_at"]} for o in obs
-                ],
+                "observations": obs_map.get(pe["id"], []),
                 "createdAt": pe["created_at"],
                 "updatedAt": pe["updated_at"],
             }

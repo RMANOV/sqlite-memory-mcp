@@ -129,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_type       ON tasks(type);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee   ON tasks(assignee);
+CREATE INDEX IF NOT EXISTS idx_tasks_title      ON tasks(title);
 CREATE INDEX IF NOT EXISTS idx_tasks_updated_at    ON tasks(updated_at);
 CREATE INDEX IF NOT EXISTS idx_entities_updated_at ON entities(updated_at);
 

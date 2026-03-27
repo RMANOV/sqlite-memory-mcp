@@ -20,11 +20,11 @@ import time
 from datetime import date, datetime, timezone
 
 from db_utils import (
-    DB_PATH,
     PRIORITY_COLORS,
     TASK_PRIORITIES,
     TASK_SECTIONS as SECTIONS,
     TaskDAO,
+    get_conn,
     is_overdue,
     now_iso,
     priority_sort_key,
@@ -74,6 +74,7 @@ PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
 
 # Upper-case priority colors for UI lookups
 _PRIORITY_COLORS_UPPER = {k.upper(): v for k, v in PRIORITY_COLORS.items()}
+_DEFAULT_PRIORITY_COLOR = "#718096"
 
 # Entity type → badge color (shared between TaskReaderDialog + entity search cards)
 _ENTITY_TYPE_COLORS = {
@@ -243,18 +244,7 @@ def _update_theme_colors():
 
 
 # Initialize with default theme
-_t = _T()
-_CLR_DONE = QColor(_t["done"])
-_CLR_NOTE_BG = QColor(_t["note_bg"])
-_CLR_OVERDUE_BG = QColor(_t["overdue_bg"])
-_CLR_OVERDUE_FG = QColor(_t["overdue_fg"])
-_CLR_HEADER_BG = QColor(_t["header_bg"])
-_CLR_HEADER_FG = QColor(_t["text2"])
-_CLR_OVERDUE_HDR_BG = QColor(_t["overdue_bg"])
-_CLR_OVERDUE_HDR_FG = QColor(_t["overdue_fg"])
-_CLR_URGENT_HDR_BG = QColor(_t["urgent_bg"])
-_CLR_URGENT_HDR_FG = QColor(_t["urgent_fg"])
-del _t
+_update_theme_colors()
 
 
 # ── Stylesheet builders ─────────────────────────────────────────────
@@ -478,16 +468,12 @@ def _batch_truth_scores(db_path=None):
     if now - _ts_cache_time < 30:
         return _ts_cache
     try:
-        conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=5)
-        conn.row_factory = sqlite3.Row
-        try:
+        with get_conn(db_path) as conn:
             rows = conn.execute(
                 "SELECT entity_name, AVG(specificity * 0.35 + falsifiability * 0.25 + "
                 "internal_consistency * 0.25 + novelty * 0.15) as iq "
                 "FROM knowledge_ratings GROUP BY entity_name"
             ).fetchall()
-        finally:
-            conn.close()
         result = {}
         for r in rows:
             avg = r["iq"] or 0.0
@@ -1010,7 +996,7 @@ class TrayPopup(QWidget):
         priority = (task.get("priority") or "medium").upper()
         plbl = QLabel(priority)
         plbl.setObjectName("priority")
-        plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, '#718096')};")
+        plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, _DEFAULT_PRIORITY_COLOR)};")
         hl.addWidget(plbl)
 
         tip = _build_rich_tooltip(task)
@@ -1568,12 +1554,8 @@ class EntityDetailDialog(QDialog):
         self._load_data()
 
     def _load_data(self):
-        conn = sqlite3.connect(self.db.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
+        with get_conn(self.db.db_path) as conn:
             self._load_data_inner(conn)
-        finally:
-            conn.close()
 
     def _load_data_inner(self, conn):
         eid = self.entity_id
@@ -1707,16 +1689,12 @@ class EntityDetailDialog(QDialog):
             EntityDetailDialog(self.db, eid, self.parent()).exec()
         elif url.startswith("task:"):
             tid = url.split(":", 1)[1]
-            _conn = sqlite3.connect(self.db.db_path)
-            _conn.row_factory = sqlite3.Row
-            try:
+            with get_conn(self.db.db_path) as _conn:
                 task_row = _conn.execute(
                     f"SELECT {_UI_COLS} FROM tasks WHERE id = ?", (tid,)
                 ).fetchone()
                 if task_row:
                     TaskReaderDialog(dict(task_row), self.db, self.parent()).exec()
-            finally:
-                _conn.close()
 
 
 # ── TaskReaderDialog ─────────────────────────────────────────────────
@@ -1818,7 +1796,7 @@ class TaskReaderDialog(QDialog):
         priority = (self.task.get("priority") or "medium").upper()
         plbl = QLabel(priority)
         plbl.setObjectName("reader-priority")
-        color = _PRIORITY_COLORS_UPPER.get(priority, "#718096")
+        color = _PRIORITY_COLORS_UPPER.get(priority, _DEFAULT_PRIORITY_COLOR)
         plbl.setStyleSheet(
             f"color: #ffffff; background: {color}; font-size: {_font_size - 2}px; "
             f"font-weight: bold; padding: 2px 8px; border-radius: 3px;"
@@ -1921,40 +1899,35 @@ class TaskReaderDialog(QDialog):
             )
 
         # AI Enrich Context (Context Packs)
-        conn = None
         try:
-            conn = sqlite3.connect(self.db.db_path)
-            conn.row_factory = sqlite3.Row
-            tid = self.task.get("id")
-            from context_packer import build_context_pack as _build_context_pack
+            with get_conn(self.db.db_path) as conn:
+                tid = self.task.get("id")
+                from context_packer import build_context_pack as _build_context_pack
 
-            pack_result = _build_context_pack(
-                conn,
-                "executor",
-                target_ref=tid,
-                token_budget=1600,
-                persist=False,
-            )
-            if (
-                pack_result.get("items_included", 0) > 0
-                and pack_result.get("body", "").strip()
-            ):
-                match_score = (pack_result.get("relevance_score") or 0.0) * 100
-                trust_score = (pack_result.get("quality_score") or 0.0) * 100
-                freshness_score = (pack_result.get("freshness_score") or 0.0) * 100
-                ai_text = _html.escape(pack_result["body"]).replace("\n", "<br>")
-                body_html += (
-                    f'<div style="margin-top:25px; padding:15px; background:rgba(40, 60, 90, 0.3); '
-                    f'border-left: 4px solid #58a6ff; border-radius:3px;">'
-                    f'<div style="color:#58a6ff; font-weight:bold; font-size:12px; margin-bottom:8px; text-transform:uppercase;">'
-                    f"⬡ Intelligence Context (Match: {match_score:.0f}% • Trust: {trust_score:.0f}% • Fresh: {freshness_score:.0f}%)</div>"
-                    f'<div style="color:#c9d1d9; font-size:13px; line-height:1.5;">{ai_text}</div></div>'
+                pack_result = _build_context_pack(
+                    conn,
+                    "executor",
+                    target_ref=tid,
+                    token_budget=1600,
+                    persist=False,
                 )
+                if (
+                    pack_result.get("items_included", 0) > 0
+                    and pack_result.get("body", "").strip()
+                ):
+                    match_score = (pack_result.get("relevance_score") or 0.0) * 100
+                    trust_score = (pack_result.get("quality_score") or 0.0) * 100
+                    freshness_score = (pack_result.get("freshness_score") or 0.0) * 100
+                    ai_text = _html.escape(pack_result["body"]).replace("\n", "<br>")
+                    body_html += (
+                        f'<div style="margin-top:25px; padding:15px; background:rgba(40, 60, 90, 0.3); '
+                        f'border-left: 4px solid #58a6ff; border-radius:3px;">'
+                        f'<div style="color:#58a6ff; font-weight:bold; font-size:12px; margin-bottom:8px; text-transform:uppercase;">'
+                        f"⬡ Intelligence Context (Match: {match_score:.0f}% • Trust: {trust_score:.0f}% • Fresh: {freshness_score:.0f}%)</div>"
+                        f'<div style="color:#c9d1d9; font-size:13px; line-height:1.5;">{ai_text}</div></div>'
+                    )
         except Exception:
             pass  # Schema might not have context_packs yet
-        finally:
-            if conn is not None:
-                conn.close()
 
         self._body_label.setText(body_html)
 
@@ -2196,7 +2169,7 @@ class ReminderPopupDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # Priority badge
-        color = PRIORITY_COLORS.get(priority, "#718096")
+        color = PRIORITY_COLORS.get(priority, _DEFAULT_PRIORITY_COLOR)
         badge = QLabel(priority.upper())
         badge.setStyleSheet(
             f"background: {color}; color: white; padding: 2px 8px; "
