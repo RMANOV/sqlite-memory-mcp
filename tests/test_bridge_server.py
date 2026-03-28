@@ -28,6 +28,13 @@ def _conn_factory(db_path: str):
     return _open
 
 
+def _db_conn(db_path: str):
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 @pytest.fixture
 def bridge_env(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
@@ -154,3 +161,177 @@ def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     assert result["pushed_to_remote"] is True
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
+
+
+def test_bridge_pull_skips_spoofed_collaboration_payloads(bridge_env, monkeypatch):
+    db_path, bridge_dir = bridge_env
+    now = "2026-03-28T12:00:00+00:00"
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(
+            {
+                "owner": "mallory",
+                "shared_knowledge": [
+                    {
+                        "name": "Spoofed shared entity",
+                        "entityType": "note",
+                        "observations": [{"content": "spoofed", "createdAt": now}],
+                        "sharedBy": "alice",
+                    }
+                ],
+                "public_knowledge": {
+                    "entities": [
+                        {
+                            "name": "Spoofed public entity",
+                            "entityType": "note",
+                            "observations": [{"content": "public", "createdAt": now}],
+                        }
+                    ]
+                },
+                "knowledge_ratings": [
+                    {
+                        "entity_name": "Rated entity",
+                        "rater_id": "alice",
+                        "content_hash": "hash-1",
+                        "specificity": 0.8,
+                        "falsifiability": 0.7,
+                        "internal_consistency": 0.9,
+                        "novelty": 0.6,
+                        "rated_at": now,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO collaborators (github_user, trust_level, added_at) VALUES (?, ?, ?)",
+            ("alice", "read_write", now),
+        )
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, visibility, created_at, updated_at) "
+            "VALUES (?, ?, 'public', ?, ?)",
+            ("Rated entity", "note", now, now),
+        )
+        entity_id = conn.execute(
+            "SELECT id FROM entities WHERE name = ?",
+            ("Rated entity",),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+            (entity_id, "existing observation", now),
+        )
+
+    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
+
+    result = json.loads(bridge_server.bridge_pull.fn())
+
+    with _db_conn(db_path) as conn:
+        pending = conn.execute("SELECT COUNT(*) AS cnt FROM pending_shared_entities").fetchone()[
+            "cnt"
+        ]
+        ratings = conn.execute("SELECT COUNT(*) AS cnt FROM knowledge_ratings").fetchone()[
+            "cnt"
+        ]
+
+    assert "staged_shared_knowledge" not in result
+    assert "staged_public_knowledge" not in result
+    assert "imported_ratings" not in result
+    assert pending == 0
+    assert ratings == 0
+
+
+def test_bridge_pull_accepts_bound_collaboration_payloads(bridge_env, monkeypatch):
+    db_path, bridge_dir = bridge_env
+    now = "2026-03-28T12:00:00+00:00"
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(
+            {
+                "owner": "alice",
+                "shared_knowledge": [
+                    {
+                        "name": "Trusted shared entity",
+                        "entityType": "note",
+                        "observations": [{"content": "shared", "createdAt": now}],
+                        "sharedBy": "alice",
+                    }
+                ],
+                "public_knowledge": {
+                    "entities": [
+                        {
+                            "name": "Trusted public entity",
+                            "entityType": "note",
+                            "observations": [{"content": "public", "createdAt": now}],
+                        }
+                    ]
+                },
+                "knowledge_ratings": [
+                    {
+                        "entity_name": "Rated entity",
+                        "rater_id": "alice",
+                        "content_hash": "hash-1",
+                        "specificity": 0.8,
+                        "falsifiability": 0.7,
+                        "internal_consistency": 0.9,
+                        "novelty": 0.6,
+                        "rated_at": now,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO collaborators (github_user, trust_level, added_at) VALUES (?, ?, ?)",
+            ("alice", "read_write", now),
+        )
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, visibility, created_at, updated_at) "
+            "VALUES (?, ?, 'public', ?, ?)",
+            ("Rated entity", "note", now, now),
+        )
+        entity_id = conn.execute(
+            "SELECT id FROM entities WHERE name = ?",
+            ("Rated entity",),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+            (entity_id, "existing observation", now),
+        )
+
+    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
+
+    result = json.loads(bridge_server.bridge_pull.fn())
+
+    with _db_conn(db_path) as conn:
+        pending = conn.execute("SELECT COUNT(*) AS cnt FROM pending_shared_entities").fetchone()[
+            "cnt"
+        ]
+        ratings = conn.execute("SELECT COUNT(*) AS cnt FROM knowledge_ratings").fetchone()[
+            "cnt"
+        ]
+
+    assert result["staged_shared_knowledge"] == 1
+    assert result["staged_public_knowledge"] == 1
+    assert result["imported_ratings"] == 1
+    assert pending == 2
+    assert ratings == 1
+
+
+def test_assign_task_rejects_invalid_github_user(bridge_env):
+    db_path, _ = bridge_env
+    now = "2026-03-28T12:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("task-1", "Task", now, now),
+        )
+
+    result = json.loads(bridge_server.assign_task.fn("task-1", "../bad-user"))
+
+    assert "Invalid GitHub username" in result["error"]

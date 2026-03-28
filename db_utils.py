@@ -126,6 +126,8 @@ TASK_ALLOWED_UPDATE_FIELDS = frozenset(
     }
 )
 
+GITHUB_USER_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
+
 # ── Recurring task validation ─────────────────────────────────────────
 RECURRING_EVERY = ("day", "week", "month", "year")
 RECURRING_WEEKDAYS = frozenset(
@@ -503,6 +505,12 @@ BRIDGE_GENERATED_FILES = frozenset(
     {"shared.json", "shared.js", "index.json", "entities_index.json"}
 )
 BRIDGE_GENERATED_DIRS = frozenset({"tasks", "entities", "public_knowledge"})
+
+
+def validate_github_username(username: str) -> None:
+    """Raise ValueError when a collaborator/assignee name is not GitHub-safe."""
+    if not GITHUB_USER_RE.match(username):
+        raise ValueError(f"Invalid GitHub username: {username!r}")
 _BRIDGE_CONFLICT_STATES = frozenset({"AA", "AU", "DD", "DU", "UA", "UD", "UU"})
 
 
@@ -561,6 +569,55 @@ def is_generated_bridge_path(path: str) -> bool:
     return any(rel == d or rel.startswith(f"{d}/") for d in BRIDGE_GENERATED_DIRS)
 
 
+def _bridge_generated_symlink_issues(repo_dir: str, limit: int = 3) -> list[str]:
+    """Return generated bridge paths that are symlinks or escape the repo root."""
+    repo_root = Path(repo_dir).resolve()
+    flagged: list[str] = []
+    seen: set[str] = set()
+
+    def _record(path: Path) -> None:
+        rel = path.relative_to(repo_dir).as_posix()
+        if rel not in seen:
+            seen.add(rel)
+            flagged.append(rel)
+
+    for rel_name in sorted(BRIDGE_GENERATED_FILES | BRIDGE_GENERATED_DIRS):
+        path = Path(repo_dir) / rel_name
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink():
+            _record(path)
+            if len(flagged) >= limit:
+                return flagged
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            _record(path)
+            if len(flagged) >= limit:
+                return flagged
+            continue
+        if resolved != repo_root and repo_root not in resolved.parents:
+            _record(path)
+            if len(flagged) >= limit:
+                return flagged
+            continue
+        if not path.is_dir():
+            continue
+        try:
+            for child in path.rglob("*"):
+                if not child.is_symlink():
+                    continue
+                _record(child)
+                if len(flagged) >= limit:
+                    return flagged
+        except OSError:
+            _record(path)
+            if len(flagged) >= limit:
+                return flagged
+    return flagged
+
+
 def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     """Prepare the bridge repo for sync without discarding user-managed files.
 
@@ -586,6 +643,14 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
                 False,
                 f"bridge repo is detached and could not checkout main: {detail}",
             )
+
+    symlink_issues = _bridge_generated_symlink_issues(repo_dir)
+    if symlink_issues:
+        shown = ", ".join(symlink_issues[:3])
+        return (
+            False,
+            f"bridge repo contains unsafe generated symlinks/escaped paths: {shown}",
+        )
 
     status = git_run(repo_dir, "status", "--porcelain")
     if status.returncode != 0:

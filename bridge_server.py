@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import socket
 import sqlite3
 import subprocess
@@ -50,6 +49,7 @@ from db_utils import (
     git_run as _git_run,
     ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
     source_hash as _source_hash,
+    validate_github_username as _validate_github_user,
 )
 from schema import (
     error as _error,
@@ -111,18 +111,30 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     return _git_run(BRIDGE_REPO, *args)
 
 
-_GITHUB_USER_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
-
-
-def _validate_github_user(username: str) -> None:
-    """Raise ValueError if username is not a valid GitHub username."""
-    if not _GITHUB_USER_RE.match(username):
-        raise ValueError(f"Invalid GitHub username: {username!r}")
-
-
 def _bridge_repo_blocked_error(message: str) -> str:
     """Return a structured bridge repo preflight error."""
     return json.dumps({"error": message, "blocked_by_repo_state": True})
+
+
+def _is_known_collaborator(
+    conn: sqlite3.Connection,
+    github_user: str | None,
+    required_trust: str | None = None,
+) -> bool:
+    """Check collaborator membership, optionally enforcing a trust level."""
+    if not github_user:
+        return False
+    if required_trust is None:
+        row = conn.execute(
+            "SELECT 1 FROM collaborators WHERE github_user = ?",
+            (github_user,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM collaborators WHERE github_user = ? AND trust_level = ?",
+            (github_user, required_trust),
+        ).fetchone()
+    return row is not None
 
 
 def _write_shared_js(shared_path: Path, payload_text: str | None = None) -> None:
@@ -930,6 +942,7 @@ def bridge_pull() -> str:
     new_relations = 0
     new_tasks = 0
     updated_tasks = 0
+    payload_owner = payload.get("owner")
 
     with _get_conn() as conn:
         for ent in entities:
@@ -1165,12 +1178,15 @@ def bridge_pull() -> str:
             )
             sender = sk.get("sharedBy", "unknown")
 
-            # Check trust: only accept from known read_write collaborators
-            collab = conn.execute(
-                "SELECT trust_level FROM collaborators WHERE github_user = ?",
-                (sender,),
-            ).fetchone()
-            if not collab or collab["trust_level"] != "read_write":
+            if payload_owner != sender:
+                logger.info(
+                    "bridge_pull: skipping knowledge for %s — sender %s does not match payload owner %s",
+                    sname,
+                    sender,
+                    payload_owner,
+                )
+                continue
+            if not _is_known_collaborator(conn, sender, required_trust="read_write"):
                 logger.info(
                     "bridge_pull: skipping knowledge from untrusted sender %s", sender
                 )
@@ -1212,32 +1228,38 @@ def bridge_pull() -> str:
             if isinstance(public_knowledge, dict)
             else []
         )
-        source_owner = payload.get("owner", "unknown")
-        for pk in pk_entities:
-            pname = pk.get("name")
-            if not pname:
-                continue
-            obs_json = json.dumps(pk.get("observations", []), ensure_ascii=False)
-            phash = _source_hash(
-                pname, pk.get("entityType", ""), pk.get("observations", [])
+        source_owner = payload_owner or "unknown"
+        if pk_entities and not _is_known_collaborator(conn, payload_owner):
+            logger.info(
+                "bridge_pull: skipping public knowledge from non-collaborator %s",
+                source_owner,
             )
-            conn.execute(
-                "INSERT OR IGNORE INTO pending_shared_entities "
-                "(name, entity_type, project, observations, priority, "
-                "shared_by, source_hash, received_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    pname,
-                    pk.get("entityType", "unknown"),
-                    pk.get("project"),
-                    obs_json,
-                    "medium",
-                    f"public:{source_owner}",
-                    phash,
-                    now,
-                ),
-            )
-            staged_public += 1
+        else:
+            for pk in pk_entities:
+                pname = pk.get("name")
+                if not pname:
+                    continue
+                obs_json = json.dumps(pk.get("observations", []), ensure_ascii=False)
+                phash = _source_hash(
+                    pname, pk.get("entityType", ""), pk.get("observations", [])
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO pending_shared_entities "
+                    "(name, entity_type, project, observations, priority, "
+                    "shared_by, source_hash, received_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pname,
+                        pk.get("entityType", "unknown"),
+                        pk.get("project"),
+                        obs_json,
+                        "medium",
+                        f"public:{source_owner}",
+                        phash,
+                        now,
+                    ),
+                )
+                staged_public += 1
         if staged_public:
             logger.info(
                 "bridge_pull: staged %d public knowledge entities for review",
@@ -1247,11 +1269,20 @@ def bridge_pull() -> str:
         # v0.9.0: Import knowledge ratings with anti-gaming validation
         imported_ratings = 0
         local_owner = os.environ.get("GITHUB_USER", socket.gethostname())
+        ratings_owner_trusted = _is_known_collaborator(conn, payload_owner)
         for kr in payload.get("knowledge_ratings", []):
             kr_rater = kr.get("rater_id", "")
             kr_entity = kr.get("entity_name", "")
             # Skip own ratings (don't import back)
             if kr_rater == local_owner:
+                continue
+            if not ratings_owner_trusted or kr_rater != payload_owner:
+                logger.info(
+                    "bridge_pull: skipping rating for %s from %s (payload owner=%s)",
+                    kr_entity,
+                    kr_rater,
+                    payload_owner,
+                )
                 continue
             # Skip if entity doesn't exist locally or isn't public
             ent = conn.execute(
@@ -1466,6 +1497,12 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
     pushed to https://github.com/{assignee}/memory-bridge.
     Pass assignee=None to unassign.
     """
+    if assignee is not None:
+        try:
+            _validate_github_user(assignee)
+        except ValueError as exc:
+            return _error(str(exc))
+
     now = _now()
     with _get_conn() as conn:
         existing = conn.execute(

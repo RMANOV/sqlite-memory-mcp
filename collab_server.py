@@ -35,6 +35,7 @@ from db_utils import (
     RATING_BURST_THRESHOLD as _RATING_BURST_THRESHOLD,
     RATING_BURST_WINDOW_HOURS as _RATING_BURST_WINDOW_HOURS,
     setup_logger,
+    validate_github_username as _validate_github_user,
 )
 from schema import (
     error as _error,
@@ -254,6 +255,11 @@ def manage_collaborators(
         if not github_user:
             return _error("github_user required for add/remove/update")
 
+        try:
+            _validate_github_user(github_user)
+        except ValueError as exc:
+            return _error(str(exc))
+
         if action == "add":
             tl = trust_level or "read_write"
             if tl not in _TRUST_LEVELS:
@@ -353,6 +359,29 @@ def share_knowledge(
         if not targets:
             return _error(
                 "No collaborators found. Use manage_collaborators(action='add') first."
+            )
+
+        seen_targets: set[str] = set()
+        validated_targets: list[str] = []
+        for target in targets:
+            try:
+                _validate_github_user(target)
+            except ValueError as exc:
+                return _error(str(exc))
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            validated_targets.append(target)
+        targets = validated_targets
+
+        known_targets = {
+            r["github_user"]
+            for r in conn.execute("SELECT github_user FROM collaborators").fetchall()
+        }
+        unknown_targets = [t for t in targets if t not in known_targets]
+        if unknown_targets:
+            return _error(
+                "Unknown collaborator(s): " + ", ".join(sorted(unknown_targets))
             )
 
         # Validate entities exist (unless wildcard)
