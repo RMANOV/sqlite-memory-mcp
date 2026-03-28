@@ -52,14 +52,10 @@ from db_utils import (
     source_hash as _source_hash,
 )
 from schema import (
-    init_db,
     error as _error,
     clamp_score as _clamp_score,
     is_valid_timestamp as _is_valid_timestamp,
 )
-
-# ── DB schema init ────────────────────────────────────────────────────────
-init_db()
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 

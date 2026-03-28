@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Unified SQLite MCP Server — all 35 tools in a single process.
+"""Unified SQLite MCP Server — all 50 tools in a single process.
 
-Consolidates 5 separate micro-servers (core, tasks, session, entity, intel)
-into one FastMCP instance using mount(). Saves ~400MB RAM per Claude Code
-session by eliminating 4 redundant Python interpreter instances.
+Consolidates the 7 domain servers (core, tasks, session, entity, intel,
+bridge, collab) into one FastMCP instance using mount(). This avoids running
+multiple redundant Python interpreter instances when a single all-in-one MCP
+server is preferred.
 
 All tools keep their original names (no prefix).
 """
@@ -12,11 +13,7 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 
-from db_utils import setup_logger
-from schema import init_db
-
-# ── Ensure DB is initialized before mounting ─────────────────────────────
-init_db()
+from db_utils import ensure_db_initialized, setup_logger
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 logger = setup_logger("sqlite-unified", "unified_server.log")
@@ -72,4 +69,5 @@ logger.info(
 )
 
 if __name__ == "__main__":
+    ensure_db_initialized()
     mcp.run(transport="stdio")

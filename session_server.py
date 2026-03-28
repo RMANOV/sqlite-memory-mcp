@@ -19,7 +19,7 @@ from db_utils import (
     now_iso as _now,
     setup_logger,
 )
-from schema import init_db, error as _error
+from schema import error as _error
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -34,10 +34,6 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
-
-# init DB
-init_db()
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: session_save

@@ -29,8 +29,6 @@ from db_utils import (
     setup_logger,
     export_relations as _export_relations,
 )
-from schema import init_db
-
 # Optional vector search (graceful fallback to FTS5-only)
 try:
     from vec_search import (
@@ -576,8 +574,6 @@ def open_nodes(names: list[str]) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Startup
 # ═══════════════════════════════════════════════════════════════════════════
-
-init_db()
 
 if __name__ == "__main__":
     _migrate_jsonl()

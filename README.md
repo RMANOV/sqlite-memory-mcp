@@ -74,6 +74,9 @@ claude mcp add sqlite_bridge python /path/to/bridge_server.py
 claude mcp add sqlite_collab python /path/to/collab_server.py
 claude mcp add sqlite_entity python /path/to/entity_server.py
 claude mcp add sqlite_intel python /path/to/intel_server.py
+
+# Optional: run the full stack as one all-in-one server instead
+claude mcp add sqlite_unified python /path/to/unified_server.py
 ```
 
 If you install the package instead of running from a checkout, the same servers are available as console scripts:
@@ -86,6 +89,9 @@ claude mcp add sqlite_bridge sqlite-memory-bridge
 claude mcp add sqlite_collab sqlite-memory-collab
 claude mcp add sqlite_entity sqlite-memory-entity
 claude mcp add sqlite_intel sqlite-memory-intel
+
+# Optional all-in-one server
+claude mcp add sqlite_unified sqlite-memory-unified
 ```
 
 ### Manual Configuration
@@ -101,6 +107,7 @@ Add these server/file pairs to your `~/.claude/settings.json` under `mcpServers`
 | `sqlite_collab` | `collab_server.py` | Collaborator and public-knowledge workflows |
 | `sqlite_entity` | `entity_server.py` | Task-entity linking and merge helpers |
 | `sqlite_intel` | `intel_server.py` | Context assessment and enrichment tools |
+| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full 50-tool stack |
 
 Each server should share the same environment values:
 

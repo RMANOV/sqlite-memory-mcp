@@ -16,7 +16,6 @@ from db_utils import (
     get_conn as _get_conn,
     setup_logger,
 )
-from schema import init_db
 from intelligence_v2 import (
     assess_context as _assess_context,
     queue_clarification as _queue_clarification,
@@ -47,10 +46,6 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
-
-# init DB
-init_db()
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: assess_context

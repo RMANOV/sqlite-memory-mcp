@@ -22,7 +22,7 @@ from db_utils import (
     setup_logger,
     TaskDAO,
 )
-from schema import init_db, error as _error
+from schema import error as _error
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -37,10 +37,6 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
-
-# ── Init DB ──────────────────────────────────────────────────────────────
-init_db()
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: link_task_entity

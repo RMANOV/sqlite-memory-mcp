@@ -37,7 +37,6 @@ from db_utils import (
     setup_logger,
 )
 from schema import (
-    init_db,
     error as _error,
 )
 
@@ -54,10 +53,6 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
-
-# ── Init DB ──────────────────────────────────────────────────────────────
-init_db()
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Private helpers (used only by collab tools)

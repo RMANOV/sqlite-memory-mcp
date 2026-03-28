@@ -3,3 +3,9 @@ __pycache__/
 server.py.v1.bak
 test_runtime.py
 press-releases/
+.pytest_cache/
+.wrangler/
+memory.db
+memory.db-*
+memory.db.bak-pre-optimization
+*.log

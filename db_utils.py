@@ -16,6 +16,8 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
+import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -337,14 +339,24 @@ _SAFE_ENTITY_ID = re.compile(r"^[1-9][0-9]*$")
 
 def setup_logger(name: str, log_file: str = "server.log") -> logging.Logger:
     """Configure file logger. Idempotent — safe to call multiple times."""
-    log_path = Path.home() / ".claude" / "memory" / log_file
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     if not logger.handlers:
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(fh)
+        candidates = [
+            Path.home() / ".claude" / "memory" / log_file,
+            Path(tempfile.gettempdir()) / "sqlite-memory-mcp" / log_file,
+        ]
+        for log_path in candidates:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                fh = logging.FileHandler(log_path, encoding="utf-8")
+            except OSError:
+                continue
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(fh)
+            break
+        if not logger.handlers:
+            logger.addHandler(logging.NullHandler())
     return logger
 
 
@@ -363,6 +375,47 @@ _PRAGMAS = (
 _BUSY_RETRIES = 3
 _BUSY_BASE_DELAY = 0.5  # seconds, doubles each retry
 
+_DB_INIT_DONE: set[str] = set()
+_DB_INIT_ACTIVE: set[str] = set()
+_DB_INIT_COND = threading.Condition()
+_DB_INIT_LOCAL = threading.local()
+
+
+def ensure_db_initialized(db_path: str | None = None) -> str:
+    """Initialize the target DB lazily, once per process and path."""
+    target = db_path or DB_PATH
+    local_paths = getattr(_DB_INIT_LOCAL, "paths", set())
+    if target in local_paths:
+        return target
+
+    with _DB_INIT_COND:
+        while target in _DB_INIT_ACTIVE:
+            _DB_INIT_COND.wait()
+        if target in _DB_INIT_DONE:
+            return target
+        _DB_INIT_ACTIVE.add(target)
+
+    _DB_INIT_LOCAL.paths = set(local_paths) | {target}
+    try:
+        from schema import init_db
+
+        init_db(target)
+    except Exception:
+        with _DB_INIT_COND:
+            _DB_INIT_ACTIVE.discard(target)
+            _DB_INIT_COND.notify_all()
+        raise
+    finally:
+        local_paths = set(getattr(_DB_INIT_LOCAL, "paths", set()))
+        local_paths.discard(target)
+        _DB_INIT_LOCAL.paths = local_paths
+
+    with _DB_INIT_COND:
+        _DB_INIT_ACTIVE.discard(target)
+        _DB_INIT_DONE.add(target)
+        _DB_INIT_COND.notify_all()
+    return target
+
 
 @contextmanager
 def get_conn(db_path: str | None = None):
@@ -373,10 +426,14 @@ def get_conn(db_path: str | None = None):
     """
     import time as _time
 
+    target = db_path or DB_PATH
+    if db_path is None:
+        ensure_db_initialized(target)
+
     # Retry connection + BEGIN on SQLITE_BUSY (lock contention with tray/bridge)
     conn = None
     for attempt in range(_BUSY_RETRIES):
-        conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=10)
+        conn = sqlite3.connect(target, isolation_level=None, timeout=10)
         conn.row_factory = sqlite3.Row
         for pragma in _PRAGMAS:
             conn.execute(pragma)
@@ -413,7 +470,10 @@ def bulk_conn(db_path: str | None = None):
     Use for batch imports where throughput matters more than per-row durability.
     WAL checkpoint runs automatically after the transaction commits.
     """
-    conn = sqlite3.connect(db_path or DB_PATH, isolation_level=None, timeout=30)
+    target = db_path or DB_PATH
+    if db_path is None:
+        ensure_db_initialized(target)
+    conn = sqlite3.connect(target, isolation_level=None, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")

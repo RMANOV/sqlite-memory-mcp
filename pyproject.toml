@@ -23,6 +23,7 @@ sqlite-memory-bridge = "bridge_server:mcp.run"
 sqlite-memory-collab = "collab_server:mcp.run"
 sqlite-memory-entity = "entity_server:mcp.run"
 sqlite-memory-intel = "intel_server:mcp.run"
+sqlite-memory-unified = "unified_server:mcp.run"
 task-tray = "task_tray:main"
 memory-digest = "daily_digest:main"
 

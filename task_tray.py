@@ -13,21 +13,52 @@ import os
 import socket as _socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import uuid
 import time
 from datetime import datetime, timedelta, timezone
 
-_log_dir = os.path.expanduser("~/.claude/mcp_servers/sqlite_kb")
-os.makedirs(_log_dir, exist_ok=True)
-_crash_log = open(os.path.join(_log_dir, "crash.log"), "a")
+
+def _resolve_log_dir() -> str:
+    for path in (
+        os.path.expanduser("~/.claude/mcp_servers/sqlite_kb"),
+        os.path.join(tempfile.gettempdir(), "sqlite-memory-mcp"),
+    ):
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return tempfile.gettempdir()
+
+
+def _open_log_file(path: str):
+    try:
+        return open(path, "a")
+    except OSError:
+        return open(os.devnull, "a")
+
+
+_log_dir = _resolve_log_dir()
+_crash_log = _open_log_file(os.path.join(_log_dir, "crash.log"))
 atexit.register(_crash_log.close)
-faulthandler.enable(file=_crash_log)
-logging.basicConfig(
-    filename=os.path.join(_log_dir, "task_tray.log"),
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+try:
+    faulthandler.enable(file=_crash_log)
+except Exception:
+    pass
+try:
+    logging.basicConfig(
+        filename=os.path.join(_log_dir, "task_tray.log"),
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+except OSError:
+    logging.basicConfig(
+        filename=os.devnull,
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 logger = logging.getLogger("task_tray")
 
 from task_search import TaskSearchEngine
@@ -61,7 +92,6 @@ class TaskDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=10000")
-        self._ensure_table()
         self._repair_fts_if_needed()
 
         self._last_promote_time: float = 0.0
