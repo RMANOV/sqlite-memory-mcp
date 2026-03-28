@@ -116,9 +116,18 @@ def fix_remote_ahead():
         if "CONFLICT" in out or "unmerged" in out:
             git_run("rebase", "--abort")
             git_run("fetch", "origin")
-            git_run("reset", "--hard", "origin/main")
-            notify("warning", "BRIDGE: conflict auto-resolved (reset to origin/main)")
-            return True  # continue — export will re-create from DB
+            reset_ok, reset_out = git_run("reset", "--hard", "origin/main")
+            if not reset_ok:
+                notify(
+                    "error",
+                    f"BRIDGE: failed to reset after conflict: {reset_out[:200]}",
+                )
+                return False
+            notify(
+                "warning",
+                "BRIDGE: conflict reset to origin/main; local DB changes will retry on next sync",
+            )
+            return False
         notify("warning", f"BRIDGE: pull --rebase failed: {out[:200]}")
         return False
 
@@ -274,10 +283,21 @@ def main(progress_callback=None):
         except (json.JSONDecodeError, TypeError):
             result = {}
 
-        pushed = (
-            result.get("pushed_to_remote", False) if isinstance(result, dict) else False
-        )
+        pushed = False
         tasks_count = result.get("tasks", 0) if isinstance(result, dict) else 0
+        if isinstance(result, dict):
+            pushed = bool(result.get("pushed_to_remote", False))
+            if result.get("blocked_by_repo_state"):
+                notify(
+                    "warning",
+                    f"BRIDGE: sync blocked — {result.get('error', 'bridge repo is not ready')}",
+                )
+                return
+            message = str(result.get("message", ""))
+            if not pushed and result.get("pushed") == 0 and message.startswith(
+                "No changes"
+            ):
+                pushed = True
 
         _progress(70, "Verifying push...")
         if not pushed:

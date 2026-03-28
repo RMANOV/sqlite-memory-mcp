@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import sqlite3
 import subprocess
@@ -63,6 +64,13 @@ _SAFETY_THRESHOLD = 10  # Block sync if this many descriptions would be removed
 def _progress(cb: Callable[[int, str], None] | None, pct: int, label: str) -> None:
     if cb is not None:
         cb(pct, label)
+
+
+def _write_shared_js(shared_path: Path, payload_text: str) -> None:
+    js_path = shared_path.with_name("shared.js")
+    tmp_path = js_path.with_suffix(".tmp")
+    tmp_path.write_text(f"window.__BRIDGE_DATA__ = {payload_text};", encoding="utf-8")
+    os.replace(tmp_path, js_path)
 
 
 def _check_sync_safety(
@@ -640,13 +648,18 @@ def main(
             pass
 
     _progress(progress_callback, 70, "Writing shared.json...")
-    shared_path.write_text(_json_dumps(payload), encoding="utf-8")
+    payload_json = _json_dumps(payload)
+    tmp_shared_path = shared_path.with_suffix(".tmp")
+    tmp_shared_path.write_text(payload_json, encoding="utf-8")
+    os.replace(tmp_shared_path, shared_path)
+    _write_shared_js(shared_path, payload_json)
 
     _progress(progress_callback, 80, "git add...")
     git_run(
         bridge_dir,
         "add",
         "shared.json",
+        "shared.js",
         "index.json",
         "tasks/",
         "entities/",
