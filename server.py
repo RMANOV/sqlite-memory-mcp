@@ -396,7 +396,7 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
                    total: int, has_more: bool}
     """
     with _get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] if offset == 0 else -1
         ent_rows = conn.execute(
             "SELECT id, name, entity_type, project FROM entities ORDER BY name LIMIT ? OFFSET ?",
             (limit, offset),

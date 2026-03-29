@@ -1824,7 +1824,7 @@ class TaskTrayApp:
         }
 
         try:
-            now_str = datetime.now(timezone.utc).isoformat()
+            now_str = now_iso()
             with get_conn(self.db.db_path) as conn:
                 rows = conn.execute(
                     "SELECT id, title, description, priority, reminder_at FROM tasks "

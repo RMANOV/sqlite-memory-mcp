@@ -1840,8 +1840,9 @@ def load_task_content(task_id: str, bridge_dir: str) -> dict | None:
     """Lazy-load full task (notes/description) from bridge per-task file."""
     if not _SAFE_TASK_ID.match(task_id):
         return None
+    real_base = os.path.realpath(bridge_dir)
     task_file = Path(bridge_dir) / "tasks" / f"{task_id}.json"
-    if not os.path.realpath(task_file).startswith(os.path.realpath(bridge_dir)):
+    if not os.path.realpath(task_file).startswith(real_base):
         return None  # path traversal attempt
     if not task_file.exists():
         return None
@@ -2052,8 +2053,9 @@ def load_entity_content(entity_id: int | str, bridge_dir: str) -> dict | None:
     eid_str = str(entity_id)
     if not _SAFE_ENTITY_ID.match(eid_str):
         return None
+    real_base = os.path.realpath(bridge_dir)
     fpath = Path(bridge_dir) / "entities" / f"{eid_str}.json"
-    if not os.path.realpath(fpath).startswith(os.path.realpath(bridge_dir)):
+    if not os.path.realpath(fpath).startswith(real_base):
         return None  # path traversal attempt
     if not fpath.exists():
         return None

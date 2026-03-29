@@ -74,7 +74,7 @@ mcp = FastMCP(
 # ── Debounced bridge auto-sync ──────────────────────────────────────
 _bridge_sync_timer: threading.Timer | None = None
 _bridge_sync_lock = threading.Lock()
-_BRIDGE_SYNC_DELAY = _BRIDGE_SYNC_DELAY_DEFAULT  # shared with task_tray via db_utils
+_BRIDGE_SYNC_DELAY = BRIDGE_SYNC_DELAY  # shared with task_tray via db_utils
 
 
 def _schedule_bridge_sync():

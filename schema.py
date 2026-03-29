@@ -993,7 +993,8 @@ def init_db(db_path: str | None = None) -> None:
                 conn.execute(migrate_q)
                 logger.info("Migration applied: %s", desc)
         _repair_memory_fts_triggers(conn)
-        # Prune access log entries older than 30 days
+        # Index + prune access log entries older than 30 days
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_access_log_accessed ON entity_access_log(accessed_at)")
         conn.execute("DELETE FROM entity_access_log WHERE accessed_at < datetime('now', '-30 days')")
 
     with _get_conn(_path) as conn:
