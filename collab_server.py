@@ -45,6 +45,8 @@ from schema import (
 
 logger = setup_logger("sqlite-collab", "collab_server.log")
 
+_COLLABORATOR_ALLOWED_FIELDS = frozenset({"display_name", "trust_level", "notes"})
+
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -311,6 +313,9 @@ def manage_collaborators(
         if not updates:
             return _error("Nothing to update")
 
+        updates = {k: v for k, v in updates.items() if k in _COLLABORATOR_ALLOWED_FIELDS}
+        if not updates:
+            return json.dumps({"error": "No valid fields to update"})
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
             f"UPDATE collaborators SET {set_clause} WHERE github_user = ?",

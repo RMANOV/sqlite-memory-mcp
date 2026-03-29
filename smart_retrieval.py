@@ -35,7 +35,7 @@ def compute_recency_decay(updated_at: str | None, half_life_days: float = RECENC
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
-        return math.pow(2, -days / half_life_days)
+        return max(math.pow(2, -days / half_life_days), 0.1)
     except (ValueError, TypeError):
         return 0.5
 

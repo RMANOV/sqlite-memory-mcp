@@ -418,7 +418,7 @@ class TaskDB:
         if not query or len(query.strip()) < 2:
             return []
         words = query.strip().split()
-        fts_q = " OR ".join(f'"{w}"' for w in words if w)
+        fts_q = " OR ".join('"' + w.replace('"', '""') + '"' for w in words if w)
         if not fts_q:
             return []
         rows = self._conn.execute(
@@ -549,7 +549,7 @@ class TaskDB:
         if not query or len(query.strip()) < 2:
             return []
         words = query.strip().split()
-        fts_q = " OR ".join(f'"{w}"' for w in words if w)
+        fts_q = " OR ".join('"' + w.replace('"', '""') + '"' for w in words if w)
         if not fts_q:
             return []
         with get_conn(self.db_path) as conn:

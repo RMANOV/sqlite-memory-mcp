@@ -388,20 +388,49 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
 
 
 @mcp.tool()
-def read_graph() -> str:
-    """Read the full knowledge graph.
+def read_graph(offset: int = 0, limit: int = 500) -> str:
+    """Read the full knowledge graph with pagination.
 
     Returns JSON: {entities: [{name, entityType, observations: [...]}],
-                   relations: [{from, to, relationType}]}
+                   relations: [{from, to, relationType}],
+                   total: int, has_more: bool}
     """
     with _get_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
         ent_rows = conn.execute(
-            "SELECT id, name, entity_type, project FROM entities ORDER BY name"
+            "SELECT id, name, entity_type, project FROM entities ORDER BY name LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
-        entities_out = [_serialize_entity(conn, e) for e in ent_rows]
+
+        # Batch-fetch observations for all entities on this page in one query
+        eids = [r[0] for r in ent_rows]
+        obs_by_entity: dict[int, list[str]] = {r[0]: [] for r in ent_rows}
+        if eids:
+            ph = ",".join("?" * len(eids))
+            obs_rows = conn.execute(
+                f"SELECT entity_id, content FROM observations WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+                eids,
+            ).fetchall()
+            for entity_id, content in obs_rows:
+                obs_by_entity[entity_id].append(content)
+
+        entities_out = [
+            {
+                "name": name,
+                "entityType": entity_type,
+                "project": project,
+                "observations": obs_by_entity.get(eid, []),
+            }
+            for eid, name, entity_type, project in ent_rows
+        ]
         relations_out = _export_relations(conn)
 
-    return json.dumps({"entities": entities_out, "relations": relations_out})
+    return json.dumps({
+        "entities": entities_out,
+        "relations": relations_out,
+        "total": total,
+        "has_more": offset + limit < total,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
