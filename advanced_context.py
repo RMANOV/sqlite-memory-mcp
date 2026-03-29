@@ -299,7 +299,12 @@ def compute_strategy_match(
                 ),
             )
         except (TypeError, ValueError):
-            pass
+            best = max(
+                best,
+                float(
+                    strategy.get("expanded_entity_scores", {}).get(str(entity_id), 0.0)
+                ),
+            )
 
     if entity_name:
         lowered = entity_name.lower()

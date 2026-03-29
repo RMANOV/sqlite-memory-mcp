@@ -9,7 +9,6 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 
 from fastmcp_compat import FastMCP
 
@@ -20,6 +19,7 @@ from db_utils import (
     tokenize_for_similarity as _tokenize,
     fts_sync_entity as _fts_sync,
     setup_logger,
+    now_iso as _now_iso,
     TaskDAO,
 )
 from schema import error as _error
@@ -57,7 +57,7 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
         entity_id = _get_entity_id(conn, entity_name)
         if not entity_id:
             return _error(f"Entity '{entity_name}' not found")
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now_iso()
 
         TaskDAO.link_entity(
             conn, task_id, entity_id, link_type="manual", created_at=now

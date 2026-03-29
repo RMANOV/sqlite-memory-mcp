@@ -273,7 +273,7 @@ CREATE TABLE IF NOT EXISTS context_chunks (
     source_hash         TEXT NOT NULL,
     title               TEXT NULL,
     body                TEXT NOT NULL,
-    language            TEXT DEFAULT 'bg',
+    language            TEXT DEFAULT NULL,
     state               TEXT NOT NULL DEFAULT 'no_enrich',
     enrich_policy       TEXT NOT NULL DEFAULT 'manual',
     materiality_score   REAL DEFAULT 0.0,

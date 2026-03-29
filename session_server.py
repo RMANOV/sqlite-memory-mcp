@@ -161,8 +161,8 @@ def search_by_project(query: str, project: str) -> str:
                     query_entity_ids=None,
                     limit=50,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Re-ranking failed, using default pool: %s", e)
 
             if reranked:
                 eids = [r["eid"] for r in reranked]

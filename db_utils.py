@@ -72,6 +72,7 @@ TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 # v0.7.0: Public knowledge visibility
 VISIBILITY_LEVELS = ("private", "pending_public", "public")
 PUBLISH_STANDBY_MINUTES = 15
+BRIDGE_SYNC_DELAY = 60  # seconds; shared between bridge_server and task_tray
 
 # Collaboration constants
 TRUST_LEVELS = ("read_only", "read_write")
@@ -229,7 +230,7 @@ def validate_task_fields(**kwargs: str | None) -> str | None:
 
 # ── Bridge Sync v2: Per-field LWW conflict resolver ─────────────────────
 
-MACHINE_ID = socket.gethostname()
+MACHINE_ID = os.environ.get("MACHINE_ID", socket.gethostname())
 _write_counter = itertools.count(1)  # atomic in CPython; no lock needed
 
 

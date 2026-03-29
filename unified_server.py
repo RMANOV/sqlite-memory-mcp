@@ -37,10 +37,10 @@ from entity_server import (
 from intel_server import (
     mcp as intel_mcp,
 )  # 8 tools: assess/clarify/answer/extract/promote/pack/impact/enrich
-from bridge_server import mcp as bridge_mcp  # 14 tools: bridge push/pull/status/sync
+from bridge_server import mcp as bridge_mcp  # 6 tools: bridge push/pull/status/sync
 from collab_server import (
     mcp as collab_mcp,
-)  # 14 tools: collaboration/sharing/verification
+)  # 9 tools: collaboration/sharing/verification
 
 # ── Unified server ───────────────────────────────────────────────────────
 

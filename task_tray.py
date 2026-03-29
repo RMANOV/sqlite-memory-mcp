@@ -212,19 +212,32 @@ class TaskDB:
 
     def get_tasks(self, section=None):
         """Return tasks excluding archived/cancelled, optionally filtered by section."""
-        rows = self._conn.execute(
-            f"SELECT {_UI_COLS} FROM tasks "
-            "WHERE status NOT IN ('archived', 'cancelled') "
-            "ORDER BY created_at"
-        ).fetchall()
-        result = [dict(r) for r in rows]
         if section:
-            result = [t for t in result if t.get("section") == section]
-        return result
+            rows = self._conn.execute(
+                f"SELECT {_UI_COLS} FROM tasks "
+                "WHERE status NOT IN ('archived', 'cancelled') "
+                "AND section = ? "
+                "ORDER BY created_at",
+                (section,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT {_UI_COLS} FROM tasks "
+                "WHERE status NOT IN ('archived', 'cancelled') "
+                "ORDER BY created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_overdue(self):
         """Return active tasks with past due_date."""
-        return [t for t in self.get_tasks() if is_overdue(t.get("due_date"))]
+        rows = self._conn.execute(
+            f"SELECT {_UI_COLS} FROM tasks "
+            "WHERE due_date < date('now') "
+            "AND due_date IS NOT NULL "
+            "AND status NOT IN ('done', 'archived', 'cancelled') "
+            "ORDER BY due_date"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def add_task(
         self,
