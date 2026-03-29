@@ -23,16 +23,7 @@ from db_utils import (
 
 # ── Adaptive confidence per predicate ──────────────────────────────────────
 
-_PREDICATE_BASE_CONFIDENCE: dict[str, float] = {
-    "uses": 0.6,
-    "depends_on": 0.7,
-    "is": 0.4,
-    "requires": 0.65,
-    "produces": 0.6,
-    "validates": 0.7,
-    "contains": 0.5,
-    "replaces": 0.55,
-}
+from enrichment_constants import _PREDICATE_BASE_CONFIDENCE
 
 EVIDENCE_BOOST_PER = 0.1
 EVIDENCE_BOOST_CAP = 0.3

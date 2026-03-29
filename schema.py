@@ -882,6 +882,16 @@ _MIGRATIONS = [
         "ALTER TABLE task_field_versions ADD COLUMN new_value TEXT DEFAULT NULL",
         "task_field_versions.new_value column (v3.2.0)",
     ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_relations_to'",
+        "CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_id)",
+        "idx_relations_to index for reverse lookups (HIGH-1)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_enrichment_runs_chunk'",
+        "CREATE INDEX IF NOT EXISTS idx_enrichment_runs_chunk ON enrichment_runs(chunk_id)",
+        "idx_enrichment_runs_chunk index (HIGH-3)",
+    ),
 ]
 
 
@@ -983,6 +993,8 @@ def init_db(db_path: str | None = None) -> None:
                 conn.execute(migrate_q)
                 logger.info("Migration applied: %s", desc)
         _repair_memory_fts_triggers(conn)
+        # Prune access log entries older than 30 days
+        conn.execute("DELETE FROM entity_access_log WHERE accessed_at < datetime('now', '-30 days')")
 
     with _get_conn(_path) as conn:
         task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]

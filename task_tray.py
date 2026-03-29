@@ -35,7 +35,7 @@ def _resolve_log_dir() -> str:
 
 def _open_log_file(path: str):
     try:
-        return open(path, "a")
+        return open(path, "a", encoding="utf-8", errors="replace")
     except OSError:
         return open(os.devnull, "a")
 

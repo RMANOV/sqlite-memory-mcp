@@ -20,7 +20,7 @@ from intelligence_v2 import (
     load_config,
     log_enrichment_run,
 )
-from lazy_enrichment import _PREDICATE_BASE_CONFIDENCE
+from enrichment_constants import _PREDICATE_BASE_CONFIDENCE
 
 _log = logging.getLogger("claim_graph")
 

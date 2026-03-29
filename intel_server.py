@@ -67,9 +67,14 @@ def assess_context(
         session_id: Optional session context
         force: If True, bypass skip logic and frozen state
     """
-    with _get_conn() as conn:
-        result = _assess_context(conn, chunk_ref, session_id, force)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _assess_context(conn, chunk_ref, session_id, force)
+            logger.info("assess_context: chunk=%s, state=%s", chunk_ref, result.get("state"))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("assess_context failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -89,9 +94,14 @@ def queue_clarification(
         chunk_ref: ID of the context chunk
         max_questions: Maximum number of questions to generate (1-5)
     """
-    with _get_conn() as conn:
-        result = _queue_clarification(conn, chunk_ref, max_questions)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _queue_clarification(conn, chunk_ref, max_questions)
+            logger.info("queue_clarification: chunk=%s, questions=%d", chunk_ref, len(result.get("questions", [])))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("queue_clarification failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -113,9 +123,14 @@ def record_human_answer(
         answer_text: Human's answer text
         question_id: Optional specific question to answer (answers all if omitted)
     """
-    with _get_conn() as conn:
-        result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
+            logger.info("record_human_answer: chunk=%s, state=%s", chunk_ref, result.get("state"))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("record_human_answer failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -136,9 +151,14 @@ def extract_candidate_claims(
         chunk_ref: ID of the context chunk to extract from
         scope_hint: Optional scope override (memory|bridge|mapping|validation|export)
     """
-    with _get_conn() as conn:
-        result = _extract_claims(conn, chunk_ref, scope_hint)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _extract_claims(conn, chunk_ref, scope_hint)
+            logger.info("extract_candidate_claims: chunk=%s, claims=%d", chunk_ref, result.get("claims_extracted", 0))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("extract_candidate_claims failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -162,9 +182,14 @@ def promote_candidate(
         claim_id: ID of the candidate claim
         mode: Promotion mode (human_confirmed|multi_evidence|imported)
     """
-    with _get_conn() as conn:
-        result = _promote_candidate(conn, claim_id, mode)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _promote_candidate(conn, claim_id, mode)
+            logger.info("promote_candidate: claim=%s, mode=%s, status=%s", claim_id, mode, result.get("status"))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("promote_candidate failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -195,9 +220,14 @@ def build_context_pack(
         session_id: Optional session context
         token_budget: Token limit (default from config, typically 4000)
     """
-    with _get_conn() as conn:
-        result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
+            logger.info("build_context_pack: type=%s, tokens=%d", pack_type, result.get("token_usage", 0))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("build_context_pack failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -220,9 +250,14 @@ def explain_impact(
         source_ref: ID of the source entity
         depth: Traversal depth (quick=1, standard=3, deep=5)
     """
-    with _get_conn() as conn:
-        result = _explain_impact(conn, source_kind, source_ref, depth)
-        return json.dumps(result)
+    try:
+        with _get_conn() as conn:
+            result = _explain_impact(conn, source_kind, source_ref, depth)
+            logger.info("explain_impact: %s=%s, depth=%s, impacts=%d", source_kind, source_ref, depth, result.get("total_impacts", 0))
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("explain_impact failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -240,76 +275,81 @@ def enrich_context(depth: str = "quick") -> str:
     Args:
         depth: Enrichment depth (quick|standard|deep)
     """
-    config = _load_intel_config()
-    if not config["enabled"]:
-        return json.dumps(
-            {"status": "disabled", "message": "Intelligence v2 is disabled"}
-        )
+    try:
+        config = _load_intel_config()
+        if not config["enabled"]:
+            return json.dumps(
+                {"status": "disabled", "message": "Intelligence v2 is disabled"}
+            )
 
-    results: dict = {"depth": depth, "steps": []}
+        results: dict = {"depth": depth, "steps": []}
 
-    with _get_conn() as conn:
-        # Step 1: Assess all enrichable chunks
-        enrichable = conn.execute(
-            "SELECT chunk_id FROM context_chunks WHERE state = 'enrichable' LIMIT 20"
-        ).fetchall()
-        assessed = []
-        for row in enrichable:
-            r = _assess_context(conn, row["chunk_id"])
-            assessed.append(r.get("chunk_id", "?"))
-        results["steps"].append({"assess": len(assessed)})
-
-        # Step 2: Build executor pack
-        pack = _build_pack(conn, "executor")
-        results["steps"].append(
-            {
-                "pack": pack.get("pack_id"),
-                "tokens": pack.get("token_usage", 0),
-                "relevance": pack.get("relevance_score", 0.0),
-                "quality": pack.get("quality_score", 0.0),
-            }
-        )
-        results["pack_body"] = pack.get("body", "")
-        task_pack_stats = _warm_task_packs(conn, pack_type="executor", limit=8)
-        results["steps"].append(task_pack_stats)
-
-        if depth in ("standard", "deep"):
-            # Step 3: Extract claims from enrichable chunks
-            claims_total = 0
-            all_claims: list = []
-            for row in enrichable:
-                cr = _extract_claims(conn, row["chunk_id"])
-                claims_total += cr.get("claims_extracted", 0)
-                all_claims.extend(cr.get("claims", []))
-            results["steps"].append({"claims_extracted": claims_total})
-
-            # Step 3b: Auto-promote high-confidence claims
-            promoted = _auto_promote_layer1(conn, all_claims)
-            results["steps"].append({"claims_promoted": len(promoted)})
-            if promoted:
-                results["promoted_facts"] = [
-                    {
-                        "subject": p["subject"],
-                        "predicate": p["predicate"],
-                        "object": p["object"],
-                        "fact_id": p["fact_id"],
-                    }
-                    for p in promoted
-                ]
-
-        if depth == "deep":
-            # Step 4: Explain impact for recent facts
-            recent = conn.execute(
-                "SELECT fact_id FROM canonical_facts "
-                "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
+        with _get_conn() as conn:
+            # Step 1: Assess all enrichable chunks
+            enrichable = conn.execute(
+                "SELECT chunk_id FROM context_chunks WHERE state = 'enrichable' LIMIT 20"
             ).fetchall()
-            impacts = []
-            for f in recent:
-                imp = _explain_impact(conn, "fact", f["fact_id"])
-                impacts.append(imp.get("total_impacts", 0))
-            results["steps"].append({"impacts_analyzed": len(impacts)})
+            assessed = []
+            for row in enrichable:
+                r = _assess_context(conn, row["chunk_id"])
+                assessed.append(r.get("chunk_id", "?"))
+            results["steps"].append({"assess": len(assessed)})
 
-    return json.dumps(results)
+            # Step 2: Build executor pack
+            pack = _build_pack(conn, "executor")
+            results["steps"].append(
+                {
+                    "pack": pack.get("pack_id"),
+                    "tokens": pack.get("token_usage", 0),
+                    "relevance": pack.get("relevance_score", 0.0),
+                    "quality": pack.get("quality_score", 0.0),
+                }
+            )
+            results["pack_body"] = pack.get("body", "")
+            task_pack_stats = _warm_task_packs(conn, pack_type="executor", limit=8)
+            results["steps"].append(task_pack_stats)
+
+            if depth in ("standard", "deep"):
+                # Step 3: Extract claims from enrichable chunks
+                claims_total = 0
+                all_claims: list = []
+                for row in enrichable:
+                    cr = _extract_claims(conn, row["chunk_id"])
+                    claims_total += cr.get("claims_extracted", 0)
+                    all_claims.extend(cr.get("claims", []))
+                results["steps"].append({"claims_extracted": claims_total})
+
+                # Step 3b: Auto-promote high-confidence claims
+                promoted = _auto_promote_layer1(conn, all_claims)
+                results["steps"].append({"claims_promoted": len(promoted)})
+                if promoted:
+                    results["promoted_facts"] = [
+                        {
+                            "subject": p["subject"],
+                            "predicate": p["predicate"],
+                            "object": p["object"],
+                            "fact_id": p["fact_id"],
+                        }
+                        for p in promoted
+                    ]
+
+            if depth == "deep":
+                # Step 4: Explain impact for recent facts
+                recent = conn.execute(
+                    "SELECT fact_id FROM canonical_facts "
+                    "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
+                ).fetchall()
+                impacts = []
+                for f in recent:
+                    imp = _explain_impact(conn, "fact", f["fact_id"])
+                    impacts.append(imp.get("total_impacts", 0))
+                results["steps"].append({"impacts_analyzed": len(impacts)})
+
+        logger.info("enrich_context: depth=%s, steps=%d", depth, len(results["steps"]))
+        return json.dumps(results)
+    except Exception as exc:
+        logger.error("enrich_context failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
