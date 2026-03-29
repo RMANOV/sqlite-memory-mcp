@@ -3,6 +3,7 @@ __pycache__/
 server.py.v1.bak
 test_runtime.py
 press-releases/
+docs/press-releases-audit.md
 .pytest_cache/
 .wrangler/
 memory.db
