@@ -1,5 +1,7 @@
 # SQLite Memory MCP Server
 
+[![SafeSkill 92/100](https://img.shields.io/badge/SafeSkill-92%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/rmanov-sqlite-memory-mcp)
+
 A production-quality SQLite-backed MCP Memory stack with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system tray task manager.
 
 Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 41 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (50 tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
