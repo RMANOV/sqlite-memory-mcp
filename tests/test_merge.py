@@ -471,6 +471,46 @@ def test_import_content_true_merges_content_fields(conn):
     assert _task(conn, tid)["description"] == "Remote desc wins"
 
 
+def test_metadata_only_merge_preserves_newer_task_updated_at(conn):
+    tid = "task-meta-updated-at"
+    local_ts = "2026-01-01T10:00:00"
+    remote_ts = "2026-01-03T12:00:00"
+
+    _insert_task(conn, tid, title="Stable title", updated_at=local_ts)
+    upsert_field_versions(
+        conn,
+        tid,
+        ["title", "status", "priority", "section", "type"],
+        timestamp=local_ts,
+        machine_id="machine-A",
+    )
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Stable title",
+            "status": "not_started",
+            "priority": "medium",
+            "section": "inbox",
+            "type": "task",
+            "updated_at": remote_ts,
+            "_field_ts": {
+                "title": [local_ts, "machine-A"],
+                "status": [local_ts, "machine-A"],
+                "priority": [local_ts, "machine-A"],
+                "section": [local_ts, "machine-A"],
+                "type": [local_ts, "machine-A"],
+            },
+        }
+    ]
+
+    _, updated = merge_import_tasks(conn, remote, import_content=False)
+
+    assert updated == 1
+    assert _task(conn, tid)["updated_at"] == remote_ts
+    assert _fv(conn, tid, "title") == (local_ts, "machine-A")
+
+
 def test_new_task_content_excluded_when_import_content_false(conn):
     """New task inserted with import_content=False must have NULL description/notes."""
     remote = [

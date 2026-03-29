@@ -1654,6 +1654,8 @@ def merge_import_tasks(
         if existing:
             local_id = existing["id"]
             local_fvs = fv_map.get(local_id, {})
+            local_updated_at = existing["updated_at"] or ""
+            remote_updated_at = remote.get("updated_at", "")
 
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
@@ -1729,6 +1731,13 @@ def merge_import_tasks(
                     set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
                     values = list(safe_fields.values()) + [local_id]
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
+            elif remote_updated_at > local_updated_at:
+                conn.execute(
+                    "UPDATE tasks SET updated_at = ? WHERE id = ?",
+                    (remote_updated_at, local_id),
+                )
+                existing_map[tid] = {**existing_map[tid], "updated_at": remote_updated_at}
+                updated_fields += 1
         else:
             # New task — insert (content only if import_content)
             # Note: cancelled tasks still exist as rows (soft-delete), so they're
