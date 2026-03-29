@@ -159,7 +159,6 @@ class BridgeSyncMixin:
 
     def _restore_profile_from_bridge(self):
         """First-run recovery: load UI state from bridge shared.json profile."""
-        import copy
         import socket as _socket
 
         # Import module-level globals from task_tray
@@ -185,7 +184,6 @@ class BridgeSyncMixin:
             if isinstance(profile.get("active_tab"), int):
                 self._saved_active_tab = profile["active_tab"]
 
-            # Load per-tab views from bridge profile (new format)
             bridge_tab_views = profile.get("tab_views")
             if isinstance(bridge_tab_views, dict):
                 for key, view in bridge_tab_views.items():
@@ -209,28 +207,6 @@ class BridgeSyncMixin:
                     self._sort_mode = v["sort"]
                     self._active_filters = v["active"]
                     self._excluded_filters = v["excluded"]
-            else:
-                # Backward compat: old format had flat sort_mode/active_filters
-                if profile.get("sort_mode") in self._SORT_MODES:
-                    for v in self._tab_views.values():
-                        v["sort"] = profile["sort_mode"]
-                    self._sort_mode = profile["sort_mode"]
-                if isinstance(profile.get("active_filters"), dict):
-                    af = {
-                        k: set(profile["active_filters"].get(k, []))
-                        for k in ("priority", "due", "project")
-                    }
-                    for v in self._tab_views.values():
-                        v["active"] = copy.deepcopy(af)
-                    self._active_filters = af
-                if isinstance(profile.get("excluded_filters"), dict):
-                    ef = {
-                        k: set(profile["excluded_filters"].get(k, []))
-                        for k in ("priority", "due", "project")
-                    }
-                    for v in self._tab_views.values():
-                        v["excluded"] = copy.deepcopy(ef)
-                    self._excluded_filters = ef
 
             geo_b64 = profile.get("geometry_b64")
             if geo_b64:

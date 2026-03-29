@@ -22,6 +22,9 @@ from typing import Any
 
 logger = logging.getLogger("sqlite-kb")
 
+_VEC_LOAD_ERRORS = (AttributeError, OSError, sqlite3.Error)
+_EMBEDDING_ERRORS = (AttributeError, OSError, RuntimeError, TypeError, ValueError)
+
 
 # ── Availability check ─────────────────────────────────────────────────
 
@@ -77,7 +80,7 @@ def load_vec(conn: sqlite3.Connection) -> bool:
     try:
         conn.execute("SELECT vec_version()")
         return True
-    except Exception:
+    except sqlite3.Error:
         pass
     try:
         conn.enable_load_extension(True)
@@ -86,10 +89,10 @@ def load_vec(conn: sqlite3.Connection) -> bool:
         finally:
             try:
                 conn.enable_load_extension(False)
-            except Exception:
+            except _VEC_LOAD_ERRORS:
                 pass  # don't mask the original load error
         return True
-    except Exception as e:
+    except _VEC_LOAD_ERRORS as e:
         logger.debug("sqlite-vec load failed: %s", e)
         return False
 
@@ -108,9 +111,27 @@ def _init_vec_table(conn: sqlite3.Connection, table_name: str) -> bool:
         )
         logger.info("%s vec0 table ready (dim=%d)", table_name, EMBEDDING_DIM)
         return True
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning("Failed to create %s: %s", table_name, e)
         return False
+
+
+def _embed_text_or_none(text: str, *, context: str) -> bytes | None:
+    try:
+        return embed_text(text)
+    except _EMBEDDING_ERRORS as exc:
+        logger.warning("Embedding failed for %s: %s", context, exc)
+        return None
+
+
+def _existing_embedding_rowids(conn: sqlite3.Connection, table_name: str) -> set[int]:
+    rowids: set[int] = set()
+    try:
+        for row in conn.execute(f"SELECT rowid FROM {table_name}"):
+            rowids.add(row[0])
+    except sqlite3.Error as exc:
+        logger.debug("Failed to read %s rowids: %s", table_name, exc)
+    return rowids
 
 
 def init_vec_table(conn: sqlite3.Connection) -> bool:
@@ -137,34 +158,39 @@ def embed_text(text: str) -> bytes:
 # ── Sync helpers (called after FTS sync on writes) ─────────────────────
 
 
-def vec_sync_entity(conn: sqlite3.Connection, entity_id: int) -> None:
+def vec_sync_entity(conn: sqlite3.Connection, entity_id: int) -> bool:
     """Update the embedding for an entity. Creates or replaces."""
     if not VEC_AVAILABLE or not load_vec(conn):
-        return
+        return False
+    try:
+        row = conn.execute(
+            "SELECT name, entity_type FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        if row is None:
+            vec_remove_entity(conn, entity_id)
+            return False
 
-    row = conn.execute(
-        "SELECT name, entity_type FROM entities WHERE id = ?",
-        (entity_id,),
-    ).fetchone()
-    if row is None:
-        vec_remove_entity(conn, entity_id)
-        return
+        obs_rows = conn.execute(
+            "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+            (entity_id,),
+        ).fetchall()
+        obs = [r["content"] for r in obs_rows]
 
-    obs_rows = conn.execute(
-        "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-        (entity_id,),
-    ).fetchall()
-    obs = [r["content"] for r in obs_rows]
+        text = _entity_text(row["name"], row["entity_type"], obs)
+        emb = _embed_text_or_none(text, context=f"entity:{entity_id}")
+        if emb is None:
+            return False
 
-    text = _entity_text(row["name"], row["entity_type"], obs)
-    emb = embed_text(text)
-
-    # vec0 doesn't support UPDATE — DELETE + INSERT
-    conn.execute("DELETE FROM entity_embeddings WHERE rowid = ?", (entity_id,))
-    conn.execute(
-        "INSERT INTO entity_embeddings(rowid, embedding) VALUES (?, ?)",
-        (entity_id, emb),
-    )
+        conn.execute("DELETE FROM entity_embeddings WHERE rowid = ?", (entity_id,))
+        conn.execute(
+            "INSERT INTO entity_embeddings(rowid, embedding) VALUES (?, ?)",
+            (entity_id, emb),
+        )
+        return True
+    except sqlite3.Error as exc:
+        logger.warning("vec_sync_entity(%d) failed: %s", entity_id, exc)
+        return False
 
 
 def vec_remove_entity(conn: sqlite3.Connection, entity_id: int) -> None:
@@ -174,7 +200,7 @@ def vec_remove_entity(conn: sqlite3.Connection, entity_id: int) -> None:
     try:
         if load_vec(conn):
             conn.execute("DELETE FROM entity_embeddings WHERE rowid = ?", (entity_id,))
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.debug("vec_remove_entity(%d) failed: %s", entity_id, e)
 
 
@@ -188,8 +214,9 @@ def vector_search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list
     """
     if not VEC_AVAILABLE or not load_vec(conn):
         return []
-
-    emb = embed_text(query)
+    emb = _embed_text_or_none(query, context="entity_search_query")
+    if emb is None:
+        return []
     try:
         rows = conn.execute(
             "SELECT ee.rowid AS eid, ee.distance, "
@@ -201,7 +228,7 @@ def vector_search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list
             (emb, limit),
         ).fetchall()
         return [dict(r) for r in rows]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning("vector_search failed: %s", e)
         return []
 
@@ -277,28 +304,33 @@ def _task_text(title: str, description: str | None, notes: str | None) -> str:
     return ". ".join(parts)
 
 
-def vec_sync_task(conn: sqlite3.Connection, task_id: str) -> None:
+def vec_sync_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Update the embedding for a task. Creates or replaces."""
     if not VEC_AVAILABLE or not load_vec(conn):
-        return
+        return False
+    try:
+        row = conn.execute(
+            "SELECT rowid, title, description, notes FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
 
-    row = conn.execute(
-        "SELECT rowid, title, description, notes FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return
+        text = _task_text(row["title"], row["description"], row["notes"])
+        emb = _embed_text_or_none(text, context=f"task:{task_id}")
+        if emb is None:
+            return False
+        rowid = row["rowid"]
 
-    text = _task_text(row["title"], row["description"], row["notes"])
-    emb = embed_text(text)
-    rowid = row["rowid"]
-
-    # vec0 doesn't support UPDATE — DELETE + INSERT
-    conn.execute("DELETE FROM task_embeddings WHERE rowid = ?", (rowid,))
-    conn.execute(
-        "INSERT INTO task_embeddings(rowid, embedding) VALUES (?, ?)",
-        (rowid, emb),
-    )
+        conn.execute("DELETE FROM task_embeddings WHERE rowid = ?", (rowid,))
+        conn.execute(
+            "INSERT INTO task_embeddings(rowid, embedding) VALUES (?, ?)",
+            (rowid, emb),
+        )
+        return True
+    except sqlite3.Error as exc:
+        logger.warning("vec_sync_task(%s) failed: %s", task_id, exc)
+        return False
 
 
 def vec_remove_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -314,7 +346,7 @@ def vec_remove_task(conn: sqlite3.Connection, task_id: str) -> None:
                 conn.execute(
                     "DELETE FROM task_embeddings WHERE rowid = ?", (row["rowid"],)
                 )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.debug("vec_remove_task(%s) failed: %s", task_id, e)
 
 
@@ -327,8 +359,9 @@ def task_vector_search(
     """
     if not VEC_AVAILABLE or not load_vec(conn):
         return []
-
-    emb = embed_text(query)
+    emb = _embed_text_or_none(query, context="task_search_query")
+    if emb is None:
+        return []
     try:
         rows = conn.execute(
             "SELECT t.id, t.title, t.description, t.notes, t.status, "
@@ -341,7 +374,7 @@ def task_vector_search(
             (emb, limit),
         ).fetchall()
         return [dict(r) for r in rows]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning("task_vector_search failed: %s", e)
         return []
 
@@ -381,13 +414,7 @@ def backfill_task_embeddings(conn: sqlite3.Connection) -> int:
     """
     if not VEC_AVAILABLE or not load_vec(conn):
         return 0
-
-    existing = set()
-    try:
-        for row in conn.execute("SELECT rowid FROM task_embeddings"):
-            existing.add(row[0])
-    except Exception:
-        pass
+    existing = _existing_embedding_rowids(conn, "task_embeddings")
 
     all_tasks = conn.execute("SELECT id, rowid FROM tasks").fetchall()
     missing = [r["id"] for r in all_tasks if r["rowid"] not in existing]
@@ -395,9 +422,9 @@ def backfill_task_embeddings(conn: sqlite3.Connection) -> int:
     count = 0
     for tid in missing:
         try:
-            vec_sync_task(conn, tid)
-            count += 1
-        except Exception as e:
+            if vec_sync_task(conn, tid):
+                count += 1
+        except _EMBEDDING_ERRORS as e:
             logger.warning("backfill failed for task %s: %s", tid, e)
 
     if count:
@@ -417,12 +444,7 @@ def backfill_embeddings(conn: sqlite3.Connection) -> int:
         return 0
 
     # Find entities without embeddings
-    existing = set()
-    try:
-        for row in conn.execute("SELECT rowid FROM entity_embeddings"):
-            existing.add(row[0])
-    except Exception:
-        pass
+    existing = _existing_embedding_rowids(conn, "entity_embeddings")
 
     all_entities = conn.execute("SELECT id FROM entities").fetchall()
     missing = [r["id"] for r in all_entities if r["id"] not in existing]
@@ -430,9 +452,9 @@ def backfill_embeddings(conn: sqlite3.Connection) -> int:
     count = 0
     for eid in missing:
         try:
-            vec_sync_entity(conn, eid)
-            count += 1
-        except Exception as e:
+            if vec_sync_entity(conn, eid):
+                count += 1
+        except _EMBEDDING_ERRORS as e:
             logger.warning("backfill failed for entity %d: %s", eid, e)
 
     if count:

@@ -70,6 +70,15 @@ from PyQt6.QtCore import (
 
 logger = logging.getLogger("task_tray")
 
+_DIALOG_OPEN_ERRORS = (RuntimeError, sqlite3.Error, OSError, ValueError)
+_OPTIONAL_CONTEXT_ERRORS = (
+    ImportError,
+    sqlite3.Error,
+    OSError,
+    RuntimeError,
+    ValueError,
+)
+
 PRIORITIES = tuple(reversed(TASK_PRIORITIES))  # descending for UI display
 
 # Upper-case priority colors for UI lookups
@@ -486,7 +495,8 @@ def _batch_truth_scores(db_path=None):
         _ts_cache = result
         _ts_cache_time = now
         return result
-    except Exception:
+    except sqlite3.Error as exc:
+        logger.debug("TruthScore badge refresh failed: %s", exc)
         return _ts_cache  # return stale cache on error
 
 
@@ -1039,11 +1049,12 @@ class TrayPopup(QWidget):
                 dlg.show()
                 dlg.raise_()
                 dlg.activateWindow()
-            except Exception:
-                import traceback
-
+            except _DIALOG_OPEN_ERRORS as exc:
                 logger.error(
-                    "Failed to open %s from popup: %s", label, traceback.format_exc()
+                    "Failed to open %s from popup: %s",
+                    label,
+                    exc,
+                    exc_info=True,
                 )
 
         QTimer.singleShot(0, _open)
@@ -1653,7 +1664,8 @@ class EntityDetailDialog(QDialog):
         # Linked tasks
         try:
             task_rows = TaskDAO.get_entity_tasks(conn, eid)
-        except Exception:
+        except sqlite3.Error as exc:
+            logger.debug("Linked task lookup failed for entity %s: %s", eid, exc)
             task_rows = []
         if task_rows:
             html_parts.append(
@@ -1926,8 +1938,12 @@ class TaskReaderDialog(QDialog):
                         f"⬡ Intelligence Context (Match: {match_score:.0f}% • Trust: {trust_score:.0f}% • Fresh: {freshness_score:.0f}%)</div>"
                         f'<div style="color:#c9d1d9; font-size:13px; line-height:1.5;">{ai_text}</div></div>'
                     )
-        except Exception:
-            pass  # Schema might not have context_packs yet
+        except _OPTIONAL_CONTEXT_ERRORS as exc:
+            logger.debug(
+                "Context pack unavailable for task %s: %s",
+                self.task.get("id"),
+                exc,
+            )
 
         self._body_label.setText(body_html)
 
@@ -2426,10 +2442,8 @@ class TaskListWidget(QListWidget):
                 dlg.show()
                 dlg.raise_()
                 dlg.activateWindow()
-            except Exception:
-                import traceback
-
-                logger.error("Failed to open %s: %s", label, traceback.format_exc())
+            except _DIALOG_OPEN_ERRORS as exc:
+                logger.error("Failed to open %s: %s", label, exc, exc_info=True)
 
         QTimer.singleShot(0, _open)
 

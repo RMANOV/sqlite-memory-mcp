@@ -45,7 +45,7 @@ _crash_log = _open_log_file(os.path.join(_log_dir, "crash.log"))
 atexit.register(_crash_log.close)
 try:
     faulthandler.enable(file=_crash_log)
-except Exception:
+except (OSError, RuntimeError, ValueError):
     pass
 try:
     logging.basicConfig(
@@ -60,6 +60,15 @@ except OSError:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 logger = logging.getLogger("task_tray")
+
+_OPTIONAL_VECTOR_ERRORS = (ImportError, sqlite3.Error, OSError, RuntimeError, ValueError)
+_OPTIONAL_PIPELINE_ERRORS = (
+    ImportError,
+    sqlite3.Error,
+    OSError,
+    RuntimeError,
+    ValueError,
+)
 
 from task_search import TaskSearchEngine
 
@@ -100,7 +109,6 @@ class TaskDB:
         # Entity enrichment cache — pre-loaded obs preview + task count
         self._enrich_cache_obs: dict[int, str] = {}
         self._enrich_cache_tc: dict[int, int] = {}
-        self._enrich_cache_valid = False
         self._enrich_cache_lock = threading.Lock()
         self._enrich_refresh_lock = threading.Lock()
         threading.Thread(target=self._refresh_enrich_cache, daemon=True).start()
@@ -129,14 +137,14 @@ class TaskDB:
             else:
                 try:
                     self._conn.execute("ROLLBACK")
-                except Exception:
+                except sqlite3.Error:
                     pass
             return False
 
     def _wal_checkpoint(self):
         try:
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        except Exception:
+        except sqlite3.Error:
             pass
 
     def _repair_fts_if_needed(self):
@@ -146,7 +154,7 @@ class TaskDB:
                 self._conn.execute(
                     f"INSERT INTO {fts_table}({fts_table}, rank) VALUES('integrity-check', 1)"
                 )
-            except Exception:
+            except sqlite3.Error:
                 try:
                     self._conn.execute(
                         f"INSERT INTO {fts_table}({fts_table}) VALUES('rebuild')"
@@ -155,112 +163,8 @@ class TaskDB:
                     logging.getLogger("task_tray").warning(
                         "Repaired corrupted FTS index: %s", fts_table
                     )
-                except Exception as e:
+                except sqlite3.Error as e:
                     logger.warning("FTS rebuild failed: %s", e)
-
-    def _ensure_table(self):
-        """Create tasks table if missing; migrate existing table to v0.5.0 schema."""
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT,
-                status TEXT DEFAULT 'not_started',
-                section TEXT DEFAULT 'inbox',
-                priority TEXT DEFAULT 'medium',
-                due_date TEXT,
-                project TEXT,
-                parent_id TEXT,
-                notes TEXT,
-                recurring TEXT,
-                type TEXT NOT NULL DEFAULT 'task',
-                assignee TEXT,
-                shared_by TEXT,
-                visibility TEXT DEFAULT 'private',
-                publish_requested_at TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-        """)
-        # Migrate existing DBs: add columns that v0.5.0 requires
-        existing = {
-            r[1] for r in self._conn.execute("PRAGMA table_info('tasks')").fetchall()
-        }
-        for col, sql in [
-            ("type", "ALTER TABLE tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'task'"),
-            ("assignee", "ALTER TABLE tasks ADD COLUMN assignee TEXT DEFAULT NULL"),
-            ("shared_by", "ALTER TABLE tasks ADD COLUMN shared_by TEXT DEFAULT NULL"),
-            (
-                "description",
-                "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
-            ),
-            (
-                "visibility",
-                "ALTER TABLE tasks ADD COLUMN visibility TEXT DEFAULT 'private'",
-            ),
-            (
-                "publish_requested_at",
-                "ALTER TABLE tasks ADD COLUMN publish_requested_at TEXT DEFAULT NULL",
-            ),
-            (
-                "reminder_at",
-                "ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT NULL",
-            ),
-        ]:
-            if col not in existing:
-                self._conn.execute(sql)
-        # Backfill null IDs
-        nulls = self._conn.execute(
-            "SELECT rowid FROM tasks WHERE id IS NULL"
-        ).fetchall()
-        for r in nulls:
-            self._conn.execute(
-                "UPDATE tasks SET id=? WHERE rowid=?", (str(uuid.uuid4()), r[0])
-            )
-        self._conn.commit()
-        # Composite indices for common UI query patterns
-        for idx_sql in (
-            "CREATE INDEX IF NOT EXISTS idx_tasks_status_type ON tasks(status, type)",
-            "CREATE INDEX IF NOT EXISTS idx_tasks_status_due ON tasks(status, due_date)",
-            "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status)",
-        ):
-            self._conn.execute(idx_sql)
-        # v0.6.0+: supporting tables for per-field LWW and entity links
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS task_field_versions ("
-            "task_id TEXT NOT NULL, field_name TEXT NOT NULL, "
-            "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', "
-            "PRIMARY KEY (task_id, field_name), "
-            "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE)"
-        )
-        # v3.2.0: add audit trail columns
-        _fv_cols = {
-            r[1]
-            for r in self._conn.execute(
-                "PRAGMA table_info('task_field_versions')"
-            ).fetchall()
-        }
-        if "old_value" not in _fv_cols:
-            self._conn.execute(
-                "ALTER TABLE task_field_versions ADD COLUMN old_value TEXT DEFAULT NULL"
-            )
-        if "new_value" not in _fv_cols:
-            self._conn.execute(
-                "ALTER TABLE task_field_versions ADD COLUMN new_value TEXT DEFAULT NULL"
-            )
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS task_entity_links ("
-            "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
-            "entity_id INTEGER NOT NULL, "
-            "link_type TEXT NOT NULL DEFAULT 'manual', "
-            "score REAL DEFAULT NULL, "
-            "created_at TEXT NOT NULL, "
-            "PRIMARY KEY (task_id, entity_id))"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tel_entity ON task_entity_links(entity_id)"
-        )
-        self._conn.commit()
 
     def close(self):
         self._wal_timer.stop()
@@ -564,8 +468,8 @@ class TaskDB:
                     fts_results = [
                         by_id[m["eid"]] for m in merged if m["eid"] in by_id
                     ][:limit]
-            except Exception:
-                pass  # Graceful degradation to FTS5-only
+            except _OPTIONAL_VECTOR_ERRORS as exc:
+                logger.debug("Entity vector search unavailable: %s", exc)
 
         # Batch enrich: obs preview + task count
         eids = [r["rowid"] for r in fts_results]
@@ -589,8 +493,8 @@ class TaskDB:
                 eids,
             ).fetchall():
                 tc_map[row["entity_id"]] = row["cnt"]
-        except Exception:
-            pass  # table may not exist in older DBs
+        except sqlite3.OperationalError as exc:
+            logger.debug("Entity task link counts unavailable: %s", exc)
 
         return [
             {
@@ -622,21 +526,15 @@ class TaskDB:
                         "SELECT entity_id, COUNT(*) as cnt FROM task_entity_links GROUP BY entity_id"
                     ).fetchall():
                         tc[row["entity_id"]] = row["cnt"]
-                except Exception:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    logger.debug("Entity enrich task counts unavailable: %s", exc)
                 with self._enrich_cache_lock:
                     self._enrich_cache_obs = obs
                     self._enrich_cache_tc = tc
-                    self._enrich_cache_valid = True
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.warning("Enrich cache refresh failed: %s", e)
         finally:
             self._enrich_refresh_lock.release()
-
-    def _invalidate_enrich_cache(self):
-        """Mark cache stale. Next refresh will reload."""
-        with self._enrich_cache_lock:
-            self._enrich_cache_valid = False
 
     def _get_enrich(self, entity_id: int) -> tuple[str, int]:
         """Get cached (obs_preview, task_count). Returns ("", 0) on miss."""
@@ -662,7 +560,8 @@ class TaskDB:
                     "FROM memory_fts WHERE memory_fts MATCH ? LIMIT ?",
                     (fts_q, limit),
                 ).fetchall()
-            except Exception:
+            except sqlite3.Error as exc:
+                logger.warning("Entity FTS search failed: %s", exc)
                 return []
             fts_results = [dict(r) for r in rows]
 
@@ -705,8 +604,8 @@ class TaskDB:
                             }
                             for vr in vec_results[:limit]
                         ]
-            except Exception:
-                pass  # Graceful degradation to FTS5-only
+            except _OPTIONAL_VECTOR_ERRORS as exc:
+                logger.debug("Fast entity vector search unavailable: %s", exc)
 
         # Apply cached enrichment (zero SQL queries)
         results = []
@@ -871,9 +770,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         _td._bold = self._settings.value("bold", "false") == "true"
         _update_theme_colors()
 
-        # First-run recovery: if QSettings has no tab_views, try bridge profile
-        # (deferred — _tab_keys not yet defined; called after tab init below)
-
         self.setStyleSheet(_build_main_style())
 
         # Central widget with tabs
@@ -934,29 +830,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     }
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             pass
-
-        # Backward compat: if no tab_views saved, load old scalar values as defaults
-        if not parsed:
-            old_sort = self._settings.value("sort_mode", "priority")
-            if old_sort in self._SORT_MODES:
-                for v in self._tab_views.values():
-                    v["sort"] = old_sort
-            try:
-                raw = self._settings.value("active_filters", "{}")
-                old_af = json.loads(raw) if isinstance(raw, str) else {}
-                raw_ex = self._settings.value("excluded_filters", "{}")
-                old_ef = json.loads(raw_ex) if isinstance(raw_ex, str) else {}
-                for v in self._tab_views.values():
-                    v["active"] = {
-                        k: set(old_af.get(k, []))
-                        for k in ("priority", "due", "project")
-                    }
-                    v["excluded"] = {
-                        k: set(old_ef.get(k, []))
-                        for k in ("priority", "due", "project")
-                    }
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
 
         # Set working state from the initial tab
         self._saved_active_tab = int(self._settings.value("active_tab", 0))
@@ -1206,7 +1079,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 created = process_recurring(conn, dry_run=False)
             if created:
                 self.refresh()
-        except Exception as exc:
+        except _OPTIONAL_PIPELINE_ERRORS as exc:
             logging.getLogger("task_tray").warning("recurring: %s", exc)
 
     # ── Appearance ─────────────────────────────────────────────────────
@@ -1424,7 +1297,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     f"Intelligence Pass Complete: {assessed} chunks, {claims} candidates, "
                     f"{promoted} facts promoted, {task_packs} task packs warmed."
                 )
-            except Exception as exc:
+            except _OPTIONAL_PIPELINE_ERRORS as exc:
+                logger.exception("Enrich pipeline failed")
                 self._enrich_done.emit(f"Enrich error: {exc}")
 
         threading.Thread(target=_work, daemon=True).start()
@@ -1746,18 +1620,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             # on_change() triggers _refresh_all → full_window.refresh(),
             # but refresh explicitly as safety net (re-entrancy guard makes it cheap).
             self.refresh()
-        except Exception:
-            import traceback
-
-            err = traceback.format_exc()
+        except sqlite3.Error as exc:
             logging.getLogger("task_tray").error(
-                "Error toggling task %s: %s", task_id, err
+                "Error toggling task %s: %s",
+                task_id,
+                exc,
+                exc_info=True,
             )
-            # DB write failed — revert checkbox visual state + notify user
             self._revert_checkbox(task_id, checked)
-            self.status.showMessage(
-                f"DB error — task not saved. {err.splitlines()[-1]}", 8000
-            )
+            self.status.showMessage(f"DB error — task not saved. {exc}", 8000)
 
     def _revert_checkbox(self, task_id, was_checked):
         """Revert checkbox to opposite state after a failed DB write."""
@@ -1922,7 +1793,6 @@ class TaskTrayApp:
 
     def _refresh_all(self):
         """Update tray icon badge + tooltip after any change."""
-        self.db._invalidate_enrich_cache()
         threading.Thread(target=self.db._refresh_enrich_cache, daemon=True).start()
         summary = self.db.get_summary()
         self._update_icon(summary)
@@ -1949,7 +1819,7 @@ class TaskTrayApp:
                     "AND status NOT IN ('done', 'archived', 'cancelled')",
                     (now_str,),
                 ).fetchall()
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logging.getLogger("task_tray").warning("reminder check: %s", exc)
             return
 

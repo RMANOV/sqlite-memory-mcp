@@ -1,10 +1,13 @@
 # tests/test_task_db.py
 import os
+import sqlite3
 import pytest
 
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import task_tray
 
 
 @pytest.fixture
@@ -18,6 +21,26 @@ def db(tmp_path):
 
 
 class TestTaskDB:
+    def test_taskdb_init_applies_shared_schema_migrations(self, db):
+        task_cols = {
+            row[1] for row in db._conn.execute("PRAGMA table_info('tasks')").fetchall()
+        }
+        version_cols = {
+            row[1]
+            for row in db._conn.execute(
+                "PRAGMA table_info('task_field_versions')"
+            ).fetchall()
+        }
+
+        assert {"reminder_at", "visibility", "publish_requested_at"} <= task_cols
+        assert {"old_value", "new_value"} <= version_cols
+        assert (
+            db._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_entity_links'"
+            ).fetchone()
+            is not None
+        )
+
     def test_get_tasks_empty(self, db):
         assert db.get_tasks() == []
 
@@ -163,3 +186,42 @@ class TestTaskDB:
         assert rows[target_id] == "cancelled"
         assert rows[same_series_id] == "cancelled"
         assert rows[other_series_id] == "done"
+
+    def test_search_entities_hybrid_tolerates_missing_task_link_table(self, db, monkeypatch):
+        db._conn.execute("DROP TABLE task_entity_links")
+        monkeypatch.setattr(
+            db,
+            "search_entities",
+            lambda query, limit: [
+                {
+                    "rowid": 1,
+                    "name": "EntityA",
+                    "entity_type": "concept",
+                    "obs_count": 0,
+                }
+            ],
+        )
+
+        results = db.search_entities_hybrid("EntityA", use_vector=False)
+
+        assert len(results) == 1
+        assert results[0]["task_count"] == 0
+        assert results[0]["name"] == "EntityA"
+
+    def test_search_entities_fast_returns_empty_on_fts_sqlite_error(
+        self, db, monkeypatch
+    ):
+        class BrokenConn:
+            def execute(self, sql, params=()):
+                raise sqlite3.OperationalError("fts unavailable")
+
+        class BrokenConnCtx:
+            def __enter__(self):
+                return BrokenConn()
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        monkeypatch.setattr(task_tray, "get_conn", lambda db_path=None: BrokenConnCtx())
+
+        assert db.search_entities_fast("query") == []
