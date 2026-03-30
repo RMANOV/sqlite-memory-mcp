@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,6 +49,14 @@ class _DummyWindow(BridgeSyncMixin):
     def restoreGeometry(self, geometry):
         self.restored_geometry = geometry
         return True
+
+
+class _CaptureStatus:
+    def __init__(self):
+        self.messages = []
+
+    def showMessage(self, message, timeout):
+        self.messages.append((message, timeout))
 
 
 @pytest.fixture
@@ -156,3 +165,43 @@ def test_restore_profile_from_bridge_leaves_defaults_when_tab_views_missing(brid
     assert window._sort_mode == "priority"
     assert window._active_filters == _empty_filters()
     assert window._excluded_filters == _empty_filters()
+
+
+def test_build_ui_profile_serializes_current_window_state(bridge_env, monkeypatch):
+    window = _DummyWindow(bridge_env)
+    window._settings = SimpleNamespace(
+        value=lambda key, default=None: {
+            "active_tab": 1,
+            "geometry": b"geo-bytes",
+        }.get(key, default)
+    )
+    window._tab_views["inbox"]["sort"] = "due"
+    window._tab_views["inbox"]["active"]["priority"] = {"high"}
+    window._tab_views["inbox"]["excluded"]["project"] = {"ops"}
+    monkeypatch.setattr(task_tray, "_theme_name", "blue")
+    monkeypatch.setattr(task_tray, "_font_size", 15)
+    monkeypatch.setattr(task_tray, "_bold", True)
+
+    profile = window._build_ui_profile()
+
+    assert profile["theme"] == "blue"
+    assert profile["font_size"] == 15
+    assert profile["bold"] is True
+    assert profile["active_tab"] == 1
+    assert profile["tab_views"]["inbox"]["sort"] == "due"
+    assert profile["tab_views"]["inbox"]["active"]["priority"] == ["high"]
+    assert profile["tab_views"]["inbox"]["excluded"]["project"] == ["ops"]
+    assert profile["geometry_b64"]
+
+
+def test_sync_bridge_skips_when_thread_already_running(bridge_env):
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._bridge_thread_lock.acquire()
+
+    try:
+        window._sync_bridge()
+    finally:
+        window._bridge_thread_lock.release()
+
+    assert window.status.messages[-1][0] == "Sync already running"

@@ -15,9 +15,15 @@ import os
 import socket
 import sqlite3
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from db_utils import (
     BRIDGE_REPO,
@@ -59,6 +65,50 @@ log = logging.getLogger("bridge_sync_worker")
 
 
 _SAFETY_THRESHOLD = 10  # Block sync if this many descriptions would be removed
+_SYNC_THREAD_LOCK = threading.Lock()
+
+
+class _RepoSyncLock:
+    """Cross-process repo lock for bridge sync."""
+
+    def __init__(self, bridge_dir: str):
+        self._path = Path(bridge_dir) / ".bridge_sync.lock"
+        self._fh = None
+
+    def acquire(self) -> bool:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fh = self._path.open("a+", encoding="utf-8")
+        try:
+            fh.seek(0)
+            fh.write("0")
+            fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+
+        self._fh = fh
+        return True
+
+    def release(self) -> None:
+        fh = self._fh
+        if fh is None:
+            return
+        try:
+            fh.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            fh.close()
+            self._fh = None
 
 
 def _progress(cb: Callable[[int, str], None] | None, pct: int, label: str) -> None:
@@ -71,6 +121,22 @@ def _write_shared_js(shared_path: Path, payload_text: str) -> None:
     tmp_path = js_path.with_suffix(".tmp")
     tmp_path.write_text(f"window.__BRIDGE_DATA__ = {payload_text};", encoding="utf-8")
     os.replace(tmp_path, js_path)
+
+
+def _ui_profile_changed(
+    shared_path: Path, machine_id: str, ui_profile: dict | None
+) -> bool:
+    """Return True when a tray UI profile needs to be exported."""
+    if ui_profile is None:
+        return False
+    if not shared_path.exists():
+        return True
+    try:
+        existing = _json_loads(shared_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return True
+    profiles = existing.get("ui_profiles", {})
+    return profiles.get(machine_id) != ui_profile
 
 
 def _check_sync_safety(
@@ -357,6 +423,7 @@ def main(
     db_path: str | None = None,
     bridge_repo: str | None = None,
     force: bool = False,
+    ui_profile: dict | None = None,
 ) -> dict:
     """Run full bridge sync: pull → LWW merge → export → push.
 
@@ -365,6 +432,53 @@ def main(
     """
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
+    machine_id = socket.gethostname()
+    repo_lock = _RepoSyncLock(bridge_dir)
+
+    if not _SYNC_THREAD_LOCK.acquire(blocking=False):
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "imported_new": 0,
+            "imported_updated": 0,
+            "already_running": True,
+        }
+    if not repo_lock.acquire():
+        _SYNC_THREAD_LOCK.release()
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "imported_new": 0,
+            "imported_updated": 0,
+            "already_running": True,
+        }
+
+    try:
+        return _main_locked(
+            progress_callback=progress_callback,
+            db_path=_db_path,
+            bridge_dir=bridge_dir,
+            force=force,
+            ui_profile=ui_profile,
+            machine_id=machine_id,
+        )
+    finally:
+        repo_lock.release()
+        _SYNC_THREAD_LOCK.release()
+
+
+def _main_locked(
+    progress_callback: Callable[[int, str], None] | None,
+    db_path: str,
+    bridge_dir: str,
+    force: bool,
+    ui_profile: dict | None,
+    machine_id: str,
+) -> dict:
+    """Run sync with process/thread locks already held."""
+    _db_path = db_path
 
     repo_ok, repo_msg = ensure_bridge_repo_ready(bridge_dir)
     if not repo_ok:
@@ -573,7 +687,15 @@ def main(
                         "   WHERE visibility = 'pending_public') AS pp",
                         (last_push_at, last_push_at),
                     ).fetchone()
-                    if chk["ct"] == 0 and chk["ce"] == 0 and chk["pp"] == 0:
+                    ui_profile_pending = _ui_profile_changed(
+                        shared_path, machine_id, ui_profile
+                    )
+                    if (
+                        chk["ct"] == 0
+                        and chk["ce"] == 0
+                        and chk["pp"] == 0
+                        and not ui_profile_pending
+                    ):
                         log.info(
                             "No changes since %s — skipping export+push", last_push_at
                         )
@@ -617,7 +739,7 @@ def main(
     payload = {
         "version": 4,
         "pushed_at": now_iso(),
-        "machine_id": socket.gethostname(),
+        "machine_id": machine_id,
         "entities": [],  # backward compat — per-entity files are authoritative
         "relations": relations_out,
         "tasks": tasks_out,
@@ -643,9 +765,12 @@ def main(
                 _merge_remote_entities(entities_out, existing)
 
             if "ui_profiles" in existing:
-                payload["ui_profiles"] = existing["ui_profiles"]
+                payload["ui_profiles"] = dict(existing["ui_profiles"])
         except (json.JSONDecodeError, OSError):
             pass
+    if ui_profile is not None:
+        profiles = payload.setdefault("ui_profiles", {})
+        profiles[machine_id] = ui_profile
 
     _progress(progress_callback, 70, "Writing shared.json...")
     payload_json = _json_dumps(payload)
@@ -669,7 +794,7 @@ def main(
     _progress(progress_callback, 90, "git commit...")
     n_ent = len(entities_out)
     n_tasks = len(payload["tasks"])
-    msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {socket.gethostname()}"
+    msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {machine_id}"
     result = git_run(bridge_dir, "commit", "-m", msg)
 
     if result.returncode != 0:

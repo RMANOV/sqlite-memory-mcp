@@ -179,7 +179,9 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
         git_calls.append(args)
         return _cp(args)
 
-    monkeypatch.setattr(bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
     monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
     monkeypatch.setattr(
@@ -188,10 +190,76 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
     )
 
-    result = bridge_sync_worker.main(force=True, bridge_repo=str(bridge_dir), db_path=db_path)
+    result = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
 
     shared_js = (bridge_dir / "shared.js").read_text(encoding="utf-8")
 
     assert result["pushed"] is True
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
+
+
+def test_bridge_sync_worker_merges_ui_profile_and_pushes_without_db_changes(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    now = db_utils.now_iso()
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
+            (now,),
+        )
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(
+            {
+                "ui_profiles": {
+                    "other-host": {"theme": "blue", "updated_at": now},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    git_calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+    monkeypatch.setattr(bridge_sync_worker.socket, "gethostname", lambda: "test-host")
+
+    result = bridge_sync_worker.main(
+        force=False,
+        bridge_repo=str(bridge_dir),
+        db_path=db_path,
+        ui_profile={"theme": "amber", "updated_at": now},
+    )
+
+    shared = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+
+    assert result.get("skipped") is not True
+    assert result["pushed"] is True
+    assert shared["ui_profiles"]["other-host"]["theme"] == "blue"
+    assert shared["ui_profiles"]["test-host"]["theme"] == "amber"
+    assert any(args[0] == "commit" for args in git_calls)

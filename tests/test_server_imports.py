@@ -23,7 +23,9 @@ def test_server_exposes_sqlite3_for_fallback_handlers():
 
 def test_tool_decorators_keep_fn_alias_for_direct_invocation_regressions():
     assert server.create_entities.fn is server.create_entities
+    assert server.create_entities([]) == server.create_entities.__wrapped__([])
     assert task_server.create_task_or_note.fn is task_server.create_task_or_note
+    assert callable(task_server.create_task_or_note.fn)
     assert session_server.session_save.fn is session_server.session_save
     assert bridge_server.bridge_push.fn is bridge_server.bridge_push
     assert collab_server.manage_collaborators.fn is collab_server.manage_collaborators

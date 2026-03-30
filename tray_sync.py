@@ -43,12 +43,29 @@ class BridgeSyncMixin:
     # Class-level constants — belong here since only sync code uses them
     _BRIDGE_DIR = os.path.expanduser("~/.claude/memory/bridge")
     _SP_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    _bridge_thread_lock = threading.Lock()
 
     # ── Sync entry points ───────────────────────────────────────────────
 
     def _auto_sync_triggered(self):
         """Debounce elapsed — run bridge sync."""
         self._sync_bridge()
+
+    def _start_bridge_sync_thread(self, target, busy_message=None):
+        """Run at most one bridge sync thread at a time."""
+        if not self._bridge_thread_lock.acquire(blocking=False):
+            if busy_message:
+                self.status.showMessage(busy_message, 3000)
+            return False
+
+        def _wrapped():
+            try:
+                target()
+            finally:
+                self._bridge_thread_lock.release()
+
+        threading.Thread(target=_wrapped, daemon=True).start()
+        return True
 
     def _periodic_pull(self):
         """Periodic pull from remote — catches changes from other machines."""
@@ -74,31 +91,36 @@ class BridgeSyncMixin:
             except Exception as exc:
                 logger.warning("Periodic pull failed: %s", exc)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._start_bridge_sync_thread(_run)
 
     def _sync_bridge(self):
         """Sync memory bridge (pull + push + shared.json)."""
         if not os.path.isdir(self._BRIDGE_DIR):
             self.status.showMessage("Bridge dir not found", 3000)
             return
+        if self._bridge_thread_lock.locked():
+            self.status.showMessage("Sync already running", 3000)
+            return
+
+        ui_profile = self._build_ui_profile()
 
         def _run():
             try:
                 import bridge_sync_worker
 
                 stats = bridge_sync_worker.main(
+                    ui_profile=ui_profile,
                     progress_callback=lambda pct, label: self._bridge_progress.emit(
                         pct, label
-                    )
+                    ),
                 )
-
-                # Patch UI profile into shared.json (tray-specific, no extra commit)
-                self._patch_ui_profile()
 
                 if stats.get("blocked_by_repo_state"):
                     self._bridge_done.emit(
                         f"Sync blocked: {stats.get('message', 'bridge repo needs attention')}"
                     )
+                elif stats.get("already_running"):
+                    self._bridge_done.emit("Sync already running")
                 elif stats.get("blocked_by_safety"):
                     safety = stats.get("safety", {})
                     self._bridge_done.emit(
@@ -121,7 +143,7 @@ class BridgeSyncMixin:
             except Exception as exc:
                 self._bridge_done.emit(f"Sync error: {exc}")
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._start_bridge_sync_thread(_run, busy_message="Sync already running")
 
     # ── Signal handlers (must run on Qt main thread via signal/slot) ────
 
@@ -218,47 +240,30 @@ class BridgeSyncMixin:
         except (json.JSONDecodeError, OSError, KeyError, ValueError):
             pass
 
-    def _patch_ui_profile(self):
-        """Write own UI profile into shared.json (persisted on next sync cycle)."""
-        import socket as _socket
-
+    def _build_ui_profile(self):
+        """Serialize the current UI profile for bridge export."""
         from db_utils import now_iso
 
         # Import module-level globals from task_tray
         import task_tray as _tt
 
-        shared_path = Path(self._BRIDGE_DIR) / "shared.json"
-        if not shared_path.exists():
-            return
-        try:
-            data = json.loads(shared_path.read_text(encoding="utf-8"))
-            profiles = data.get("ui_profiles", {})
-
-            # Serialize per-tab views for bridge profile
-            serializable_views = {}
-            for key, view in self._tab_views.items():
-                serializable_views[key] = {
-                    "sort": view["sort"],
-                    "active": {k: list(v) for k, v in view["active"].items()},
-                    "excluded": {k: list(v) for k, v in view["excluded"].items()},
-                }
-
-            profiles[_socket.gethostname()] = {
-                "theme": _tt._theme_name,
-                "font_size": _tt._font_size,
-                "bold": _tt._bold,
-                "active_tab": int(self._settings.value("active_tab", 0)),
-                "tab_views": serializable_views,
-                "updated_at": now_iso(),
+        serializable_views = {}
+        for key, view in self._tab_views.items():
+            serializable_views[key] = {
+                "sort": view["sort"],
+                "active": {k: list(v) for k, v in view["active"].items()},
+                "excluded": {k: list(v) for k, v in view["excluded"].items()},
             }
-            geo = self._settings.value("geometry")
-            if geo:
-                profiles[_socket.gethostname()]["geometry_b64"] = base64.b64encode(
-                    bytes(geo)
-                ).decode("ascii")
-            data["ui_profiles"] = profiles
-            shared_path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-        except (json.JSONDecodeError, OSError):
-            pass  # non-critical — UI profiles sync on next cycle
+
+        profile = {
+            "theme": _tt._theme_name,
+            "font_size": _tt._font_size,
+            "bold": _tt._bold,
+            "active_tab": int(self._settings.value("active_tab", 0)),
+            "tab_views": serializable_views,
+            "updated_at": now_iso(),
+        }
+        geo = self._settings.value("geometry")
+        if geo:
+            profile["geometry_b64"] = base64.b64encode(bytes(geo)).decode("ascii")
+        return profile

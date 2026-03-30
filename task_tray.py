@@ -61,7 +61,13 @@ except OSError:
     )
 logger = logging.getLogger("task_tray")
 
-_OPTIONAL_VECTOR_ERRORS = (ImportError, sqlite3.Error, OSError, RuntimeError, ValueError)
+_OPTIONAL_VECTOR_ERRORS = (
+    ImportError,
+    sqlite3.Error,
+    OSError,
+    RuntimeError,
+    ValueError,
+)
 _OPTIONAL_PIPELINE_ERRORS = (
     ImportError,
     sqlite3.Error,
@@ -753,6 +759,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._search_text = ""
         self._entity_results: list[dict] = []
         self._entity_seq_id = 0
+        self._entity_search_lock = threading.Lock()
+        self._entity_search_running = False
+        self._pending_entity_search: tuple[int, str] | None = None
         self._pre_search_tab: int | None = None  # tab to restore after search clears
         self._active_filters = {"priority": set(), "due": set(), "project": set()}
         self._excluded_filters = {"priority": set(), "due": set(), "project": set()}
@@ -1050,9 +1059,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._purge_timer.timeout.connect(self._run_purge)
         self._purge_timer.start(_PURGE_INTERVAL_MS)
 
-        # Auto-sync: watch memory.db for changes (push on local change)
-        self._db_watcher = QFileSystemWatcher([str(Path(self.db.db_path))], self)
+        # Auto-sync: watch DB, WAL, and parent directory so WAL-only writes are seen.
+        self._db_watch_dir = str(Path(self.db.db_path).parent)
+        self._db_watcher = QFileSystemWatcher(self)
+        self._refresh_db_watch_paths()
         self._db_watcher.fileChanged.connect(self._on_db_changed)
+        self._db_watcher.directoryChanged.connect(self._on_db_dir_changed)
         self._auto_sync_timer = QTimer(self)
         self._auto_sync_timer.setSingleShot(True)
         self._auto_sync_timer.setInterval(60_000)  # 60s debounce
@@ -1077,8 +1089,25 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """DB file changed — start/restart debounce timers."""
         self._auto_sync_timer.start()  # 60s bridge sync debounce
         self._db_refresh_debounce.start()  # 500ms UI refresh debounce
-        # Re-add path (Qt removes watched files after change notification)
-        self._db_watcher.addPath(path)
+        self._refresh_db_watch_paths()
+
+    def _on_db_dir_changed(self, path):
+        """Directory changed — catch WAL create/rotate events."""
+        self._auto_sync_timer.start()
+        self._db_refresh_debounce.start()
+        self._refresh_db_watch_paths()
+
+    def _refresh_db_watch_paths(self):
+        """Ensure DB watcher tracks the DB, WAL, and parent directory."""
+        wanted = {self._db_watch_dir}
+        db_path = Path(self.db.db_path)
+        for candidate in (db_path, Path(f"{self.db.db_path}-wal")):
+            if candidate.exists():
+                wanted.add(str(candidate))
+        current = set(self._db_watcher.files()) | set(self._db_watcher.directories())
+        missing = sorted(wanted - current)
+        if missing:
+            self._db_watcher.addPaths(missing)
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
@@ -1333,6 +1362,39 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             if key == "suggested" and self._search_text:
                 self._load_tab(key)
 
+    def _cancel_entity_searches(self):
+        """Invalidate in-flight entity searches and clear queued work."""
+        self._entity_seq_id += 1
+        with self._entity_search_lock:
+            self._pending_entity_search = None
+
+    def _request_entity_search(self, query: str):
+        """Coalesce entity searches into a single background worker."""
+        self._entity_seq_id += 1
+        seq_id = self._entity_seq_id
+        with self._entity_search_lock:
+            self._pending_entity_search = (seq_id, query)
+            if self._entity_search_running:
+                return
+            self._entity_search_running = True
+
+        def _entity_worker():
+            while True:
+                with self._entity_search_lock:
+                    pending = self._pending_entity_search
+                    self._pending_entity_search = None
+                if pending is None:
+                    with self._entity_search_lock:
+                        if self._pending_entity_search is None:
+                            self._entity_search_running = False
+                            return
+                    continue
+                worker_seq_id, worker_query = pending
+                results = self.db.search_entities_fast(worker_query, limit=10)
+                self._entity_search_done.emit(results, worker_seq_id)
+
+        threading.Thread(target=_entity_worker, daemon=True).start()
+
     def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""
         if conn is not None:
@@ -1458,15 +1520,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             )
             # Async entity search — tasks render immediately, entities arrive via signal
             self._entity_results = []
-            self._entity_seq_id += 1
-            _seq = self._entity_seq_id
-            _q = self._search_text
-
-            def _entity_worker(seq_id=_seq, query=_q):
-                results = self.db.search_entities_fast(query, limit=10)
-                self._entity_search_done.emit(results, seq_id)
-
-            threading.Thread(target=_entity_worker, daemon=True).start()
+            self._request_entity_search(self._search_text)
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
                 if key == "suggested":
@@ -1480,6 +1534,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 else:
                     self._filtered_cache[key] = self._sort_tasks(source)
         else:
+            self._cancel_entity_searches()
             self._entity_results = []
             for key in self._tab_keys:
                 if key in self._tab_views:
