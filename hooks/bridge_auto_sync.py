@@ -41,6 +41,28 @@ WRITE_TOOLS = {
     "mcp__sqlite_collab__rate_public_knowledge",
     "mcp__sqlite_collab__update_verification",
     "mcp__sqlite_entity__merge_entities",
+    # Unified server names after sqlite_unified migration
+    "mcp__sqlite_unified__create_entities",
+    "mcp__sqlite_unified__add_observations",
+    "mcp__sqlite_unified__delete_entities",
+    "mcp__sqlite_unified__delete_observations",
+    "mcp__sqlite_unified__create_relations",
+    "mcp__sqlite_unified__delete_relations",
+    "mcp__sqlite_unified__create_task_or_note",
+    "mcp__sqlite_unified__update_task",
+    "mcp__sqlite_unified__archive_done_tasks",
+    "mcp__sqlite_unified__bump_overdue_priority",
+    "mcp__sqlite_unified__assign_task",
+    "mcp__sqlite_unified__review_shared_tasks",
+    "mcp__sqlite_unified__process_recurring_tasks",
+    "mcp__sqlite_unified__manage_collaborators",
+    "mcp__sqlite_unified__share_knowledge",
+    "mcp__sqlite_unified__review_shared_knowledge",
+    "mcp__sqlite_unified__request_publish",
+    "mcp__sqlite_unified__cancel_publish",
+    "mcp__sqlite_unified__rate_public_knowledge",
+    "mcp__sqlite_unified__update_verification",
+    "mcp__sqlite_unified__merge_entities",
 }
 
 LEVEL_PREFIX = {

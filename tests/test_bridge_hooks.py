@@ -40,7 +40,9 @@ def test_bridge_auto_sync_handles_invalid_json_input(tmp_path):
 def test_bridge_auto_sync_tracks_new_collab_writes_without_retriggering_bridge_push(
     tmp_path, monkeypatch
 ):
-    module = _load_module("bridge_auto_sync_test", ROOT / "hooks" / "bridge_auto_sync.py")
+    module = _load_module(
+        "bridge_auto_sync_test", ROOT / "hooks" / "bridge_auto_sync.py"
+    )
     module.DIRTY_FLAG = str(tmp_path / ".bridge_dirty")
     module.LAST_SYNC = str(tmp_path / ".bridge_last_sync")
     module.NOTIFY_FILE = str(tmp_path / ".bridge_notification")
@@ -76,8 +78,49 @@ def test_bridge_auto_sync_tracks_new_collab_writes_without_retriggering_bridge_p
     assert launches == []
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__sqlite_collab__request_publish",
+        "mcp__sqlite_unified__create_task_or_note",
+    ],
+)
+def test_bridge_auto_sync_tracks_unified_and_collab_writes(
+    tmp_path, monkeypatch, tool_name
+):
+    module = _load_module(
+        f"bridge_auto_sync_test_{tool_name}",
+        ROOT / "hooks" / "bridge_auto_sync.py",
+    )
+    module.DIRTY_FLAG = str(tmp_path / ".bridge_dirty")
+    module.LAST_SYNC = str(tmp_path / ".bridge_last_sync")
+    module.NOTIFY_FILE = str(tmp_path / ".bridge_notification")
+    module.WORKER_SCRIPT = str(tmp_path / "bridge_sync_worker.py")
+    Path(module.WORKER_SCRIPT).write_text("print('worker')\n", encoding="utf-8")
+
+    launches = []
+
+    def fake_popen(args, **kwargs):
+        launches.append(args)
+        return types.SimpleNamespace(pid=1234)
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    out = io.StringIO()
+    rc = module.main(
+        stdin=io.StringIO(json.dumps({"tool_name": tool_name})),
+        stdout=out,
+    )
+
+    assert rc == 0
+    assert Path(module.DIRTY_FLAG).exists()
+    assert len(launches) == 1
+
+
 def test_hook_worker_treats_no_change_push_as_success(tmp_path, monkeypatch):
-    module = _load_module("bridge_hook_worker_test", ROOT / "hooks" / "bridge_sync_worker.py")
+    module = _load_module(
+        "bridge_hook_worker_test", ROOT / "hooks" / "bridge_sync_worker.py"
+    )
     module.LOCK_FILE = str(tmp_path / ".lock")
     module.LAST_SYNC = str(tmp_path / ".last_sync")
     module.DIRTY_FLAG = str(tmp_path / ".dirty")
@@ -92,7 +135,9 @@ def test_hook_worker_treats_no_change_push_as_success(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "preflight_git_check", lambda: (True, None))
     monkeypatch.setattr(module, "_read_fail_count", lambda: 0)
     monkeypatch.setattr(module, "_write_fail_count", fail_counts.append)
-    monkeypatch.setattr(module, "notify", lambda level, msg: notifications.append((level, msg)))
+    monkeypatch.setattr(
+        module, "notify", lambda level, msg: notifications.append((level, msg))
+    )
     monkeypatch.setattr(
         module,
         "fix_remote_ahead",
