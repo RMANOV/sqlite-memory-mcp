@@ -27,7 +27,10 @@ from db_utils import (
     get_entity_id as _get_entity_id,
     fts_sync_entity as _fts_sync,
     TaskDAO,
+    BRIDGE_SYNC_DELAY,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
+    bridge_change_summary as _bridge_change_summary,
+    promote_pending_public_entities as _promote_pending_public_entities,
     MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
     _NOWIN,
     now_iso as _now,
@@ -44,6 +47,10 @@ from db_utils import (
     export_entity_files as _export_entity_files,
     export_entities_index as _export_entities_index,
     load_entities_from_files as _load_entities_from_files,
+    load_remote_entities_for_import as _load_remote_entities_for_import,
+    load_remote_tasks_for_merge as _load_remote_tasks_for_merge,
+    import_bridge_entities_and_relations as _import_bridge_entities_and_relations,
+    import_bridge_knowledge_ratings as _import_bridge_knowledge_ratings,
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     BRIDGE_REPO,
     BRIDGE_SYNC_DELAY,
@@ -445,15 +452,61 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     # v4: One-time migration shared.json → per-entity files
     _migrate_entities_to_per_files(BRIDGE_REPO)
 
+    shared_path = Path(BRIDGE_REPO) / "shared.json"
+    export_started_at = _now()
+    remote_payload: dict[str, Any] = {}
+    if shared_path.exists():
+        try:
+            remote_payload = _json_loads(shared_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            logger.warning("bridge_push: shared.json read failed before merge: %s", exc)
+
     with _get_conn() as conn:
-        # v2.0.0: LWW merge remote index.json into local DB
-        _bp_index_path = Path(BRIDGE_REPO) / "index.json"
-        if _bp_index_path.exists():
+        remote_entities = _load_remote_entities_for_import(
+            BRIDGE_REPO,
+            remote_payload,
+            logger,
+        )
+        remote_relations = remote_payload.get("relations", [])
+        if not isinstance(remote_relations, list):
+            remote_relations = []
+        if remote_entities or remote_relations:
             try:
-                _remote_idx = _json_loads(_bp_index_path.read_text(encoding="utf-8"))
-                _merge_import_tasks(conn, _remote_idx.get("tasks", []))
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("bridge_push: index.json merge failed: %s", exc)
+                _import_bridge_entities_and_relations(
+                    conn,
+                    remote_entities,
+                    remote_relations,
+                )
+            except (
+                sqlite3.OperationalError,
+                sqlite3.IntegrityError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                logger.warning("bridge_push: entity/relation merge failed: %s", exc)
+
+        remote_tasks, _tasks_from_index = _load_remote_tasks_for_merge(
+            BRIDGE_REPO,
+            remote_payload,
+            logger,
+        )
+        if remote_tasks:
+            try:
+                _merge_import_tasks(conn, remote_tasks, import_content=True)
+            except (
+                sqlite3.OperationalError,
+                sqlite3.IntegrityError,
+                ValueError,
+            ) as exc:
+                logger.warning("bridge_push: task merge failed: %s", exc)
+
+        remote_ratings = remote_payload.get("knowledge_ratings", [])
+        if isinstance(remote_ratings, list) and remote_ratings:
+            try:
+                _import_bridge_knowledge_ratings(conn, remote_ratings)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+                logger.warning("bridge_push: rating merge failed: %s", exc)
 
         # Incremental check: skip if no changes since last push
         if not force:
@@ -462,18 +515,12 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             ).fetchone()
             if last_push_row:
                 last_push_at = last_push_row["value"]
-                row = conn.execute(
-                    "SELECT "
-                    "  (SELECT COUNT(*) FROM tasks WHERE updated_at > ?) AS changed_tasks, "
-                    "  (SELECT COUNT(*) FROM entities WHERE updated_at > ?) AS changed_ents, "
-                    "  (SELECT COUNT(*) FROM entities WHERE visibility = 'pending_public') AS pending_pub",
-                    (last_push_at, last_push_at),
-                ).fetchone()
-                if (
-                    row["changed_tasks"] == 0
-                    and row["changed_ents"] == 0
-                    and row["pending_pub"] == 0
-                ):
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(minutes=_PUBLISH_STANDBY_MINUTES)
+                ).isoformat()
+                change_summary = _bridge_change_summary(conn, last_push_at, cutoff)
+                if not any(change_summary.values()):
                     logger.info(
                         "bridge_push: no changes since %s, skipping", last_push_at
                     )
@@ -487,12 +534,12 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=_PUBLISH_STANDBY_MINUTES)
         ).isoformat()
-        promoted_ent = conn.execute(
-            "UPDATE entities SET visibility='public' "
-            "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-            (cutoff,),
-        ).rowcount
-        promoted_tasks = TaskDAO.promote_pending_public(conn, cutoff)
+        promoted_ent = _promote_pending_public_entities(conn, cutoff, export_started_at)
+        promoted_tasks = TaskDAO.promote_pending_public(
+            conn,
+            cutoff,
+            updated_at=export_started_at,
+        )
         if promoted_ent or promoted_tasks:
             logger.info(
                 "bridge_push: promoted %d entities, %d tasks to public",
@@ -646,7 +693,6 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         payload["knowledge_ratings"] = [dict(r) for r in rating_rows]
 
     # Merge remote tasks + preserve extra keys from remote
-    shared_path = Path(BRIDGE_REPO) / "shared.json"
     index_exists = (Path(BRIDGE_REPO) / "index.json").exists()
     if shared_path.exists():
         try:
@@ -896,7 +942,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         with _get_conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
-                (_now(),),
+                (export_started_at,),
             )
 
     return json.dumps(result)
@@ -942,13 +988,13 @@ def bridge_pull() -> str:
                 return _error(f"Failed to read shared.json: {exc}")
             logger.warning("bridge_pull: shared.json parse failed: %s", exc)
 
-    # v4: load entities from per-entity files, fall back to shared.json
-    _eidx_path = Path(BRIDGE_REPO) / "entities_index.json"
-    if _eidx_path.exists():
-        entities = _load_entities_from_files(BRIDGE_REPO)
-    else:
-        entities = payload.get("entities", [])
+    entities = _load_remote_entities_for_import(BRIDGE_REPO, payload, logger)
     relations = payload.get("relations", [])
+    remote_tasks, tasks_from_index = _load_remote_tasks_for_merge(
+        BRIDGE_REPO,
+        payload,
+        logger,
+    )
     # Stage shared_tasks for review (never auto-import from other accounts)
     shared_tasks = payload.get("shared_tasks", [])
     staged_count = 0
@@ -1007,27 +1053,8 @@ def bridge_pull() -> str:
                 )
                 new_relations += cur3.rowcount
 
-        # v2.0.0: Import tasks via per-field LWW merge from index.json
-        if _has_index:
+        if tasks_from_index:
             try:
-                _idx_data = _json_loads(_pull_index_path.read_text(encoding="utf-8"))
-                remote_tasks = _idx_data.get("tasks", [])
-                enriched = 0
-                for task in remote_tasks:
-                    if task.get("_tombstone"):
-                        continue
-                    content = _load_task_content(task.get("id", ""), BRIDGE_REPO)
-                    if content:
-                        for content_field in _CONTENT_FIELDS:
-                            if content_field in content:
-                                task[content_field] = content[content_field]
-                        if content.get("description") or content.get("notes"):
-                            enriched += 1
-                if enriched:
-                    logger.info(
-                        "bridge_pull: enriched %d tasks with content from per-task files",
-                        enriched,
-                    )
                 new_tasks, updated_tasks = _merge_import_tasks(
                     conn, remote_tasks, import_content=True
                 )
@@ -1042,17 +1069,8 @@ def bridge_pull() -> str:
                 new_tasks, updated_tasks = 0, 0
         else:
             # Legacy fallback: task-level LWW from shared.json
-            tasks = list(payload.get("tasks", []))
-            for key, val in payload.items():
-                if (
-                    key.endswith("_tasks")
-                    and key != "tasks"
-                    and key != "shared_tasks"
-                    and isinstance(val, list)
-                ):
-                    tasks.extend(val)
             tasks_sorted = sorted(
-                tasks,
+                remote_tasks,
                 key=lambda t: (
                     t.get("parent_id") is not None,
                     t.get("created_at", ""),

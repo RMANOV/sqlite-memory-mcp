@@ -758,6 +758,97 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def promote_pending_public_entities(
+    conn: sqlite3.Connection,
+    cutoff_ts: str,
+    updated_at: str | None = None,
+) -> int:
+    """Promote pending_public entities to public. Returns count promoted."""
+    ts = updated_at or now_iso()
+    cur = conn.execute(
+        "UPDATE entities SET visibility='public', updated_at = ? "
+        "WHERE visibility='pending_public' AND publish_requested_at <= ?",
+        (ts, cutoff_ts),
+    )
+    return cur.rowcount
+
+
+def bridge_change_summary(
+    conn: sqlite3.Connection,
+    since_ts: str,
+    publish_cutoff_ts: str | None = None,
+) -> dict[str, int]:
+    """Return bridge-relevant changes since a sync watermark.
+
+    Includes relation/rating churn and pending_public items whose standby window
+    has elapsed, so incremental push logic does not skip exportable changes.
+    """
+    cutoff = publish_cutoff_ts or (
+        datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
+    ).isoformat()
+
+    values: dict[str, int] = {
+        "changed_tasks": 0,
+        "changed_entities": 0,
+        "changed_relations": 0,
+        "changed_ratings": 0,
+        "ready_public_entities": 0,
+        "ready_public_tasks": 0,
+    }
+
+    if _sqlite_table_exists(conn, "tasks"):
+        values["changed_tasks"] = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+        values["ready_public_tasks"] = conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE visibility = 'pending_public' AND publish_requested_at <= ?",
+            (cutoff,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "entities"):
+        values["changed_entities"] = conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+        values["ready_public_entities"] = conn.execute(
+            "SELECT COUNT(*) FROM entities "
+            "WHERE visibility = 'pending_public' AND publish_requested_at <= ?",
+            (cutoff,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "relations"):
+        values["changed_relations"] = conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "knowledge_ratings"):
+        values["changed_ratings"] = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_ratings WHERE rated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    return values
+
+
+def bridge_has_changes(
+    conn: sqlite3.Connection,
+    since_ts: str,
+    publish_cutoff_ts: str | None = None,
+) -> bool:
+    return any(bridge_change_summary(conn, since_ts, publish_cutoff_ts).values())
+
+
 def parse_iso_datetime_for_compare(value: str | None) -> datetime:
     """Parse ISO datetime defensively for ordering comparisons.
 
@@ -1135,12 +1226,17 @@ class TaskDAO:
         return ids
 
     @staticmethod
-    def promote_pending_public(conn: sqlite3.Connection, cutoff_ts: str) -> int:
+    def promote_pending_public(
+        conn: sqlite3.Connection,
+        cutoff_ts: str,
+        updated_at: str | None = None,
+    ) -> int:
         """Promote pending_public tasks to public. Returns count promoted."""
+        ts = updated_at or now_iso()
         cur = conn.execute(
-            "UPDATE tasks SET visibility = 'public' "
+            "UPDATE tasks SET visibility = 'public', updated_at = ? "
             "WHERE visibility = 'pending_public' AND publish_requested_at <= ?",
-            (cutoff_ts,),
+            (ts, cutoff_ts),
         )
         return cur.rowcount
 
@@ -2095,6 +2191,176 @@ def load_entities_from_files(bridge_dir: str) -> list[dict]:
         content = load_entity_content(eid, bridge_dir)
         entities.append(content if content else meta)
     return entities
+
+
+def collect_legacy_bridge_tasks(payload: dict[str, Any]) -> list[dict]:
+    """Collect legacy task arrays from shared.json-style bridge payloads."""
+    tasks = list(payload.get("tasks", []))
+    for key, value in payload.items():
+        if (
+            key.endswith("_tasks")
+            and key not in {"tasks", "shared_tasks"}
+            and isinstance(value, list)
+        ):
+            tasks.extend(value)
+    return tasks
+
+
+def load_remote_entities_for_import(
+    bridge_dir: str,
+    payload: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """Load remote bridge entities, falling back to shared.json on manifest errors."""
+    index_path = Path(bridge_dir) / "entities_index.json"
+    if not index_path.exists():
+        return list(payload.get("entities", []))
+    try:
+        json_loads(index_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError, TypeError) as exc:
+        if logger is not None:
+            logger.warning(
+                "entities_index.json read failed: %s; falling back to shared.json entities",
+                exc,
+            )
+        return list(payload.get("entities", []))
+    return load_entities_from_files(bridge_dir)
+
+
+def load_remote_tasks_for_merge(
+    bridge_dir: str,
+    payload: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> tuple[list[dict], bool]:
+    """Load bridge tasks, hydrating per-task content and falling back on manifest errors.
+
+    Returns (tasks, loaded_from_index_json).
+    """
+    index_path = Path(bridge_dir) / "index.json"
+    if not index_path.exists():
+        return collect_legacy_bridge_tasks(payload), False
+
+    try:
+        idx_data = json_loads(index_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError, TypeError) as exc:
+        if logger is not None:
+            logger.warning(
+                "index.json read failed: %s; falling back to shared.json tasks",
+                exc,
+            )
+        return collect_legacy_bridge_tasks(payload), False
+
+    remote_tasks = idx_data.get("tasks", [])
+    enriched = 0
+    for task in remote_tasks:
+        if task.get("_tombstone"):
+            continue
+        content = load_task_content(task.get("id", ""), bridge_dir)
+        if not content:
+            continue
+        for field in CONTENT_FIELDS:
+            if field in content:
+                task[field] = content[field]
+        if content.get("description") or content.get("notes"):
+            enriched += 1
+
+    if enriched and logger is not None:
+        logger.info(
+            "bridge tasks: enriched %d tasks with content from per-task files",
+            enriched,
+        )
+    return remote_tasks, True
+
+
+def import_bridge_entities_and_relations(
+    conn: sqlite3.Connection,
+    entities: list[dict],
+    relations: list[dict],
+) -> tuple[int, int, int]:
+    """Merge bridge entities/observations/relations into the local DB."""
+    now = now_iso()
+    new_entities = 0
+    new_observations = 0
+    new_relations = 0
+
+    for ent in entities:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO entities "
+            "(name, entity_type, project, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                ent["name"],
+                ent["entityType"],
+                ent.get("project"),
+                ent.get("createdAt", now),
+                ent.get("updatedAt", now),
+            ),
+        )
+        new_entities += cur.rowcount
+
+        eid = get_entity_id(conn, ent["name"])
+        if not eid:
+            continue
+        for obs in ent.get("observations", []):
+            content = obs["content"] if isinstance(obs, dict) else obs
+            created = obs.get("createdAt", now) if isinstance(obs, dict) else now
+            cur2 = conn.execute(
+                "INSERT OR IGNORE INTO observations (entity_id, content, created_at) "
+                "VALUES (?, ?, ?)",
+                (eid, content, created),
+            )
+            new_observations += cur2.rowcount
+        fts_sync_entity(conn, eid)
+
+    for rel in relations:
+        from_id = get_entity_id(conn, rel["from"])
+        to_id = get_entity_id(conn, rel["to"])
+        if not from_id or not to_id:
+            continue
+        cur3 = conn.execute(
+            "INSERT OR IGNORE INTO relations "
+            "(from_id, to_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
+            (
+                from_id,
+                to_id,
+                rel["relationType"],
+                rel.get("createdAt", now),
+            ),
+        )
+        new_relations += cur3.rowcount
+
+    return new_entities, new_observations, new_relations
+
+
+def import_bridge_knowledge_ratings(
+    conn: sqlite3.Connection,
+    ratings: list[dict],
+) -> int:
+    """Merge bridge knowledge ratings into the local DB."""
+    imported = 0
+    for rating in ratings:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO knowledge_ratings "
+            "(entity_name, rater_id, content_hash, specificity, falsifiability, "
+            "internal_consistency, novelty, verification_outcome, usefulness, "
+            "verification_context, rated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rating.get("entity_name"),
+                rating.get("rater_id"),
+                rating.get("content_hash"),
+                rating.get("specificity"),
+                rating.get("falsifiability"),
+                rating.get("internal_consistency"),
+                rating.get("novelty"),
+                rating.get("verification_outcome"),
+                rating.get("usefulness"),
+                rating.get("verification_context"),
+                rating.get("rated_at") or now_iso(),
+            ),
+        )
+        imported += cur.rowcount
+    return imported
 
 
 def migrate_entities_to_per_files(bridge_dir: str) -> bool:

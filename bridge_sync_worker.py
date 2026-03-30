@@ -42,8 +42,7 @@ from db_utils import (
     json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
     export_task_files,
     export_index_json,
-    load_task_content,
-    CONTENT_FIELDS,
+    load_remote_tasks_for_merge,
     content_length,
     has_meaningful_content,
     is_suspicious_content_shrink,
@@ -53,9 +52,13 @@ from db_utils import (
     fts_sync_entity,
     export_entity_files,
     export_entities_index,
-    load_entities_from_files,
+    load_remote_entities_for_import,
+    import_bridge_entities_and_relations,
+    import_bridge_knowledge_ratings,
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
+    bridge_change_summary,
+    promote_pending_public_entities,
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -479,6 +482,7 @@ def _main_locked(
 ) -> dict:
     """Run sync with process/thread locks already held."""
     _db_path = db_path
+    export_started_at = now_iso()
 
     repo_ok, repo_msg = ensure_bridge_repo_ready(bridge_dir)
     if not repo_ok:
@@ -499,15 +503,11 @@ def _main_locked(
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
         ).isoformat()
+        promote_pending_public_entities(conn, cutoff, export_started_at)
         conn.execute(
-            "UPDATE entities SET visibility='public' "
+            "UPDATE tasks SET visibility='public', updated_at = ? "
             "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-            (cutoff,),
-        )
-        conn.execute(
-            "UPDATE tasks SET visibility='public' "
-            "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-            (cutoff,),
+            (export_started_at, cutoff),
         )
 
     # Phase 2: Git pull (no transaction held)
@@ -549,53 +549,62 @@ def _main_locked(
     migrate_to_per_task_files(bridge_dir)
     migrate_entities_to_per_files(bridge_dir)
 
+    remote_payload: dict = {}
+    if shared_path.exists():
+        try:
+            remote_payload = _json_loads(shared_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            log.warning("shared.json read failed for merge: %s", exc)
+
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 10, "Importing remote entities...")
-        remote_entities = load_entities_from_files(bridge_dir)
-        if remote_entities:
-            n_ent_imported = _import_remote_entities(conn, remote_entities)
-            if n_ent_imported:
-                log.info(
-                    "Imported %d remote entities (from per-entity files)",
-                    n_ent_imported,
-                )
-        elif shared_path.exists():
+        remote_entities = load_remote_entities_for_import(
+            bridge_dir,
+            remote_payload,
+            log,
+        )
+        remote_relations = remote_payload.get("relations", [])
+        if not isinstance(remote_relations, list):
+            remote_relations = []
+        if remote_entities or remote_relations:
             try:
-                remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                n_ent_imported = _import_remote_entities(
-                    conn, remote_data.get("entities", [])
+                n_ent_imported, _, n_rel_imported = import_bridge_entities_and_relations(
+                    conn,
+                    remote_entities,
+                    remote_relations,
                 )
-                if n_ent_imported:
-                    log.info("Imported %d remote entities", n_ent_imported)
-            except (json.JSONDecodeError, OSError) as exc:
-                log.warning("shared.json read failed for entity import: %s", exc)
-    # Entity import transaction closed — entities committed independently
+                if n_ent_imported or n_rel_imported:
+                    log.info(
+                        "Imported %d remote entities and %d relations",
+                        n_ent_imported,
+                        n_rel_imported,
+                    )
+            except (
+                sqlite3.OperationalError,
+                sqlite3.IntegrityError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                log.warning("Entity/relation merge failed: %s", exc)
 
-    # Phase 3a-2: Import tasks (own transaction — entity imports safe even if this fails)
+        remote_ratings = remote_payload.get("knowledge_ratings", [])
+        if isinstance(remote_ratings, list) and remote_ratings:
+            try:
+                imported_ratings = import_bridge_knowledge_ratings(conn, remote_ratings)
+                if imported_ratings:
+                    log.info("Imported %d remote knowledge ratings", imported_ratings)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+                log.warning("Rating merge failed: %s", exc)
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 15, "Importing remote tasks...")
-        if index_path.exists():
+        remote_tasks, _loaded_from_index = load_remote_tasks_for_merge(
+            bridge_dir,
+            remote_payload,
+            log,
+        )
+        if remote_tasks:
             try:
-                idx_data = _json_loads(index_path.read_text(encoding="utf-8"))
-                remote_tasks = idx_data.get("tasks", [])
-
-                # Enrich with content from per-task files (fixes dead load_task_content)
-                enriched = 0
-                for task in remote_tasks:
-                    if task.get("_tombstone"):
-                        continue
-                    content = load_task_content(task.get("id", ""), bridge_dir)
-                    if content:
-                        for cf in CONTENT_FIELDS:
-                            if cf in content:
-                                task[cf] = content[cf]
-                        if content.get("description") or content.get("notes"):
-                            enriched += 1
-                if enriched:
-                    log.info(
-                        "Enriched %d tasks with content from per-task files", enriched
-                    )
-
                 new_t, upd_t = merge_import_tasks(
                     conn, remote_tasks, import_content=True
                 )
@@ -603,24 +612,9 @@ def _main_locked(
             except (
                 sqlite3.OperationalError,
                 sqlite3.IntegrityError,
-                json.JSONDecodeError,
                 ValueError,
             ) as exc:
-                log.warning("index.json merge failed: %s", exc)
-        elif shared_path.exists():
-            try:
-                remote_data = _json_loads(shared_path.read_text(encoding="utf-8"))
-                new_t, upd_t = merge_import_tasks(
-                    conn, remote_data.get("tasks", []), import_content=True
-                )
-                log.info("Imported %d new, updated %d from remote", new_t, upd_t)
-            except (
-                sqlite3.OperationalError,
-                sqlite3.IntegrityError,
-                json.JSONDecodeError,
-                ValueError,
-            ) as exc:
-                log.warning("Task merge from shared.json failed: %s", exc)
+                log.warning("Task merge failed: %s", exc)
     # Task import transaction closed — DB lock released
 
     # Safety valve: check BEFORE export (bridge files still contain remote data)
@@ -679,23 +673,15 @@ def _main_locked(
                 ).fetchone()
                 if meta_row:
                     last_push_at = meta_row["value"]
-                    chk = conn.execute(
-                        "SELECT "
-                        "  (SELECT COUNT(*) FROM tasks WHERE updated_at > ?) AS ct, "
-                        "  (SELECT COUNT(*) FROM entities WHERE updated_at > ?) AS ce, "
-                        "  (SELECT COUNT(*) FROM entities "
-                        "   WHERE visibility = 'pending_public') AS pp",
-                        (last_push_at, last_push_at),
-                    ).fetchone()
+                    cutoff = (
+                        datetime.now(timezone.utc)
+                        - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
+                    ).isoformat()
+                    change_summary = bridge_change_summary(conn, last_push_at, cutoff)
                     ui_profile_pending = _ui_profile_changed(
                         shared_path, machine_id, ui_profile
                     )
-                    if (
-                        chk["ct"] == 0
-                        and chk["ce"] == 0
-                        and chk["pp"] == 0
-                        and not ui_profile_pending
-                    ):
+                    if not any(change_summary.values()) and not ui_profile_pending:
                         log.info(
                             "No changes since %s — skipping export+push", last_push_at
                         )
@@ -819,7 +805,7 @@ def _main_locked(
             conn.execute(
                 "INSERT OR REPLACE INTO bridge_meta(key, value) "
                 "VALUES('last_push_at', ?)",
-                (now_iso(),),
+                (export_started_at,),
             )
 
     # Deploy to Cloudflare Pages (auto-update after push)
