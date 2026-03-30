@@ -46,6 +46,7 @@ from db_utils import (
     load_entities_from_files as _load_entities_from_files,
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     BRIDGE_REPO,
+    BRIDGE_SYNC_DELAY,
     git_run as _git_run,
     ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
     source_hash as _source_hash,
@@ -179,7 +180,11 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
             try:
                 existing = json.loads(shared_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError) as e:
-                logger.warning("_push_to_assignee: ignoring corrupt shared.json for %s: %s", assignee, e)
+                logger.warning(
+                    "_push_to_assignee: ignoring corrupt shared.json for %s: %s",
+                    assignee,
+                    e,
+                )
 
         # Merge into shared_tasks array (upsert by id, last-write-wins)
         shared_tasks = {t["id"]: t for t in existing.get("shared_tasks", [])}
@@ -336,7 +341,11 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
             try:
                 existing = json.loads(shared_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError) as e:
-                logger.warning("_push_knowledge_to: ignoring corrupt shared.json for %s: %s", target_user, e)
+                logger.warning(
+                    "_push_knowledge_to: ignoring corrupt shared.json for %s: %s",
+                    target_user,
+                    e,
+                )
 
         # Merge into shared_knowledge (dedup by sourceHash)
         current = {e["sourceHash"]: e for e in existing.get("shared_knowledge", [])}
@@ -843,7 +852,9 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         )
         gh_repo = os.environ.get("BRIDGE_GH_REPO", "")
         if not gh_repo:
-            logger.warning("bridge_push: BRIDGE_GH_REPO not set, skipping GitHub release")
+            logger.warning(
+                "bridge_push: BRIDGE_GH_REPO not set, skipping GitHub release"
+            )
         else:
             try:
                 rel_result = subprocess.run(
@@ -869,7 +880,8 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                     logger.info("bridge_push: created GitHub release %s", tag_name)
                 else:
                     logger.warning(
-                        "bridge_push: GitHub release failed: %s", rel_result.stderr.strip()
+                        "bridge_push: GitHub release failed: %s",
+                        rel_result.stderr.strip(),
                     )
             except Exception as exc:
                 logger.warning("bridge_push: GitHub release error: %s", exc)
@@ -1439,7 +1451,9 @@ def bridge_status() -> str:
             _eidx = _json_loads(_status_eidx_path.read_text(encoding="utf-8"))
             remote_names = {e["name"] for e in _eidx.get("entities", []) if "name" in e}
         except (json.JSONDecodeError, OSError) as e:
-            logger.debug("bridge_pull status: ignoring corrupt entities_index.json: %s", e)
+            logger.debug(
+                "bridge_pull status: ignoring corrupt entities_index.json: %s", e
+            )
     if shared_path.exists():
         try:
             payload = _json_loads(shared_path.read_text(encoding="utf-8"))

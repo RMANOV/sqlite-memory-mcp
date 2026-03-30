@@ -14,8 +14,8 @@ ARCHITECTURE NOTE — NOT a duplicate of ../bridge_sync_worker.py (authoritative
 
 These two files serve different layers and must NOT be merged or replaced with
 a thin delegate. Fix bugs in each independently; keep this comment updated.
-Deployed copy lives at ~/.claude/hooks/bridge_sync_worker.py (WORKER_SCRIPT in
-bridge_auto_sync.py). After changes here, copy to that location.
+bridge_auto_sync.py now prefers this repo copy and only falls back to the
+legacy deployed copy under ~/.claude/hooks if needed.
 """
 
 import json
@@ -35,7 +35,8 @@ LOG_FILE = os.path.expanduser("~/.claude/memory/bridge_sync.log")
 SERVER_DIR = os.path.expanduser("~/.claude/mcp_servers/sqlite_memory")
 BRIDGE_REPO = os.path.expanduser("~/.claude/memory/bridge")
 FAIL_COUNTER = os.path.expanduser("~/.claude/memory/.bridge_fail_count")
-MAX_FAILURES = 2
+MAX_FAILURES = 2  # warning threshold only; auto-sync keeps retrying
+MAX_DRAIN_CYCLES = 3
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -216,6 +217,17 @@ def _write_fail_count(count):
         pass
 
 
+def _read_dirty_timestamp():
+    """Return the latest known dirty timestamp, if any."""
+    try:
+        if os.path.exists(DIRTY_FLAG):
+            with open(DIRTY_FLAG, encoding="utf-8") as f:
+                return float(f.read().strip())
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def main(progress_callback=None):
     """Run bridge pull + push cycle.
 
@@ -230,107 +242,136 @@ def main(progress_callback=None):
             except Exception:
                 pass  # UI callback failure must not break sync
 
-    # Failure counter — stop auto-sync after MAX_FAILURES consecutive failures
     fail_count = _read_fail_count()
     if fail_count >= MAX_FAILURES:
-        logging.info(
-            "Auto-sync disabled — %d consecutive failures. Manual sync needed.",
+        logging.warning(
+            "Auto-sync saw %d consecutive failures; retrying instead of disabling.",
             fail_count,
         )
-        return
 
     if not acquire_lock():
         logging.info("Skipped — another sync in progress")
         return
 
     try:
-        # Pre-flight: ensure bridge git repo is in clean state
-        _progress(2, "Preflight check...")
-        ok, msg = preflight_git_check()
-        if not ok:
-            notify("warning", f"BRIDGE: sync blocked — {msg}")
-            return
+        for cycle in range(1, MAX_DRAIN_CYCLES + 1):
+            cycle_started_at = time.time()
 
-        sys.path.insert(0, SERVER_DIR)
-        from bridge_server import bridge_pull, bridge_push
+            # Pre-flight: ensure bridge git repo is in clean state
+            _progress(2, "Preflight check...")
+            ok, msg = preflight_git_check()
+            if not ok:
+                notify("warning", f"BRIDGE: sync blocked — {msg}")
+                return
 
-        # Step 1: Pull remote changes into local DB
-        _progress(5, "git pull...")
-        pull_fn = bridge_pull.fn
-        if inspect.iscoroutinefunction(pull_fn):
-            pull_result = asyncio.run(pull_fn())
-        else:
-            pull_result = pull_fn()
-        logging.info("bridge_pull result: %s", pull_result)
-        _progress(35, "Preparing push...")
+            sys.path.insert(0, SERVER_DIR)
+            from bridge_server import bridge_pull, bridge_push
 
-        # Step 2: Push local (now merged) DB to remote
-        fn = bridge_push.fn
-        _progress(40, "Pushing...")
+            # Step 1: Pull remote changes into local DB
+            _progress(5, "git pull...")
+            pull_fn = bridge_pull.fn
+            if inspect.iscoroutinefunction(pull_fn):
+                pull_result = asyncio.run(pull_fn())
+            else:
+                pull_result = pull_fn()
+            logging.info("bridge_pull result: %s", pull_result)
+            _progress(35, "Preparing push...")
 
-        if inspect.iscoroutinefunction(fn):
-            result_str = asyncio.run(fn(tag="shared"))
-        else:
-            result_str = fn(tag="shared")
+            # Step 2: Push local (now merged) DB to remote
+            fn = bridge_push.fn
+            _progress(40, "Pushing...")
 
-        logging.info("bridge_push result: %s", result_str)
+            if inspect.iscoroutinefunction(fn):
+                result_str = asyncio.run(fn(tag="shared"))
+            else:
+                result_str = fn(tag="shared")
 
-        # Parse result to check pushed_to_remote
-        try:
-            result = (
-                json.loads(result_str) if isinstance(result_str, str) else result_str
-            )
-        except (json.JSONDecodeError, TypeError):
-            result = {}
+            logging.info("bridge_push result: %s", result_str)
 
-        pushed = False
-        tasks_count = result.get("tasks", 0) if isinstance(result, dict) else 0
-        if isinstance(result, dict):
-            pushed = bool(result.get("pushed_to_remote", False))
-            if result.get("blocked_by_repo_state"):
+            # Parse result to check pushed_to_remote
+            try:
+                result = (
+                    json.loads(result_str)
+                    if isinstance(result_str, str)
+                    else result_str
+                )
+            except (json.JSONDecodeError, TypeError):
+                result = {}
+
+            pushed = False
+            tasks_count = result.get("tasks", 0) if isinstance(result, dict) else 0
+            if isinstance(result, dict):
+                pushed = bool(result.get("pushed_to_remote", False))
+                if result.get("blocked_by_repo_state"):
+                    notify(
+                        "warning",
+                        f"BRIDGE: sync blocked — {result.get('error', 'bridge repo is not ready')}",
+                    )
+                    return
+                message = str(result.get("message", ""))
+                if (
+                    not pushed
+                    and result.get("pushed") == 0
+                    and message.startswith("No changes")
+                ):
+                    pushed = True
+
+            _progress(70, "Verifying push...")
+            if not pushed:
+                # Remote might be ahead — try auto-resolve
+                logging.warning("pushed_to_remote=false, attempting auto-resolve")
+                if fix_remote_ahead():
+                    pushed = True
+                else:
+                    # Check if it was just "nothing to commit"
+                    ok, status = git_run("status", "--porcelain")
+                    if ok and not status:
+                        # Working tree clean — maybe shared.json didn't change
+                        ok, log = git_run("log", "--oneline", "origin/main..HEAD")
+                        if ok and not log:
+                            notify(
+                                "info", f"BRIDGE: already in sync ({tasks_count} tasks)"
+                            )
+                            pushed = True
+
+            _progress(90, "Finalizing...")
+            if not pushed:
+                fail_count += 1
+                _write_fail_count(fail_count)
                 notify(
                     "warning",
-                    f"BRIDGE: sync blocked — {result.get('error', 'bridge repo is not ready')}",
+                    f"BRIDGE: sync incomplete — {tasks_count} tasks exported but push failed. Check bridge_sync.log",
                 )
-                return
-            message = str(result.get("message", ""))
-            if not pushed and result.get("pushed") == 0 and message.startswith(
-                "No changes"
-            ):
-                pushed = True
+                break
 
-        _progress(70, "Verifying push...")
-        if not pushed:
-            # Remote might be ahead — try auto-resolve
-            logging.warning("pushed_to_remote=false, attempting auto-resolve")
-            if fix_remote_ahead():
-                pushed = True
-            else:
-                # Check if it was just "nothing to commit"
-                ok, status = git_run("status", "--porcelain")
-                if ok and not status:
-                    # Working tree clean — maybe shared.json didn't change
-                    ok, log = git_run("log", "--oneline", "origin/main..HEAD")
-                    if ok and not log:
-                        notify("info", f"BRIDGE: already in sync ({tasks_count} tasks)")
-                        pushed = True
+            fail_count = 0
+            _write_fail_count(0)
+            dirty_after = _read_dirty_timestamp()
+            if dirty_after is not None and dirty_after > cycle_started_at:
+                logging.info(
+                    "New writes arrived during sync; draining cycle %d/%d "
+                    "(dirty %.3f > start %.3f)",
+                    cycle,
+                    MAX_DRAIN_CYCLES,
+                    dirty_after,
+                    cycle_started_at,
+                )
+                if cycle < MAX_DRAIN_CYCLES:
+                    continue
+                notify(
+                    "warning",
+                    "BRIDGE: new writes kept arriving during sync; pending changes remain dirty for the next trigger",
+                )
+                break
 
-        _progress(90, "Finalizing...")
-        if pushed:
             with open(LAST_SYNC, "w") as f:
                 f.write(str(time.time()))
             try:
                 os.unlink(DIRTY_FLAG)
             except OSError:
                 pass
-            _write_fail_count(0)
             notify("info", f"BRIDGE: synced {tasks_count} tasks OK")
-        else:
-            _write_fail_count(fail_count + 1)
-            notify(
-                "warning",
-                f"BRIDGE: sync incomplete — {tasks_count} tasks exported but push failed. Check bridge_sync.log",
-            )
+            break
 
     except Exception as e:
         _write_fail_count(fail_count + 1)

@@ -17,7 +17,10 @@ DIRTY_FLAG = os.path.expanduser("~/.claude/memory/.bridge_dirty")
 LAST_SYNC = os.path.expanduser("~/.claude/memory/.bridge_last_sync")
 NOTIFY_FILE = os.path.expanduser("~/.claude/memory/.bridge_notification")
 DEBOUNCE_SECONDS = 600
-WORKER_SCRIPT = os.path.expanduser("~/.claude/hooks/bridge_sync_worker.py")
+WORKER_SCRIPT = os.path.expanduser(
+    "~/.claude/mcp_servers/sqlite_memory/hooks/bridge_sync_worker.py"
+)
+WORKER_FALLBACK_SCRIPT = os.path.expanduser("~/.claude/hooks/bridge_sync_worker.py")
 
 WRITE_TOOLS = {
     "mcp__sqlite_memory__create_entities",
@@ -131,12 +134,27 @@ def _should_sync(now: float) -> bool:
     return True
 
 
+def _resolve_worker_script() -> str | None:
+    candidates = []
+    for path in (WORKER_SCRIPT, WORKER_FALLBACK_SCRIPT):
+        if path and path not in candidates:
+            candidates.append(path)
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _launch_worker() -> str | None:
-    if not os.path.isfile(WORKER_SCRIPT):
-        return f"BRIDGE WARNING: auto-sync worker missing: {WORKER_SCRIPT}"
+    worker_path = _resolve_worker_script()
+    if worker_path is None:
+        return (
+            "BRIDGE WARNING: auto-sync worker missing: "
+            f"{WORKER_SCRIPT} (fallback: {WORKER_FALLBACK_SCRIPT})"
+        )
     try:
         subprocess.Popen(
-            [sys.executable, WORKER_SCRIPT],
+            [sys.executable, worker_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
