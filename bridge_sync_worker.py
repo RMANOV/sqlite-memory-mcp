@@ -52,9 +52,7 @@ from db_utils import (
     fts_sync_entity,
     export_entity_files,
     export_entities_index,
-    load_remote_entities_for_import,
-    import_bridge_entities_and_relations,
-    import_bridge_knowledge_ratings,
+    import_remote_bridge_data,
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
     bridge_change_summary,
@@ -558,44 +556,14 @@ def _main_locked(
 
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 10, "Importing remote entities...")
-        remote_entities = load_remote_entities_for_import(
-            bridge_dir,
-            remote_payload,
-            log,
-        )
-        remote_relations = remote_payload.get("relations", [])
-        if not isinstance(remote_relations, list):
-            remote_relations = []
-        if remote_entities or remote_relations:
-            try:
-                n_ent_imported, _, n_rel_imported = import_bridge_entities_and_relations(
-                    conn,
-                    remote_entities,
-                    remote_relations,
-                )
-                if n_ent_imported or n_rel_imported:
-                    log.info(
-                        "Imported %d remote entities and %d relations",
-                        n_ent_imported,
-                        n_rel_imported,
-                    )
-            except (
-                sqlite3.OperationalError,
-                sqlite3.IntegrityError,
-                KeyError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                log.warning("Entity/relation merge failed: %s", exc)
-
-        remote_ratings = remote_payload.get("knowledge_ratings", [])
-        if isinstance(remote_ratings, list) and remote_ratings:
-            try:
-                imported_ratings = import_bridge_knowledge_ratings(conn, remote_ratings)
-                if imported_ratings:
-                    log.info("Imported %d remote knowledge ratings", imported_ratings)
-            except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
-                log.warning("Rating merge failed: %s", exc)
+        br = import_remote_bridge_data(conn, bridge_dir, remote_payload, log)
+        if br["entities"] or br["relations"]:
+            log.info(
+                "Imported %d remote entities and %d relations",
+                br["entities"], br["relations"],
+            )
+        if br["ratings"]:
+            log.info("Imported %d remote knowledge ratings", br["ratings"])
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 15, "Importing remote tasks...")
         remote_tasks, _loaded_from_index = load_remote_tasks_for_merge(

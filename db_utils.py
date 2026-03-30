@@ -2363,6 +2363,44 @@ def import_bridge_knowledge_ratings(
     return imported
 
 
+def import_remote_bridge_data(
+    conn: sqlite3.Connection,
+    bridge_dir: str,
+    remote_payload: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> dict[str, int]:
+    """Import remote entities, relations, and knowledge ratings from bridge data.
+
+    Returns {"entities": N, "relations": N, "ratings": N}.
+    """
+    result = {"entities": 0, "relations": 0, "ratings": 0}
+
+    remote_entities = load_remote_entities_for_import(bridge_dir, remote_payload, logger)
+    remote_relations = remote_payload.get("relations", [])
+    if not isinstance(remote_relations, list):
+        remote_relations = []
+    if remote_entities or remote_relations:
+        try:
+            n_ent, _, n_rel = import_bridge_entities_and_relations(
+                conn, remote_entities, remote_relations,
+            )
+            result["entities"] = n_ent
+            result["relations"] = n_rel
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            if logger:
+                logger.warning("Entity/relation merge failed: %s", exc)
+
+    remote_ratings = remote_payload.get("knowledge_ratings", [])
+    if isinstance(remote_ratings, list) and remote_ratings:
+        try:
+            result["ratings"] = import_bridge_knowledge_ratings(conn, remote_ratings)
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Rating merge failed: %s", exc)
+
+    return result
+
+
 def migrate_entities_to_per_files(bridge_dir: str) -> bool:
     """Signal that entity migration to per-file format is needed.
 

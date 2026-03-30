@@ -27,7 +27,6 @@ from db_utils import (
     get_entity_id as _get_entity_id,
     fts_sync_entity as _fts_sync,
     TaskDAO,
-    BRIDGE_SYNC_DELAY,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
     bridge_change_summary as _bridge_change_summary,
     promote_pending_public_entities as _promote_pending_public_entities,
@@ -41,16 +40,12 @@ from db_utils import (
     merge_import_tasks as _merge_import_tasks,
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
-    load_task_content as _load_task_content,
-    CONTENT_FIELDS as _CONTENT_FIELDS,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     export_entity_files as _export_entity_files,
     export_entities_index as _export_entities_index,
-    load_entities_from_files as _load_entities_from_files,
     load_remote_entities_for_import as _load_remote_entities_for_import,
     load_remote_tasks_for_merge as _load_remote_tasks_for_merge,
-    import_bridge_entities_and_relations as _import_bridge_entities_and_relations,
-    import_bridge_knowledge_ratings as _import_bridge_knowledge_ratings,
+    import_remote_bridge_data as _import_remote_bridge_data,
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     BRIDGE_REPO,
     BRIDGE_SYNC_DELAY,
@@ -462,51 +457,16 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             logger.warning("bridge_push: shared.json read failed before merge: %s", exc)
 
     with _get_conn() as conn:
-        remote_entities = _load_remote_entities_for_import(
-            BRIDGE_REPO,
-            remote_payload,
-            logger,
-        )
-        remote_relations = remote_payload.get("relations", [])
-        if not isinstance(remote_relations, list):
-            remote_relations = []
-        if remote_entities or remote_relations:
-            try:
-                _import_bridge_entities_and_relations(
-                    conn,
-                    remote_entities,
-                    remote_relations,
-                )
-            except (
-                sqlite3.OperationalError,
-                sqlite3.IntegrityError,
-                KeyError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                logger.warning("bridge_push: entity/relation merge failed: %s", exc)
+        _import_remote_bridge_data(conn, BRIDGE_REPO, remote_payload, logger)
 
         remote_tasks, _tasks_from_index = _load_remote_tasks_for_merge(
-            BRIDGE_REPO,
-            remote_payload,
-            logger,
+            BRIDGE_REPO, remote_payload, logger,
         )
         if remote_tasks:
             try:
                 _merge_import_tasks(conn, remote_tasks, import_content=True)
-            except (
-                sqlite3.OperationalError,
-                sqlite3.IntegrityError,
-                ValueError,
-            ) as exc:
+            except (sqlite3.Error, ValueError) as exc:
                 logger.warning("bridge_push: task merge failed: %s", exc)
-
-        remote_ratings = remote_payload.get("knowledge_ratings", [])
-        if isinstance(remote_ratings, list) and remote_ratings:
-            try:
-                _import_bridge_knowledge_ratings(conn, remote_ratings)
-            except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
-                logger.warning("bridge_push: rating merge failed: %s", exc)
 
         # Incremental check: skip if no changes since last push
         if not force:
