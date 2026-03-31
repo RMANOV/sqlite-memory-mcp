@@ -335,6 +335,8 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
     evidence_ref        TEXT NOT NULL,
     weight              REAL NOT NULL,
     excerpt             TEXT NULL,
+    source_start        INTEGER NULL,
+    source_end          INTEGER NULL,
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ce_claim ON claim_evidence(claim_id);
@@ -350,6 +352,10 @@ CREATE TABLE IF NOT EXISTS canonical_facts (
     confidence          REAL NOT NULL,
     validation_mode     TEXT NOT NULL,
     source_claim_id     TEXT NULL REFERENCES candidate_claims(claim_id),
+    valid_from          TEXT NULL,
+    valid_to            TEXT NULL,
+    superseded_by_fact_id TEXT NULL REFERENCES canonical_facts(fact_id),
+    contradiction_count INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -365,6 +371,7 @@ CREATE TABLE IF NOT EXISTS context_packs (
     token_budget        INTEGER NOT NULL,
     body                TEXT NOT NULL,
     freshness_score     REAL NOT NULL,
+    contract_version    TEXT NOT NULL DEFAULT 'legacy',
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cp_target ON context_packs(pack_type, target_ref);
@@ -395,11 +402,92 @@ CREATE TABLE IF NOT EXISTS enrichment_runs (
     finished_at         TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS memory_cursors (
+    machine_id          TEXT PRIMARY KEY,
+    last_clock          INTEGER NOT NULL DEFAULT 0,
+    updated_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_events (
+    event_id            TEXT PRIMARY KEY,
+    event_type          TEXT NOT NULL,
+    aggregate_kind      TEXT NOT NULL,
+    aggregate_id        TEXT NOT NULL,
+    field_name          TEXT NULL,
+    actor_type          TEXT NOT NULL DEFAULT 'system',
+    actor_id            TEXT NULL,
+    machine_id          TEXT NOT NULL,
+    tool_name           TEXT NOT NULL,
+    logical_clock       INTEGER NOT NULL,
+    event_ts            TEXT NOT NULL,
+    old_value           TEXT NULL,
+    new_value           TEXT NULL,
+    payload_json        TEXT NULL,
+    parent_event_id     TEXT NULL,
+    source_kind         TEXT NULL,
+    source_ref          TEXT NULL,
+    source_excerpt      TEXT NULL,
+    source_start        INTEGER NULL,
+    source_end          INTEGER NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_clock
+    ON memory_events(machine_id, logical_clock);
+CREATE INDEX IF NOT EXISTS idx_memory_events_aggregate
+    ON memory_events(aggregate_kind, aggregate_id, logical_clock DESC);
+
+CREATE TABLE IF NOT EXISTS provenance_links (
+    provenance_id       TEXT PRIMARY KEY,
+    subject_kind        TEXT NOT NULL,
+    subject_ref         TEXT NOT NULL,
+    source_kind         TEXT NOT NULL,
+    source_ref          TEXT NOT NULL,
+    span_start          INTEGER NULL,
+    span_end            INTEGER NULL,
+    excerpt             TEXT NULL,
+    confidence          REAL NOT NULL DEFAULT 1.0,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provenance_subject
+    ON provenance_links(subject_kind, subject_ref);
+
+CREATE TABLE IF NOT EXISTS knowledge_links (
+    link_id             TEXT PRIMARY KEY,
+    subject_kind        TEXT NOT NULL,
+    subject_ref         TEXT NOT NULL,
+    relation_type       TEXT NOT NULL,
+    object_kind         TEXT NOT NULL,
+    object_ref          TEXT NOT NULL,
+    rationale           TEXT NULL,
+    created_at          TEXT NOT NULL,
+    active              INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_subject
+    ON knowledge_links(subject_kind, subject_ref, relation_type, active);
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_object
+    ON knowledge_links(object_kind, object_ref, relation_type, active);
+
+CREATE TABLE IF NOT EXISTS memory_audit_issues (
+    issue_id            TEXT PRIMARY KEY,
+    issue_type          TEXT NOT NULL,
+    severity            TEXT NOT NULL,
+    subject_kind        TEXT NOT NULL,
+    subject_ref         TEXT NOT NULL,
+    details_json        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'open',
+    first_detected_at   TEXT NOT NULL,
+    last_detected_at    TEXT NOT NULL,
+    resolved_at         TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_audit_status
+    ON memory_audit_issues(status, severity, issue_type);
+
 CREATE TABLE IF NOT EXISTS task_field_versions (
     task_id     TEXT NOT NULL,
     field_name  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     updated_by  TEXT NOT NULL DEFAULT '',
+    updated_order INTEGER NOT NULL DEFAULT 0,
+    source_event_id TEXT DEFAULT NULL,
     PRIMARY KEY (task_id, field_name),
     FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
@@ -892,6 +980,158 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_enrichment_runs_chunk ON enrichment_runs(chunk_id)",
         "idx_enrichment_runs_chunk index (HIGH-3)",
     ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_cursors'",
+        "CREATE TABLE memory_cursors ("
+        "machine_id TEXT PRIMARY KEY, "
+        "last_clock INTEGER NOT NULL DEFAULT 0, "
+        "updated_at TEXT NOT NULL)",
+        "memory_cursors table (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_events'",
+        "CREATE TABLE memory_events ("
+        "event_id TEXT PRIMARY KEY, "
+        "event_type TEXT NOT NULL, "
+        "aggregate_kind TEXT NOT NULL, "
+        "aggregate_id TEXT NOT NULL, "
+        "field_name TEXT NULL, "
+        "actor_type TEXT NOT NULL DEFAULT 'system', "
+        "actor_id TEXT NULL, "
+        "machine_id TEXT NOT NULL, "
+        "tool_name TEXT NOT NULL, "
+        "logical_clock INTEGER NOT NULL, "
+        "event_ts TEXT NOT NULL, "
+        "old_value TEXT NULL, "
+        "new_value TEXT NULL, "
+        "payload_json TEXT NULL, "
+        "parent_event_id TEXT NULL, "
+        "source_kind TEXT NULL, "
+        "source_ref TEXT NULL, "
+        "source_excerpt TEXT NULL, "
+        "source_start INTEGER NULL, "
+        "source_end INTEGER NULL)",
+        "memory_events table (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memory_events_clock'",
+        "CREATE UNIQUE INDEX idx_memory_events_clock ON memory_events(machine_id, logical_clock)",
+        "idx_memory_events_clock index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memory_events_aggregate'",
+        "CREATE INDEX idx_memory_events_aggregate ON memory_events(aggregate_kind, aggregate_id, logical_clock DESC)",
+        "idx_memory_events_aggregate index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provenance_links'",
+        "CREATE TABLE provenance_links ("
+        "provenance_id TEXT PRIMARY KEY, "
+        "subject_kind TEXT NOT NULL, "
+        "subject_ref TEXT NOT NULL, "
+        "source_kind TEXT NOT NULL, "
+        "source_ref TEXT NOT NULL, "
+        "span_start INTEGER NULL, "
+        "span_end INTEGER NULL, "
+        "excerpt TEXT NULL, "
+        "confidence REAL NOT NULL DEFAULT 1.0, "
+        "created_at TEXT NOT NULL)",
+        "provenance_links table (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_provenance_subject'",
+        "CREATE INDEX idx_provenance_subject ON provenance_links(subject_kind, subject_ref)",
+        "idx_provenance_subject index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_links'",
+        "CREATE TABLE knowledge_links ("
+        "link_id TEXT PRIMARY KEY, "
+        "subject_kind TEXT NOT NULL, "
+        "subject_ref TEXT NOT NULL, "
+        "relation_type TEXT NOT NULL, "
+        "object_kind TEXT NOT NULL, "
+        "object_ref TEXT NOT NULL, "
+        "rationale TEXT NULL, "
+        "created_at TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 1)",
+        "knowledge_links table (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_knowledge_links_subject'",
+        "CREATE INDEX idx_knowledge_links_subject ON knowledge_links(subject_kind, subject_ref, relation_type, active)",
+        "idx_knowledge_links_subject index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_knowledge_links_object'",
+        "CREATE INDEX idx_knowledge_links_object ON knowledge_links(object_kind, object_ref, relation_type, active)",
+        "idx_knowledge_links_object index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_audit_issues'",
+        "CREATE TABLE memory_audit_issues ("
+        "issue_id TEXT PRIMARY KEY, "
+        "issue_type TEXT NOT NULL, "
+        "severity TEXT NOT NULL, "
+        "subject_kind TEXT NOT NULL, "
+        "subject_ref TEXT NOT NULL, "
+        "details_json TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'open', "
+        "first_detected_at TEXT NOT NULL, "
+        "last_detected_at TEXT NOT NULL, "
+        "resolved_at TEXT NULL)",
+        "memory_audit_issues table (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memory_audit_status'",
+        "CREATE INDEX idx_memory_audit_status ON memory_audit_issues(status, severity, issue_type)",
+        "idx_memory_audit_status index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('task_field_versions') WHERE name='updated_order'",
+        "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0",
+        "task_field_versions.updated_order column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('task_field_versions') WHERE name='source_event_id'",
+        "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL",
+        "task_field_versions.source_event_id column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('claim_evidence') WHERE name='source_start'",
+        "ALTER TABLE claim_evidence ADD COLUMN source_start INTEGER DEFAULT NULL",
+        "claim_evidence.source_start column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('claim_evidence') WHERE name='source_end'",
+        "ALTER TABLE claim_evidence ADD COLUMN source_end INTEGER DEFAULT NULL",
+        "claim_evidence.source_end column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('canonical_facts') WHERE name='valid_from'",
+        "ALTER TABLE canonical_facts ADD COLUMN valid_from TEXT DEFAULT NULL",
+        "canonical_facts.valid_from column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('canonical_facts') WHERE name='valid_to'",
+        "ALTER TABLE canonical_facts ADD COLUMN valid_to TEXT DEFAULT NULL",
+        "canonical_facts.valid_to column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('canonical_facts') WHERE name='superseded_by_fact_id'",
+        "ALTER TABLE canonical_facts ADD COLUMN superseded_by_fact_id TEXT DEFAULT NULL",
+        "canonical_facts.superseded_by_fact_id column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('canonical_facts') WHERE name='contradiction_count'",
+        "ALTER TABLE canonical_facts ADD COLUMN contradiction_count INTEGER NOT NULL DEFAULT 0",
+        "canonical_facts.contradiction_count column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('context_packs') WHERE name='contract_version'",
+        "ALTER TABLE context_packs ADD COLUMN contract_version TEXT NOT NULL DEFAULT 'legacy'",
+        "context_packs.contract_version column (v3.4.0)",
+    ),
 ]
 
 
@@ -994,8 +1234,12 @@ def init_db(db_path: str | None = None) -> None:
                 logger.info("Migration applied: %s", desc)
         _repair_memory_fts_triggers(conn)
         # Index + prune access log entries older than 30 days
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_access_log_accessed ON entity_access_log(accessed_at)")
-        conn.execute("DELETE FROM entity_access_log WHERE accessed_at < datetime('now', '-30 days')")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_log_accessed ON entity_access_log(accessed_at)"
+        )
+        conn.execute(
+            "DELETE FROM entity_access_log WHERE accessed_at < datetime('now', '-30 days')"
+        )
 
     with _get_conn(_path) as conn:
         task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]

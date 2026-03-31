@@ -31,6 +31,9 @@ def test_tool_decorators_keep_fn_alias_for_direct_invocation_regressions():
     assert collab_server.manage_collaborators.fn is collab_server.manage_collaborators
     assert entity_server.link_task_entity.fn is entity_server.link_task_entity
     assert intel_server.assess_context.fn is intel_server.assess_context
+    assert intel_server.audit_memory.fn is intel_server.audit_memory
+    assert intel_server.replay_memory.fn is intel_server.replay_memory
+    assert intel_server.govern_fact.fn is intel_server.govern_fact
 
 
 def test_unified_server_imports_and_exposes_mcp_instance():

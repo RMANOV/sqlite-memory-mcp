@@ -140,6 +140,7 @@ def create_task_or_note(
             task_id,
             _MERGEABLE_FIELDS,
             now,
+            tool_name="sqlite-tasks.create_task_or_note",
             new_values={
                 "title": title,
                 "description": description,
@@ -265,6 +266,7 @@ def update_task(
             updates["updated_at"],
             old_values=old_values,
             new_values=new_values,
+            tool_name="sqlite-tasks.update_task",
         )
         # Re-embed if content fields changed
         if {"title", "description", "notes"} & set(changed_keys):
@@ -533,6 +535,7 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
                 now,
                 old_values={"status": "done"},
                 new_values={"status": "archived"},
+                tool_name="sqlite-tasks.archive_done_tasks",
             )
 
     logger.info(
@@ -590,6 +593,7 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
                     "priority": old_priority["priority"] if old_priority else None
                 },
                 new_values={"priority": target_priority},
+                tool_name="sqlite-tasks.bump_overdue_priority",
             )
             bumped += 1
 

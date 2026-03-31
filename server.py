@@ -28,7 +28,9 @@ from db_utils import (
     serialize_entity as _serialize_entity,
     setup_logger,
     export_relations as _export_relations,
+    record_memory_event,
 )
+
 # Optional vector search (graceful fallback to FTS5-only)
 try:
     from vec_search import (
@@ -167,6 +169,23 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
 
             eid = _get_entity_id(conn, name)
             if eid:
+                if cur.rowcount > 0:
+                    record_memory_event(
+                        conn,
+                        event_type="entity_create",
+                        aggregate_kind="entity",
+                        aggregate_id=str(eid),
+                        tool_name="sqlite-kb.create_entities",
+                        event_ts=now,
+                        new_value={
+                            "name": name,
+                            "entity_type": etype,
+                            "project": project,
+                            "visibility": vis,
+                        },
+                        source_kind="entity",
+                        source_ref=str(eid),
+                    )
                 if project is not None and cur.rowcount == 0:
                     conn.execute(
                         "UPDATE entities SET project = ?, updated_at = ? "
@@ -182,6 +201,18 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                     )
                     if cur_obs.rowcount > 0:
                         new_obs_ids.append((cur_obs.lastrowid, obs))
+                        record_memory_event(
+                            conn,
+                            event_type="observation_add",
+                            aggregate_kind="observation",
+                            aggregate_id=str(cur_obs.lastrowid),
+                            tool_name="sqlite-kb.create_entities",
+                            event_ts=now,
+                            new_value={"entity_id": eid, "content": obs},
+                            source_kind="entity",
+                            source_ref=str(eid),
+                            source_excerpt=obs[:300],
+                        )
                 _fts_sync(conn, eid)
                 if _VEC_AVAILABLE:
                     try:
@@ -232,6 +263,19 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                     (eid, content, now),
                 )
                 added += cur.rowcount
+                if cur.rowcount > 0:
+                    record_memory_event(
+                        conn,
+                        event_type="observation_add",
+                        aggregate_kind="observation",
+                        aggregate_id=str(cur.lastrowid),
+                        tool_name="sqlite-kb.add_observations",
+                        event_ts=now,
+                        new_value={"entity_id": eid, "content": content},
+                        source_kind="entity",
+                        source_ref=str(eid),
+                        source_excerpt=content[:300],
+                    )
             conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, eid))
             _fts_sync(conn, eid)
             if _VEC_AVAILABLE:
@@ -291,6 +335,22 @@ def create_relations(relations: list[dict[str, Any]]) -> str:
                 (from_id, to_id, rel_type, now),
             )
             created += cur.rowcount
+            if cur.rowcount > 0:
+                record_memory_event(
+                    conn,
+                    event_type="relation_create",
+                    aggregate_kind="relation",
+                    aggregate_id=f"{from_id}:{rel_type}:{to_id}",
+                    tool_name="sqlite-kb.create_relations",
+                    event_ts=now,
+                    new_value={
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "relation_type": rel_type,
+                    },
+                    source_kind="entity",
+                    source_ref=str(from_id),
+                )
 
     logger.info(
         "create_relations: %d created out of %d requested", created, len(relations)
@@ -310,11 +370,23 @@ def delete_entities(entityNames: list[str]) -> str:
     Also cleans up the FTS index.
     """
     deleted = 0
+    now = _now()
     with _get_conn() as conn:
         for name in entityNames:
             eid = _get_entity_id(conn, name)
             if eid is None:
                 continue
+            record_memory_event(
+                conn,
+                event_type="entity_delete",
+                aggregate_kind="entity",
+                aggregate_id=str(eid),
+                tool_name="sqlite-kb.delete_entities",
+                event_ts=now,
+                old_value={"name": name},
+                source_kind="entity",
+                source_ref=str(eid),
+            )
             _fts_remove(conn, eid)
             if _VEC_AVAILABLE:
                 try:
@@ -335,6 +407,7 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
     Each dict has: entityName (str), observations (list[str]).
     """
     deleted = 0
+    now = _now()
     with _get_conn() as conn:
         for item in deletions:
             entity_name = item["entityName"]
@@ -342,11 +415,28 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
             if eid is None:
                 continue
             for obs in item.get("observations", []):
+                row = conn.execute(
+                    "SELECT id FROM observations WHERE entity_id = ? AND content = ?",
+                    (eid, obs),
+                ).fetchone()
                 cur = conn.execute(
                     "DELETE FROM observations WHERE entity_id = ? AND content = ?",
                     (eid, obs),
                 )
                 deleted += cur.rowcount
+                if cur.rowcount > 0 and row:
+                    record_memory_event(
+                        conn,
+                        event_type="observation_delete",
+                        aggregate_kind="observation",
+                        aggregate_id=str(row["id"]),
+                        tool_name="sqlite-kb.delete_observations",
+                        event_ts=now,
+                        old_value={"entity_id": eid, "content": obs},
+                        source_kind="entity",
+                        source_ref=str(eid),
+                        source_excerpt=obs[:300],
+                    )
             _fts_sync(conn, eid)
             if _VEC_AVAILABLE:
                 try:
@@ -365,6 +455,7 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
     Each dict has: from (str), to (str), relationType (str).
     """
     deleted = 0
+    now = _now()
     with _get_conn() as conn:
         for rel in relations:
             from_id = _get_entity_id(conn, rel["from"])
@@ -377,6 +468,22 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
                 (from_id, to_id, rel["relationType"]),
             )
             deleted += cur.rowcount
+            if cur.rowcount > 0:
+                record_memory_event(
+                    conn,
+                    event_type="relation_delete",
+                    aggregate_kind="relation",
+                    aggregate_id=f"{from_id}:{rel['relationType']}:{to_id}",
+                    tool_name="sqlite-kb.delete_relations",
+                    event_ts=now,
+                    old_value={
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "relation_type": rel["relationType"],
+                    },
+                    source_kind="entity",
+                    source_ref=str(from_id),
+                )
 
     logger.info("delete_relations: %d deleted", deleted)
     return json.dumps({"deleted": deleted})
@@ -396,7 +503,11 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
                    total: int, has_more: bool}
     """
     with _get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] if offset == 0 else -1
+        total = (
+            conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            if offset == 0
+            else -1
+        )
         ent_rows = conn.execute(
             "SELECT id, name, entity_type, project FROM entities ORDER BY name LIMIT ? OFFSET ?",
             (limit, offset),
@@ -425,12 +536,14 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
         ]
         relations_out = _export_relations(conn)
 
-    return json.dumps({
-        "entities": entities_out,
-        "relations": relations_out,
-        "total": total,
-        "has_more": offset + limit < total,
-    })
+    return json.dumps(
+        {
+            "entities": entities_out,
+            "relations": relations_out,
+            "total": total,
+            "has_more": offset + limit < total,
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

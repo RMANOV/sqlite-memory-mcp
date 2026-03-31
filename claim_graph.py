@@ -14,7 +14,12 @@ import re
 import sqlite3
 from typing import Any
 
-from db_utils import now_iso
+from db_utils import (
+    add_knowledge_link,
+    add_provenance_link,
+    now_iso,
+    record_memory_event,
+)
 from intelligence_v2 import (
     _new_id,
     load_config,
@@ -112,9 +117,9 @@ def _detect_scope(text: str) -> str:
     return max(scores, key=scores.get)
 
 
-def _extract_spo_tuples(text: str) -> list[dict[str, str]]:
+def _extract_spo_tuples(text: str) -> list[dict[str, Any]]:
     """Extract (Subject, Predicate, Object) tuples from text using patterns."""
-    tuples: list[dict[str, str]] = []
+    tuples: list[dict[str, Any]] = []
     seen = set()
 
     for pattern, predicate in _RELATION_PATTERNS:
@@ -136,6 +141,9 @@ def _extract_spo_tuples(text: str) -> list[dict[str, str]]:
                         "subject": subject,
                         "predicate": predicate,
                         "object": obj,
+                        "start": match.start(0),
+                        "end": match.end(0),
+                        "excerpt": match.group(0).strip(),
                     }
                 )
 
@@ -225,15 +233,50 @@ def extract_candidate_claims(
         evidence_id = _new_id()
         conn.execute(
             "INSERT INTO claim_evidence "
-            "(evidence_id, claim_id, evidence_type, evidence_ref, weight, excerpt, created_at) "
-            "VALUES (?, ?, 'source_chunk', ?, 1.0, ?, ?)",
+            "(evidence_id, claim_id, evidence_type, evidence_ref, weight, excerpt, "
+            "source_start, source_end, created_at) "
+            "VALUES (?, ?, 'source_chunk', ?, 1.0, ?, ?, ?, ?)",
             (
                 evidence_id,
                 claim_id,
                 chunk_id,
-                body[:200] if len(body) > 200 else body,
+                t.get("excerpt") or (body[:200] if len(body) > 200 else body),
+                t.get("start"),
+                t.get("end"),
                 now,
             ),
+        )
+        add_provenance_link(
+            conn,
+            subject_kind="claim",
+            subject_ref=claim_id,
+            source_kind="chunk",
+            source_ref=chunk_id,
+            span_start=t.get("start"),
+            span_end=t.get("end"),
+            excerpt=t.get("excerpt"),
+            confidence=confidence,
+            created_at=now,
+        )
+        record_memory_event(
+            conn,
+            event_type="claim_extract",
+            aggregate_kind="claim",
+            aggregate_id=claim_id,
+            tool_name="sqlite-intel.extract_candidate_claims",
+            event_ts=now,
+            new_value={
+                "subject": t["subject"],
+                "predicate": t["predicate"],
+                "object": t["object"],
+                "scope": scope,
+                "confidence": confidence,
+            },
+            source_kind="chunk",
+            source_ref=chunk_id,
+            source_excerpt=t.get("excerpt"),
+            source_start=t.get("start"),
+            source_end=t.get("end"),
         )
 
         claims_created.append(
@@ -393,12 +436,60 @@ def promote_candidate(
             }
 
     # Promote: create canonical fact
-    fact_id = _new_id()
     now = now_iso()
+
+    existing_same = conn.execute(
+        "SELECT fact_id FROM canonical_facts "
+        "WHERE subject = ? AND predicate = ? AND object_text = ? "
+        "AND COALESCE(valid_to, '') = '' "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (row["subject"], row["predicate"], row["object_text"]),
+    ).fetchone()
+    if existing_same:
+        fact_id = existing_same["fact_id"]
+        conn.execute(
+            "UPDATE candidate_claims SET status = 'promoted', promoted_to_fact_id = ?, "
+            "updated_at = ? WHERE claim_id = ?",
+            (fact_id, now, claim_id),
+        )
+        add_provenance_link(
+            conn,
+            subject_kind="fact",
+            subject_ref=fact_id,
+            source_kind="claim",
+            source_ref=claim_id,
+            excerpt=f"Existing fact reinforced by claim {claim_id}",
+            created_at=now,
+        )
+        record_memory_event(
+            conn,
+            event_type="fact_reinforce",
+            aggregate_kind="fact",
+            aggregate_id=fact_id,
+            tool_name="sqlite-intel.promote_candidate",
+            event_ts=now,
+            new_value={"claim_id": claim_id, "mode": mode},
+            source_kind="claim",
+            source_ref=claim_id,
+        )
+        return {
+            "claim_id": claim_id,
+            "promoted": True,
+            "fact_id": fact_id,
+            "subject": row["subject"],
+            "predicate": row["predicate"],
+            "object": row["object_text"],
+            "scope": claim_scope,
+            "validation_mode": mode,
+            "reused_existing_fact": True,
+        }
+
+    fact_id = _new_id()
 
     # Build provenance summary
     evidence_rows = conn.execute(
-        "SELECT evidence_type, evidence_ref FROM claim_evidence WHERE claim_id = ?",
+        "SELECT evidence_type, evidence_ref, excerpt, source_start, source_end "
+        "FROM claim_evidence WHERE claim_id = ?",
         (claim_id,),
     ).fetchall()
     provenance = f"Promoted via {mode} from claim {claim_id}. "
@@ -415,8 +506,9 @@ def promote_candidate(
         "INSERT INTO canonical_facts "
         "(fact_id, subject, predicate, object_text, object_type, fact_scope, "
         "provenance_summary, confidence, validation_mode, source_claim_id, "
+        "valid_from, valid_to, superseded_by_fact_id, contradiction_count, "
         "created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)",
         (
             fact_id,
             row["subject"],
@@ -430,6 +522,7 @@ def promote_candidate(
             claim_id,
             now,
             now,
+            now,
         ),
     )
 
@@ -439,6 +532,29 @@ def promote_candidate(
         "updated_at = ? WHERE claim_id = ?",
         (fact_id, now, claim_id),
     )
+    add_provenance_link(
+        conn,
+        subject_kind="fact",
+        subject_ref=fact_id,
+        source_kind="claim",
+        source_ref=claim_id,
+        excerpt=f"Promoted from claim {claim_id}",
+        confidence=row["confidence"],
+        created_at=now,
+    )
+    for ev in evidence_rows:
+        add_provenance_link(
+            conn,
+            subject_kind="fact",
+            subject_ref=fact_id,
+            source_kind=ev["evidence_type"],
+            source_ref=ev["evidence_ref"],
+            span_start=ev["source_start"],
+            span_end=ev["source_end"],
+            excerpt=ev["excerpt"],
+            confidence=row["confidence"],
+            created_at=now,
+        )
 
     # Create impact edge: source_chunk → promoted fact
     try:
@@ -456,6 +572,57 @@ def promote_candidate(
         )
     except Exception as e:
         _log.debug("impact_graph link failed: %s", e)
+
+    competing_rows = conn.execute(
+        "SELECT fact_id FROM canonical_facts "
+        "WHERE fact_id != ? AND subject = ? AND predicate = ? "
+        "AND object_text != ? AND COALESCE(valid_to, '') = ''",
+        (fact_id, row["subject"], row["predicate"], row["object_text"]),
+    ).fetchall()
+    for comp in competing_rows:
+        add_knowledge_link(
+            conn,
+            subject_kind="fact",
+            subject_ref=fact_id,
+            relation_type="contradicts",
+            object_kind="fact",
+            object_ref=comp["fact_id"],
+            rationale=f"Same subject/predicate, different object after claim {claim_id}",
+            created_at=now,
+        )
+        add_knowledge_link(
+            conn,
+            subject_kind="fact",
+            subject_ref=comp["fact_id"],
+            relation_type="contradicts",
+            object_kind="fact",
+            object_ref=fact_id,
+            rationale=f"Same subject/predicate, different object after claim {claim_id}",
+            created_at=now,
+        )
+        conn.execute(
+            "UPDATE canonical_facts SET contradiction_count = contradiction_count + 1 "
+            "WHERE fact_id IN (?, ?)",
+            (fact_id, comp["fact_id"]),
+        )
+
+    record_memory_event(
+        conn,
+        event_type="fact_promote",
+        aggregate_kind="fact",
+        aggregate_id=fact_id,
+        tool_name="sqlite-intel.promote_candidate",
+        event_ts=now,
+        new_value={
+            "subject": row["subject"],
+            "predicate": row["predicate"],
+            "object": row["object_text"],
+            "claim_id": claim_id,
+            "mode": mode,
+        },
+        source_kind="claim",
+        source_ref=claim_id,
+    )
 
     log_enrichment_run(
         conn, "promote_candidate", "success", claim_id, started_at=started

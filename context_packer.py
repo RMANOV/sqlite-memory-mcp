@@ -23,7 +23,13 @@ from advanced_context import (
     compute_strategy_match as _compute_advanced_task_match,
     select_context_items as _select_advanced_items,
 )
-from db_utils import now_iso
+from db_utils import (
+    _sqlite_has_column,
+    _sqlite_table_exists,
+    add_provenance_link,
+    effective_fact_confidence,
+    now_iso,
+)
 from intelligence_v2 import (
     _new_id,
     load_config,
@@ -40,6 +46,7 @@ _EXECUTOR_MIN_CHUNK_RELEVANCE = 0.45
 _EXECUTOR_MIN_CHUNK_TRUST = 0.30
 _EXECUTOR_PREVIEW_MIN_RELEVANCE = 0.50
 _EXECUTOR_PREVIEW_MIN_QUALITY = 0.50
+_RETRIEVAL_CONTRACT_VERSION = "memory_contract_v1"
 _MAX_ITEMS_BY_TYPE = {
     "fact": 6,
     "claim": 5,
@@ -183,7 +190,14 @@ def _greedy_select_items(
     budget: int,
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     """Baseline deterministic selector used when advanced mode is disabled."""
-    items.sort(key=lambda x: x["score"], reverse=True)
+    items.sort(
+        key=lambda x: (
+            -float(x["score"]),
+            str(x["type"]),
+            str(x.get("id", "")),
+            str(x["text"]),
+        )
+    )
 
     selected: list[dict[str, Any]] = []
     tokens_used = 0
@@ -506,11 +520,47 @@ def build_context_pack(
         return best
 
     # 1. Canonical facts (highest trust)
+    fact_cols = [
+        "fact_id",
+        "subject",
+        "predicate",
+        "object_text",
+        "fact_scope",
+        "confidence",
+        "source_claim_id",
+        "created_at",
+        "updated_at",
+    ]
+    if _sqlite_has_column(conn, "canonical_facts", "valid_from"):
+        fact_cols.append("valid_from")
+    if _sqlite_has_column(conn, "canonical_facts", "valid_to"):
+        fact_cols.append("valid_to")
+    if _sqlite_has_column(conn, "canonical_facts", "contradiction_count"):
+        fact_cols.append("contradiction_count")
     facts = conn.execute(
-        "SELECT fact_id, subject, predicate, object_text, fact_scope, confidence, "
-        "created_at FROM canonical_facts ORDER BY confidence DESC"
+        f"SELECT {', '.join(fact_cols)} FROM canonical_facts "
+        "ORDER BY confidence DESC, updated_at DESC, fact_id"
     ).fetchall()
-    for f in facts:
+    for fact_row in facts:
+        f = dict(fact_row)
+        if f.get("valid_to"):
+            continue
+        contradiction_count = int(f.get("contradiction_count") or 0)
+        if contradiction_count > 0:
+            # Retrieval contract: unresolved contradictions are not canonical.
+            continue
+        has_fact_provenance = False
+        if _sqlite_table_exists(conn, "provenance_links"):
+            has_fact_provenance = (
+                conn.execute(
+                    "SELECT 1 FROM provenance_links "
+                    "WHERE subject_kind = 'fact' AND subject_ref = ? LIMIT 1",
+                    (f["fact_id"],),
+                ).fetchone()
+                is not None
+            )
+        if not f.get("source_claim_id") and not has_fact_provenance:
+            continue
         rel = _task_match(
             f["subject"],
             f["predicate"],
@@ -519,10 +569,23 @@ def build_context_pack(
         )
         if is_task_scoped and rel < _MIN_RELEVANCE_THRESHOLD:
             continue
-        trust = max(0.75, _signal_floor(f["confidence"], 0.75))
+        trust = max(
+            0.55,
+            effective_fact_confidence(
+                f["confidence"],
+                updated_at=f.get("updated_at") or f.get("created_at"),
+                contradiction_count=contradiction_count,
+            ),
+        )
         freshness = _compute_recency_score(f["created_at"])
         ts = _format_ts(f["created_at"])
-        text = f"{ts}[FACT] {f['subject']} {f['predicate']} {f['object_text']} (scope: {f['fact_scope']})"
+        validity_suffix = ""
+        if f.get("valid_from"):
+            validity_suffix = f", valid_from: {f['valid_from'][:10]}"
+        text = (
+            f"{ts}[FACT] {f['subject']} {f['predicate']} {f['object_text']} "
+            f"(scope: {f['fact_scope']}{validity_suffix})"
+        )
         items.append(
             {
                 "type": "fact",
@@ -554,11 +617,17 @@ def build_context_pack(
         )
 
     # 2. Candidate claims (provisional)
-    claims = conn.execute(
+    claim_sql = (
         "SELECT claim_id, subject, predicate, object_text, claim_scope, confidence, "
         "created_at FROM candidate_claims WHERE status = 'candidate' "
-        "ORDER BY confidence DESC LIMIT 50"
-    ).fetchall()
+    )
+    if _sqlite_table_exists(conn, "claim_evidence"):
+        claim_sql += (
+            "AND EXISTS (SELECT 1 FROM claim_evidence ce "
+            "WHERE ce.claim_id = candidate_claims.claim_id) "
+        )
+    claim_sql += "ORDER BY confidence DESC, created_at DESC, claim_id LIMIT 50"
+    claims = conn.execute(claim_sql).fetchall()
     for c in claims:
         rel = _task_match(
             c["subject"],
@@ -810,23 +879,54 @@ def build_context_pack(
     if persist:
         pack_id = _new_id()
         now = now_iso()
-        conn.execute(
-            "INSERT INTO context_packs "
-            "(pack_id, session_id, entity_id, pack_type, target_ref, input_signature, "
-            "token_budget, body, freshness_score, created_at) "
-            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                pack_id,
-                session_id,
-                pack_type,
-                target_ref,
-                input_sig,
-                budget,
-                pack_body,
-                freshness_score,
-                now,
-            ),
-        )
+        if _sqlite_has_column(conn, "context_packs", "contract_version"):
+            conn.execute(
+                "INSERT INTO context_packs "
+                "(pack_id, session_id, entity_id, pack_type, target_ref, input_signature, "
+                "token_budget, body, freshness_score, contract_version, created_at) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pack_id,
+                    session_id,
+                    pack_type,
+                    target_ref,
+                    input_sig,
+                    budget,
+                    pack_body,
+                    freshness_score,
+                    _RETRIEVAL_CONTRACT_VERSION,
+                    now,
+                ),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO context_packs "
+                "(pack_id, session_id, entity_id, pack_type, target_ref, input_signature, "
+                "token_budget, body, freshness_score, created_at) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pack_id,
+                    session_id,
+                    pack_type,
+                    target_ref,
+                    input_sig,
+                    budget,
+                    pack_body,
+                    freshness_score,
+                    now,
+                ),
+            )
+        for item in visible_selected:
+            add_provenance_link(
+                conn,
+                subject_kind="context_pack",
+                subject_ref=pack_id,
+                source_kind=item["type"],
+                source_ref=str(item.get("id", "")),
+                excerpt=item["text"][:400],
+                confidence=item.get("trust", 0.5),
+                created_at=now,
+            )
         _prune_context_pack_history(
             conn,
             pack_type,
@@ -857,6 +957,7 @@ def build_context_pack(
         "relevance_score": round(relevance_score, 3),
         "quality_score": round(quality_score, 3),
         "previewable": previewable,
+        "contract_version": _RETRIEVAL_CONTRACT_VERSION,
         "advanced_context": {
             "enabled": bool(advanced_strategy.get("enabled")),
             "query_expansion_used": bool(advanced_strategy.get("query_expansion_used")),

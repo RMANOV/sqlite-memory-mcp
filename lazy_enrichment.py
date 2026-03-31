@@ -17,7 +17,9 @@ from typing import Any
 logger = logging.getLogger("lazy_enrichment")
 
 from db_utils import (
+    add_provenance_link,
     now_iso,
+    record_memory_event,
     tokenize_for_similarity as _tokenize,
 )
 
@@ -216,22 +218,47 @@ def auto_promote_claim(
     fact_id = f"lf-{uuid.uuid4()}"
 
     try:
+        columns = [
+            "fact_id",
+            "subject",
+            "predicate",
+            "object_text",
+            "object_type",
+            "fact_scope",
+            "provenance_summary",
+            "confidence",
+            "validation_mode",
+            "source_claim_id",
+            "created_at",
+            "updated_at",
+        ]
+        values: list[Any] = [
+            fact_id,
+            row["subject"],
+            row["predicate"],
+            row["object_text"],
+            "text",
+            "entity",
+            f"Auto-promoted from lazy_claim {claim_id} (evidence accumulation)",
+            confidence,
+            "auto_lazy",
+            None,
+            now,
+            now,
+        ]
+        if (
+            "valid_from"
+            in {
+                col["name"]
+                for col in conn.execute("PRAGMA table_info('canonical_facts')")
+            }.copy()
+        ):
+            columns.append("valid_from")
+            values.append(now)
         conn.execute(
-            "INSERT INTO canonical_facts "
-            "(fact_id, subject, predicate, object_text, object_type, fact_scope, "
-            "provenance_summary, confidence, validation_mode, source_claim_id, "
-            "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 'text', 'entity', ?, ?, 'auto_lazy', NULL, ?, ?)",
-            (
-                fact_id,
-                row["subject"],
-                row["predicate"],
-                row["object_text"],
-                f"Auto-promoted from lazy_claim {claim_id} (evidence accumulation)",
-                confidence,
-                now,
-                now,
-            ),
+            f"INSERT INTO canonical_facts ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            values,
         )
     except (sqlite3.IntegrityError, sqlite3.OperationalError) as e:
         logger.warning("auto_promote_claim insert failed: %s", e)
@@ -241,6 +268,43 @@ def auto_promote_claim(
         "UPDATE lazy_claims SET status = 'promoted', promoted_to_fact_id = ?, "
         "updated_at = ? WHERE claim_id = ?",
         (fact_id, now, claim_id),
+    )
+    add_provenance_link(
+        conn,
+        subject_kind="fact",
+        subject_ref=fact_id,
+        source_kind="lazy_claim",
+        source_ref=claim_id,
+        excerpt=f"Auto-promoted from lazy_claim {claim_id}",
+        confidence=confidence,
+        created_at=now,
+    )
+    add_provenance_link(
+        conn,
+        subject_kind="fact",
+        subject_ref=fact_id,
+        source_kind="observation",
+        source_ref=str(row["observation_id"]),
+        excerpt=f"Observation {row['observation_id']} for entity {row['entity_id']}",
+        confidence=confidence,
+        created_at=now,
+    )
+    record_memory_event(
+        conn,
+        event_type="fact_promote",
+        aggregate_kind="fact",
+        aggregate_id=fact_id,
+        tool_name="lazy_enrichment.auto_promote_claim",
+        event_ts=now,
+        new_value={
+            "claim_id": claim_id,
+            "subject": row["subject"],
+            "predicate": row["predicate"],
+            "object": row["object_text"],
+            "mode": "auto_lazy",
+        },
+        source_kind="lazy_claim",
+        source_ref=claim_id,
     )
     return fact_id
 

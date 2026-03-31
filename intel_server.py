@@ -32,6 +32,12 @@ from context_packer import (
     warm_recent_task_packs as _warm_task_packs,
 )
 from impact_graph import explain_impact as _explain_impact
+from memory_audit import (
+    govern_fact as _govern_fact,
+    list_memory_audit_issues as _list_memory_audit_issues,
+    replay_memory_events as _replay_memory_events,
+    run_memory_audit as _run_memory_audit,
+)
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -46,6 +52,7 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: assess_context
@@ -70,7 +77,9 @@ def assess_context(
     try:
         with _get_conn() as conn:
             result = _assess_context(conn, chunk_ref, session_id, force)
-            logger.info("assess_context: chunk=%s, state=%s", chunk_ref, result.get("state"))
+            logger.info(
+                "assess_context: chunk=%s, state=%s", chunk_ref, result.get("state")
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("assess_context failed: %s", exc, exc_info=True)
@@ -97,7 +106,11 @@ def queue_clarification(
     try:
         with _get_conn() as conn:
             result = _queue_clarification(conn, chunk_ref, max_questions)
-            logger.info("queue_clarification: chunk=%s, questions=%d", chunk_ref, len(result.get("questions", [])))
+            logger.info(
+                "queue_clarification: chunk=%s, questions=%d",
+                chunk_ref,
+                len(result.get("questions", [])),
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("queue_clarification failed: %s", exc, exc_info=True)
@@ -126,7 +139,11 @@ def record_human_answer(
     try:
         with _get_conn() as conn:
             result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
-            logger.info("record_human_answer: chunk=%s, state=%s", chunk_ref, result.get("state"))
+            logger.info(
+                "record_human_answer: chunk=%s, state=%s",
+                chunk_ref,
+                result.get("state"),
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("record_human_answer failed: %s", exc, exc_info=True)
@@ -154,7 +171,11 @@ def extract_candidate_claims(
     try:
         with _get_conn() as conn:
             result = _extract_claims(conn, chunk_ref, scope_hint)
-            logger.info("extract_candidate_claims: chunk=%s, claims=%d", chunk_ref, result.get("claims_extracted", 0))
+            logger.info(
+                "extract_candidate_claims: chunk=%s, claims=%d",
+                chunk_ref,
+                result.get("claims_extracted", 0),
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("extract_candidate_claims failed: %s", exc, exc_info=True)
@@ -185,7 +206,12 @@ def promote_candidate(
     try:
         with _get_conn() as conn:
             result = _promote_candidate(conn, claim_id, mode)
-            logger.info("promote_candidate: claim=%s, mode=%s, status=%s", claim_id, mode, result.get("status"))
+            logger.info(
+                "promote_candidate: claim=%s, mode=%s, status=%s",
+                claim_id,
+                mode,
+                result.get("status"),
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("promote_candidate failed: %s", exc, exc_info=True)
@@ -223,7 +249,11 @@ def build_context_pack(
     try:
         with _get_conn() as conn:
             result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
-            logger.info("build_context_pack: type=%s, tokens=%d", pack_type, result.get("token_usage", 0))
+            logger.info(
+                "build_context_pack: type=%s, tokens=%d",
+                pack_type,
+                result.get("token_usage", 0),
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("build_context_pack failed: %s", exc, exc_info=True)
@@ -253,7 +283,13 @@ def explain_impact(
     try:
         with _get_conn() as conn:
             result = _explain_impact(conn, source_kind, source_ref, depth)
-            logger.info("explain_impact: %s=%s, depth=%s, impacts=%d", source_kind, source_ref, depth, result.get("total_impacts", 0))
+            logger.info(
+                "explain_impact: %s=%s, depth=%s, impacts=%d",
+                source_kind,
+                source_ref,
+                depth,
+                result.get("total_impacts", 0),
+            )
             return json.dumps(result)
     except Exception as exc:
         logger.error("explain_impact failed: %s", exc, exc_info=True)
@@ -261,7 +297,121 @@ def explain_impact(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Tool 8: enrich_context
+# Tool 8: audit_memory
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def audit_memory(
+    repair: bool = True,
+    stale_sync_minutes: int = 120,
+) -> str:
+    """Run the persistent self-repair audit loop over facts, packs, provenance, and sync drift."""
+    try:
+        with _get_conn() as conn:
+            result = _run_memory_audit(
+                conn,
+                repair=repair,
+                stale_sync_minutes=stale_sync_minutes,
+            )
+            logger.info(
+                "audit_memory: open=%d resolved=%d repair=%s",
+                result.get("open_issue_count", 0),
+                result.get("resolved_issue_count", 0),
+                repair,
+            )
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("audit_memory failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 9: replay_memory
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def replay_memory(
+    aggregate_kind: str = "",
+    aggregate_id: str = "",
+    limit: int = 100,
+    since_ts: str = "",
+) -> str:
+    """Replay append-only memory events for a task/fact/chunk or for the whole ledger."""
+    try:
+        with _get_conn() as conn:
+            result = _replay_memory_events(
+                conn,
+                aggregate_kind=aggregate_kind or None,
+                aggregate_id=aggregate_id or None,
+                limit=limit,
+                since_ts=since_ts or None,
+            )
+            logger.info(
+                "replay_memory: aggregate=%s:%s count=%d",
+                aggregate_kind or "*",
+                aggregate_id or "*",
+                result.get("count", 0),
+            )
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("replay_memory failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 10: govern_fact
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def govern_fact(
+    fact_id: str,
+    action: str,
+    target_fact_id: str = "",
+    rationale: str = "",
+    effective_at: str = "",
+) -> str:
+    """Apply truth-maintenance to a fact: supersede, contradict, invalidate, or revalidate."""
+    try:
+        with _get_conn() as conn:
+            result = _govern_fact(
+                conn,
+                fact_id,
+                action,
+                target_fact_id=target_fact_id or None,
+                rationale=rationale or None,
+                effective_at=effective_at or None,
+            )
+            logger.info(
+                "govern_fact: fact=%s action=%s changed=%s",
+                fact_id,
+                action,
+                result.get("changed"),
+            )
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("govern_fact failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 11: list_memory_issues
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def list_memory_issues(status: str = "open", limit: int = 100) -> str:
+    """List persisted memory audit issues after the latest audit run."""
+    try:
+        with _get_conn() as conn:
+            result = _list_memory_audit_issues(conn, status=status, limit=limit)
+            logger.info(
+                "list_memory_issues: status=%s count=%d",
+                status,
+                result.get("count", 0),
+            )
+            return json.dumps(result)
+    except Exception as exc:
+        logger.error("list_memory_issues failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 12: enrich_context
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
 def enrich_context(depth: str = "quick") -> str:

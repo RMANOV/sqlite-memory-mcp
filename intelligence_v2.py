@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from db_utils import (
+    add_provenance_link,
     json_loads,
     now_iso,
+    record_memory_event,
 )
 
 _log = logging.getLogger("intelligence-v2")
@@ -458,6 +460,24 @@ def assess_context(
         "last_ai_attempt_at = ?, updated_at = ? WHERE chunk_id = ?",
         (new_state, materiality, now, now, chunk_id),
     )
+    if new_state != current_state:
+        record_memory_event(
+            conn,
+            event_type="chunk_state_change",
+            aggregate_kind="chunk",
+            aggregate_id=chunk_id,
+            tool_name="sqlite-intel.assess_context",
+            event_ts=now,
+            old_value={"state": current_state},
+            new_value={
+                "state": new_state,
+                "materiality": round(materiality, 3),
+                "uncertainty": round(uncertainty, 3),
+            },
+            source_kind="chunk",
+            source_ref=chunk_id,
+            source_excerpt=body[:300],
+        )
 
     enrich_policy = config["default_enrich_policy"]
 
@@ -535,11 +555,24 @@ def queue_clarification(
     question_ids = []
     for q in questions:
         qid = _new_id()
+        q_created_at = now_iso()
         conn.execute(
             "INSERT INTO context_questions "
             "(question_id, chunk_id, question_text, question_type, priority_score, "
             "state, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
-            (qid, chunk_id, q["text"], q["type"], q["priority"], now_iso()),
+            (qid, chunk_id, q["text"], q["type"], q["priority"], q_created_at),
+        )
+        record_memory_event(
+            conn,
+            event_type="question_create",
+            aggregate_kind="question",
+            aggregate_id=qid,
+            tool_name="sqlite-intel.queue_clarification",
+            event_ts=q_created_at,
+            new_value=q,
+            source_kind="chunk",
+            source_ref=chunk_id,
+            source_excerpt=q["text"],
         )
         question_ids.append(qid)
 
@@ -565,6 +598,19 @@ def queue_clarification(
             "UPDATE context_chunks SET state = 'awaiting_human', "
             "last_ai_attempt_at = ?, updated_at = ? WHERE chunk_id = ?",
             (now, now, chunk_id),
+        )
+        record_memory_event(
+            conn,
+            event_type="chunk_state_change",
+            aggregate_kind="chunk",
+            aggregate_id=chunk_id,
+            tool_name="sqlite-intel.queue_clarification",
+            event_ts=now,
+            old_value={"state": current_state},
+            new_value={"state": "awaiting_human"},
+            source_kind="chunk",
+            source_ref=chunk_id,
+            source_excerpt=block_text[:300],
         )
 
     log_enrichment_run(
@@ -658,6 +704,29 @@ def record_human_answer(
         "UPDATE context_chunks SET state = ?, source_hash = ?, "
         "last_human_update_at = ?, updated_at = ? WHERE chunk_id = ?",
         (new_state, new_hash, now, now, chunk_id),
+    )
+    add_provenance_link(
+        conn,
+        subject_kind="chunk",
+        subject_ref=chunk_id,
+        source_kind="human_answer",
+        source_ref=question_id or chunk_id,
+        excerpt=answer_text[:300],
+        confidence=1.0,
+        created_at=now,
+    )
+    record_memory_event(
+        conn,
+        event_type="human_answer",
+        aggregate_kind="chunk",
+        aggregate_id=chunk_id,
+        tool_name="sqlite-intel.record_human_answer",
+        event_ts=now,
+        old_value={"state": current_state, "source_hash": row["source_hash"]},
+        new_value={"state": new_state, "source_hash": new_hash},
+        source_kind="human_answer",
+        source_ref=question_id or chunk_id,
+        source_excerpt=answer_text[:300],
     )
 
     log_enrichment_run(

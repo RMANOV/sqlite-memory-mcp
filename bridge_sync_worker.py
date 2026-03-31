@@ -52,6 +52,13 @@ from db_utils import (
     fts_sync_entity,
     export_entity_files,
     export_entities_index,
+    export_candidate_claims,
+    export_claim_evidence,
+    export_canonical_facts,
+    export_provenance_links,
+    export_knowledge_links,
+    export_memory_events,
+    export_memory_audit_issues,
     import_remote_bridge_data,
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
@@ -356,6 +363,19 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
         return [dict(r) for r in rows] if rows else []
     except sqlite3.OperationalError:
         return []
+
+
+def _export_extended_memory(conn: sqlite3.Connection) -> dict[str, list]:
+    """Export append-only/event/provenance memory artifacts for cross-device sync."""
+    return {
+        "candidate_claims": export_candidate_claims(conn),
+        "claim_evidence": export_claim_evidence(conn),
+        "canonical_facts": export_canonical_facts(conn),
+        "provenance_links": export_provenance_links(conn),
+        "knowledge_links": export_knowledge_links(conn),
+        "memory_events": export_memory_events(conn),
+        "memory_audit_issues": export_memory_audit_issues(conn),
+    }
 
 
 def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict]:
@@ -668,7 +688,21 @@ def _main_locked(
             log.warning("Sync skip-check error: %s", e)
 
     # Phase 3b: Export (read-only, separate short transaction)
+    audit_summary: dict | None = None
+    extended_memory: dict[str, list] = {}
     with get_conn(_db_path) as conn:
+        try:
+            from memory_audit import run_memory_audit
+
+            _progress(progress_callback, 18, "Auditing memory...")
+            audit_summary = run_memory_audit(
+                conn,
+                repair=True,
+                stale_sync_minutes=120,
+            )
+        except Exception as exc:
+            log.warning("Memory audit failed during bridge sync: %s", exc)
+
         _progress(progress_callback, 20, "Exporting entities...")
         entities_out, entity_ids = _export_entities(conn)
         _progress(progress_callback, 30, "Exporting relations...")
@@ -688,6 +722,8 @@ def _main_locked(
         pub_entities, pub_tasks = _export_public_knowledge(conn)
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
         kr_out = _export_knowledge_ratings(conn)
+        _progress(progress_callback, 58, "Exporting memory ledger...")
+        extended_memory = _export_extended_memory(conn)
     # Export transaction closed
 
     # Phase 4: Build payload + write files + git ops (no transaction)
@@ -700,6 +736,7 @@ def _main_locked(
         "relations": relations_out,
         "tasks": tasks_out,
     }
+    payload.update(extended_memory)
     if pub_entities or pub_tasks:
         payload["public_knowledge"] = {
             "entities": pub_entities,
@@ -707,6 +744,13 @@ def _main_locked(
         }
     if kr_out:
         payload["knowledge_ratings"] = kr_out
+    if audit_summary is not None:
+        payload["memory_health"] = {
+            "audit_version": audit_summary.get("audit_version"),
+            "open_issue_count": audit_summary.get("open_issue_count", 0),
+            "resolved_issue_count": audit_summary.get("resolved_issue_count", 0),
+            "repairs": audit_summary.get("repairs", {}),
+        }
 
     # Gen-B guard: only run legacy merge when index.json doesn't exist
     if shared_path.exists():

@@ -7,6 +7,7 @@ utilities used by server.py, task_tray.py, and utility scripts.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import itertools
 import json
 import logging
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import threading
 import tempfile
+import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -776,6 +778,275 @@ def _sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _sqlite_has_column(
+    conn: sqlite3.Connection, table_name: str, column_name: str
+) -> bool:
+    try:
+        rows = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    except sqlite3.OperationalError:
+        return False
+    return any(r["name"] == column_name for r in rows)
+
+
+def _new_event_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _json_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json_dumps(value)
+    except Exception:
+        return str(value)
+
+
+def _infer_event_origin() -> tuple[str, str]:
+    for frame_info in inspect.stack()[2:]:
+        module = inspect.getmodule(frame_info.frame)
+        mod_name = module.__name__ if module else ""
+        if mod_name.endswith("db_utils"):
+            continue
+        func_name = frame_info.function or "unknown"
+        if mod_name:
+            return f"{mod_name}.{func_name}", mod_name
+        return func_name, ""
+    return "system.unknown", "system"
+
+
+def _next_logical_clock(
+    conn: sqlite3.Connection,
+    machine_id: str | None = None,
+    *,
+    floor: int | None = None,
+    updated_at: str | None = None,
+) -> int:
+    """Monotonic per-machine counter stored in DB, independent of wall clock."""
+    mid = machine_id or MACHINE_ID
+    now = updated_at or now_iso()
+    if not _sqlite_table_exists(conn, "memory_cursors"):
+        return max(1, int(floor or 0) + 1)
+    row = conn.execute(
+        "SELECT last_clock FROM memory_cursors WHERE machine_id = ?",
+        (mid,),
+    ).fetchone()
+    current = int(row["last_clock"]) if row else 0
+    next_clock = max(current, int(floor or 0)) + 1
+    conn.execute(
+        "INSERT INTO memory_cursors (machine_id, last_clock, updated_at) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(machine_id) DO UPDATE SET "
+        "last_clock = excluded.last_clock, updated_at = excluded.updated_at",
+        (mid, next_clock, now),
+    )
+    return next_clock
+
+
+def record_memory_event(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    aggregate_kind: str,
+    aggregate_id: str,
+    field_name: str | None = None,
+    actor_type: str = "system",
+    actor_id: str | None = None,
+    machine_id: str | None = None,
+    tool_name: str | None = None,
+    event_ts: str | None = None,
+    old_value: Any = None,
+    new_value: Any = None,
+    payload: dict[str, Any] | list[Any] | None = None,
+    parent_event_id: str | None = None,
+    source_kind: str | None = None,
+    source_ref: str | None = None,
+    source_excerpt: str | None = None,
+    source_start: int | None = None,
+    source_end: int | None = None,
+    logical_clock: int | None = None,
+) -> dict[str, Any]:
+    """Append immutable event to the local ledger and return its metadata."""
+    if not _sqlite_table_exists(conn, "memory_events"):
+        inferred_tool, inferred_actor = _infer_event_origin()
+        return {
+            "event_id": None,
+            "logical_clock": int(logical_clock or 0),
+            "machine_id": machine_id or MACHINE_ID,
+            "tool_name": tool_name or inferred_tool,
+            "actor_id": actor_id or inferred_actor,
+        }
+
+    inferred_tool, inferred_actor = _infer_event_origin()
+    resolved_tool = tool_name or inferred_tool
+    resolved_actor = actor_id or inferred_actor or MACHINE_ID
+    mid = machine_id or MACHINE_ID
+    ts = event_ts or now_iso()
+    clock = int(logical_clock or _next_logical_clock(conn, mid, updated_at=ts))
+    event_id = _new_event_id()
+
+    conn.execute(
+        "INSERT INTO memory_events ("
+        "event_id, event_type, aggregate_kind, aggregate_id, field_name, "
+        "actor_type, actor_id, machine_id, tool_name, logical_clock, event_ts, "
+        "old_value, new_value, payload_json, parent_event_id, source_kind, "
+        "source_ref, source_excerpt, source_start, source_end"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            event_type,
+            aggregate_kind,
+            aggregate_id,
+            field_name,
+            actor_type,
+            resolved_actor,
+            mid,
+            resolved_tool,
+            clock,
+            ts,
+            _json_text(old_value),
+            _json_text(new_value),
+            json_dumps(payload) if payload is not None else None,
+            parent_event_id,
+            source_kind,
+            source_ref,
+            source_excerpt,
+            source_start,
+            source_end,
+        ),
+    )
+    return {
+        "event_id": event_id,
+        "logical_clock": clock,
+        "machine_id": mid,
+        "tool_name": resolved_tool,
+        "actor_id": resolved_actor,
+    }
+
+
+def add_provenance_link(
+    conn: sqlite3.Connection,
+    *,
+    subject_kind: str,
+    subject_ref: str,
+    source_kind: str,
+    source_ref: str,
+    span_start: int | None = None,
+    span_end: int | None = None,
+    excerpt: str | None = None,
+    confidence: float = 1.0,
+    created_at: str | None = None,
+) -> str | None:
+    if not _sqlite_table_exists(conn, "provenance_links"):
+        return None
+    row = conn.execute(
+        "SELECT provenance_id FROM provenance_links "
+        "WHERE subject_kind = ? AND subject_ref = ? AND source_kind = ? "
+        "AND source_ref = ? AND COALESCE(span_start, -1) = COALESCE(?, -1) "
+        "AND COALESCE(span_end, -1) = COALESCE(?, -1)",
+        (subject_kind, subject_ref, source_kind, source_ref, span_start, span_end),
+    ).fetchone()
+    if row:
+        return row["provenance_id"]
+    prov_id = _new_event_id()
+    conn.execute(
+        "INSERT INTO provenance_links "
+        "(provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+        "span_start, span_end, excerpt, confidence, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            prov_id,
+            subject_kind,
+            subject_ref,
+            source_kind,
+            source_ref,
+            span_start,
+            span_end,
+            excerpt,
+            confidence,
+            created_at or now_iso(),
+        ),
+    )
+    return prov_id
+
+
+def add_knowledge_link(
+    conn: sqlite3.Connection,
+    *,
+    subject_kind: str,
+    subject_ref: str,
+    relation_type: str,
+    object_kind: str,
+    object_ref: str,
+    rationale: str | None = None,
+    active: bool = True,
+    created_at: str | None = None,
+) -> str | None:
+    if not _sqlite_table_exists(conn, "knowledge_links"):
+        return None
+    row = conn.execute(
+        "SELECT link_id FROM knowledge_links "
+        "WHERE subject_kind = ? AND subject_ref = ? AND relation_type = ? "
+        "AND object_kind = ? AND object_ref = ? AND active = ?",
+        (
+            subject_kind,
+            subject_ref,
+            relation_type,
+            object_kind,
+            object_ref,
+            1 if active else 0,
+        ),
+    ).fetchone()
+    if row:
+        return row["link_id"]
+    link_id = _new_event_id()
+    conn.execute(
+        "INSERT INTO knowledge_links "
+        "(link_id, subject_kind, subject_ref, relation_type, object_kind, object_ref, "
+        "rationale, created_at, active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            link_id,
+            subject_kind,
+            subject_ref,
+            relation_type,
+            object_kind,
+            object_ref,
+            rationale,
+            created_at or now_iso(),
+            1 if active else 0,
+        ),
+    )
+    return link_id
+
+
+def effective_fact_confidence(
+    confidence: float,
+    *,
+    updated_at: str | None = None,
+    contradiction_count: int = 0,
+    half_life_days: int = 180,
+) -> float:
+    """Decay stale facts slowly and penalize unresolved contradictions."""
+    value = max(0.0, min(1.0, float(confidence)))
+    if updated_at:
+        try:
+            age_days = max(
+                0.0,
+                (
+                    datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)
+                ).total_seconds()
+                / 86400.0,
+            )
+            value *= 0.5 ** (age_days / max(1, half_life_days))
+        except (TypeError, ValueError):
+            pass
+    if contradiction_count > 0:
+        value *= max(0.2, 1.0 - (0.2 * contradiction_count))
+    return max(0.0, min(1.0, value))
+
+
 def promote_pending_public_entities(
     conn: sqlite3.Connection,
     cutoff_ts: str,
@@ -813,6 +1084,12 @@ def bridge_change_summary(
         "changed_entities": 0,
         "changed_relations": 0,
         "changed_ratings": 0,
+        "changed_claims": 0,
+        "changed_facts": 0,
+        "changed_provenance": 0,
+        "changed_truth_links": 0,
+        "changed_events": 0,
+        "changed_audit_issues": 0,
         "ready_public_entities": 0,
         "ready_public_tasks": 0,
     }
@@ -848,6 +1125,42 @@ def bridge_change_summary(
     if _sqlite_table_exists(conn, "knowledge_ratings"):
         values["changed_ratings"] = conn.execute(
             "SELECT COUNT(*) FROM knowledge_ratings WHERE rated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "candidate_claims"):
+        values["changed_claims"] = conn.execute(
+            "SELECT COUNT(*) FROM candidate_claims WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "canonical_facts"):
+        values["changed_facts"] = conn.execute(
+            "SELECT COUNT(*) FROM canonical_facts WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "provenance_links"):
+        values["changed_provenance"] = conn.execute(
+            "SELECT COUNT(*) FROM provenance_links WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "knowledge_links"):
+        values["changed_truth_links"] = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_links WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "memory_events"):
+        values["changed_events"] = conn.execute(
+            "SELECT COUNT(*) FROM memory_events WHERE event_ts > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "memory_audit_issues"):
+        values["changed_audit_issues"] = conn.execute(
+            "SELECT COUNT(*) FROM memory_audit_issues WHERE last_detected_at > ?",
             (since_ts,),
         ).fetchone()[0]
 
@@ -1413,6 +1726,14 @@ def upsert_field_versions(
     machine_id: str | None = None,
     old_values: dict[str, Any] | None = None,
     new_values: dict[str, Any] | None = None,
+    *,
+    tool_name: str | None = None,
+    actor_type: str = "system",
+    actor_id: str | None = None,
+    source_kind: str = "task",
+    source_ref: str | None = None,
+    provenance_map: dict[str, dict[str, Any]] | None = None,
+    record_events: bool = True,
 ) -> None:
     """Upsert field versions for the given fields.
 
@@ -1424,18 +1745,93 @@ def upsert_field_versions(
     mid = machine_id or _next_machine_id()
     _old = old_values or {}
     _new = new_values or {}
+    _prov = provenance_map or {}
+    has_old = _sqlite_has_column(conn, "task_field_versions", "old_value")
+    has_new = _sqlite_has_column(conn, "task_field_versions", "new_value")
+    has_order = _sqlite_has_column(conn, "task_field_versions", "updated_order")
+    has_event = _sqlite_has_column(conn, "task_field_versions", "source_event_id")
     for field in fields:
         ov = _old.get(field)
         nv = _new.get(field)
         # Truncate to 500 chars to avoid bloat
         ov_str = str(ov)[:500] if ov is not None else None
         nv_str = str(nv)[:500] if nv is not None else None
-        conn.execute(
-            "INSERT OR REPLACE INTO task_field_versions "
-            "(task_id, field_name, updated_at, updated_by, old_value, new_value) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, field, ts, mid, ov_str, nv_str),
+        event_meta: dict[str, Any] | None = None
+        if record_events:
+            prov = _prov.get(field, {})
+            event_meta = record_memory_event(
+                conn,
+                event_type="task_field_set",
+                aggregate_kind="task",
+                aggregate_id=task_id,
+                field_name=field,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                machine_id=mid,
+                tool_name=tool_name,
+                event_ts=ts,
+                old_value=ov,
+                new_value=nv,
+                payload={
+                    "task_id": task_id,
+                    "field_name": field,
+                    "old_value": ov,
+                    "new_value": nv,
+                },
+                source_kind=prov.get("source_kind", source_kind),
+                source_ref=prov.get("source_ref", source_ref or task_id),
+                source_excerpt=prov.get("excerpt"),
+                source_start=prov.get("start"),
+                source_end=prov.get("end"),
+            )
+
+        _store_task_field_version(
+            conn,
+            task_id,
+            field,
+            updated_at=ts,
+            updated_by=mid,
+            old_value=ov_str if has_old else None,
+            new_value=nv_str if has_new else None,
+            updated_order=int((event_meta or {}).get("logical_clock") or 0)
+            if has_order
+            else None,
+            source_event_id=(event_meta or {}).get("event_id") if has_event else None,
         )
+
+
+def _store_task_field_version(
+    conn: sqlite3.Connection,
+    task_id: str,
+    field_name: str,
+    *,
+    updated_at: str,
+    updated_by: str,
+    old_value: str | None = None,
+    new_value: str | None = None,
+    updated_order: int | None = None,
+    source_event_id: str | None = None,
+) -> None:
+    columns = ["task_id", "field_name", "updated_at", "updated_by"]
+    values: list[Any] = [task_id, field_name, updated_at, updated_by]
+    if _sqlite_has_column(conn, "task_field_versions", "old_value"):
+        columns.append("old_value")
+        values.append(old_value)
+    if _sqlite_has_column(conn, "task_field_versions", "new_value"):
+        columns.append("new_value")
+        values.append(new_value)
+    if _sqlite_has_column(conn, "task_field_versions", "updated_order"):
+        columns.append("updated_order")
+        values.append(int(updated_order or 0))
+    if _sqlite_has_column(conn, "task_field_versions", "source_event_id"):
+        columns.append("source_event_id")
+        values.append(source_event_id)
+    placeholders = ", ".join("?" for _ in columns)
+    conn.execute(
+        f"INSERT OR REPLACE INTO task_field_versions ({', '.join(columns)}) "
+        f"VALUES ({placeholders})",
+        values,
+    )
 
 
 # ── Bridge Sync v2: Per-task file export ─────────────────────────────────
@@ -1449,6 +1845,30 @@ TASK_EXPORT_COLS = (
 ENTITY_EXPORT_COLS = (
     "id, name, entity_type, project, visibility, created_at, updated_at"
 )
+
+
+def _task_field_version_select(
+    conn: sqlite3.Connection,
+) -> tuple[str, bool, bool]:
+    cols = ["task_id", "field_name", "updated_at", "updated_by"]
+    has_order = _sqlite_has_column(conn, "task_field_versions", "updated_order")
+    has_event = _sqlite_has_column(conn, "task_field_versions", "source_event_id")
+    if has_order:
+        cols.append("updated_order")
+    if has_event:
+        cols.append("source_event_id")
+    return ", ".join(cols), has_order, has_event
+
+
+def _field_version_entry(
+    row: sqlite3.Row, *, has_order: bool, has_event: bool
+) -> list[Any]:
+    entry: list[Any] = [row["updated_at"], row["updated_by"]]
+    if has_order:
+        entry.append(row["updated_order"])
+    if has_event:
+        entry.append(row["source_event_id"])
+    return entry
 
 
 def export_task_files(
@@ -1485,17 +1905,18 @@ def export_task_files(
 
     # Batch fetch all field versions in one query
     ph = ",".join("?" * len(task_ids))
+    fv_select, has_order, has_event = _task_field_version_select(conn)
     fv_rows = conn.execute(
-        "SELECT task_id, field_name, updated_at, updated_by "
-        "FROM task_field_versions WHERE task_id IN ({})".format(ph),
+        f"SELECT {fv_select} FROM task_field_versions WHERE task_id IN ({ph})",
         task_ids,
     ).fetchall()
     fv_map: dict[str, dict] = {}
     for fvr in fv_rows:
-        fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = [
-            fvr["updated_at"],
-            fvr["updated_by"],
-        ]
+        fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = _field_version_entry(
+            fvr,
+            has_order=has_order,
+            has_event=has_event,
+        )
 
     # Batch fetch task-entity links
     link_rows = conn.execute(
@@ -1572,16 +1993,19 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
     fv_map: dict[str, dict[str, list]] = {}
     if all_ids:
         ph = ",".join("?" * len(all_ids))
+        fv_select, has_order, has_event = _task_field_version_select(conn)
         fv_rows = conn.execute(
-            f"SELECT task_id, field_name, updated_at, updated_by "
-            f"FROM task_field_versions WHERE task_id IN ({ph})",
+            f"SELECT {fv_select} FROM task_field_versions WHERE task_id IN ({ph})",
             all_ids,
         ).fetchall()
         for fvr in fv_rows:
-            fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = [
-                fvr["updated_at"],
-                fvr["updated_by"],
-            ]
+            fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = (
+                _field_version_entry(
+                    fvr,
+                    has_order=has_order,
+                    has_event=has_event,
+                )
+            )
 
     tasks: list[dict] = []
     for r in rows:
@@ -1610,14 +2034,40 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
 # ── Bridge Sync v2: Per-field LWW merge ──────────────────────────────────
 
 
-def _parse_field_ts(remote_fts: dict, field: str, fallback_ts: str) -> tuple[str, str]:
-    """Extract (timestamp, machine_id) from _field_ts entry with fallback."""
+def _parse_field_ts(
+    remote_fts: dict,
+    field: str,
+    fallback_ts: str,
+) -> tuple[str, str, int, str | None]:
+    """Extract field version metadata from bridge payload with backward compat."""
     entry = remote_fts.get(field)
+    if isinstance(entry, dict):
+        return (
+            str(entry.get("updated_at") or fallback_ts),
+            str(entry.get("updated_by") or MACHINE_ID),
+            int(entry.get("updated_order") or 0),
+            entry.get("source_event_id"),
+        )
+    if isinstance(entry, (list, tuple)) and len(entry) >= 4:
+        return str(entry[0]), str(entry[1]), int(entry[2] or 0), entry[3]
+    if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+        return str(entry[0]), str(entry[1]), int(entry[2] or 0), None
     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-        return str(entry[0]), str(entry[1])
+        return str(entry[0]), str(entry[1]), 0, None
     # Backward compat: no _field_ts → task-level updated_at.
     # Use MACHINE_ID (not "") so old peers don't systematically lose ties.
-    return fallback_ts, MACHINE_ID
+    return fallback_ts, MACHINE_ID, 0, None
+
+
+def _field_version_sort_key(
+    updated_at: str,
+    updated_by: str,
+    updated_order: int = 0,
+) -> tuple[int, Any, str]:
+    """Prefer logical clocks; fall back to timestamp ordering for legacy peers."""
+    if int(updated_order or 0) > 0:
+        return (1, int(updated_order), str(updated_by or ""))
+    return (0, str(updated_at or ""), str(updated_by or ""))
 
 
 def merge_import_tasks(
@@ -1625,13 +2075,11 @@ def merge_import_tasks(
     remote_tasks: list[dict],
     import_content: bool = False,
 ) -> tuple[int, int]:
-    """Per-field LWW (Last-Write-Wins) merge. Returns (new_count, updated_field_count).
+    """Per-field causal/LWW merge. Returns (new_count, updated_field_count).
 
-    NOT a true CRDT — uses timestamp-based conflict resolution without vector clocks.
-    Works well for single-user multi-machine sync. May lose updates on clock skew >1s.
-
-    Merge rule: for each field, (timestamp, machine_id) lexicographic comparison.
-    Remote wins if (remote_ts, remote_by) > (local_ts, local_by).
+    Preferred rule: (logical_clock, machine_id) when updated_order exists.
+    Legacy fallback: (timestamp, machine_id) for older bridge peers.
+    All writes should also exist in memory_events, so overwritten values remain auditable.
 
     import_content=False: only merge metadata fields (for index.json pull).
     import_content=True: also merge description/notes (for on-demand load).
@@ -1663,16 +2111,18 @@ def merge_import_tasks(
         ).fetchall()
         existing_map = {r["id"]: r for r in existing_rows}
 
+        fv_select, has_order, has_event = _task_field_version_select(conn)
         fv_rows = conn.execute(
-            f"SELECT task_id, field_name, updated_at, updated_by "
-            f"FROM task_field_versions WHERE task_id IN ({placeholders})",
+            f"SELECT {fv_select} FROM task_field_versions WHERE task_id IN ({placeholders})",
             remote_ids,
         ).fetchall()
-        fv_map: dict[str, dict[str, tuple[str, str]]] = {}
+        fv_map: dict[str, dict[str, tuple[str, str, int, str | None]]] = {}
         for r in fv_rows:
             fv_map.setdefault(r["task_id"], {})[r["field_name"]] = (
                 r["updated_at"],
                 r["updated_by"],
+                int(r["updated_order"]) if has_order else 0,
+                r["source_event_id"] if has_event else None,
             )
 
         # Pre-fetch full task rows for content field checks
@@ -1715,14 +2165,17 @@ def merge_import_tasks(
         if remote.get("_tombstone"):
             existing = existing_map.get(tid)
             if existing:
-                remote_ts, remote_by = _parse_field_ts(
+                remote_ts, remote_by, remote_order, remote_event_id = _parse_field_ts(
                     remote_fts, "status", fallback_ts
                 )
                 local_fv_data = fv_map.get(tid, {}).get("status")
                 local_ts = local_fv_data[0] if local_fv_data else ""
                 local_by = local_fv_data[1] if local_fv_data else ""
+                local_order = local_fv_data[2] if local_fv_data else 0
 
-                tombstone_wins = (remote_ts, remote_by) > (local_ts, local_by)
+                tombstone_wins = _field_version_sort_key(
+                    remote_ts, remote_by, remote_order
+                ) > _field_version_sort_key(local_ts, local_by, local_order)
 
                 # Fallback: if field timestamps are equal, tombstone wins
                 # when its updated_at is newer (archival may not update field_versions)
@@ -1743,16 +2196,14 @@ def merge_import_tasks(
                         "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                         (remote["status"], now, tid),
                     )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO task_field_versions "
-                        "(task_id, field_name, updated_at, updated_by) "
-                        "VALUES (?, ?, ?, ?)",
-                        (
-                            tid,
-                            "status",
-                            remote_ts or fallback_ts,
-                            remote_by or _MACHINE_ID,
-                        ),
+                    _store_task_field_version(
+                        conn,
+                        tid,
+                        "status",
+                        updated_at=remote_ts or fallback_ts,
+                        updated_by=remote_by or MACHINE_ID,
+                        updated_order=remote_order,
+                        source_event_id=remote_event_id,
                     )
                     updated_fields += 1
             continue
@@ -1772,14 +2223,18 @@ def merge_import_tasks(
                 if field not in remote:
                     continue
                 remote_val = remote.get(field)
-                remote_ts, remote_by = _parse_field_ts(remote_fts, field, fallback_ts)
+                remote_ts, remote_by, remote_order, remote_event_id = _parse_field_ts(
+                    remote_fts, field, fallback_ts
+                )
 
                 local_fv = local_fvs.get(field)
                 local_ts = local_fv[0] if local_fv else ""
                 local_by = local_fv[1] if local_fv else ""
+                local_order = local_fv[2] if local_fv else 0
 
-                # Lexicographic: (timestamp, machine_id) — higher wins
-                if (remote_ts, remote_by) > (local_ts, local_by):
+                if _field_version_sort_key(
+                    remote_ts, remote_by, remote_order
+                ) > _field_version_sort_key(local_ts, local_by, local_order):
                     # Content protection: never nullify or drastically shrink local content
                     if field in CONTENT_FIELDS:
                         local_val = task_content_map.get(local_id, {}).get(field)
@@ -1805,11 +2260,14 @@ def merge_import_tasks(
                             )
                             continue
                     fields_to_update[field] = remote_val
-                    conn.execute(
-                        "INSERT OR REPLACE INTO task_field_versions "
-                        "(task_id, field_name, updated_at, updated_by) "
-                        "VALUES (?, ?, ?, ?)",
-                        (local_id, field, remote_ts, remote_by),
+                    _store_task_field_version(
+                        conn,
+                        local_id,
+                        field,
+                        updated_at=remote_ts,
+                        updated_by=remote_by,
+                        updated_order=remote_order,
+                        source_event_id=remote_event_id,
                     )
                     updated_fields += 1
 
@@ -1907,16 +2365,19 @@ def merge_import_tasks(
                 ),
             )
             # Seed field versions from remote _field_ts (batch insert)
-            fv_batch = []
             for field in MERGEABLE_FIELDS:
-                fts, fby = _parse_field_ts(remote_fts, field, fallback_ts)
-                fv_batch.append((tid, field, fts, fby))
-            conn.executemany(
-                "INSERT OR IGNORE INTO task_field_versions "
-                "(task_id, field_name, updated_at, updated_by) "
-                "VALUES (?, ?, ?, ?)",
-                fv_batch,
-            )
+                fts, fby, forder, fevent = _parse_field_ts(
+                    remote_fts, field, fallback_ts
+                )
+                _store_task_field_version(
+                    conn,
+                    tid,
+                    field,
+                    updated_at=fts,
+                    updated_by=fby,
+                    updated_order=forder,
+                    source_event_id=fevent,
+                )
             new_count += 1
 
     # Import task-entity links from remote tasks (reuse `now` from above)
@@ -2382,6 +2843,391 @@ def import_bridge_knowledge_ratings(
     return imported
 
 
+def export_candidate_claims(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "candidate_claims"):
+        return []
+    rows = conn.execute(
+        "SELECT claim_id, chunk_id, subject, predicate, object_text, object_type, "
+        "claim_scope, confidence, status, requires_human, promoted_to_fact_id, "
+        "created_at, updated_at "
+        "FROM candidate_claims ORDER BY created_at, claim_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_candidate_claims(conn: sqlite3.Connection, claims: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "candidate_claims"):
+        return 0
+    imported = 0
+    for claim in claims:
+        row = conn.execute(
+            "SELECT updated_at FROM candidate_claims WHERE claim_id = ?",
+            (claim.get("claim_id"),),
+        ).fetchone()
+        if row and (row["updated_at"] or "") >= (claim.get("updated_at") or ""):
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO candidate_claims "
+            "(claim_id, chunk_id, subject, predicate, object_text, object_type, "
+            "claim_scope, confidence, status, requires_human, promoted_to_fact_id, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                claim.get("claim_id"),
+                claim.get("chunk_id"),
+                claim.get("subject"),
+                claim.get("predicate"),
+                claim.get("object_text"),
+                claim.get("object_type", "text"),
+                claim.get("claim_scope", "memory"),
+                claim.get("confidence", 0.0),
+                claim.get("status", "candidate"),
+                claim.get("requires_human", 1),
+                claim.get("promoted_to_fact_id"),
+                claim.get("created_at") or now_iso(),
+                claim.get("updated_at") or now_iso(),
+            ),
+        )
+        imported += 1
+    return imported
+
+
+def export_claim_evidence(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "claim_evidence"):
+        return []
+    cols = [
+        "evidence_id",
+        "claim_id",
+        "evidence_type",
+        "evidence_ref",
+        "weight",
+        "excerpt",
+        "created_at",
+    ]
+    if _sqlite_has_column(conn, "claim_evidence", "source_start"):
+        cols.append("source_start")
+    if _sqlite_has_column(conn, "claim_evidence", "source_end"):
+        cols.append("source_end")
+    rows = conn.execute(
+        f"SELECT {', '.join(cols)} FROM claim_evidence ORDER BY created_at, evidence_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_claim_evidence(conn: sqlite3.Connection, evidence_rows: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "claim_evidence"):
+        return 0
+    has_start = _sqlite_has_column(conn, "claim_evidence", "source_start")
+    has_end = _sqlite_has_column(conn, "claim_evidence", "source_end")
+    imported = 0
+    for ev in evidence_rows:
+        columns = [
+            "evidence_id",
+            "claim_id",
+            "evidence_type",
+            "evidence_ref",
+            "weight",
+            "excerpt",
+            "created_at",
+        ]
+        values: list[Any] = [
+            ev.get("evidence_id"),
+            ev.get("claim_id"),
+            ev.get("evidence_type"),
+            ev.get("evidence_ref"),
+            ev.get("weight", 1.0),
+            ev.get("excerpt"),
+            ev.get("created_at") or now_iso(),
+        ]
+        if has_start:
+            columns.append("source_start")
+            values.append(ev.get("source_start"))
+        if has_end:
+            columns.append("source_end")
+            values.append(ev.get("source_end"))
+        placeholders = ", ".join("?" for _ in columns)
+        conn.execute(
+            f"INSERT OR IGNORE INTO claim_evidence ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            values,
+        )
+        imported += conn.execute("SELECT changes()").fetchone()[0]
+    return imported
+
+
+def export_canonical_facts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "canonical_facts"):
+        return []
+    cols = [
+        "fact_id",
+        "subject",
+        "predicate",
+        "object_text",
+        "object_type",
+        "fact_scope",
+        "provenance_summary",
+        "confidence",
+        "validation_mode",
+        "source_claim_id",
+        "created_at",
+        "updated_at",
+    ]
+    for col in (
+        "valid_from",
+        "valid_to",
+        "superseded_by_fact_id",
+        "contradiction_count",
+    ):
+        if _sqlite_has_column(conn, "canonical_facts", col):
+            cols.append(col)
+    rows = conn.execute(
+        f"SELECT {', '.join(cols)} FROM canonical_facts ORDER BY created_at, fact_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_canonical_facts(conn: sqlite3.Connection, facts: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "canonical_facts"):
+        return 0
+    has_valid_from = _sqlite_has_column(conn, "canonical_facts", "valid_from")
+    has_valid_to = _sqlite_has_column(conn, "canonical_facts", "valid_to")
+    has_superseded = _sqlite_has_column(
+        conn, "canonical_facts", "superseded_by_fact_id"
+    )
+    has_contradiction_count = _sqlite_has_column(
+        conn, "canonical_facts", "contradiction_count"
+    )
+    imported = 0
+    for fact in facts:
+        row = conn.execute(
+            "SELECT updated_at FROM canonical_facts WHERE fact_id = ?",
+            (fact.get("fact_id"),),
+        ).fetchone()
+        if row and (row["updated_at"] or "") >= (fact.get("updated_at") or ""):
+            continue
+        columns = [
+            "fact_id",
+            "subject",
+            "predicate",
+            "object_text",
+            "object_type",
+            "fact_scope",
+            "provenance_summary",
+            "confidence",
+            "validation_mode",
+            "source_claim_id",
+            "created_at",
+            "updated_at",
+        ]
+        values: list[Any] = [
+            fact.get("fact_id"),
+            fact.get("subject"),
+            fact.get("predicate"),
+            fact.get("object_text"),
+            fact.get("object_type", "text"),
+            fact.get("fact_scope", "memory"),
+            fact.get("provenance_summary", ""),
+            fact.get("confidence", 0.0),
+            fact.get("validation_mode", "imported"),
+            fact.get("source_claim_id"),
+            fact.get("created_at") or now_iso(),
+            fact.get("updated_at") or now_iso(),
+        ]
+        if has_valid_from:
+            columns.append("valid_from")
+            values.append(fact.get("valid_from"))
+        if has_valid_to:
+            columns.append("valid_to")
+            values.append(fact.get("valid_to"))
+        if has_superseded:
+            columns.append("superseded_by_fact_id")
+            values.append(fact.get("superseded_by_fact_id"))
+        if has_contradiction_count:
+            columns.append("contradiction_count")
+            values.append(fact.get("contradiction_count", 0))
+        placeholders = ", ".join("?" for _ in columns)
+        conn.execute(
+            f"INSERT OR REPLACE INTO canonical_facts ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            values,
+        )
+        imported += 1
+    return imported
+
+
+def export_provenance_links(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "provenance_links"):
+        return []
+    rows = conn.execute(
+        "SELECT provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+        "span_start, span_end, excerpt, confidence, created_at "
+        "FROM provenance_links ORDER BY created_at, provenance_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_provenance_links(conn: sqlite3.Connection, links: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "provenance_links"):
+        return 0
+    imported = 0
+    for link in links:
+        conn.execute(
+            "INSERT OR IGNORE INTO provenance_links "
+            "(provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+            "span_start, span_end, excerpt, confidence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                link.get("provenance_id"),
+                link.get("subject_kind"),
+                link.get("subject_ref"),
+                link.get("source_kind"),
+                link.get("source_ref"),
+                link.get("span_start"),
+                link.get("span_end"),
+                link.get("excerpt"),
+                link.get("confidence", 1.0),
+                link.get("created_at") or now_iso(),
+            ),
+        )
+        imported += conn.execute("SELECT changes()").fetchone()[0]
+    return imported
+
+
+def export_knowledge_links(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "knowledge_links"):
+        return []
+    rows = conn.execute(
+        "SELECT link_id, subject_kind, subject_ref, relation_type, object_kind, "
+        "object_ref, rationale, created_at, active "
+        "FROM knowledge_links ORDER BY created_at, link_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_knowledge_links(conn: sqlite3.Connection, links: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "knowledge_links"):
+        return 0
+    imported = 0
+    for link in links:
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_links "
+            "(link_id, subject_kind, subject_ref, relation_type, object_kind, "
+            "object_ref, rationale, created_at, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                link.get("link_id"),
+                link.get("subject_kind"),
+                link.get("subject_ref"),
+                link.get("relation_type"),
+                link.get("object_kind"),
+                link.get("object_ref"),
+                link.get("rationale"),
+                link.get("created_at") or now_iso(),
+                link.get("active", 1),
+            ),
+        )
+        imported += 1
+    return imported
+
+
+def export_memory_events(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "memory_events"):
+        return []
+    rows = conn.execute(
+        "SELECT event_id, event_type, aggregate_kind, aggregate_id, field_name, "
+        "actor_type, actor_id, machine_id, tool_name, logical_clock, event_ts, "
+        "old_value, new_value, payload_json, parent_event_id, source_kind, "
+        "source_ref, source_excerpt, source_start, source_end "
+        "FROM memory_events ORDER BY machine_id, logical_clock"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_memory_events(conn: sqlite3.Connection, events: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "memory_events"):
+        return 0
+    imported = 0
+    for event in events:
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_events "
+            "(event_id, event_type, aggregate_kind, aggregate_id, field_name, actor_type, "
+            "actor_id, machine_id, tool_name, logical_clock, event_ts, old_value, "
+            "new_value, payload_json, parent_event_id, source_kind, source_ref, "
+            "source_excerpt, source_start, source_end) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.get("event_id"),
+                event.get("event_type"),
+                event.get("aggregate_kind"),
+                event.get("aggregate_id"),
+                event.get("field_name"),
+                event.get("actor_type", "system"),
+                event.get("actor_id"),
+                event.get("machine_id", MACHINE_ID),
+                event.get("tool_name", "remote.import"),
+                event.get("logical_clock", 0),
+                event.get("event_ts") or now_iso(),
+                event.get("old_value"),
+                event.get("new_value"),
+                event.get("payload_json"),
+                event.get("parent_event_id"),
+                event.get("source_kind"),
+                event.get("source_ref"),
+                event.get("source_excerpt"),
+                event.get("source_start"),
+                event.get("source_end"),
+            ),
+        )
+        delta = conn.execute("SELECT changes()").fetchone()[0]
+        if delta:
+            imported += delta
+            _next_logical_clock(
+                conn,
+                event.get("machine_id", MACHINE_ID),
+                floor=int(event.get("logical_clock") or 0),
+                updated_at=event.get("event_ts") or now_iso(),
+            )
+    return imported
+
+
+def export_memory_audit_issues(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "memory_audit_issues"):
+        return []
+    rows = conn.execute(
+        "SELECT issue_id, issue_type, severity, subject_kind, subject_ref, "
+        "details_json, status, first_detected_at, last_detected_at, resolved_at "
+        "FROM memory_audit_issues ORDER BY last_detected_at, issue_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_memory_audit_issues(conn: sqlite3.Connection, issues: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "memory_audit_issues"):
+        return 0
+    imported = 0
+    for issue in issues:
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_audit_issues "
+            "(issue_id, issue_type, severity, subject_kind, subject_ref, details_json, "
+            "status, first_detected_at, last_detected_at, resolved_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                issue.get("issue_id"),
+                issue.get("issue_type"),
+                issue.get("severity", "medium"),
+                issue.get("subject_kind"),
+                issue.get("subject_ref"),
+                issue.get("details_json", "{}"),
+                issue.get("status", "open"),
+                issue.get("first_detected_at") or now_iso(),
+                issue.get("last_detected_at") or now_iso(),
+                issue.get("resolved_at"),
+            ),
+        )
+        imported += 1
+    return imported
+
+
 def import_remote_bridge_data(
     conn: sqlite3.Connection,
     bridge_dir: str,
@@ -2390,9 +3236,20 @@ def import_remote_bridge_data(
 ) -> dict[str, int]:
     """Import remote entities, relations, and knowledge ratings from bridge data.
 
-    Returns {"entities": N, "relations": N, "ratings": N}.
+    Returns {"entities": N, "relations": N, "ratings": N, ...}.
     """
-    result = {"entities": 0, "relations": 0, "ratings": 0}
+    result = {
+        "entities": 0,
+        "relations": 0,
+        "ratings": 0,
+        "claims": 0,
+        "claim_evidence": 0,
+        "facts": 0,
+        "provenance": 0,
+        "knowledge_links": 0,
+        "events": 0,
+        "audit_issues": 0,
+    }
 
     remote_entities = load_remote_entities_for_import(
         bridge_dir, remote_payload, logger
@@ -2420,6 +3277,69 @@ def import_remote_bridge_data(
         except sqlite3.Error as exc:
             if logger:
                 logger.warning("Rating merge failed: %s", exc)
+
+    if isinstance(remote_payload.get("candidate_claims"), list):
+        try:
+            result["claims"] = import_candidate_claims(
+                conn, remote_payload["candidate_claims"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Candidate claim import failed: %s", exc)
+
+    if isinstance(remote_payload.get("claim_evidence"), list):
+        try:
+            result["claim_evidence"] = import_claim_evidence(
+                conn, remote_payload["claim_evidence"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Claim evidence import failed: %s", exc)
+
+    if isinstance(remote_payload.get("canonical_facts"), list):
+        try:
+            result["facts"] = import_canonical_facts(
+                conn, remote_payload["canonical_facts"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Canonical fact import failed: %s", exc)
+
+    if isinstance(remote_payload.get("provenance_links"), list):
+        try:
+            result["provenance"] = import_provenance_links(
+                conn, remote_payload["provenance_links"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Provenance import failed: %s", exc)
+
+    if isinstance(remote_payload.get("knowledge_links"), list):
+        try:
+            result["knowledge_links"] = import_knowledge_links(
+                conn, remote_payload["knowledge_links"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Knowledge link import failed: %s", exc)
+
+    if isinstance(remote_payload.get("memory_events"), list):
+        try:
+            result["events"] = import_memory_events(
+                conn, remote_payload["memory_events"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Memory event import failed: %s", exc)
+
+    if isinstance(remote_payload.get("memory_audit_issues"), list):
+        try:
+            result["audit_issues"] = import_memory_audit_issues(
+                conn, remote_payload["memory_audit_issues"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Audit issue import failed: %s", exc)
 
     return result
 

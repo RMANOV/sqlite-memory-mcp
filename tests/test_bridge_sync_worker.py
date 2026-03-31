@@ -231,6 +231,49 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
 
 
+def test_bridge_sync_worker_exports_memory_ledger_sections(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    git_calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    result = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+
+    assert result["pushed"] is True
+    assert "candidate_claims" in payload
+    assert "claim_evidence" in payload
+    assert "canonical_facts" in payload
+    assert "provenance_links" in payload
+    assert "knowledge_links" in payload
+    assert "memory_events" in payload
+    assert "memory_audit_issues" in payload
+    assert "memory_health" in payload
+
+
 def test_repo_sync_lock_lives_outside_bridge_repo(tmp_path):
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()

@@ -71,6 +71,13 @@ def _insert_fact(
         ") VALUES (?, ?, ?, ?, 'text', ?, 'test provenance', ?, 'manual', NULL, ?, ?)",
         (fact_id, subject, predicate, object_text, fact_scope, confidence, ts, ts),
     )
+    conn.execute(
+        "INSERT INTO provenance_links ("
+        "provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+        "span_start, span_end, excerpt, confidence, created_at"
+        ") VALUES (?, 'fact', ?, 'chunk', ?, NULL, NULL, ?, 1.0, ?)",
+        (f"prov-{fact_id}", fact_id, f"source-{fact_id}", f"{subject} {predicate}", ts),
+    )
 
 
 def test_task_scoped_pack_matches_snake_case_tool_keyword(conn):
@@ -180,6 +187,37 @@ def test_executor_body_suppresses_context_fragments_when_fact_is_present(conn):
     assert "## Canonical Facts" in result["body"]
     assert "## Context Fragments" not in result["body"]
     assert result["sections"]["chunks"] == 0
+
+
+def test_executor_pack_hides_contradicted_facts(conn):
+    task_id = "task-contradicted-fact"
+    _insert_task(
+        conn,
+        task_id,
+        "Redis usage decision",
+        "Need only settled facts, not unresolved contradictions.",
+    )
+    _insert_fact(
+        conn,
+        "fact-redis",
+        subject="Service",
+        predicate="uses",
+        object_text="Redis",
+    )
+    conn.execute(
+        "UPDATE canonical_facts SET contradiction_count = 1 WHERE fact_id = 'fact-redis'"
+    )
+
+    result = build_context_pack(
+        conn,
+        pack_type="executor",
+        target_ref=task_id,
+        token_budget=1200,
+        persist=False,
+    )
+
+    assert "Redis" not in result["body"]
+    assert result["sections"]["facts"] == 0
 
 
 def test_warm_recent_task_packs_only_builds_information_rich_tasks(conn):
