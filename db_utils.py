@@ -503,7 +503,13 @@ def bulk_conn(db_path: str | None = None):
 log = logging.getLogger(__name__)
 
 BRIDGE_GENERATED_FILES = frozenset(
-    {"shared.json", "shared.js", "index.json", "entities_index.json"}
+    {
+        "shared.json",
+        "shared.js",
+        "index.json",
+        "entities_index.json",
+        ".bridge_sync.lock",  # legacy in-repo lock path; safe to discard
+    }
 )
 BRIDGE_GENERATED_DIRS = frozenset({"tasks", "entities", "public_knowledge"})
 
@@ -512,6 +518,8 @@ def validate_github_username(username: str) -> None:
     """Raise ValueError when a collaborator/assignee name is not GitHub-safe."""
     if not GITHUB_USER_RE.match(username):
         raise ValueError(f"Invalid GitHub username: {username!r}")
+
+
 _BRIDGE_CONFLICT_STATES = frozenset({"AA", "AU", "DD", "DU", "UA", "UD", "UU"})
 
 
@@ -707,6 +715,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         "shared.js",
         "index.json",
         "entities_index.json",
+        ".bridge_sync.lock",
         "tasks",
         "entities",
         "public_knowledge",
@@ -720,6 +729,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         "shared.js",
         "index.json",
         "entities_index.json",
+        ".bridge_sync.lock",
         "tasks",
         "entities",
         "public_knowledge",
@@ -791,9 +801,12 @@ def bridge_change_summary(
     Includes relation/rating churn and pending_public items whose standby window
     has elapsed, so incremental push logic does not skip exportable changes.
     """
-    cutoff = publish_cutoff_ts or (
-        datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
-    ).isoformat()
+    cutoff = (
+        publish_cutoff_ts
+        or (
+            datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
+        ).isoformat()
+    )
 
     values: dict[str, int] = {
         "changed_tasks": 0,
@@ -1811,7 +1824,10 @@ def merge_import_tasks(
                 if not remote_val:
                     continue
                 local_content = task_content_map.get(local_id, {})
-                if local_id in task_content_map and local_content.get(content_field) is None:
+                if (
+                    local_id in task_content_map
+                    and local_content.get(content_field) is None
+                ):
                     fields_to_update[content_field] = remote_val
                     updated_fields += 1
 
@@ -1832,7 +1848,10 @@ def merge_import_tasks(
                     "UPDATE tasks SET updated_at = ? WHERE id = ?",
                     (remote_updated_at, local_id),
                 )
-                existing_map[tid] = {**existing_map[tid], "updated_at": remote_updated_at}
+                existing_map[tid] = {
+                    **existing_map[tid],
+                    "updated_at": remote_updated_at,
+                }
                 updated_fields += 1
         else:
             # New task — insert (content only if import_content)
@@ -2375,14 +2394,18 @@ def import_remote_bridge_data(
     """
     result = {"entities": 0, "relations": 0, "ratings": 0}
 
-    remote_entities = load_remote_entities_for_import(bridge_dir, remote_payload, logger)
+    remote_entities = load_remote_entities_for_import(
+        bridge_dir, remote_payload, logger
+    )
     remote_relations = remote_payload.get("relations", [])
     if not isinstance(remote_relations, list):
         remote_relations = []
     if remote_entities or remote_relations:
         try:
             n_ent, _, n_rel = import_bridge_entities_and_relations(
-                conn, remote_entities, remote_relations,
+                conn,
+                remote_entities,
+                remote_relations,
             )
             result["entities"] = n_ent
             result["relations"] = n_rel

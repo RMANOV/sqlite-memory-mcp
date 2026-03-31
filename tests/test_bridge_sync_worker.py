@@ -132,6 +132,36 @@ def test_bridge_repo_ready_discards_generated_artifacts(monkeypatch):
     assert any(args[:2] == ("clean", "-fd") for args in calls)
 
 
+def test_bridge_repo_ready_discards_legacy_lock_file(monkeypatch):
+    calls = []
+    statuses = iter(
+        [
+            _cp(("status", "--porcelain"), stdout="?? .bridge_sync.lock\n"),
+            _cp(("status", "--porcelain"), stdout=""),
+        ]
+    )
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _cp(args, stdout="main\n")
+        if args == ("status", "--porcelain"):
+            return next(statuses)
+        if args[:2] in {("checkout", "--"), ("clean", "-fd")}:
+            return _cp(args)
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready("bridge")
+
+    assert ok is True
+    assert msg is None
+    assert any(
+        ".bridge_sync.lock" in args for args in calls if args[:2] == ("clean", "-fd")
+    )
+
+
 def test_bridge_repo_ready_recovers_detached_head(monkeypatch):
     calls = []
 
@@ -199,6 +229,17 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert result["pushed"] is True
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
+
+
+def test_repo_sync_lock_lives_outside_bridge_repo(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    lock = bridge_sync_worker._RepoSyncLock(str(bridge_dir))
+
+    assert lock._path.parent == bridge_dir.parent
+    assert lock._path.parent != bridge_dir
+    assert lock._path.name == ".bridge.sync.lock"
 
 
 def test_bridge_sync_worker_merges_ui_profile_and_pushes_without_db_changes(

@@ -23,6 +23,7 @@ def _load_module(name: str, path: Path):
 def test_bridge_auto_sync_handles_invalid_json_input(tmp_path):
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
+    env["USERPROFILE"] = str(tmp_path)
     proc = subprocess.run(
         [sys.executable, str(ROOT / "hooks" / "bridge_auto_sync.py")],
         input="{",

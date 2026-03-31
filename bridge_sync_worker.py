@@ -73,7 +73,8 @@ class _RepoSyncLock:
     """Cross-process repo lock for bridge sync."""
 
     def __init__(self, bridge_dir: str):
-        self._path = Path(bridge_dir) / ".bridge_sync.lock"
+        repo_root = Path(bridge_dir).resolve()
+        self._path = repo_root.parent / f".{repo_root.name}.sync.lock"
         self._fh = None
 
     def acquire(self) -> bool:
@@ -560,7 +561,8 @@ def _main_locked(
         if br["entities"] or br["relations"]:
             log.info(
                 "Imported %d remote entities and %d relations",
-                br["entities"], br["relations"],
+                br["entities"],
+                br["relations"],
             )
         if br["ratings"]:
             log.info("Imported %d remote knowledge ratings", br["ratings"])
