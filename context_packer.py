@@ -36,6 +36,10 @@ logger = logging.getLogger("sqlite-kb")
 _MIN_RELEVANCE_THRESHOLD = 0.18
 _TASK_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-я_./:-]{4,}")
 _RECENCY_HALF_LIFE_DAYS = 21
+_EXECUTOR_MIN_CHUNK_RELEVANCE = 0.45
+_EXECUTOR_MIN_CHUNK_TRUST = 0.30
+_EXECUTOR_PREVIEW_MIN_RELEVANCE = 0.50
+_EXECUTOR_PREVIEW_MIN_QUALITY = 0.50
 _MAX_ITEMS_BY_TYPE = {
     "fact": 6,
     "claim": 5,
@@ -370,7 +374,7 @@ _PACK_PRIORITIES = {
         "fact_weight": 1.0,
         "claim_weight": 0.5,  # executor uses confirmed facts
         "question_weight": 0.3,
-        "chunk_weight": 0.6,  # raw context for implementation
+        "chunk_weight": 0.1,  # executor should prefer direct evidence over raw fragments
     },
     "bridge_checker": {
         "fact_weight": 0.8,
@@ -646,7 +650,7 @@ def build_context_pack(
             )
 
     # 4. Enrichable/uncertain chunks (raw context)
-    if priorities["chunk_weight"] > 0.2:
+    if priorities["chunk_weight"] > 0:
         chunk_limit = 100 if is_task_scoped else 30
         chunks = conn.execute(
             "SELECT chunk_id, entity_id, source_ref, title, body, materiality_score, "
@@ -657,6 +661,11 @@ def build_context_pack(
             (chunk_limit,),
         ).fetchall()
         for ch in chunks:
+            min_chunk_relevance = _MIN_RELEVANCE_THRESHOLD
+            if pack_type == "executor":
+                min_chunk_relevance = max(
+                    min_chunk_relevance, _EXECUTOR_MIN_CHUNK_RELEVANCE
+                )
             rel = _task_match(
                 ch["source_ref"],
                 ch["title"],
@@ -664,9 +673,11 @@ def build_context_pack(
                 entity_id=ch["entity_id"],
                 entity_name=ch["source_ref"] or ch["title"],
             )
-            if is_task_scoped and rel < _MIN_RELEVANCE_THRESHOLD:
+            if is_task_scoped and rel < min_chunk_relevance:
                 continue
             trust = _CHUNK_TRUST_BY_STATE.get(ch["state"], 0.18)
+            if pack_type == "executor" and trust < _EXECUTOR_MIN_CHUNK_TRUST:
+                continue
             freshness = _compute_recency_score(ch["created_at"])
             ts = _format_ts(ch["created_at"])
             label = f"[CONTEXT:{ch['state'].upper()}]"
@@ -725,6 +736,27 @@ def build_context_pack(
     else:
         selected, tokens_used, selection_meta = _greedy_select_items(items, budget)
 
+    visible_selected = list(selected)
+    if pack_type == "executor" and any(
+        item["type"] in {"fact", "claim", "question"} for item in selected
+    ):
+        # Reader/executor views should not mix solid signal with loose fragment dumps.
+        visible_selected = [item for item in selected if item["type"] != "chunk"]
+
+    total_weight = sum(max(item["score"], 0.001) for item in visible_selected) or 1.0
+    relevance_score = (
+        sum(item["relevance"] * max(item["score"], 0.001) for item in visible_selected)
+        / total_weight
+    )
+    quality_score = (
+        sum(item["trust"] * max(item["score"], 0.001) for item in visible_selected)
+        / total_weight
+    )
+    freshness_score = (
+        sum(item["freshness"] * max(item["score"], 0.001) for item in visible_selected)
+        / total_weight
+    )
+
     # Build pack body
     sections: dict[str, list[str]] = {
         "facts": [],
@@ -732,7 +764,7 @@ def build_context_pack(
         "questions": [],
         "chunks": [],
     }
-    for item in selected:
+    for item in visible_selected:
         sections[item["type"] + "s" if item["type"] != "chunk" else "chunks"].append(
             item["text"]
         )
@@ -759,22 +791,20 @@ def build_context_pack(
         )
     )
 
+    previewable = bool(body_parts)
+    if pack_type == "executor":
+        has_core_signal = bool(
+            sections["facts"] or sections["claims"] or sections["questions"]
+        )
+        previewable = (
+            previewable
+            and has_core_signal
+            and relevance_score >= _EXECUTOR_PREVIEW_MIN_RELEVANCE
+            and quality_score >= _EXECUTOR_PREVIEW_MIN_QUALITY
+        )
+
     # Compute input signature for caching
     input_sig = f"{pack_type}:{target_ref}:{session_id}:{budget}"
-
-    total_weight = sum(max(item["score"], 0.001) for item in selected) or 1.0
-    relevance_score = (
-        sum(item["relevance"] * max(item["score"], 0.001) for item in selected)
-        / total_weight
-    )
-    quality_score = (
-        sum(item["trust"] * max(item["score"], 0.001) for item in selected)
-        / total_weight
-    )
-    freshness_score = (
-        sum(item["freshness"] * max(item["score"], 0.001) for item in selected)
-        / total_weight
-    )
 
     pack_id = None
     if persist:
@@ -820,11 +850,13 @@ def build_context_pack(
         "token_budget": budget,
         "token_usage": tokens_used,
         "items_included": len(selected),
+        "preview_items_included": len(visible_selected),
         "task_scoped": is_task_scoped,
         "persisted": persist,
         "freshness_score": round(freshness_score, 3),
         "relevance_score": round(relevance_score, 3),
         "quality_score": round(quality_score, 3),
+        "previewable": previewable,
         "advanced_context": {
             "enabled": bool(advanced_strategy.get("enabled")),
             "query_expansion_used": bool(advanced_strategy.get("query_expansion_used")),

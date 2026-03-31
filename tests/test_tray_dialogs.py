@@ -31,3 +31,29 @@ def test_batch_truth_scores_returns_stale_cache_on_sqlite_error(monkeypatch):
     )
 
     assert tray_dialogs._batch_truth_scores() == stale_cache
+
+
+def test_should_render_context_preview_hides_weak_executor_pack():
+    assert (
+        tray_dialogs._should_render_context_preview(
+            {
+                "items_included": 1,
+                "body": "## Context Fragments\nweak raw chunk",
+                "previewable": False,
+            }
+        )
+        is False
+    )
+
+
+def test_should_render_context_preview_allows_strong_executor_pack():
+    assert (
+        tray_dialogs._should_render_context_preview(
+            {
+                "items_included": 1,
+                "body": "## Canonical Facts\nhigh-confidence fact",
+                "previewable": True,
+            }
+        )
+        is True
+    )

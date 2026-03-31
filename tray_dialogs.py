@@ -107,6 +107,17 @@ _REFRESH_INTERVAL_MS = 30_000
 
 # ── Clipboard helpers ────────────────────────────────────────────────
 
+
+def _should_render_context_preview(pack_result) -> bool:
+    if not isinstance(pack_result, dict):
+        return False
+    if pack_result.get("items_included", 0) <= 0:
+        return False
+    if not (pack_result.get("body") or "").strip():
+        return False
+    return bool(pack_result.get("previewable", True))
+
+
 _wl_copy_proc = None  # Track wl-copy PID to prevent ghost windows
 _HAS_WL_COPY = (
     bool(os.environ.get("WAYLAND_DISPLAY")) and shutil.which("wl-copy") is not None
@@ -1006,7 +1017,9 @@ class TrayPopup(QWidget):
         priority = (task.get("priority") or "medium").upper()
         plbl = QLabel(priority)
         plbl.setObjectName("priority")
-        plbl.setStyleSheet(f"color: {_PRIORITY_COLORS_UPPER.get(priority, _DEFAULT_PRIORITY_COLOR)};")
+        plbl.setStyleSheet(
+            f"color: {_PRIORITY_COLORS_UPPER.get(priority, _DEFAULT_PRIORITY_COLOR)};"
+        )
         hl.addWidget(plbl)
 
         tip = _build_rich_tooltip(task)
@@ -1923,10 +1936,7 @@ class TaskReaderDialog(QDialog):
                     token_budget=1600,
                     persist=False,
                 )
-                if (
-                    pack_result.get("items_included", 0) > 0
-                    and pack_result.get("body", "").strip()
-                ):
+                if _should_render_context_preview(pack_result):
                     match_score = (pack_result.get("relevance_score") or 0.0) * 100
                     trust_score = (pack_result.get("quality_score") or 0.0) * 100
                     freshness_score = (pack_result.get("freshness_score") or 0.0) * 100

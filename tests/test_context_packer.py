@@ -53,6 +53,26 @@ def _insert_chunk(
     )
 
 
+def _insert_fact(
+    conn,
+    fact_id: str,
+    *,
+    subject: str,
+    predicate: str,
+    object_text: str,
+    confidence: float = 0.95,
+    fact_scope: str = "task",
+) -> None:
+    ts = "2026-03-24T10:00:00+00:00"
+    conn.execute(
+        "INSERT INTO canonical_facts ("
+        "fact_id, subject, predicate, object_text, object_type, fact_scope, "
+        "provenance_summary, confidence, validation_mode, source_claim_id, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, 'text', ?, 'test provenance', ?, 'manual', NULL, ?, ?)",
+        (fact_id, subject, predicate, object_text, fact_scope, confidence, ts, ts),
+    )
+
+
 def test_task_scoped_pack_matches_snake_case_tool_keyword(conn):
     task_id = "task-tool"
     _insert_task(
@@ -91,7 +111,7 @@ def test_task_scoped_pack_matches_snake_case_tool_keyword(conn):
     assert result["relevance_score"] > 0.3
 
 
-def test_task_preview_pack_keeps_low_trust_for_raw_chunks_and_does_not_persist(conn):
+def test_task_preview_pack_hides_weak_chunk_only_context_and_does_not_persist(conn):
     task_id = "task-preview"
     _insert_task(
         conn,
@@ -118,8 +138,48 @@ def test_task_preview_pack_keeps_low_trust_for_raw_chunks_and_does_not_persist(c
     after = conn.execute("SELECT COUNT(*) AS cnt FROM context_packs").fetchone()["cnt"]
 
     assert result["items_included"] == 1
+    assert result["preview_items_included"] == 1
     assert result["quality_score"] < 0.5
+    assert result["previewable"] is False
     assert after == before
+
+
+def test_executor_body_suppresses_context_fragments_when_fact_is_present(conn):
+    task_id = "task-fact-and-chunk"
+    _insert_task(
+        conn,
+        task_id,
+        "Investigate Generator Interface",
+        "Need generator interface details.",
+    )
+    _insert_fact(
+        conn,
+        "fact-generator",
+        subject="Generator Interface",
+        predicate="defines",
+        object_text="generate(mapped_data, client_name, period_start, period_end, output_dir)",
+    )
+    _insert_chunk(
+        conn,
+        "chunk-generator",
+        title="Generator Interface notes",
+        body="Generator Interface defines generate(mapped_data, client_name, period_start, period_end, output_dir).",
+        source_ref="Generator Interface",
+    )
+
+    result = build_context_pack(
+        conn,
+        pack_type="executor",
+        target_ref=task_id,
+        token_budget=1200,
+        persist=False,
+    )
+
+    assert result["items_included"] >= 2
+    assert result["previewable"] is True
+    assert "## Canonical Facts" in result["body"]
+    assert "## Context Fragments" not in result["body"]
+    assert result["sections"]["chunks"] == 0
 
 
 def test_warm_recent_task_packs_only_builds_information_rich_tasks(conn):
