@@ -264,6 +264,9 @@ def test_bridge_sync_worker_exports_memory_ledger_sections(tmp_path, monkeypatch
     payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
 
     assert result["pushed"] is True
+    assert "context_chunks" in payload
+    assert "context_annotations" in payload
+    assert "context_questions" in payload
     assert "candidate_claims" in payload
     assert "claim_evidence" in payload
     assert "canonical_facts" in payload
@@ -272,6 +275,7 @@ def test_bridge_sync_worker_exports_memory_ledger_sections(tmp_path, monkeypatch
     assert "memory_events" in payload
     assert "memory_audit_issues" in payload
     assert "memory_health" in payload
+    assert payload["memory_events"] == []
 
 
 def test_repo_sync_lock_lives_outside_bridge_repo(tmp_path):
@@ -347,3 +351,43 @@ def test_bridge_sync_worker_merges_ui_profile_and_pushes_without_db_changes(
     assert shared["ui_profiles"]["other-host"]["theme"] == "blue"
     assert shared["ui_profiles"]["test-host"]["theme"] == "amber"
     assert any(args[0] == "commit" for args in git_calls)
+
+
+def test_bridge_sync_worker_records_last_push_at_from_payload_timestamp(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    result = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+        ).fetchone()["value"]
+
+    assert result["pushed"] is True
+    assert stored == payload["pushed_at"]

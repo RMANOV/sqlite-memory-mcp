@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import itertools
 import json
 import logging
 import os
@@ -233,16 +232,37 @@ def validate_task_fields(**kwargs: str | None) -> str | None:
 # ── Bridge Sync v2: Per-field LWW conflict resolver ─────────────────────
 
 MACHINE_ID = os.environ.get("MACHINE_ID", socket.gethostname())
-_write_counter = itertools.count(1)  # atomic in CPython; no lock needed
+_HLC_COUNTER_BITS = 16
+_HLC_COUNTER_MASK = (1 << _HLC_COUNTER_BITS) - 1
+_HLC_PACKED_MIN = 1 << 32
 
 
-def _next_machine_id() -> str:
-    """Return machine_id with monotonic counter suffix for deterministic ordering.
+def _iso_to_epoch_ms(value: str | None) -> int:
+    raw = (value or "").strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw) if raw else datetime.now(timezone.utc)
+    except ValueError:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp() * 1000)
 
-    Two writes in the same microsecond on the same machine get different IDs:
-    DESKTOP:0001, DESKTOP:0002 → lexicographic comparison picks the later write.
-    """
-    return f"{MACHINE_ID}:{next(_write_counter):06d}"
+
+def _decode_logical_clock(clock: int) -> tuple[int, int]:
+    value = int(clock or 0)
+    if value <= 0:
+        return 0, 0
+    if value < _HLC_PACKED_MIN:
+        return value, 0
+    return value >> _HLC_COUNTER_BITS, value & _HLC_COUNTER_MASK
+
+
+def _pack_logical_clock(physical_ms: int, counter: int) -> int:
+    return (max(0, int(physical_ms)) << _HLC_COUNTER_BITS) | (
+        int(counter) & _HLC_COUNTER_MASK
+    )
 
 
 METADATA_FIELDS = (
@@ -823,17 +843,40 @@ def _next_logical_clock(
     floor: int | None = None,
     updated_at: str | None = None,
 ) -> int:
-    """Monotonic per-machine counter stored in DB, independent of wall clock."""
+    """Return next HLC-style packed logical clock for the given device.
+
+    The packed integer is globally comparable across machines because its high bits
+    encode physical UTC milliseconds, while low bits encode an intra-millisecond
+    counter. This keeps wall-time ordering for unrelated writes and still preserves
+    causality when remote clocks have been observed locally.
+    """
     mid = machine_id or MACHINE_ID
     now = updated_at or now_iso()
+    now_ms = _iso_to_epoch_ms(now)
+    floor_value = int(floor or 0)
     if not _sqlite_table_exists(conn, "memory_cursors"):
-        return max(1, int(floor or 0) + 1)
+        physical_ms = max(now_ms, _decode_logical_clock(floor_value)[0])
+        counter = 0
+        if physical_ms == _decode_logical_clock(floor_value)[0]:
+            counter = _decode_logical_clock(floor_value)[1] + 1
+        return _pack_logical_clock(physical_ms, counter)
     row = conn.execute(
         "SELECT last_clock FROM memory_cursors WHERE machine_id = ?",
         (mid,),
     ).fetchone()
     current = int(row["last_clock"]) if row else 0
-    next_clock = max(current, int(floor or 0)) + 1
+    current_ms, current_counter = _decode_logical_clock(current)
+    floor_ms, floor_counter = _decode_logical_clock(floor_value)
+    physical_ms = max(now_ms, current_ms, floor_ms)
+    if physical_ms == current_ms == floor_ms:
+        counter = max(current_counter, floor_counter) + 1
+    elif physical_ms == current_ms:
+        counter = current_counter + 1
+    elif physical_ms == floor_ms:
+        counter = floor_counter + 1
+    else:
+        counter = 0
+    next_clock = _pack_logical_clock(physical_ms, counter)
     conn.execute(
         "INSERT INTO memory_cursors (machine_id, last_clock, updated_at) "
         "VALUES (?, ?, ?) "
@@ -842,6 +885,45 @@ def _next_logical_clock(
         (mid, next_clock, now),
     )
     return next_clock
+
+
+def _observe_logical_clock(
+    conn: sqlite3.Connection,
+    floor: int,
+    *,
+    machine_id: str | None = None,
+    updated_at: str | None = None,
+) -> int:
+    """Advance the local device cursor to at least the observed remote clock."""
+    mid = machine_id or MACHINE_ID
+    now = updated_at or now_iso()
+    observed = int(floor or 0)
+    if not _sqlite_table_exists(conn, "memory_cursors"):
+        return observed
+    row = conn.execute(
+        "SELECT last_clock FROM memory_cursors WHERE machine_id = ?",
+        (mid,),
+    ).fetchone()
+    current = int(row["last_clock"]) if row else 0
+    next_clock = max(current, observed)
+    conn.execute(
+        "INSERT INTO memory_cursors (machine_id, last_clock, updated_at) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(machine_id) DO UPDATE SET "
+        "last_clock = excluded.last_clock, updated_at = excluded.updated_at",
+        (mid, next_clock, now),
+    )
+    return next_clock
+
+
+def _event_sort_key(
+    event_ts: str | None,
+    machine_id: str | None,
+    logical_clock: int = 0,
+) -> tuple[int, Any, str]:
+    if int(logical_clock or 0) >= _HLC_PACKED_MIN:
+        return (1, int(logical_clock), str(machine_id or ""))
+    return (0, str(event_ts or ""), str(machine_id or ""))
 
 
 def record_memory_event(
@@ -1084,6 +1166,9 @@ def bridge_change_summary(
         "changed_entities": 0,
         "changed_relations": 0,
         "changed_ratings": 0,
+        "changed_chunks": 0,
+        "changed_annotations": 0,
+        "changed_questions": 0,
         "changed_claims": 0,
         "changed_facts": 0,
         "changed_provenance": 0,
@@ -1125,6 +1210,25 @@ def bridge_change_summary(
     if _sqlite_table_exists(conn, "knowledge_ratings"):
         values["changed_ratings"] = conn.execute(
             "SELECT COUNT(*) FROM knowledge_ratings WHERE rated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "context_chunks"):
+        values["changed_chunks"] = conn.execute(
+            "SELECT COUNT(*) FROM context_chunks WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "context_annotations"):
+        values["changed_annotations"] = conn.execute(
+            "SELECT COUNT(*) FROM context_annotations WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "context_questions"):
+        values["changed_questions"] = conn.execute(
+            "SELECT COUNT(*) FROM context_questions "
+            "WHERE COALESCE(answered_at, created_at) > ?",
             (since_ts,),
         ).fetchone()[0]
 
@@ -1742,7 +1846,7 @@ def upsert_field_versions(
         new_values: {field_name: new_value} — truncated to 500 chars.
     """
     ts = timestamp or now_iso()
-    mid = machine_id or _next_machine_id()
+    mid = machine_id or MACHINE_ID
     _old = old_values or {}
     _new = new_values or {}
     _prov = provenance_map or {}
@@ -2064,8 +2168,8 @@ def _field_version_sort_key(
     updated_by: str,
     updated_order: int = 0,
 ) -> tuple[int, Any, str]:
-    """Prefer logical clocks; fall back to timestamp ordering for legacy peers."""
-    if int(updated_order or 0) > 0:
+    """Prefer packed HLC clocks; fall back to timestamp ordering for legacy peers."""
+    if int(updated_order or 0) >= _HLC_PACKED_MIN:
         return (1, int(updated_order), str(updated_by or ""))
     return (0, str(updated_at or ""), str(updated_by or ""))
 
@@ -2316,23 +2420,6 @@ def merge_import_tasks(
             # Note: cancelled tasks still exist as rows (soft-delete), so they're
             # handled by the `if existing:` branch above — LWW field versioning
             # prevents remote from overwriting the newer local cancelled status.
-
-            # Dedup guard: skip if same title already exists (any status)
-            remote_title = remote.get("title")
-            if remote_title:
-                dedup = conn.execute(
-                    "SELECT id, status FROM tasks WHERE title = ? LIMIT 1",
-                    (remote_title,),
-                ).fetchone()
-                if dedup:
-                    _log.info(
-                        "Dedup guard: skipping new task '%s' — same title "
-                        "exists locally (task %s, status=%s)",
-                        remote_title[:50],
-                        dedup["id"][:12],
-                        dedup["status"],
-                    )
-                    continue
 
             desc = remote.get("description") if import_content else None
             notes = remote.get("notes") if import_content else None
@@ -2843,6 +2930,88 @@ def import_bridge_knowledge_ratings(
     return imported
 
 
+def _build_remote_event_heads(
+    events: list[dict] | None,
+    aggregate_kind: str,
+) -> dict[str, dict[str, Any]]:
+    heads: dict[str, dict[str, Any]] = {}
+    if not events:
+        return heads
+    for event in events:
+        if event.get("aggregate_kind") != aggregate_kind:
+            continue
+        aggregate_id = str(event.get("aggregate_id") or "")
+        if not aggregate_id:
+            continue
+        current = heads.get(aggregate_id)
+        if current is None or _event_sort_key(
+            event.get("event_ts"),
+            event.get("machine_id"),
+            int(event.get("logical_clock") or 0),
+        ) > _event_sort_key(
+            current.get("event_ts"),
+            current.get("machine_id"),
+            int(current.get("logical_clock") or 0),
+        ):
+            heads[aggregate_id] = event
+    return heads
+
+
+def _load_local_event_heads(
+    conn: sqlite3.Connection,
+    aggregate_kind: str,
+    aggregate_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not aggregate_ids or not _sqlite_table_exists(conn, "memory_events"):
+        return {}
+    placeholders = ",".join("?" * len(aggregate_ids))
+    rows = conn.execute(
+        "SELECT aggregate_id, machine_id, logical_clock, event_ts "
+        "FROM memory_events WHERE aggregate_kind = ? AND aggregate_id IN ("
+        + placeholders
+        + ")",
+        (aggregate_kind, *aggregate_ids),
+    ).fetchall()
+    heads: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        aggregate_id = row["aggregate_id"]
+        current = heads.get(aggregate_id)
+        candidate = dict(row)
+        if current is None or _event_sort_key(
+            candidate.get("event_ts"),
+            candidate.get("machine_id"),
+            int(candidate.get("logical_clock") or 0),
+        ) > _event_sort_key(
+            current.get("event_ts"),
+            current.get("machine_id"),
+            int(current.get("logical_clock") or 0),
+        ):
+            heads[aggregate_id] = candidate
+    return heads
+
+
+def _remote_row_is_newer(
+    *,
+    local_updated_at: str | None,
+    remote_updated_at: str | None,
+    local_event_head: dict[str, Any] | None,
+    remote_event_head: dict[str, Any] | None,
+) -> bool:
+    if local_event_head or remote_event_head:
+        local_key = _event_sort_key(
+            (local_event_head or {}).get("event_ts") or local_updated_at,
+            (local_event_head or {}).get("machine_id"),
+            int((local_event_head or {}).get("logical_clock") or 0),
+        )
+        remote_key = _event_sort_key(
+            (remote_event_head or {}).get("event_ts") or remote_updated_at,
+            (remote_event_head or {}).get("machine_id"),
+            int((remote_event_head or {}).get("logical_clock") or 0),
+        )
+        return remote_key > local_key
+    return (remote_updated_at or "") > (local_updated_at or "")
+
+
 def export_candidate_claims(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     if not _sqlite_table_exists(conn, "candidate_claims"):
         return []
@@ -2855,23 +3024,262 @@ def export_candidate_claims(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def import_candidate_claims(conn: sqlite3.Connection, claims: list[dict]) -> int:
-    if not _sqlite_table_exists(conn, "candidate_claims"):
+def export_context_chunks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "context_chunks"):
+        return []
+    rows = conn.execute(
+        "SELECT chunk_id, session_id, entity_id, source_type, source_ref, source_hash, "
+        "title, body, language, state, enrich_policy, materiality_score, "
+        "last_human_update_at, last_ai_attempt_at, created_at, updated_at "
+        "FROM context_chunks ORDER BY created_at, chunk_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_context_chunks(
+    conn: sqlite3.Connection,
+    chunks: list[dict],
+    *,
+    remote_event_heads: dict[str, dict[str, Any]] | None = None,
+) -> int:
+    if not _sqlite_table_exists(conn, "context_chunks"):
         return 0
+    chunk_ids = [str(ch.get("chunk_id") or "") for ch in chunks if ch.get("chunk_id")]
+    local_rows: dict[str, sqlite3.Row] = {}
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = conn.execute(
+            "SELECT chunk_id, updated_at FROM context_chunks WHERE chunk_id IN ("
+            + placeholders
+            + ")",
+            tuple(chunk_ids),
+        ).fetchall()
+        local_rows = {r["chunk_id"]: r for r in rows}
+    local_heads = _load_local_event_heads(conn, "chunk", chunk_ids)
     imported = 0
-    for claim in claims:
-        row = conn.execute(
-            "SELECT updated_at FROM candidate_claims WHERE claim_id = ?",
-            (claim.get("claim_id"),),
-        ).fetchone()
-        if row and (row["updated_at"] or "") >= (claim.get("updated_at") or ""):
+    for chunk in chunks:
+        chunk_id = chunk.get("chunk_id")
+        if not chunk_id:
+            continue
+        local_row = local_rows.get(chunk_id)
+        if local_row and not _remote_row_is_newer(
+            local_updated_at=local_row["updated_at"],
+            remote_updated_at=chunk.get("updated_at"),
+            local_event_head=local_heads.get(chunk_id),
+            remote_event_head=(remote_event_heads or {}).get(chunk_id),
+        ):
             continue
         conn.execute(
-            "INSERT OR REPLACE INTO candidate_claims "
+            "INSERT INTO context_chunks "
+            "(chunk_id, session_id, entity_id, source_type, source_ref, source_hash, "
+            "title, body, language, state, enrich_policy, materiality_score, "
+            "last_human_update_at, last_ai_attempt_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(chunk_id) DO UPDATE SET "
+            "session_id = excluded.session_id, "
+            "entity_id = excluded.entity_id, "
+            "source_type = excluded.source_type, "
+            "source_ref = excluded.source_ref, "
+            "source_hash = excluded.source_hash, "
+            "title = excluded.title, "
+            "body = excluded.body, "
+            "language = excluded.language, "
+            "state = excluded.state, "
+            "enrich_policy = excluded.enrich_policy, "
+            "materiality_score = excluded.materiality_score, "
+            "last_human_update_at = excluded.last_human_update_at, "
+            "last_ai_attempt_at = excluded.last_ai_attempt_at, "
+            "updated_at = excluded.updated_at",
+            (
+                chunk.get("chunk_id"),
+                chunk.get("session_id"),
+                chunk.get("entity_id"),
+                chunk.get("source_type"),
+                chunk.get("source_ref"),
+                chunk.get("source_hash"),
+                chunk.get("title"),
+                chunk.get("body", ""),
+                chunk.get("language"),
+                chunk.get("state", "no_enrich"),
+                chunk.get("enrich_policy", "manual"),
+                chunk.get("materiality_score", 0.0),
+                chunk.get("last_human_update_at"),
+                chunk.get("last_ai_attempt_at"),
+                chunk.get("created_at") or now_iso(),
+                chunk.get("updated_at") or now_iso(),
+            ),
+        )
+        imported += 1
+    return imported
+
+
+def export_context_annotations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "context_annotations"):
+        return []
+    rows = conn.execute(
+        "SELECT annotation_id, chunk_id, author_type, annotation_type, body, "
+        "source_hash_seen, created_at FROM context_annotations "
+        "ORDER BY created_at, annotation_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_context_annotations(
+    conn: sqlite3.Connection, annotations: list[dict]
+) -> int:
+    if not _sqlite_table_exists(conn, "context_annotations"):
+        return 0
+    imported = 0
+    for ann in annotations:
+        conn.execute(
+            "INSERT OR IGNORE INTO context_annotations "
+            "(annotation_id, chunk_id, author_type, annotation_type, body, source_hash_seen, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ann.get("annotation_id"),
+                ann.get("chunk_id"),
+                ann.get("author_type"),
+                ann.get("annotation_type"),
+                ann.get("body", ""),
+                ann.get("source_hash_seen"),
+                ann.get("created_at") or now_iso(),
+            ),
+        )
+        imported += conn.execute("SELECT changes()").fetchone()[0]
+    return imported
+
+
+def export_context_questions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "context_questions"):
+        return []
+    rows = conn.execute(
+        "SELECT question_id, chunk_id, question_text, question_type, priority_score, "
+        "state, answered_by, answered_at, answer_text, created_at "
+        "FROM context_questions ORDER BY created_at, question_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_context_questions(
+    conn: sqlite3.Connection,
+    questions: list[dict],
+    *,
+    remote_event_heads: dict[str, dict[str, Any]] | None = None,
+) -> int:
+    if not _sqlite_table_exists(conn, "context_questions"):
+        return 0
+    question_ids = [
+        str(q.get("question_id") or "") for q in questions if q.get("question_id")
+    ]
+    local_rows: dict[str, sqlite3.Row] = {}
+    if question_ids:
+        placeholders = ",".join("?" * len(question_ids))
+        rows = conn.execute(
+            "SELECT question_id, answered_at, created_at FROM context_questions "
+            "WHERE question_id IN (" + placeholders + ")",
+            tuple(question_ids),
+        ).fetchall()
+        local_rows = {r["question_id"]: r for r in rows}
+    local_heads = _load_local_event_heads(conn, "question", question_ids)
+    imported = 0
+    for question in questions:
+        question_id = question.get("question_id")
+        if not question_id:
+            continue
+        local_row = local_rows.get(question_id)
+        local_updated_at = (
+            (local_row["answered_at"] or local_row["created_at"]) if local_row else None
+        )
+        remote_updated_at = question.get("answered_at") or question.get("created_at")
+        if local_row and not _remote_row_is_newer(
+            local_updated_at=local_updated_at,
+            remote_updated_at=remote_updated_at,
+            local_event_head=local_heads.get(question_id),
+            remote_event_head=(remote_event_heads or {}).get(question_id),
+        ):
+            continue
+        conn.execute(
+            "INSERT INTO context_questions "
+            "(question_id, chunk_id, question_text, question_type, priority_score, "
+            "state, answered_by, answered_at, answer_text, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(question_id) DO UPDATE SET "
+            "chunk_id = excluded.chunk_id, "
+            "question_text = excluded.question_text, "
+            "question_type = excluded.question_type, "
+            "priority_score = excluded.priority_score, "
+            "state = excluded.state, "
+            "answered_by = excluded.answered_by, "
+            "answered_at = excluded.answered_at, "
+            "answer_text = excluded.answer_text",
+            (
+                question.get("question_id"),
+                question.get("chunk_id"),
+                question.get("question_text", ""),
+                question.get("question_type", ""),
+                question.get("priority_score", 0.0),
+                question.get("state", "open"),
+                question.get("answered_by"),
+                question.get("answered_at"),
+                question.get("answer_text"),
+                question.get("created_at") or now_iso(),
+            ),
+        )
+        imported += 1
+    return imported
+
+
+def import_candidate_claims(
+    conn: sqlite3.Connection,
+    claims: list[dict],
+    *,
+    remote_event_heads: dict[str, dict[str, Any]] | None = None,
+) -> int:
+    if not _sqlite_table_exists(conn, "candidate_claims"):
+        return 0
+    claim_ids = [
+        str(claim.get("claim_id") or "") for claim in claims if claim.get("claim_id")
+    ]
+    local_rows: dict[str, sqlite3.Row] = {}
+    if claim_ids:
+        placeholders = ",".join("?" * len(claim_ids))
+        rows = conn.execute(
+            "SELECT claim_id, updated_at FROM candidate_claims WHERE claim_id IN ("
+            + placeholders
+            + ")",
+            tuple(claim_ids),
+        ).fetchall()
+        local_rows = {r["claim_id"]: r for r in rows}
+    local_heads = _load_local_event_heads(conn, "claim", claim_ids)
+    imported = 0
+    for claim in claims:
+        claim_id = claim.get("claim_id")
+        row = local_rows.get(claim_id)
+        if row and not _remote_row_is_newer(
+            local_updated_at=row["updated_at"],
+            remote_updated_at=claim.get("updated_at"),
+            local_event_head=local_heads.get(str(claim_id)),
+            remote_event_head=(remote_event_heads or {}).get(str(claim_id)),
+        ):
+            continue
+        conn.execute(
+            "INSERT INTO candidate_claims "
             "(claim_id, chunk_id, subject, predicate, object_text, object_type, "
             "claim_scope, confidence, status, requires_human, promoted_to_fact_id, "
             "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(claim_id) DO UPDATE SET "
+            "chunk_id = excluded.chunk_id, "
+            "subject = excluded.subject, "
+            "predicate = excluded.predicate, "
+            "object_text = excluded.object_text, "
+            "object_type = excluded.object_type, "
+            "claim_scope = excluded.claim_scope, "
+            "confidence = excluded.confidence, "
+            "status = excluded.status, "
+            "requires_human = excluded.requires_human, "
+            "promoted_to_fact_id = excluded.promoted_to_fact_id, "
+            "updated_at = excluded.updated_at",
             (
                 claim.get("claim_id"),
                 claim.get("chunk_id"),
@@ -2986,9 +3394,26 @@ def export_canonical_facts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def import_canonical_facts(conn: sqlite3.Connection, facts: list[dict]) -> int:
+def import_canonical_facts(
+    conn: sqlite3.Connection,
+    facts: list[dict],
+    *,
+    remote_event_heads: dict[str, dict[str, Any]] | None = None,
+) -> int:
     if not _sqlite_table_exists(conn, "canonical_facts"):
         return 0
+    fact_ids = [str(fact.get("fact_id") or "") for fact in facts if fact.get("fact_id")]
+    local_rows: dict[str, sqlite3.Row] = {}
+    if fact_ids:
+        placeholders = ",".join("?" * len(fact_ids))
+        rows = conn.execute(
+            "SELECT fact_id, updated_at FROM canonical_facts WHERE fact_id IN ("
+            + placeholders
+            + ")",
+            tuple(fact_ids),
+        ).fetchall()
+        local_rows = {r["fact_id"]: r for r in rows}
+    local_heads = _load_local_event_heads(conn, "fact", fact_ids)
     has_valid_from = _sqlite_has_column(conn, "canonical_facts", "valid_from")
     has_valid_to = _sqlite_has_column(conn, "canonical_facts", "valid_to")
     has_superseded = _sqlite_has_column(
@@ -2999,11 +3424,14 @@ def import_canonical_facts(conn: sqlite3.Connection, facts: list[dict]) -> int:
     )
     imported = 0
     for fact in facts:
-        row = conn.execute(
-            "SELECT updated_at FROM canonical_facts WHERE fact_id = ?",
-            (fact.get("fact_id"),),
-        ).fetchone()
-        if row and (row["updated_at"] or "") >= (fact.get("updated_at") or ""):
+        fact_id = fact.get("fact_id")
+        row = local_rows.get(fact_id)
+        if row and not _remote_row_is_newer(
+            local_updated_at=row["updated_at"],
+            remote_updated_at=fact.get("updated_at"),
+            local_event_head=local_heads.get(str(fact_id)),
+            remote_event_head=(remote_event_heads or {}).get(str(fact_id)),
+        ):
             continue
         columns = [
             "fact_id",
@@ -3046,9 +3474,14 @@ def import_canonical_facts(conn: sqlite3.Connection, facts: list[dict]) -> int:
             columns.append("contradiction_count")
             values.append(fact.get("contradiction_count", 0))
         placeholders = ", ".join("?" for _ in columns)
+        update_columns = [
+            col for col in columns if col not in {"fact_id", "created_at"}
+        ]
+        update_sql = ", ".join(f"{col} = excluded.{col}" for col in update_columns)
         conn.execute(
-            f"INSERT OR REPLACE INTO canonical_facts ({', '.join(columns)}) "
-            f"VALUES ({placeholders})",
+            f"INSERT INTO canonical_facts ({', '.join(columns)}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT(fact_id) DO UPDATE SET {update_sql}",
             values,
         )
         imported += 1
@@ -3181,12 +3614,21 @@ def import_memory_events(conn: sqlite3.Connection, events: list[dict]) -> int:
         delta = conn.execute("SELECT changes()").fetchone()[0]
         if delta:
             imported += delta
-            _next_logical_clock(
+            observed_clock = int(event.get("logical_clock") or 0)
+            event_mid = event.get("machine_id", MACHINE_ID)
+            _observe_logical_clock(
                 conn,
-                event.get("machine_id", MACHINE_ID),
-                floor=int(event.get("logical_clock") or 0),
+                observed_clock,
+                machine_id=event_mid,
                 updated_at=event.get("event_ts") or now_iso(),
             )
+            if event_mid != MACHINE_ID:
+                _observe_logical_clock(
+                    conn,
+                    observed_clock,
+                    machine_id=MACHINE_ID,
+                    updated_at=event.get("event_ts") or now_iso(),
+                )
     return imported
 
 
@@ -3242,6 +3684,9 @@ def import_remote_bridge_data(
         "entities": 0,
         "relations": 0,
         "ratings": 0,
+        "chunks": 0,
+        "annotations": 0,
+        "questions": 0,
         "claims": 0,
         "claim_evidence": 0,
         "facts": 0,
@@ -3250,6 +3695,15 @@ def import_remote_bridge_data(
         "events": 0,
         "audit_issues": 0,
     }
+    remote_events = (
+        remote_payload.get("memory_events", [])
+        if isinstance(remote_payload.get("memory_events"), list)
+        else []
+    )
+    chunk_heads = _build_remote_event_heads(remote_events, "chunk")
+    question_heads = _build_remote_event_heads(remote_events, "question")
+    claim_heads = _build_remote_event_heads(remote_events, "claim")
+    fact_heads = _build_remote_event_heads(remote_events, "fact")
 
     remote_entities = load_remote_entities_for_import(
         bridge_dir, remote_payload, logger
@@ -3278,10 +3732,43 @@ def import_remote_bridge_data(
             if logger:
                 logger.warning("Rating merge failed: %s", exc)
 
+    if isinstance(remote_payload.get("context_chunks"), list):
+        try:
+            result["chunks"] = import_context_chunks(
+                conn,
+                remote_payload["context_chunks"],
+                remote_event_heads=chunk_heads,
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Context chunk import failed: %s", exc)
+
+    if isinstance(remote_payload.get("context_annotations"), list):
+        try:
+            result["annotations"] = import_context_annotations(
+                conn, remote_payload["context_annotations"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Context annotation import failed: %s", exc)
+
+    if isinstance(remote_payload.get("context_questions"), list):
+        try:
+            result["questions"] = import_context_questions(
+                conn,
+                remote_payload["context_questions"],
+                remote_event_heads=question_heads,
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Context question import failed: %s", exc)
+
     if isinstance(remote_payload.get("candidate_claims"), list):
         try:
             result["claims"] = import_candidate_claims(
-                conn, remote_payload["candidate_claims"]
+                conn,
+                remote_payload["candidate_claims"],
+                remote_event_heads=claim_heads,
             )
         except sqlite3.Error as exc:
             if logger:
@@ -3299,7 +3786,9 @@ def import_remote_bridge_data(
     if isinstance(remote_payload.get("canonical_facts"), list):
         try:
             result["facts"] = import_canonical_facts(
-                conn, remote_payload["canonical_facts"]
+                conn,
+                remote_payload["canonical_facts"],
+                remote_event_heads=fact_heads,
             )
         except sqlite3.Error as exc:
             if logger:
@@ -3323,11 +3812,9 @@ def import_remote_bridge_data(
             if logger:
                 logger.warning("Knowledge link import failed: %s", exc)
 
-    if isinstance(remote_payload.get("memory_events"), list):
+    if remote_events:
         try:
-            result["events"] = import_memory_events(
-                conn, remote_payload["memory_events"]
-            )
+            result["events"] = import_memory_events(conn, remote_events)
         except sqlite3.Error as exc:
             if logger:
                 logger.warning("Memory event import failed: %s", exc)

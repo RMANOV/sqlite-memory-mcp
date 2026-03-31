@@ -52,6 +52,9 @@ from db_utils import (
     fts_sync_entity,
     export_entity_files,
     export_entities_index,
+    export_context_chunks,
+    export_context_annotations,
+    export_context_questions,
     export_candidate_claims,
     export_claim_evidence,
     export_canonical_facts,
@@ -368,6 +371,9 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
 def _export_extended_memory(conn: sqlite3.Connection) -> dict[str, list]:
     """Export append-only/event/provenance memory artifacts for cross-device sync."""
     return {
+        "context_chunks": export_context_chunks(conn),
+        "context_annotations": export_context_annotations(conn),
+        "context_questions": export_context_questions(conn),
         "candidate_claims": export_candidate_claims(conn),
         "claim_evidence": export_claim_evidence(conn),
         "canonical_facts": export_canonical_facts(conn),
@@ -607,6 +613,21 @@ def _main_locked(
                 log.warning("Task merge failed: %s", exc)
     # Task import transaction closed — DB lock released
 
+    audit_summary: dict | None = None
+    try:
+        from memory_audit import run_memory_audit
+
+        with get_conn(_db_path) as conn:
+            _progress(progress_callback, 18, "Auditing memory...")
+            audit_summary = run_memory_audit(
+                conn,
+                repair=True,
+                stale_sync_minutes=120,
+                emit_event=False,
+            )
+    except Exception as exc:
+        log.warning("Memory audit failed during bridge sync: %s", exc)
+
     # Safety valve: check BEFORE export (bridge files still contain remote data)
     if not force:
         with get_conn(_db_path) as conn:
@@ -688,21 +709,8 @@ def _main_locked(
             log.warning("Sync skip-check error: %s", e)
 
     # Phase 3b: Export (read-only, separate short transaction)
-    audit_summary: dict | None = None
     extended_memory: dict[str, list] = {}
     with get_conn(_db_path) as conn:
-        try:
-            from memory_audit import run_memory_audit
-
-            _progress(progress_callback, 18, "Auditing memory...")
-            audit_summary = run_memory_audit(
-                conn,
-                repair=True,
-                stale_sync_minutes=120,
-            )
-        except Exception as exc:
-            log.warning("Memory audit failed during bridge sync: %s", exc)
-
         _progress(progress_callback, 20, "Exporting entities...")
         entities_out, entity_ids = _export_entities(conn)
         _progress(progress_callback, 30, "Exporting relations...")
@@ -819,7 +827,7 @@ def _main_locked(
             conn.execute(
                 "INSERT OR REPLACE INTO bridge_meta(key, value) "
                 "VALUES('last_push_at', ?)",
-                (export_started_at,),
+                (payload["pushed_at"],),
             )
 
     # Deploy to Cloudflare Pages (auto-update after push)

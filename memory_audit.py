@@ -521,6 +521,7 @@ def run_memory_audit(
     *,
     repair: bool = True,
     stale_sync_minutes: int = 120,
+    emit_event: bool = True,
 ) -> dict[str, Any]:
     """Run memory health audit and persist open/resolved issues."""
     if not _sqlite_table_exists(conn, "memory_audit_issues"):
@@ -811,28 +812,30 @@ def run_memory_audit(
         )
         resolved += 1
 
-    record_memory_event(
-        conn,
-        event_type="memory_audit_run",
-        aggregate_kind="audit",
-        aggregate_id="memory",
-        tool_name="sqlite-intel.audit_memory",
-        event_ts=detected_at,
-        new_value={
-            "open_issues": len(issues),
-            "resolved_issues": resolved,
-            "repairs": repairs,
-        },
-        payload={
-            "audit_version": _AUDIT_VERSION,
-            "repair": repair,
-            "stale_sync_minutes": stale_sync_minutes,
-        },
-    )
+    if emit_event and (issues or resolved or any(repairs.values())):
+        record_memory_event(
+            conn,
+            event_type="memory_audit_run",
+            aggregate_kind="audit",
+            aggregate_id="memory",
+            tool_name="sqlite-intel.audit_memory",
+            event_ts=detected_at,
+            new_value={
+                "open_issues": len(issues),
+                "resolved_issues": resolved,
+                "repairs": repairs,
+            },
+            payload={
+                "audit_version": _AUDIT_VERSION,
+                "repair": repair,
+                "stale_sync_minutes": stale_sync_minutes,
+            },
+        )
 
     return {
         "audit_version": _AUDIT_VERSION,
         "repair": repair,
+        "emit_event": emit_event,
         "open_issue_count": len(issues),
         "resolved_issue_count": resolved,
         "issues": issues,

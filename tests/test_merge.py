@@ -20,6 +20,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from db_utils import (
+    _field_version_sort_key,
+    _pack_logical_clock,
     merge_import_tasks,
     now_iso,
     upsert_field_versions,
@@ -708,11 +710,11 @@ def test_lww_content_overwrite_when_remote_has_value(conn):
     assert row["description"] == "New better content"  # Remote wins
 
 
-# ── Test 11: Dedup Guard ─────────────────────────────────────────────────
+# ── Test 11: Same-title tasks keep distinct UUIDs ────────────────────────
 
 
-def test_dedup_guard_blocks_recently_cancelled_title(conn):
-    """New remote task with same title as recently cancelled local should be skipped."""
+def test_same_title_remote_task_survives_cancelled_local(conn):
+    """A distinct UUID must not be dropped just because a cancelled task shares its title."""
     _insert_task(
         conn, "old-1", title="Weekly review", status="cancelled", updated_at=now_iso()
     )
@@ -728,17 +730,21 @@ def test_dedup_guard_blocks_recently_cancelled_title(conn):
         }
     ]
     new_count, _ = merge_import_tasks(conn, remote, import_content=False)
-    assert new_count == 0  # Blocked by dedup
+    assert new_count == 1
     assert (
         conn.execute("SELECT id FROM tasks WHERE id='new-uuid-dedup'").fetchone()
-        is None
+        is not None
     )
 
 
-def test_dedup_guard_blocks_active_duplicate_title(conn):
-    """New remote task with same title as existing active local should be skipped."""
+def test_same_title_remote_task_survives_active_local(conn):
+    """A distinct UUID must remain a distinct task even when titles collide."""
     _insert_task(
-        conn, "active-1", title="Deploy pipeline", status="not_started", updated_at=now_iso()
+        conn,
+        "active-1",
+        title="Deploy pipeline",
+        status="not_started",
+        updated_at=now_iso(),
     )
 
     remote = [
@@ -751,15 +757,15 @@ def test_dedup_guard_blocks_active_duplicate_title(conn):
         }
     ]
     new_count, _ = merge_import_tasks(conn, remote, import_content=False)
-    assert new_count == 0  # Blocked — same title exists locally
+    assert new_count == 1
     assert (
         conn.execute("SELECT id FROM tasks WHERE id='new-uuid-active-dup'").fetchone()
-        is None
+        is not None
     )
 
 
-def test_dedup_guard_blocks_done_duplicate_title(conn):
-    """New remote task with same title as done local should be skipped."""
+def test_same_title_remote_task_survives_done_local(conn):
+    """Completed local tasks must not shadow new remote UUIDs."""
     _insert_task(
         conn, "done-1", title="Fix auth bug", status="done", updated_at=now_iso()
     )
@@ -774,15 +780,15 @@ def test_dedup_guard_blocks_done_duplicate_title(conn):
         }
     ]
     new_count, _ = merge_import_tasks(conn, remote, import_content=False)
-    assert new_count == 0  # Blocked — same title exists (done)
+    assert new_count == 1
     assert (
         conn.execute("SELECT id FROM tasks WHERE id='new-uuid-done-dup'").fetchone()
-        is None
+        is not None
     )
 
 
 def test_dedup_guard_allows_different_title(conn):
-    """Dedup guard should not block tasks with different titles."""
+    """Different titles continue to insert normally."""
     _insert_task(
         conn, "old-2", title="Weekly review", status="cancelled", updated_at=now_iso()
     )
@@ -801,4 +807,29 @@ def test_dedup_guard_allows_different_title(conn):
     assert (
         conn.execute("SELECT id FROM tasks WHERE id='new-uuid-diff'").fetchone()
         is not None
+    )
+
+
+def test_legacy_updated_order_falls_back_to_timestamp_ordering():
+    """Old scalar counters must not beat newer remote timestamps across machines."""
+    local_key = _field_version_sort_key(
+        "2026-03-31T10:00:00+00:00",
+        "machine-A",
+        100,
+    )
+    remote_key = _field_version_sort_key(
+        "2026-03-31T11:00:00+00:00",
+        "machine-B",
+        5,
+    )
+
+    assert remote_key > local_key
+
+
+def test_packed_logical_clock_order_is_globally_comparable():
+    older = _pack_logical_clock(1_743_412_800_000, 0)
+    newer = _pack_logical_clock(1_743_412_801_000, 0)
+
+    assert _field_version_sort_key("2026-03-31T10:00:01+00:00", "machine-B", newer) > (
+        _field_version_sort_key("2026-03-31T10:00:00+00:00", "machine-A", older)
     )
