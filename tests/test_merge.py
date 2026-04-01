@@ -314,21 +314,32 @@ def test_tombstone_wins_when_field_ts_equal_but_updated_at_newer(conn):
     assert row["status"] == "archived"
 
 
-def test_tombstone_nonexistent_task_skipped(conn):
-    """Tombstone for a task that doesn't exist locally → silently skipped."""
+def test_tombstone_nonexistent_task_materialized(conn):
+    """Tombstones must materialize missing archived/cancelled rows on bootstrap."""
     remote = [
         {
             "id": "task-ghost",
+            "title": "Ghost task",
             "_tombstone": True,
             "status": "cancelled",
             "updated_at": "2026-01-01T10:00:00",
+            "created_at": "2025-12-31T10:00:00",
+            "description": "Recovered tombstone description",
+            "notes": "Recovered tombstone notes",
+            "_field_ts": {"status": ["2026-01-01T10:00:00", "machine-B"]},
         }
     ]
-    new_count, updated = merge_import_tasks(conn, remote)
+    new_count, updated = merge_import_tasks(conn, remote, import_content=True)
 
-    assert new_count == 0
+    assert new_count == 1
     assert updated == 0
-    assert _task(conn, "task-ghost") is None
+    row = _task(conn, "task-ghost")
+    assert row is not None
+    assert row["title"] == "Ghost task"
+    assert row["status"] == "cancelled"
+    assert row["description"] == "Recovered tombstone description"
+    assert row["notes"] == "Recovered tombstone notes"
+    assert _fv(conn, "task-ghost", "status") == ("2026-01-01T10:00:00", "machine-B")
 
 
 # ── Test 6: Clock skew ────────────────────────────────────────────────────

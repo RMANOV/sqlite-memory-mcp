@@ -6,6 +6,7 @@ utilities used by server.py, task_tray.py, and utility scripts.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import json
@@ -357,9 +358,23 @@ MERGEABLE_FIELDS = (
 
 _TOMBSTONE_DAYS = 30
 
-# Path traversal defense: task IDs must be UUID-safe (alphanumeric + hyphens)
+# Path traversal defense for direct filename usage: raw task IDs may only use
+# alphanumerics and hyphens. Legacy IDs are still supported via encoded stems.
 _SAFE_TASK_ID = re.compile(r"^[a-zA-Z0-9\-]+$")
 _SAFE_ENTITY_ID = re.compile(r"^[1-9][0-9]*$")
+
+
+def _task_storage_stem(task_id: str) -> str:
+    """Return a filesystem-safe stem for per-task bridge files."""
+    if _SAFE_TASK_ID.match(task_id):
+        return task_id
+    encoded = base64.urlsafe_b64encode(task_id.encode("utf-8")).decode("ascii")
+    return f"_id_{encoded.rstrip('=')}"
+
+
+def _task_storage_path(task_id: str, bridge_dir: str) -> Path:
+    """Return the canonical per-task bridge file path for a task id."""
+    return Path(bridge_dir) / "tasks" / f"{_task_storage_stem(task_id)}.json"
 
 
 def setup_logger(name: str, log_file: str = "server.log") -> logging.Logger:
@@ -2744,30 +2759,36 @@ def export_task_files(
     bridge_dir: str,
     changed_since: str | None = None,
 ) -> list[str]:
-    """Export tasks to per-task JSON files in tasks/. Returns exported IDs."""
+    """Export active tasks plus recent tombstones to per-task bridge files."""
     tasks_dir = Path(bridge_dir) / "tasks"
     tasks_dir.mkdir(exist_ok=True)
 
-    status_filter = "AND status NOT IN ('archived', 'cancelled')"
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
+    export_filter = (
+        "WHERE (status NOT IN ('archived', 'cancelled') "
+        "OR (status IN ('archived', 'cancelled') AND updated_at > ?))"
+    )
     if changed_since:
         rows = conn.execute(
-            f"SELECT {TASK_EXPORT_COLS} FROM tasks WHERE updated_at >= ? {status_filter}",
-            (changed_since,),
+            f"SELECT {TASK_EXPORT_COLS} FROM tasks "
+            f"{export_filter} AND updated_at >= ? ORDER BY created_at",
+            (cutoff, changed_since),
         ).fetchall()
     else:
         rows = conn.execute(
-            f"SELECT {TASK_EXPORT_COLS} FROM tasks WHERE 1=1 {status_filter}"
+            f"SELECT {TASK_EXPORT_COLS} FROM tasks {export_filter} ORDER BY created_at",
+            (cutoff,),
         ).fetchall()
 
     exported: list[str] = []
-    # Build task map from already-fetched rows (no second query needed)
     task_ids = []
     task_map: dict[str, dict] = {}
     for row in rows:
         tid = row["id"]
-        if _SAFE_TASK_ID.match(tid):
-            task_ids.append(tid)
-            task_map[tid] = dict(row)
+        if not isinstance(tid, str) or not tid:
+            continue
+        task_ids.append(tid)
+        task_map[tid] = dict(row)
     if not task_ids:
         return exported
 
@@ -2816,7 +2837,7 @@ def export_task_files(
 
     for tid in task_ids:
         task = task_map[tid]
-        task_path = tasks_dir / f"{tid}.json"
+        task_path = _task_storage_path(tid, bridge_dir)
 
         # Content-aware export: preserve bridge descriptions/notes if local is NULL
         if task_path.exists():
@@ -2834,9 +2855,9 @@ def export_task_files(
     # Clean stale files only during full export (changed_since=None).
     # During incremental export, task_ids is partial — cleanup would delete valid files.
     if not changed_since:
-        active_ids = set(task_ids)
+        active_stems = {_task_storage_stem(tid) for tid in task_ids}
         for stale in tasks_dir.iterdir():
-            if stale.suffix == ".json" and stale.stem not in active_ids:
+            if stale.suffix == ".json" and stale.stem not in active_stems:
                 stale.unlink()
 
     return exported
@@ -2983,6 +3004,7 @@ def merge_import_tasks(
 
     # Pre-fetch: collect remote IDs that exist locally + their field versions
     remote_ids = [r.get("id") for r in tasks_sorted if r.get("id")]
+    remote_id_set = {rid for rid in remote_ids if isinstance(rid, str) and rid}
     remote_event_by_id = _build_event_lookup_by_id(remote_events)
     remote_status_heads = _build_task_field_event_heads(remote_events, "status")
     if remote_ids:
@@ -3023,12 +3045,20 @@ def merge_import_tasks(
 
     for remote in tasks_sorted:
         tid = remote.get("id")
-        if not tid or not _SAFE_TASK_ID.match(tid):
+        if not isinstance(tid, str) or not tid:
             continue
 
         sanitize_task_enums(remote)
         remote_fts = remote.get("_field_ts", {})
         fallback_ts = remote.get("updated_at", "")
+        parent_id = remote.get("parent_id")
+        if (
+            isinstance(parent_id, str)
+            and parent_id
+            and parent_id not in existing_map
+            and parent_id not in remote_id_set
+        ):
+            parent_id = None
         (
             remote_status_ts,
             remote_status_by,
@@ -3124,6 +3154,56 @@ def merge_import_tasks(
                         source_event_id=remote_event_id,
                     )
                     updated_fields += 1
+            else:
+                desc = remote.get("description") if import_content else None
+                notes = remote.get("notes") if import_content else None
+                created_at = remote.get("created_at") or fallback_ts or now
+                updated_at = remote.get("updated_at") or fallback_ts or created_at
+                tombstone_status = remote.get("status", "archived")
+                if tombstone_status not in TASK_HIDDEN_STATUSES:
+                    tombstone_status = "archived"
+                conn.execute(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(id, title, description, status, priority, section, due_date, "
+                    "project, parent_id, notes, recurring, reminder_at, type, assignee, shared_by, "
+                    "visibility, publish_requested_at, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        tid,
+                        remote.get("title", ""),
+                        desc,
+                        tombstone_status,
+                        remote.get("priority", "medium"),
+                        remote.get("section", "inbox"),
+                        remote.get("due_date"),
+                        remote.get("project"),
+                        parent_id,
+                        notes,
+                        remote.get("recurring"),
+                        remote.get("reminder_at"),
+                        remote.get("type", "task"),
+                        remote.get("assignee"),
+                        remote.get("shared_by"),
+                        remote.get("visibility", "private"),
+                        remote.get("publish_requested_at"),
+                        created_at,
+                        updated_at,
+                    ),
+                )
+                for field in MERGEABLE_FIELDS:
+                    fts, fby, forder, fevent = _parse_field_ts(
+                        remote_fts, field, fallback_ts
+                    )
+                    _store_task_field_version(
+                        conn,
+                        tid,
+                        field,
+                        updated_at=fts,
+                        updated_by=fby,
+                        updated_order=forder,
+                        source_event_id=fevent,
+                    )
+                new_count += 1
             continue
 
         # Match by UUID only — authoritative in LWW model
@@ -3332,7 +3412,7 @@ def merge_import_tasks(
                     remote.get("section", "inbox"),
                     remote.get("due_date"),
                     remote.get("project"),
-                    remote.get("parent_id"),
+                    parent_id,
                     notes,
                     remote.get("recurring"),
                     remote.get("reminder_at"),
@@ -3367,7 +3447,7 @@ def merge_import_tasks(
         if not remote_links:
             continue
         tid = rt.get("id", "")
-        if not _SAFE_TASK_ID.match(tid):
+        if not isinstance(tid, str) or not tid:
             continue
         local_task = conn.execute(
             "SELECT id FROM tasks WHERE id = ?", (tid,)
@@ -3404,10 +3484,10 @@ def merge_import_tasks(
 
 def load_task_content(task_id: str, bridge_dir: str) -> dict | None:
     """Lazy-load full task (notes/description) from bridge per-task file."""
-    if not _SAFE_TASK_ID.match(task_id):
+    if not isinstance(task_id, str) or not task_id:
         return None
     real_base = os.path.realpath(bridge_dir)
-    task_file = Path(bridge_dir) / "tasks" / f"{task_id}.json"
+    task_file = _task_storage_path(task_id, bridge_dir)
     if not os.path.realpath(task_file).startswith(real_base):
         return None  # path traversal attempt
     if not task_file.exists():
@@ -3479,11 +3559,14 @@ def migrate_to_per_task_files(bridge_dir: str) -> bool:
         count = 0
         for task in tasks:
             tid = task.get("id")
-            if not tid or not _SAFE_TASK_ID.match(tid):
+            if not isinstance(tid, str) or not tid:
                 continue
             if "_field_ts" not in task:
                 task["_field_ts"] = {}
-            (tmp_dir / f"{tid}.json").write_text(json_dumps(task), encoding="utf-8")
+            (tmp_dir / f"{_task_storage_stem(tid)}.json").write_text(
+                json_dumps(task),
+                encoding="utf-8",
+            )
             count += 1
 
         # Atomic rename
@@ -3714,8 +3797,6 @@ def load_remote_tasks_for_merge(
     remote_tasks = idx_data.get("tasks", [])
     enriched = 0
     for task in remote_tasks:
-        if task.get("_tombstone"):
-            continue
         content = load_task_content(task.get("id", ""), bridge_dir)
         if not content:
             continue

@@ -8,7 +8,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from db_utils import import_remote_bridge_data, record_memory_event
+from db_utils import (
+    export_index_json,
+    export_task_files,
+    import_remote_bridge_data,
+    load_remote_tasks_for_merge,
+    merge_import_tasks,
+    now_iso,
+    record_memory_event,
+)
 from schema import init_db
 
 
@@ -259,3 +267,90 @@ def test_import_remote_bridge_data_uses_event_heads_for_fact_merge(conn):
 
     assert result["facts"] == 0
     assert fact["object_text"] == "Redis"
+
+
+def test_bridge_roundtrip_keeps_unsafe_ids_and_recent_tombstones(conn):
+    source_db, base_dir = conn
+    bridge_dir = os.path.join(base_dir, "bridge")
+    os.makedirs(bridge_dir, exist_ok=True)
+
+    created = now_iso()
+    source_db.execute(
+        "INSERT INTO tasks (id, title, description, notes, status, section, priority, "
+        "type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "test_inbox_2",
+            "Unsafe active task",
+            "Unsafe active description",
+            "Unsafe active notes",
+            "not_started",
+            "inbox",
+            "medium",
+            "task",
+            created,
+            created,
+        ),
+    )
+    source_db.execute(
+        "INSERT INTO tasks (id, title, description, notes, status, section, priority, "
+        "type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "archived-1",
+            "Archived task",
+            "Archived description",
+            "Archived notes",
+            "archived",
+            "inbox",
+            "medium",
+            "task",
+            created,
+            created,
+        ),
+    )
+    source_db.execute(
+        "INSERT INTO tasks (id, title, description, notes, status, section, priority, "
+        "type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "cancelled-1",
+            "Cancelled task",
+            "Cancelled description",
+            "Cancelled notes",
+            "cancelled",
+            "inbox",
+            "medium",
+            "task",
+            created,
+            created,
+        ),
+    )
+
+    export_task_files(source_db, bridge_dir)
+    export_index_json(source_db, bridge_dir)
+    remote_tasks, loaded = load_remote_tasks_for_merge(bridge_dir, {})
+
+    recovered_db_path = os.path.join(base_dir, "recovered.db")
+    init_db(recovered_db_path)
+    recovered = sqlite3.connect(recovered_db_path, isolation_level=None)
+    recovered.row_factory = sqlite3.Row
+    recovered.execute("PRAGMA foreign_keys=ON")
+    try:
+        new_count, updated = merge_import_tasks(
+            recovered,
+            remote_tasks,
+            import_content=True,
+        )
+        assert loaded is True
+        assert new_count == 3
+        assert updated == 0
+        rows = recovered.execute(
+            "SELECT id, status, description, notes FROM tasks ORDER BY id"
+        ).fetchall()
+        by_id = {row["id"]: dict(row) for row in rows}
+        assert set(by_id) == {"archived-1", "cancelled-1", "test_inbox_2"}
+        assert by_id["test_inbox_2"]["status"] == "not_started"
+        assert by_id["archived-1"]["status"] == "archived"
+        assert by_id["cancelled-1"]["status"] == "cancelled"
+        assert by_id["archived-1"]["description"] == "Archived description"
+        assert by_id["cancelled-1"]["notes"] == "Cancelled notes"
+    finally:
+        recovered.close()

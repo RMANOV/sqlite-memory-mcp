@@ -11,9 +11,12 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from db_utils import (
+    _task_storage_stem,
     export_index_json,
     export_task_files,
     json_loads,
+    load_remote_tasks_for_merge,
+    load_task_content,
     now_iso,
     upsert_field_versions,
 )
@@ -145,7 +148,7 @@ class TestExportTaskFiles:
         assert "_links" in data
 
     def test_archived_cancelled_excluded(self, setup):
-        """Archived and cancelled tasks are not exported."""
+        """Recent archived/cancelled tasks also get per-task bridge files."""
         conn, bridge_dir = setup
         _insert_task(conn, "task-active", "Active task")
         _insert_task(conn, "task-arch", "Archived task", status="archived")
@@ -153,10 +156,55 @@ class TestExportTaskFiles:
 
         exported = export_task_files(conn, bridge_dir)
 
-        assert exported == ["task-active"]
+        assert set(exported) == {"task-active", "task-arch", "task-cancel"}
         tasks_dir = os.path.join(bridge_dir, "tasks")
-        assert not os.path.exists(os.path.join(tasks_dir, "task-arch.json"))
-        assert not os.path.exists(os.path.join(tasks_dir, "task-cancel.json"))
+        assert os.path.exists(os.path.join(tasks_dir, "task-active.json"))
+        assert os.path.exists(os.path.join(tasks_dir, "task-arch.json"))
+        assert os.path.exists(os.path.join(tasks_dir, "task-cancel.json"))
+
+    def test_unsafe_task_id_uses_encoded_filename(self, setup):
+        """Legacy unsafe IDs must export via a deterministic safe filename."""
+        conn, bridge_dir = setup
+        task_id = "task_bad_1"
+        _insert_task(conn, task_id, "Unsafe id task")
+
+        exported = export_task_files(conn, bridge_dir)
+
+        stem = _task_storage_stem(task_id)
+        tasks_dir = os.path.join(bridge_dir, "tasks")
+        assert task_id in exported
+        assert stem != task_id
+        assert os.path.isfile(os.path.join(tasks_dir, f"{stem}.json"))
+        data = load_task_content(task_id, bridge_dir)
+        assert data is not None
+        assert data["id"] == task_id
+        assert data["title"] == "Unsafe id task"
+
+    def test_recent_tombstones_keep_content_for_bootstrap(self, setup):
+        """Recent tombstones should keep description/notes for fresh imports."""
+        conn, bridge_dir = setup
+        _insert_task(
+            conn,
+            "task-cancel",
+            "Cancelled task",
+            status="cancelled",
+            description="Cancelled task details",
+        )
+        conn.execute(
+            "UPDATE tasks SET notes = ? WHERE id = ?",
+            ("Cancelled task notes", "task-cancel"),
+        )
+
+        export_task_files(conn, bridge_dir)
+        export_index_json(conn, bridge_dir)
+
+        tasks, loaded_from_index = load_remote_tasks_for_merge(bridge_dir, {})
+
+        assert loaded_from_index is True
+        task = next(t for t in tasks if t["id"] == "task-cancel")
+        assert task["_tombstone"] is True
+        assert task["description"] == "Cancelled task details"
+        assert task["notes"] == "Cancelled task notes"
 
     def test_content_aware_preserves_bridge_description(self, setup):
         """NULL local description is filled from existing bridge file, not overwritten."""
