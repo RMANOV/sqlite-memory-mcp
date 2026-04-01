@@ -253,6 +253,29 @@ class TestExportTaskFiles:
         )
         assert data["description"] == "Local description"
 
+    def test_content_aware_preserves_existing_bridge_on_suspicious_shrink(self, setup):
+        """Suspicious local shrink must not overwrite richer bridge content."""
+        conn, bridge_dir = setup
+        _insert_task(conn, "task-001", "My task", description="x" * 500)
+
+        tasks_dir = os.path.join(bridge_dir, "tasks")
+        os.makedirs(tasks_dir, exist_ok=True)
+        existing = {
+            "id": "task-001",
+            "description": "x" * 5000,
+            "notes": None,
+        }
+        open(os.path.join(tasks_dir, "task-001.json"), "w", encoding="utf-8").write(
+            json.dumps(existing)
+        )
+
+        export_task_files(conn, bridge_dir)
+
+        data = json_loads(
+            open(os.path.join(tasks_dir, "task-001.json"), encoding="utf-8").read()
+        )
+        assert len(data["description"]) == 5000
+
     def test_stale_file_cleanup_on_full_export(self, setup):
         """Full export (changed_since=None) removes files for tasks no longer active."""
         conn, bridge_dir = setup

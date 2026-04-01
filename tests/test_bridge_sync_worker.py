@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import bridge_sync_worker
-from bridge_sync_worker import _check_sync_safety
+from bridge_sync_worker import _auto_heal_sync_safety, _check_sync_safety
 import db_utils
 from schema import init_db
 
@@ -65,6 +65,63 @@ def test_check_sync_safety_flags_drastic_description_shrink(setup):
     assert safety["is_safe"] is False
     assert safety["descriptions_shrunk"] == 1
     assert safety["examples"][0]["task_id"] == task_id
+
+
+def test_auto_heal_sync_safety_restores_bridge_content(tmp_path):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = str(tmp_path / "bridge")
+    os.makedirs(os.path.join(bridge_dir, "tasks"), exist_ok=True)
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        now = db_utils.now_iso()
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, status, section, priority, type, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-restore",
+                "Needs restore",
+                "x" * 500,
+                "not_started",
+                "inbox",
+                "medium",
+                "task",
+                now,
+                now,
+            ),
+        )
+        with open(
+            os.path.join(bridge_dir, "tasks", "task-restore.json"),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                {
+                    "id": "task-restore",
+                    "title": "Needs restore",
+                    "description": "x" * 5000,
+                    "notes": "Bridge notes",
+                    "updated_at": now,
+                },
+                fh,
+            )
+
+        repairs = _auto_heal_sync_safety(conn, bridge_dir)
+        row = conn.execute(
+            "SELECT description, notes FROM tasks WHERE id = 'task-restore'"
+        ).fetchone()
+        safety = _check_sync_safety(conn, bridge_dir)
+
+        assert repairs["tasks_touched"] == 1
+        assert repairs["restored_descriptions"] == 1
+        assert repairs["restored_notes"] == 1
+        assert len(row["description"]) == 5000
+        assert row["notes"] == "Bridge notes"
+        assert safety["is_safe"] is True
+    finally:
+        conn.close()
 
 
 def _cp(args, returncode=0, stdout="", stderr=""):
@@ -229,6 +286,87 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert result["pushed"] is True
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
+
+
+def test_bridge_sync_worker_auto_heals_shrink_instead_of_blocking(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "tasks").mkdir(parents=True)
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    now = db_utils.now_iso()
+    conn.execute(
+        "INSERT INTO tasks (id, title, description, status, section, priority, type, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "task-001",
+            "Shrink task",
+            "x" * 500,
+            "not_started",
+            "inbox",
+            "medium",
+            "task",
+            now,
+            now,
+        ),
+    )
+    conn.close()
+
+    with open(bridge_dir / "tasks" / "task-001.json", "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "id": "task-001",
+                "title": "Shrink task",
+                "description": "x" * 5000,
+                "notes": None,
+                "updated_at": now,
+            },
+            fh,
+        )
+
+    git_calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    result = bridge_sync_worker.main(
+        force=False,
+        bridge_repo=str(bridge_dir),
+        db_path=db_path,
+    )
+
+    healed_conn = sqlite3.connect(db_path, isolation_level=None)
+    healed_conn.row_factory = sqlite3.Row
+    try:
+        row = healed_conn.execute(
+            "SELECT description FROM tasks WHERE id = 'task-001'"
+        ).fetchone()
+    finally:
+        healed_conn.close()
+
+    assert result["pushed"] is True
+    assert result.get("blocked_by_safety") is not True
+    assert len(row["description"]) == 5000
 
 
 def test_export_tasks_prefers_authoritative_status_event(tmp_path):

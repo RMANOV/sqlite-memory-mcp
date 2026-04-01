@@ -2844,8 +2844,14 @@ def export_task_files(
             try:
                 existing = json_loads(task_path.read_text(encoding="utf-8"))
                 for content_field in CONTENT_FIELDS:
-                    if not task.get(content_field) and existing.get(content_field):
-                        task[content_field] = existing[content_field]
+                    local_content = task.get(content_field)
+                    existing_content = existing.get(content_field)
+                    if not has_meaningful_content(
+                        local_content
+                    ) and has_meaningful_content(existing_content):
+                        task[content_field] = existing_content
+                    elif is_suspicious_content_shrink(existing_content, local_content):
+                        task[content_field] = existing_content
             except (ValueError, OSError):
                 pass
 

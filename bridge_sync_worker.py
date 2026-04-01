@@ -35,6 +35,7 @@ from db_utils import (
     git_run,
     git_retry,
     _NOWIN,
+    record_memory_conflict,
     serialize_entity,
     export_relations,
     now_iso,
@@ -244,6 +245,95 @@ def _check_sync_safety(
         and stats["descriptions_shrunk"] == 0
         and stats["notes_shrunk"] == 0
     )
+    return stats
+
+
+def _auto_heal_sync_safety(conn: sqlite3.Connection, bridge_dir: str) -> dict:
+    """Restore richer bridge content into local DB before export when safe to do so."""
+    tasks_dir = Path(bridge_dir) / "tasks"
+    stats = {
+        "restored_descriptions": 0,
+        "restored_notes": 0,
+        "tasks_touched": 0,
+        "examples": [],
+    }
+    if not tasks_dir.exists():
+        return stats
+
+    for task_file in tasks_dir.glob("*.json"):
+        try:
+            bridge_task = _json_loads(task_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+
+        tid = bridge_task.get("id")
+        if not tid:
+            continue
+
+        local = conn.execute(
+            "SELECT title, status, project, description, notes, updated_at "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        if not local:
+            continue
+
+        changes = {}
+        local_updated_at = local["updated_at"]
+        bridge_updated_at = bridge_task.get("updated_at")
+        for field in ("description", "notes"):
+            bridge_value = bridge_task.get(field)
+            local_value = local[field]
+            if not has_meaningful_content(bridge_value):
+                continue
+            if not has_meaningful_content(local_value):
+                rationale = "bridge content restored over empty local field"
+            elif is_suspicious_content_shrink(bridge_value, local_value):
+                rationale = "bridge content restored after suspicious local shrink"
+            else:
+                continue
+
+            changes[field] = bridge_value
+            if field == "description":
+                stats["restored_descriptions"] += 1
+            else:
+                stats["restored_notes"] += 1
+            if len(stats["examples"]) < 5:
+                stats["examples"].append(
+                    {
+                        "task_id": tid,
+                        "field": field,
+                        "bridge_len": content_length(bridge_value),
+                        "local_len": content_length(local_value),
+                    }
+                )
+            record_memory_conflict(
+                conn,
+                aggregate_kind="task",
+                aggregate_id=tid,
+                field_name=field,
+                local_value=local_value,
+                remote_value=bridge_value,
+                local_updated_at=local_updated_at,
+                remote_updated_at=bridge_updated_at,
+                winner="bridge_restore",
+                rationale=rationale,
+            )
+
+        if not changes:
+            continue
+
+        apply_task_mutation(
+            conn,
+            tid,
+            changes,
+            tool_name="bridge_sync_worker.safety_restore",
+            actor_id="bridge_sync_worker",
+            source_kind="bridge_task",
+            source_ref=tid,
+        )
+        stats["tasks_touched"] += 1
+
     return stats
 
 
@@ -655,7 +745,15 @@ def _main_locked(
     # Safety valve: check BEFORE export (bridge files still contain remote data)
     if not force:
         with get_conn(_db_path) as conn:
+            repairs = _auto_heal_sync_safety(conn, bridge_dir)
             safety = _check_sync_safety(conn, bridge_dir)
+        if repairs["tasks_touched"]:
+            log.info(
+                "Safety auto-restore repaired %d tasks (%d descriptions, %d notes)",
+                repairs["tasks_touched"],
+                repairs["restored_descriptions"],
+                repairs["restored_notes"],
+            )
         if not safety["is_safe"]:
             log.warning(
                 "SAFETY VALVE: %d descriptions removed, %d notes removed, "
