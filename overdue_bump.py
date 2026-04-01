@@ -13,6 +13,7 @@ from db_utils import (
     PRIORITY_RANK,
     TASK_ACTIVE_EXCLUSIONS,
     TASK_PRIORITIES,
+    apply_task_mutation,
     get_conn,
     now_iso,
 )
@@ -61,16 +62,24 @@ def run(db_path: str, target_priority: str, dry_run: bool) -> int:
                     )
         else:
             now = now_iso()
-            cur = conn.execute(
-                f"UPDATE tasks SET priority = ?, updated_at = ? "
+            rows = conn.execute(
+                f"SELECT id FROM tasks "
                 f"WHERE due_date < date('now') "
                 f"AND status NOT IN ({_EXCL_PH}) "
                 f"AND priority IN ({ph})",
-                [target_priority, now]
-                + list(TASK_ACTIVE_EXCLUSIONS)
-                + lower_priorities,
+                list(TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
             )
-            print(f"Bumped {cur.rowcount} task(s) to '{target_priority}'.")
+            bumped = 0
+            for row in rows.fetchall():
+                result = apply_task_mutation(
+                    conn,
+                    row["id"],
+                    {"priority": target_priority},
+                    timestamp=now,
+                    tool_name="overdue_bump.run",
+                )
+                bumped += int(result.get("updated", 0))
+            print(f"Bumped {bumped} task(s) to '{target_priority}'.")
 
     return 0
 

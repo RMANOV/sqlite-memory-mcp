@@ -303,6 +303,9 @@ def test_bridge_sync_worker_exports_memory_ledger_sections(tmp_path, monkeypatch
     assert "knowledge_links" in payload
     assert "memory_events" in payload
     assert "memory_audit_issues" in payload
+    assert "memory_artifacts" in payload
+    assert "memory_conflicts" in payload
+    assert "memory_audit_state" in payload
     assert "memory_health" in payload
     assert payload["memory_events"] == []
 

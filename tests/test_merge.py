@@ -932,3 +932,59 @@ def test_merge_repairs_local_stale_status_from_field_event_authority(conn):
 
     assert _task(conn, tid)["status"] == "done"
     assert updated >= 1
+
+
+def test_merge_records_conflict_objects(conn):
+    conn.execute(
+        """
+        CREATE TABLE memory_conflicts (
+            conflict_id TEXT PRIMARY KEY,
+            conflict_key TEXT NOT NULL UNIQUE,
+            aggregate_kind TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            field_name TEXT,
+            local_value TEXT,
+            remote_value TEXT,
+            local_updated_at TEXT,
+            remote_updated_at TEXT,
+            local_updated_order INTEGER NOT NULL DEFAULT 0,
+            remote_updated_order INTEGER NOT NULL DEFAULT 0,
+            local_source_event_id TEXT,
+            remote_source_event_id TEXT,
+            winner TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            rationale TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    tid = "task-conflict"
+    local_ts = "2026-04-01T08:00:00+00:00"
+    remote_ts = "2026-04-01T09:00:00+00:00"
+    _insert_task(conn, tid, title="Local title", updated_at=local_ts)
+    upsert_field_versions(
+        conn, tid, ["title"], timestamp=local_ts, machine_id="machine-A"
+    )
+
+    merge_import_tasks(
+        conn,
+        [
+            {
+                "id": tid,
+                "title": "Remote title",
+                "updated_at": remote_ts,
+                "_field_ts": {"title": [remote_ts, "machine-B"]},
+            }
+        ],
+    )
+
+    row = conn.execute(
+        "SELECT field_name, winner, status FROM memory_conflicts WHERE aggregate_id = ?",
+        (tid,),
+    ).fetchone()
+
+    assert row["field_name"] == "title"
+    assert row["winner"] == "remote"
+    assert row["status"] == "open"

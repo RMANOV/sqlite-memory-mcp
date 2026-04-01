@@ -481,6 +481,60 @@ CREATE TABLE IF NOT EXISTS memory_audit_issues (
 CREATE INDEX IF NOT EXISTS idx_memory_audit_status
     ON memory_audit_issues(status, severity, issue_type);
 
+CREATE TABLE IF NOT EXISTS memory_artifacts (
+    artifact_id          TEXT PRIMARY KEY,
+    artifact_key         TEXT NOT NULL UNIQUE,
+    artifact_kind        TEXT NOT NULL,
+    scope_kind           TEXT NOT NULL,
+    scope_ref            TEXT NOT NULL,
+    title                TEXT NULL,
+    body                 TEXT NOT NULL,
+    confidence           REAL NOT NULL DEFAULT 1.0,
+    status               TEXT NOT NULL DEFAULT 'active',
+    valid_from           TEXT NULL,
+    valid_to             TEXT NULL,
+    source_event_id      TEXT NULL,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_artifacts_scope
+    ON memory_artifacts(artifact_kind, scope_kind, scope_ref, status);
+
+CREATE TABLE IF NOT EXISTS memory_conflicts (
+    conflict_id          TEXT PRIMARY KEY,
+    conflict_key         TEXT NOT NULL UNIQUE,
+    aggregate_kind       TEXT NOT NULL,
+    aggregate_id         TEXT NOT NULL,
+    field_name           TEXT NULL,
+    local_value          TEXT NULL,
+    remote_value         TEXT NULL,
+    local_updated_at     TEXT NULL,
+    remote_updated_at    TEXT NULL,
+    local_updated_order  INTEGER NOT NULL DEFAULT 0,
+    remote_updated_order INTEGER NOT NULL DEFAULT 0,
+    local_source_event_id TEXT NULL,
+    remote_source_event_id TEXT NULL,
+    winner               TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'open',
+    rationale            TEXT NULL,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    resolved_at          TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_conflicts_status
+    ON memory_conflicts(status, aggregate_kind, aggregate_id, field_name);
+
+CREATE TABLE IF NOT EXISTS memory_audit_state (
+    runner_name          TEXT PRIMARY KEY,
+    cadence_minutes      INTEGER NOT NULL DEFAULT 60,
+    last_started_at      TEXT NULL,
+    last_finished_at     TEXT NULL,
+    next_run_after       TEXT NULL,
+    last_status          TEXT NOT NULL DEFAULT 'never',
+    last_summary_json    TEXT NULL,
+    updated_at           TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_field_versions (
     task_id     TEXT NOT NULL,
     field_name  TEXT NOT NULL,
@@ -1086,6 +1140,72 @@ _MIGRATIONS = [
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memory_audit_status'",
         "CREATE INDEX idx_memory_audit_status ON memory_audit_issues(status, severity, issue_type)",
         "idx_memory_audit_status index (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_artifacts'",
+        "CREATE TABLE memory_artifacts ("
+        "artifact_id TEXT PRIMARY KEY, "
+        "artifact_key TEXT NOT NULL UNIQUE, "
+        "artifact_kind TEXT NOT NULL, "
+        "scope_kind TEXT NOT NULL, "
+        "scope_ref TEXT NOT NULL, "
+        "title TEXT NULL, "
+        "body TEXT NOT NULL, "
+        "confidence REAL NOT NULL DEFAULT 1.0, "
+        "status TEXT NOT NULL DEFAULT 'active', "
+        "valid_from TEXT NULL, "
+        "valid_to TEXT NULL, "
+        "source_event_id TEXT NULL, "
+        "created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)",
+        "memory_artifacts table (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memory_artifacts_scope'",
+        "CREATE INDEX idx_memory_artifacts_scope ON memory_artifacts(artifact_kind, scope_kind, scope_ref, status)",
+        "idx_memory_artifacts_scope index (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_conflicts'",
+        "CREATE TABLE memory_conflicts ("
+        "conflict_id TEXT PRIMARY KEY, "
+        "conflict_key TEXT NOT NULL UNIQUE, "
+        "aggregate_kind TEXT NOT NULL, "
+        "aggregate_id TEXT NOT NULL, "
+        "field_name TEXT NULL, "
+        "local_value TEXT NULL, "
+        "remote_value TEXT NULL, "
+        "local_updated_at TEXT NULL, "
+        "remote_updated_at TEXT NULL, "
+        "local_updated_order INTEGER NOT NULL DEFAULT 0, "
+        "remote_updated_order INTEGER NOT NULL DEFAULT 0, "
+        "local_source_event_id TEXT NULL, "
+        "remote_source_event_id TEXT NULL, "
+        "winner TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'open', "
+        "rationale TEXT NULL, "
+        "created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL, "
+        "resolved_at TEXT NULL)",
+        "memory_conflicts table (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memory_conflicts_status'",
+        "CREATE INDEX idx_memory_conflicts_status ON memory_conflicts(status, aggregate_kind, aggregate_id, field_name)",
+        "idx_memory_conflicts_status index (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_audit_state'",
+        "CREATE TABLE memory_audit_state ("
+        "runner_name TEXT PRIMARY KEY, "
+        "cadence_minutes INTEGER NOT NULL DEFAULT 60, "
+        "last_started_at TEXT NULL, "
+        "last_finished_at TEXT NULL, "
+        "next_run_after TEXT NULL, "
+        "last_status TEXT NOT NULL DEFAULT 'never', "
+        "last_summary_json TEXT NULL, "
+        "updated_at TEXT NOT NULL)",
+        "memory_audit_state table (v3.5.0)",
     ),
     (
         "SELECT 1 FROM pragma_table_info('task_field_versions') WHERE name='updated_order'",

@@ -11,10 +11,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from db_utils import (
+    MERGEABLE_FIELDS,
+    _event_sort_key,
+    _store_task_field_version,
     _sqlite_has_column,
     _sqlite_table_exists,
     add_knowledge_link,
@@ -23,11 +26,13 @@ from db_utils import (
     json_loads,
     now_iso,
     record_memory_event,
+    upsert_memory_artifact,
 )
 
 logger = logging.getLogger("sqlite-kb")
 
-_AUDIT_VERSION = "memory_audit_v1"
+_AUDIT_VERSION = "memory_audit_v2"
+_RETRIEVAL_CONTRACT_VERSION = "memory_contract_v2"
 _FACT_ACTIONS = ("supersede", "contradict", "invalidate", "revalidate")
 
 
@@ -82,6 +87,176 @@ def _table_timestamp(
         if row[col]:
             return str(row[col])
     return None
+
+
+def _parse_event_value(raw: Any) -> Any:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return json_loads(raw)
+    except Exception:
+        return raw
+
+
+def _load_task_event_heads(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "memory_events"):
+        return {}
+    rows = conn.execute(
+        "SELECT event_id, field_name, new_value, event_ts, machine_id, logical_clock "
+        "FROM memory_events WHERE aggregate_kind = 'task' AND aggregate_id = ? "
+        "AND field_name IS NOT NULL",
+        (task_id,),
+    ).fetchall()
+    heads: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        field_name = row["field_name"]
+        if not field_name:
+            continue
+        current = heads.get(field_name)
+        candidate = dict(row)
+        if current is None or _event_sort_key(
+            candidate.get("event_ts"),
+            candidate.get("machine_id"),
+            int(candidate.get("logical_clock") or 0),
+        ) > _event_sort_key(
+            current.get("event_ts"),
+            current.get("machine_id"),
+            int(current.get("logical_clock") or 0),
+        ):
+            heads[field_name] = candidate
+    return heads
+
+
+def rebuild_task_from_events(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    repair: bool = False,
+) -> dict[str, Any]:
+    """Rebuild task field state from the event ledger and optionally repair row drift."""
+    if not (
+        _sqlite_table_exists(conn, "tasks")
+        and _sqlite_table_exists(conn, "memory_events")
+        and _sqlite_table_exists(conn, "task_field_versions")
+    ):
+        return {"task_id": task_id, "status": "disabled"}
+    row = conn.execute(
+        "SELECT "
+        + ", ".join([*MERGEABLE_FIELDS, "updated_at"])
+        + " FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "status": "missing"}
+
+    event_heads = _load_task_event_heads(conn, task_id)
+    version_rows = conn.execute(
+        "SELECT field_name, updated_at, updated_by, new_value, updated_order, source_event_id "
+        "FROM task_field_versions WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    versions = {ver["field_name"]: ver for ver in version_rows}
+
+    rebuilt: dict[str, Any] = {}
+    drift: dict[str, dict[str, Any]] = {}
+    max_event_ts = ""
+    for field in MERGEABLE_FIELDS:
+        head = event_heads.get(field)
+        if head is not None:
+            value = _parse_event_value(head.get("new_value"))
+            rebuilt[field] = value
+            max_event_ts = max(max_event_ts, str(head.get("event_ts") or ""))
+        elif field in versions and versions[field]["new_value"] is not None:
+            rebuilt[field] = _parse_event_value(versions[field]["new_value"])
+            max_event_ts = max(max_event_ts, str(versions[field]["updated_at"] or ""))
+        if field in rebuilt and row[field] != rebuilt[field]:
+            drift[field] = {
+                "materialized": row[field],
+                "replayed": rebuilt[field],
+            }
+
+    repaired_fields: list[str] = []
+    if (
+        repair
+        and drift
+        and max_event_ts
+        and str(row["updated_at"] or "") <= max_event_ts
+    ):
+        set_clause = ", ".join(f"{field} = ?" for field in drift)
+        values = [rebuilt[field] for field in drift] + [max_event_ts, task_id]
+        conn.execute(
+            f"UPDATE tasks SET {set_clause}, updated_at = ? WHERE id = ?",
+            values,
+        )
+        for field in drift:
+            version_row = versions.get(field)
+            if version_row is not None:
+                _store_task_field_version(
+                    conn,
+                    task_id,
+                    field,
+                    updated_at=str(version_row["updated_at"] or max_event_ts),
+                    updated_by=str(version_row["updated_by"] or ""),
+                    new_value=str(version_row["new_value"])
+                    if version_row["new_value"] is not None
+                    else None,
+                    updated_order=int(version_row["updated_order"] or 0),
+                    source_event_id=version_row["source_event_id"],
+                )
+        repaired_fields = sorted(drift)
+
+    return {
+        "task_id": task_id,
+        "status": "ok",
+        "rebuilt": rebuilt,
+        "drift": drift,
+        "repaired_fields": repaired_fields,
+        "max_event_ts": max_event_ts or None,
+    }
+
+
+def _repair_context_pack_artifacts(conn: sqlite3.Connection) -> int:
+    if not (
+        _sqlite_table_exists(conn, "context_packs")
+        and _sqlite_table_exists(conn, "memory_artifacts")
+    ):
+        return 0
+    repaired = 0
+    rows = conn.execute(
+        "SELECT pack_id, pack_type, target_ref, body, freshness_score, created_at "
+        "FROM context_packs"
+    ).fetchall()
+    for row in rows:
+        provenance = []
+        if _sqlite_table_exists(conn, "provenance_links"):
+            prov_rows = conn.execute(
+                "SELECT source_kind, source_ref, span_start, span_end, excerpt, confidence "
+                "FROM provenance_links WHERE subject_kind = 'context_pack' AND subject_ref = ?",
+                (row["pack_id"],),
+            ).fetchall()
+            provenance = [dict(prov) for prov in prov_rows]
+        result = upsert_memory_artifact(
+            conn,
+            artifact_kind="summary",
+            scope_kind="context_pack",
+            scope_ref=row["pack_id"],
+            artifact_key=f"summary:context_pack:{row['pack_id']}",
+            title=f"{row['pack_type']} context summary",
+            body=row["body"],
+            confidence=float(row["freshness_score"] or 0.0),
+            created_at=row["created_at"],
+            updated_at=row["created_at"],
+            provenance=provenance,
+            tool_name="memory_audit.repair_context_pack_artifacts",
+        )
+        if result.get("changed"):
+            repaired += 1
+    return repaired
 
 
 def _refresh_contradiction_counts(
@@ -355,7 +530,7 @@ def govern_fact(
     _refresh_contradiction_counts(
         conn, {fact_id} | ({target_fact_id} if target_fact_id else set())
     )
-    record_memory_event(
+    event_meta = record_memory_event(
         conn,
         event_type=f"fact_{action}",
         aggregate_kind="fact",
@@ -381,6 +556,42 @@ def govern_fact(
         source_kind="fact",
         source_ref=target_fact_id or fact_id,
         source_excerpt=rationale,
+    )
+    provenance = [
+        {
+            "source_kind": "fact",
+            "source_ref": fact_id,
+            "excerpt": rationale or f"{action} {fact_id}",
+        }
+    ]
+    if target_fact_id:
+        provenance.append(
+            {
+                "source_kind": "fact",
+                "source_ref": target_fact_id,
+                "excerpt": rationale or f"{action} {target_fact_id}",
+            }
+        )
+    upsert_memory_artifact(
+        conn,
+        artifact_kind="decision",
+        scope_kind="fact",
+        scope_ref=fact_id,
+        artifact_key=f"decision:fact:{fact_id}:{action}:{target_fact_id or ''}:{valid_at}",
+        title=f"Fact {action}",
+        body=(
+            f"Action: {action}\n"
+            f"Fact: {fact_id}\n"
+            f"Target: {target_fact_id or '-'}\n"
+            f"Effective at: {valid_at}\n"
+            f"Rationale: {rationale or '(none)'}"
+        ),
+        confidence=1.0,
+        valid_from=valid_at,
+        source_event_id=event_meta.get("event_id"),
+        updated_at=now,
+        provenance=provenance,
+        tool_name="sqlite-intel.govern_fact",
     )
     return {
         "fact_id": fact_id,
@@ -534,12 +745,17 @@ def run_memory_audit(
         "fact_provenance_backfilled": 0,
         "supersede_links_repaired": 0,
         "contradiction_counts_refreshed": 0,
+        "context_pack_summaries_materialized": 0,
+        "task_materialization_reconciled": 0,
     }
 
     if repair:
         repairs["fact_provenance_backfilled"] = _repair_fact_provenance(conn)
         repairs["supersede_links_repaired"] = _repair_supersede_links(conn)
         repairs["contradiction_counts_refreshed"] = _refresh_contradiction_counts(conn)
+        repairs["context_pack_summaries_materialized"] = _repair_context_pack_artifacts(
+            conn
+        )
 
     def add_issue(
         issue_type: str,
@@ -759,7 +975,7 @@ def run_memory_audit(
                 if "contract_version" in row.keys()
                 else "legacy"
             )
-            if contract_version != "memory_contract_v1":
+            if contract_version != _RETRIEVAL_CONTRACT_VERSION:
                 add_issue(
                     "context_pack_contract_legacy",
                     "low",
@@ -767,6 +983,127 @@ def run_memory_audit(
                     pack_id,
                     {"contract_version": contract_version},
                 )
+
+    if _sqlite_table_exists(conn, "memory_artifacts"):
+        rows = conn.execute(
+            "SELECT artifact_id, artifact_kind, scope_kind, scope_ref, title, updated_at "
+            "FROM memory_artifacts WHERE COALESCE(valid_to, '') = ''"
+        ).fetchall()
+        for row in rows:
+            artifact_id = row["artifact_id"]
+            prov_rows = (
+                conn.execute(
+                    "SELECT source_kind, source_ref FROM provenance_links "
+                    "WHERE subject_kind = 'artifact' AND subject_ref = ?",
+                    (artifact_id,),
+                ).fetchall()
+                if _sqlite_table_exists(conn, "provenance_links")
+                else []
+            )
+            if not prov_rows:
+                add_issue(
+                    "artifact_missing_provenance",
+                    "high",
+                    "artifact",
+                    artifact_id,
+                    {
+                        "artifact_kind": row["artifact_kind"],
+                        "scope_kind": row["scope_kind"],
+                        "scope_ref": row["scope_ref"],
+                        "title": row["title"],
+                    },
+                )
+            stale_sources: list[dict[str, str]] = []
+            artifact_dt = _parse_ts(row["updated_at"])
+            if artifact_dt:
+                for prov in prov_rows:
+                    updated_at = None
+                    if prov["source_kind"] == "fact":
+                        updated_at = _table_timestamp(
+                            conn, "canonical_facts", "fact_id", prov["source_ref"]
+                        )
+                    elif prov["source_kind"] == "claim":
+                        updated_at = _table_timestamp(
+                            conn, "candidate_claims", "claim_id", prov["source_ref"]
+                        )
+                    elif prov["source_kind"] == "chunk":
+                        updated_at = _table_timestamp(
+                            conn, "context_chunks", "chunk_id", prov["source_ref"]
+                        )
+                    elif prov["source_kind"] == "context_pack":
+                        updated_at = _table_timestamp(
+                            conn, "context_packs", "pack_id", prov["source_ref"]
+                        )
+                    updated_dt = _parse_ts(updated_at)
+                    if updated_dt and updated_dt > artifact_dt:
+                        stale_sources.append(
+                            {
+                                "source_kind": prov["source_kind"],
+                                "source_ref": prov["source_ref"],
+                                "updated_at": updated_at or "",
+                            }
+                        )
+                if stale_sources:
+                    add_issue(
+                        "artifact_stale",
+                        "medium",
+                        "artifact",
+                        artifact_id,
+                        {
+                            "artifact_kind": row["artifact_kind"],
+                            "stale_sources": stale_sources[:10],
+                        },
+                    )
+
+    if _sqlite_table_exists(conn, "tasks") and _sqlite_table_exists(
+        conn, "memory_events"
+    ):
+        rows = conn.execute("SELECT id, updated_at FROM tasks").fetchall()
+        for row in rows:
+            rebuilt = rebuild_task_from_events(conn, row["id"], repair=repair)
+            repaired_fields = rebuilt.get("repaired_fields", [])
+            if repaired_fields:
+                repairs["task_materialization_reconciled"] += len(repaired_fields)
+                continue
+            drift = rebuilt.get("drift", {})
+            if not drift:
+                continue
+            max_event_ts = rebuilt.get("max_event_ts")
+            issue_type = (
+                "task_write_bypass"
+                if max_event_ts and str(row["updated_at"] or "") > str(max_event_ts)
+                else "task_materialization_drift"
+            )
+            add_issue(
+                issue_type,
+                "high" if issue_type == "task_write_bypass" else "medium",
+                "task",
+                row["id"],
+                {
+                    "drift_fields": drift,
+                    "task_updated_at": row["updated_at"],
+                    "max_event_ts": max_event_ts,
+                },
+            )
+
+    if _sqlite_table_exists(conn, "memory_conflicts"):
+        rows = conn.execute(
+            "SELECT conflict_id, aggregate_kind, aggregate_id, field_name, winner, rationale "
+            "FROM memory_conflicts WHERE status = 'open'"
+        ).fetchall()
+        for row in rows:
+            add_issue(
+                "memory_conflict_open",
+                "medium",
+                row["aggregate_kind"],
+                row["conflict_id"],
+                {
+                    "aggregate_id": row["aggregate_id"],
+                    "field_name": row["field_name"],
+                    "winner": row["winner"],
+                    "rationale": row["rationale"],
+                },
+            )
 
     if _sqlite_table_exists(conn, "memory_events") and _sqlite_table_exists(
         conn, "bridge_meta"
@@ -841,3 +1178,87 @@ def run_memory_audit(
         "issues": issues,
         "repairs": repairs,
     }
+
+
+def maybe_run_memory_audit(
+    conn: sqlite3.Connection,
+    *,
+    runner_name: str = "background",
+    cadence_minutes: int = 60,
+    repair: bool = True,
+    stale_sync_minutes: int = 120,
+    force: bool = False,
+    emit_event: bool = True,
+) -> dict[str, Any]:
+    """Run the audit only when due, persisting scheduler state in the DB."""
+    if not _sqlite_table_exists(conn, "memory_audit_state"):
+        return run_memory_audit(
+            conn,
+            repair=repair,
+            stale_sync_minutes=stale_sync_minutes,
+            emit_event=emit_event,
+        )
+
+    now = now_iso()
+    row = conn.execute(
+        "SELECT cadence_minutes, next_run_after, last_status FROM memory_audit_state "
+        "WHERE runner_name = ?",
+        (runner_name,),
+    ).fetchone()
+    cadence = max(
+        5, int((row["cadence_minutes"] if row else cadence_minutes) or cadence_minutes)
+    )
+    next_run_after = row["next_run_after"] if row else None
+    next_dt = _parse_ts(next_run_after)
+    if not force and next_dt and next_dt > _parse_ts(now):
+        return {
+            "status": "skipped_due",
+            "runner_name": runner_name,
+            "next_run_after": next_run_after,
+            "audit_version": _AUDIT_VERSION,
+        }
+
+    conn.execute(
+        "INSERT INTO memory_audit_state ("
+        "runner_name, cadence_minutes, last_started_at, last_finished_at, next_run_after, "
+        "last_status, last_summary_json, updated_at"
+        ") VALUES (?, ?, ?, NULL, NULL, 'running', NULL, ?) "
+        "ON CONFLICT(runner_name) DO UPDATE SET "
+        "cadence_minutes = excluded.cadence_minutes, "
+        "last_started_at = excluded.last_started_at, "
+        "last_status = 'running', updated_at = excluded.updated_at",
+        (runner_name, cadence, now, now),
+    )
+    try:
+        result = run_memory_audit(
+            conn,
+            repair=repair,
+            stale_sync_minutes=stale_sync_minutes,
+            emit_event=emit_event,
+        )
+        finished = now_iso()
+        next_after = (_parse_ts(finished) + timedelta(minutes=cadence)).isoformat()
+        conn.execute(
+            "UPDATE memory_audit_state SET last_finished_at = ?, next_run_after = ?, "
+            "last_status = 'success', last_summary_json = ?, updated_at = ? "
+            "WHERE runner_name = ?",
+            (finished, next_after, json_dumps(result), finished, runner_name),
+        )
+        result["runner_name"] = runner_name
+        result["scheduled_next_run_after"] = next_after
+        return result
+    except Exception as exc:
+        failed = now_iso()
+        conn.execute(
+            "UPDATE memory_audit_state SET last_finished_at = ?, next_run_after = ?, "
+            "last_status = 'error', last_summary_json = ?, updated_at = ? "
+            "WHERE runner_name = ?",
+            (
+                failed,
+                (_parse_ts(failed) + timedelta(minutes=cadence)).isoformat(),
+                json_dumps({"error": str(exc)}),
+                failed,
+                runner_name,
+            ),
+        )
+        raise

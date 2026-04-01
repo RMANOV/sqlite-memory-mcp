@@ -11,7 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from memory_audit import (
     govern_fact,
     list_memory_audit_issues,
+    maybe_run_memory_audit,
     replay_memory_events,
+    rebuild_task_from_events,
     run_memory_audit,
 )
 from schema import init_db
@@ -190,3 +192,82 @@ def test_govern_fact_supersede_sets_validity_and_links(conn):
     assert old_row["valid_to"] == "2026-03-31T09:00:00+00:00"
     assert old_row["superseded_by_fact_id"] == "fact-new"
     assert link["relation_type"] == "supersedes"
+
+
+def test_rebuild_task_from_events_repairs_stale_materialization(conn):
+    ts = "2026-03-31T08:00:00+00:00"
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, type, created_at, updated_at) "
+        "VALUES ('task-audit', 'Audit me', 'not_started', 'medium', 'inbox', 'task', ?, ?)",
+        (ts, ts),
+    )
+    conn.execute(
+        "UPDATE tasks SET status = 'not_started', updated_at = ? WHERE id = 'task-audit'",
+        ("2026-03-31T08:01:00+00:00",),
+    )
+    from db_utils import upsert_field_versions
+
+    upsert_field_versions(
+        conn,
+        "task-audit",
+        ("status",),
+        timestamp="2026-03-31T08:05:00+00:00",
+        machine_id="fedora",
+        old_values={"status": "not_started"},
+        new_values={"status": "done"},
+        tool_name="test.rebuild_task",
+    )
+
+    result = rebuild_task_from_events(conn, "task-audit", repair=True)
+    row = conn.execute("SELECT status FROM tasks WHERE id = 'task-audit'").fetchone()
+
+    assert "status" in result["repaired_fields"]
+    assert row["status"] == "done"
+
+
+def test_run_memory_audit_detects_task_write_bypass(conn):
+    ts = "2026-03-31T09:00:00+00:00"
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, type, created_at, updated_at) "
+        "VALUES ('task-bypass', 'Original', 'not_started', 'medium', 'inbox', 'task', ?, ?)",
+        (ts, ts),
+    )
+    from db_utils import upsert_field_versions
+
+    upsert_field_versions(
+        conn,
+        "task-bypass",
+        ("title",),
+        timestamp=ts,
+        machine_id="win",
+        new_values={"title": "Original"},
+        tool_name="test.write_guard",
+    )
+    conn.execute(
+        "UPDATE tasks SET title = 'Bypassed', updated_at = '2026-03-31T10:00:00+00:00' "
+        "WHERE id = 'task-bypass'"
+    )
+
+    result = run_memory_audit(conn, repair=False)
+
+    assert any(issue["issue_type"] == "task_write_bypass" for issue in result["issues"])
+
+
+def test_maybe_run_memory_audit_respects_schedule(conn):
+    first = maybe_run_memory_audit(
+        conn,
+        runner_name="test-runner",
+        cadence_minutes=60,
+        repair=False,
+        emit_event=False,
+    )
+    second = maybe_run_memory_audit(
+        conn,
+        runner_name="test-runner",
+        cadence_minutes=60,
+        repair=False,
+        emit_event=False,
+    )
+
+    assert first["audit_version"] == "memory_audit_v2"
+    assert second["status"] == "skipped_due"

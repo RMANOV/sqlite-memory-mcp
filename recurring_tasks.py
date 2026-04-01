@@ -16,7 +16,13 @@ import sys
 import uuid
 from datetime import date, timedelta
 
-from db_utils import DB_PATH, MERGEABLE_FIELDS, get_conn, now_iso, upsert_field_versions
+from db_utils import (
+    DB_PATH,
+    apply_task_mutation,
+    create_task_with_ledger,
+    get_conn,
+    now_iso,
+)
 
 
 def matches_schedule(config: dict, today: date) -> bool:
@@ -231,40 +237,38 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
                 f"  recurring={raw_recurring}"
             )
         else:
-            conn.execute(
-                """
-                INSERT INTO tasks
-                    (id, title, description, status, priority, section, due_date,
-                     project, parent_id, notes, recurring, type, assignee,
-                     shared_by, visibility, reminder_at, created_at, updated_at)
-                VALUES
-                    (:id, :title, :description, :status, :priority, :section, :due_date,
-                     :project, :parent_id, :notes, :recurring, :type, :assignee,
-                     :shared_by, :visibility, :reminder_at, :created_at, :updated_at)
-                """,
-                new_task,
-            )
-            upsert_field_versions(
+            create_task_with_ledger(
                 conn,
                 new_task["id"],
-                MERGEABLE_FIELDS,
-                timestamp=timestamp,
-                new_values={f: new_task.get(f) for f in MERGEABLE_FIELDS},
+                new_task["title"],
+                timestamp,
+                description=new_task.get("description"),
+                status=new_task.get("status", "not_started"),
+                priority=new_task.get("priority", "medium"),
+                section=new_task.get("section", "inbox"),
+                due_date=new_task.get("due_date"),
+                project=new_task.get("project"),
+                parent_id=new_task.get("parent_id"),
+                notes=new_task.get("notes"),
+                recurring=new_task.get("recurring"),
+                reminder_at=new_task.get("reminder_at"),
+                type=new_task.get("type", "task"),
+                assignee=new_task.get("assignee"),
+                shared_by=new_task.get("shared_by"),
+                visibility=new_task.get("visibility", "private"),
+                publish_requested_at=new_task.get("publish_requested_at"),
+                created_at=new_task.get("created_at"),
+                tool_name="recurring_tasks.process_recurring",
             )
             # Track last_spawned in source task's recurring config for interval scheduling
             config["last_spawned"] = today.isoformat()
             updated_recurring = json.dumps(config)
-            conn.execute(
-                "UPDATE tasks SET recurring = ?, updated_at = ? WHERE id = ?",
-                (updated_recurring, timestamp, task["id"]),
-            )
-            upsert_field_versions(
+            apply_task_mutation(
                 conn,
                 task["id"],
-                ("recurring",),
+                {"recurring": updated_recurring},
                 timestamp=timestamp,
-                old_values={"recurring": raw_recurring},
-                new_values={"recurring": updated_recurring},
+                tool_name="recurring_tasks.process_recurring",
             )
             print(
                 f"  Created: title='{new_task['title']}'"

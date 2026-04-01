@@ -20,6 +20,7 @@ from typing import Any
 from fastmcp_compat import FastMCP
 
 from db_utils import (
+    apply_task_mutation as _apply_task_mutation,
     get_conn as _get_conn,
     get_entity_id as _get_entity_id,
     fts_query as _fts_query,
@@ -313,7 +314,9 @@ def manage_collaborators(
         if not updates:
             return _error("Nothing to update")
 
-        updates = {k: v for k, v in updates.items() if k in _COLLABORATOR_ALLOWED_FIELDS}
+        updates = {
+            k: v for k, v in updates.items() if k in _COLLABORATOR_ALLOWED_FIELDS
+        }
         if not updates:
             return json.dumps({"error": "No valid fields to update"})
         set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -733,20 +736,25 @@ def request_publish(
                 # else already pending/public — skip silently
 
         for tid in task_ids or []:
-            cur = conn.execute(
-                "UPDATE tasks SET visibility='pending_public', "
-                "publish_requested_at=?, updated_at=? "
-                "WHERE id=? AND visibility='private'",
-                (now, now, tid),
+            row = conn.execute(
+                "SELECT visibility FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            if not row:
+                not_found.append(f"task:{tid}")
+                continue
+            if row["visibility"] != "private":
+                continue
+            result = _apply_task_mutation(
+                conn,
+                tid,
+                {
+                    "visibility": "pending_public",
+                    "publish_requested_at": now,
+                },
+                timestamp=now,
+                tool_name="sqlite-collab.request_publish",
             )
-            if cur.rowcount:
-                updated_tasks += cur.rowcount
-            else:
-                row = conn.execute(
-                    "SELECT visibility FROM tasks WHERE id=?", (tid,)
-                ).fetchone()
-                if not row:
-                    not_found.append(f"task:{tid}")
+            updated_tasks += int(result.get("updated", 0))
 
     logger.info(
         "request_publish: %d entities, %d tasks set to pending_public",
@@ -800,13 +808,19 @@ def cancel_publish(
             reverted_entities += cur.rowcount
 
         for tid in task_ids or []:
-            cur = conn.execute(
-                "UPDATE tasks SET visibility='private', "
-                "publish_requested_at=NULL, updated_at=? "
-                "WHERE id=? AND visibility='pending_public'",
-                (now, tid),
+            row = conn.execute(
+                "SELECT visibility FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            if not row or row["visibility"] != "pending_public":
+                continue
+            result = _apply_task_mutation(
+                conn,
+                tid,
+                {"visibility": "private", "publish_requested_at": None},
+                timestamp=now,
+                tool_name="sqlite-collab.cancel_publish",
             )
-            reverted_tasks += cur.rowcount
+            reverted_tasks += int(result.get("updated", 0))
 
     logger.info(
         "cancel_publish: reverted %d entities, %d tasks to private",

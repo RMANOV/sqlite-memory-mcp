@@ -19,12 +19,12 @@ from db_utils import (
     TaskDAO,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
-    MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
     validate_task_fields as _validate_task_fields,
     build_priority_order_sql,
     now_iso as _now,
     setup_logger,
-    upsert_field_versions as _upsert_field_versions,
+    apply_task_mutation as _apply_task_mutation,
+    create_task_with_ledger as _create_task_with_ledger,
 )
 
 # Pre-built SQL for active-task exclusion
@@ -119,12 +119,13 @@ def create_task_or_note(
         if parent_id:
             if not TaskDAO.exists(conn, parent_id):
                 return json.dumps({"error": f"Parent task {parent_id} not found"})
-        TaskDAO.create(
+        _create_task_with_ledger(
             conn,
             task_id,
             title,
             now,
             description=description,
+            status="not_started",
             priority=priority,
             section=section,
             due_date=due_date,
@@ -134,25 +135,7 @@ def create_task_or_note(
             recurring=recurring,
             reminder_at=reminder_at,
             type=type,
-        )
-        _upsert_field_versions(
-            conn,
-            task_id,
-            _MERGEABLE_FIELDS,
-            now,
             tool_name="sqlite-tasks.create_task_or_note",
-            new_values={
-                "title": title,
-                "description": description,
-                "priority": priority,
-                "section": section,
-                "due_date": due_date,
-                "project": project,
-                "parent_id": parent_id,
-                "notes": notes,
-                "recurring": recurring,
-                "type": type,
-            },
         )
         _vec_sync_task_safe(conn, task_id)
 
@@ -244,32 +227,18 @@ def update_task(
     updates["updated_at"] = _now()
 
     with _get_conn() as conn:
-        # Read old values before updating (for field version audit trail)
         changed_keys = [k for k in updates if k != "updated_at"]
-        old_row = (
-            conn.execute(
-                f"SELECT {', '.join(changed_keys)} FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-            if changed_keys
-            else None
-        )
-        old_values = {k: old_row[k] for k in changed_keys} if old_row else {}
-
-        if TaskDAO.update(conn, task_id, updates) == 0:
-            return json.dumps({"error": f"Task {task_id} not found"})
-        new_values = {k: updates[k] for k in changed_keys}
-        _upsert_field_versions(
+        result = _apply_task_mutation(
             conn,
             task_id,
-            changed_keys,
-            updates["updated_at"],
-            old_values=old_values,
-            new_values=new_values,
+            {k: v for k, v in updates.items() if k != "updated_at"},
+            timestamp=updates["updated_at"],
             tool_name="sqlite-tasks.update_task",
         )
+        if result.get("updated", 0) == 0 and result.get("missing"):
+            return json.dumps({"error": f"Task {task_id} not found"})
         # Re-embed if content fields changed
-        if {"title", "description", "notes"} & set(changed_keys):
+        if {"title", "description", "notes"} & set(result.get("changed_fields", ())):
             _vec_sync_task_safe(conn, task_id)
 
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
@@ -525,18 +494,7 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
         return json.dumps({"error": "older_than_days must be non-negative"})
 
     with _get_conn() as conn:
-        now = _now()
         affected_ids = TaskDAO.archive_done(conn, older_than_days)
-        for tid in affected_ids:
-            _upsert_field_versions(
-                conn,
-                tid,
-                ("status",),
-                now,
-                old_values={"status": "done"},
-                new_values={"status": "archived"},
-                tool_name="sqlite-tasks.archive_done_tasks",
-            )
 
     logger.info(
         "archive_done_tasks: %d archived (older than %d days)",
@@ -578,24 +536,15 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
         ).fetchall()
         bumped = 0
         for row in affected:
-            old_priority = conn.execute(
-                "SELECT priority FROM tasks WHERE id = ?", (row["id"],)
-            ).fetchone()
-            TaskDAO.update(
-                conn, row["id"], {"priority": target_priority, "updated_at": now}
-            )
-            _upsert_field_versions(
+            result = _apply_task_mutation(
                 conn,
                 row["id"],
-                ("priority",),
-                now,
-                old_values={
-                    "priority": old_priority["priority"] if old_priority else None
-                },
-                new_values={"priority": target_priority},
+                {"priority": target_priority},
+                timestamp=now,
                 tool_name="sqlite-tasks.bump_overdue_priority",
             )
-            bumped += 1
+            if result.get("updated", 0):
+                bumped += 1
 
     logger.info("bump_overdue_priority: %d bumped to %s", bumped, target_priority)
     return json.dumps({"bumped": bumped, "target_priority": target_priority})

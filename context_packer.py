@@ -29,6 +29,7 @@ from db_utils import (
     add_provenance_link,
     effective_fact_confidence,
     now_iso,
+    upsert_memory_artifact,
 )
 from intelligence_v2 import (
     _new_id,
@@ -46,7 +47,7 @@ _EXECUTOR_MIN_CHUNK_RELEVANCE = 0.45
 _EXECUTOR_MIN_CHUNK_TRUST = 0.30
 _EXECUTOR_PREVIEW_MIN_RELEVANCE = 0.50
 _EXECUTOR_PREVIEW_MIN_QUALITY = 0.50
-_RETRIEVAL_CONTRACT_VERSION = "memory_contract_v1"
+_RETRIEVAL_CONTRACT_VERSION = "memory_contract_v2"
 _MAX_ITEMS_BY_TYPE = {
     "fact": 6,
     "claim": 5,
@@ -58,6 +59,73 @@ _CHUNK_TRUST_BY_STATE = {
     "enrichable": 0.35,
     "uncertain": 0.22,
     "awaiting_human": 0.16,
+}
+_RETRIEVAL_POLICIES: dict[str, dict[str, Any]] = {
+    "planner": {
+        "min_relevance": {
+            "fact": 0.18,
+            "claim": 0.18,
+            "question": 0.18,
+            "chunk": 0.20,
+        },
+        "min_trust": {"chunk": 0.16},
+        "suppress_chunks_if_core_signal": False,
+        "preview_requires_core_signal": False,
+        "preview_min_relevance": 0.0,
+        "preview_min_quality": 0.0,
+    },
+    "reviewer": {
+        "min_relevance": {
+            "fact": 0.18,
+            "claim": 0.18,
+            "question": 0.18,
+            "chunk": 0.22,
+        },
+        "min_trust": {"chunk": 0.18},
+        "suppress_chunks_if_core_signal": False,
+        "preview_requires_core_signal": False,
+        "preview_min_relevance": 0.0,
+        "preview_min_quality": 0.0,
+    },
+    "executor": {
+        "min_relevance": {
+            "fact": 0.18,
+            "claim": 0.22,
+            "question": 0.22,
+            "chunk": _EXECUTOR_MIN_CHUNK_RELEVANCE,
+        },
+        "min_trust": {"chunk": _EXECUTOR_MIN_CHUNK_TRUST},
+        "suppress_chunks_if_core_signal": True,
+        "preview_requires_core_signal": True,
+        "preview_min_relevance": _EXECUTOR_PREVIEW_MIN_RELEVANCE,
+        "preview_min_quality": _EXECUTOR_PREVIEW_MIN_QUALITY,
+    },
+    "bridge_checker": {
+        "min_relevance": {
+            "fact": 0.18,
+            "claim": 0.18,
+            "question": 0.18,
+            "chunk": 0.22,
+        },
+        "min_trust": {"chunk": 0.18},
+        "suppress_chunks_if_core_signal": False,
+        "preview_requires_core_signal": False,
+        "preview_min_relevance": 0.0,
+        "preview_min_quality": 0.0,
+    },
+    "handoff": {
+        "min_relevance": {
+            "fact": 0.18,
+            "claim": 0.18,
+            "question": 0.18,
+            "chunk": 0.20,
+        },
+        "min_trust": {"chunk": 0.16},
+        "suppress_chunks_if_core_signal": False,
+        "preview_requires_core_signal": False,
+        "preview_min_relevance": 0.0,
+        "preview_min_quality": 0.0,
+    },
 }
 
 
@@ -444,6 +512,7 @@ def build_context_pack(
 
     budget = token_budget or config.get("context_pack_token_budget_default", 4000)
     priorities = _PACK_PRIORITIES[pack_type]
+    policy = _RETRIEVAL_POLICIES[pack_type]
 
     # Task-relevant filtering: when target_ref is a task ID, scope to relevant entities
     relevant_names: dict[str, float] = {}
@@ -567,7 +636,7 @@ def build_context_pack(
             f["object_text"],
             entity_name=f["subject"],
         )
-        if is_task_scoped and rel < _MIN_RELEVANCE_THRESHOLD:
+        if is_task_scoped and rel < policy["min_relevance"]["fact"]:
             continue
         trust = max(
             0.55,
@@ -635,7 +704,7 @@ def build_context_pack(
             c["object_text"],
             entity_name=c["subject"],
         )
-        if is_task_scoped and rel < _MIN_RELEVANCE_THRESHOLD:
+        if is_task_scoped and rel < policy["min_relevance"]["claim"]:
             continue
         trust = min(0.7, 0.2 + (_signal_floor(c["confidence"], 0.2) * 0.5))
         freshness = _compute_recency_score(c["created_at"])
@@ -686,7 +755,7 @@ def build_context_pack(
         ).fetchall()
         for q in questions:
             rel = _task_match(q["chunk_title"], q["question_text"])
-            if is_task_scoped and rel < _MIN_RELEVANCE_THRESHOLD:
+            if is_task_scoped and rel < policy["min_relevance"]["question"]:
                 continue
             trust = 0.55
             freshness = _compute_recency_score(q["created_at"])
@@ -730,11 +799,7 @@ def build_context_pack(
             (chunk_limit,),
         ).fetchall()
         for ch in chunks:
-            min_chunk_relevance = _MIN_RELEVANCE_THRESHOLD
-            if pack_type == "executor":
-                min_chunk_relevance = max(
-                    min_chunk_relevance, _EXECUTOR_MIN_CHUNK_RELEVANCE
-                )
+            min_chunk_relevance = policy["min_relevance"]["chunk"]
             rel = _task_match(
                 ch["source_ref"],
                 ch["title"],
@@ -745,7 +810,7 @@ def build_context_pack(
             if is_task_scoped and rel < min_chunk_relevance:
                 continue
             trust = _CHUNK_TRUST_BY_STATE.get(ch["state"], 0.18)
-            if pack_type == "executor" and trust < _EXECUTOR_MIN_CHUNK_TRUST:
+            if trust < float(policy["min_trust"].get("chunk", 0.0)):
                 continue
             freshness = _compute_recency_score(ch["created_at"])
             ts = _format_ts(ch["created_at"])
@@ -806,7 +871,7 @@ def build_context_pack(
         selected, tokens_used, selection_meta = _greedy_select_items(items, budget)
 
     visible_selected = list(selected)
-    if pack_type == "executor" and any(
+    if policy["suppress_chunks_if_core_signal"] and any(
         item["type"] in {"fact", "claim", "question"} for item in selected
     ):
         # Reader/executor views should not mix solid signal with loose fragment dumps.
@@ -861,15 +926,15 @@ def build_context_pack(
     )
 
     previewable = bool(body_parts)
-    if pack_type == "executor":
+    if policy["preview_requires_core_signal"] or policy["preview_min_relevance"] > 0.0:
         has_core_signal = bool(
             sections["facts"] or sections["claims"] or sections["questions"]
         )
         previewable = (
             previewable
-            and has_core_signal
-            and relevance_score >= _EXECUTOR_PREVIEW_MIN_RELEVANCE
-            and quality_score >= _EXECUTOR_PREVIEW_MIN_QUALITY
+            and (has_core_signal if policy["preview_requires_core_signal"] else True)
+            and relevance_score >= float(policy["preview_min_relevance"])
+            and quality_score >= float(policy["preview_min_quality"])
         )
 
     # Compute input signature for caching
@@ -927,6 +992,28 @@ def build_context_pack(
                 confidence=item.get("trust", 0.5),
                 created_at=now,
             )
+        upsert_memory_artifact(
+            conn,
+            artifact_kind="summary",
+            scope_kind="context_pack",
+            scope_ref=pack_id,
+            artifact_key=f"summary:context_pack:{pack_id}",
+            title=f"{pack_type} context summary",
+            body=pack_body,
+            confidence=quality_score,
+            created_at=now,
+            updated_at=now,
+            provenance=[
+                {
+                    "source_kind": item["type"],
+                    "source_ref": str(item.get("id", "")),
+                    "excerpt": item["text"][:400],
+                    "confidence": item.get("trust", 0.5),
+                }
+                for item in visible_selected
+            ],
+            tool_name="context_packer.build_context_pack",
+        )
         _prune_context_pack_history(
             conn,
             pack_type,
@@ -958,6 +1045,12 @@ def build_context_pack(
         "quality_score": round(quality_score, 3),
         "previewable": previewable,
         "contract_version": _RETRIEVAL_CONTRACT_VERSION,
+        "selection_policy": {
+            "pack_type": pack_type,
+            "min_relevance": policy["min_relevance"],
+            "min_trust": policy["min_trust"],
+            "suppress_chunks_if_core_signal": policy["suppress_chunks_if_core_signal"],
+        },
         "advanced_context": {
             "enabled": bool(advanced_strategy.get("enabled")),
             "query_expansion_used": bool(advanced_strategy.get("query_expansion_used")),

@@ -82,11 +82,12 @@ from db_utils import (
     DB_PATH,
     MERGEABLE_FIELDS,
     TaskDAO,
+    apply_task_mutation,
+    create_task_with_ledger,
     get_conn,
     is_overdue,
     now_iso,
     priority_sort_key,
-    upsert_field_versions,
 )
 from schema import init_db
 
@@ -260,7 +261,7 @@ class TaskDB:
         task_id = str(uuid.uuid4())
         now = now_iso()
         with self._transact(self._conn):
-            TaskDAO.create(
+            create_task_with_ledger(
                 self._conn,
                 task_id,
                 title,
@@ -272,22 +273,7 @@ class TaskDB:
                 due_date=due_date,
                 project=project,
                 type=type,
-            )
-            upsert_field_versions(
-                self._conn,
-                task_id,
-                MERGEABLE_FIELDS,
-                now,
-                new_values={
-                    "title": title,
-                    "description": description,
-                    "status": status,
-                    "section": section,
-                    "priority": priority,
-                    "due_date": due_date,
-                    "project": project,
-                    "type": type,
-                },
+                tool_name="task_tray.add_task",
             )
         if self.on_change:
             self.on_change()
@@ -312,23 +298,15 @@ class TaskDB:
         """Set status=done."""
         now = now_iso()
         with self._transact(self._conn):
-            old_row = self._conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            old_status = old_row["status"] if old_row else None
-            updated = TaskDAO.update(
-                self._conn, task_id, {"status": "done", "updated_at": now}
-            )
-            if updated == 0:
-                return False
-            upsert_field_versions(
+            result = apply_task_mutation(
                 self._conn,
                 task_id,
-                ("status",),
-                now,
-                old_values={"status": old_status},
-                new_values={"status": "done"},
+                {"status": "done"},
+                timestamp=now,
+                tool_name="task_tray.mark_done",
             )
+            if result.get("updated", 0) == 0:
+                return False
         if self.on_change:
             self.on_change()
         return True
@@ -339,28 +317,16 @@ class TaskDB:
             return False
         now = now_iso()
         changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
-        fields["updated_at"] = now
         with self._transact(self._conn):
-            if changed:
-                old_row = self._conn.execute(
-                    f"SELECT {', '.join(changed)} FROM tasks WHERE id = ?",
-                    (task_id,),
-                ).fetchone()
-                old_values = {k: old_row[k] for k in changed} if old_row else {}
-            else:
-                old_values = {}
-            updated = TaskDAO.update(self._conn, task_id, fields)
-            if updated == 0:
+            result = apply_task_mutation(
+                self._conn,
+                task_id,
+                fields,
+                timestamp=now,
+                tool_name="task_tray.update_task",
+            )
+            if result.get("updated", 0) == 0:
                 return False
-            if changed:
-                upsert_field_versions(
-                    self._conn,
-                    task_id,
-                    changed,
-                    now,
-                    old_values=old_values,
-                    new_values={k: fields[k] for k in changed},
-                )
         if self.on_change:
             self.on_change()
         return True
@@ -376,21 +342,16 @@ class TaskDB:
                 task_id,
                 "title, recurring, project, parent_id, type, status",
             )
-            old_status = row["status"] if row else None
             # Cancel the target task
-            updated = TaskDAO.update(
-                self._conn, task_id, {"status": "cancelled", "updated_at": now}
-            )
-            if updated == 0:
-                return False
-            upsert_field_versions(
+            result = apply_task_mutation(
                 self._conn,
                 task_id,
-                ("status",),
-                now,
-                old_values={"status": old_status},
-                new_values={"status": "cancelled"},
+                {"status": "cancelled"},
+                timestamp=now,
+                tool_name="task_tray.delete_task",
             )
+            if result.get("updated", 0) == 0:
+                return False
             # For recurring tasks: cancel all done siblings to break spawn cycle
             if row and row["recurring"]:
                 series_key = self._recurring_series_key(row["recurring"])
@@ -411,20 +372,13 @@ class TaskDB:
                     if self._recurring_series_key(s["recurring"]) == series_key
                 ]
                 if sibling_ids:
-                    ph = ",".join("?" * len(sibling_ids))
-                    self._conn.execute(
-                        f"UPDATE tasks SET status='cancelled', updated_at=? "
-                        f"WHERE id IN ({ph})",
-                        [now, *sibling_ids],
-                    )
                     for sid in sibling_ids:
-                        upsert_field_versions(
+                        apply_task_mutation(
                             self._conn,
                             sid,
-                            ("status",),
-                            now,
-                            old_values={"status": "done"},
-                            new_values={"status": "cancelled"},
+                            {"status": "cancelled"},
+                            timestamp=now,
+                            tool_name="task_tray.delete_task",
                         )
         if self.on_change:
             self.on_change()
@@ -1762,6 +1716,20 @@ class TaskTrayApp:
         )
         self._enrich_timer.start(60_000)
 
+        self._audit_timer = QTimer(self.app)
+        self._audit_timer.timeout.connect(
+            lambda: threading.Thread(
+                target=self._run_background_memory_audit, daemon=True
+            ).start()
+        )
+        self._audit_timer.start(10 * 60_000)
+        QTimer.singleShot(
+            15_000,
+            lambda: threading.Thread(
+                target=self._run_background_memory_audit, daemon=True
+            ).start(),
+        )
+
         # Tray icon
         self.tray = QSystemTrayIcon()
         self._update_icon()
@@ -1806,6 +1774,29 @@ class TaskTrayApp:
             summary = self.db.get_summary()
         pm = create_tray_icon_pixmap(summary["overdue"])
         self.tray.setIcon(QIcon(pm))
+
+    def _run_background_memory_audit(self):
+        try:
+            from memory_audit import maybe_run_memory_audit
+
+            with get_conn(self.db.db_path) as conn:
+                result = maybe_run_memory_audit(
+                    conn,
+                    runner_name="tray_background",
+                    cadence_minutes=60,
+                    repair=True,
+                    stale_sync_minutes=120,
+                    emit_event=True,
+                )
+            if result.get("status") not in {"skipped_due", "disabled"}:
+                logger.info(
+                    "background memory audit: open=%s resolved=%s next=%s",
+                    result.get("open_issue_count", 0),
+                    result.get("resolved_issue_count", 0),
+                    result.get("scheduled_next_run_after"),
+                )
+        except Exception as exc:
+            logger.warning("background memory audit failed: %s", exc)
 
     def _tooltip(self, summary=None):
         if summary is None:
@@ -1948,6 +1939,7 @@ class TaskTrayApp:
 
     def _on_quit(self):
         self._enrich_timer.stop()
+        self._audit_timer.stop()
         self._reminder_timer.stop()
         if self._instance_socket:
             self._instance_socket.close()

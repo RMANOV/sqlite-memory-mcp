@@ -30,6 +30,7 @@ from db_utils import (
     DB_PATH,
     PUBLISH_STANDBY_MINUTES,
     TASK_EXPORT_COLS,
+    apply_task_mutation,
     canonicalize_exported_task_statuses,
     git_run,
     git_retry,
@@ -63,6 +64,9 @@ from db_utils import (
     export_knowledge_links,
     export_memory_events,
     export_memory_audit_issues,
+    export_memory_artifacts,
+    export_memory_conflicts,
+    export_memory_audit_state,
     import_remote_bridge_data,
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
@@ -385,6 +389,9 @@ def _export_extended_memory(conn: sqlite3.Connection) -> dict[str, list]:
         "knowledge_links": export_knowledge_links(conn),
         "memory_events": export_memory_events(conn),
         "memory_audit_issues": export_memory_audit_issues(conn),
+        "memory_artifacts": export_memory_artifacts(conn),
+        "memory_conflicts": export_memory_conflicts(conn),
+        "memory_audit_state": export_memory_audit_state(conn),
     }
 
 
@@ -533,11 +540,19 @@ def _main_locked(
             datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
         ).isoformat()
         promote_pending_public_entities(conn, cutoff, export_started_at)
-        conn.execute(
-            "UPDATE tasks SET visibility='public', updated_at = ? "
-            "WHERE visibility='pending_public' AND publish_requested_at <= ?",
-            (export_started_at, cutoff),
-        )
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE visibility='pending_public' "
+            "AND publish_requested_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            apply_task_mutation(
+                conn,
+                row["id"],
+                {"visibility": "public"},
+                timestamp=export_started_at,
+                tool_name="bridge_sync_worker.promote_pending_public",
+            )
 
     # Phase 2: Git pull (no transaction held)
     _progress(progress_callback, 5, "git pull...")
@@ -622,12 +637,14 @@ def _main_locked(
 
     audit_summary: dict | None = None
     try:
-        from memory_audit import run_memory_audit
+        from memory_audit import maybe_run_memory_audit
 
         with get_conn(_db_path) as conn:
             _progress(progress_callback, 18, "Auditing memory...")
-            audit_summary = run_memory_audit(
+            audit_summary = maybe_run_memory_audit(
                 conn,
+                runner_name="bridge_sync",
+                cadence_minutes=60,
                 repair=True,
                 stale_sync_minutes=120,
                 emit_event=False,

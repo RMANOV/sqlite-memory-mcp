@@ -240,3 +240,48 @@ def test_warm_recent_task_packs_only_builds_information_rich_tasks(conn):
 
     assert stats["task_packs_built"] == 1
     assert stats["task_packs_with_context"] == 1
+
+
+def test_persisted_context_pack_materializes_summary_artifact_v2(conn):
+    task_id = "task-artifact"
+    _insert_task(
+        conn,
+        task_id,
+        "Generator Interface",
+        "Need durable summary artifact with provenance.",
+    )
+    _insert_fact(
+        conn,
+        "fact-artifact",
+        subject="Generator Interface",
+        predicate="defines",
+        object_text="generate(mapped_data, client_name, period_start, period_end, output_dir)",
+    )
+
+    result = build_context_pack(
+        conn,
+        pack_type="executor",
+        target_ref=task_id,
+        token_budget=1200,
+        persist=True,
+    )
+
+    artifact = conn.execute(
+        "SELECT artifact_kind, scope_kind, scope_ref, title "
+        "FROM memory_artifacts WHERE artifact_key = ?",
+        (f"summary:context_pack:{result['pack_id']}",),
+    ).fetchone()
+    prov = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM provenance_links "
+        "WHERE subject_kind = 'artifact' AND subject_ref = ("
+        "SELECT artifact_id FROM memory_artifacts WHERE artifact_key = ?"
+        ")",
+        (f"summary:context_pack:{result['pack_id']}",),
+    ).fetchone()["cnt"]
+
+    assert result["contract_version"] == "memory_contract_v2"
+    assert result["selection_policy"]["pack_type"] == "executor"
+    assert artifact["artifact_kind"] == "summary"
+    assert artifact["scope_kind"] == "context_pack"
+    assert artifact["scope_ref"] == result["pack_id"]
+    assert prov >= 1

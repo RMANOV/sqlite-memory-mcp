@@ -1129,6 +1129,237 @@ def effective_fact_confidence(
     return max(0.0, min(1.0, value))
 
 
+def upsert_memory_artifact(
+    conn: sqlite3.Connection,
+    *,
+    artifact_kind: str,
+    scope_kind: str,
+    scope_ref: str,
+    body: str,
+    artifact_key: str | None = None,
+    title: str | None = None,
+    confidence: float = 1.0,
+    status: str = "active",
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    source_event_id: str | None = None,
+    created_at: str | None = None,
+    updated_at: str | None = None,
+    provenance: list[dict[str, Any]] | None = None,
+    tool_name: str | None = None,
+    emit_event: bool = True,
+) -> dict[str, Any]:
+    if not _sqlite_table_exists(conn, "memory_artifacts"):
+        return {"artifact_id": None, "artifact_key": None, "changed": False}
+    now = updated_at or now_iso()
+    key = artifact_key or f"{artifact_kind}:{scope_kind}:{scope_ref}"
+    row = conn.execute(
+        "SELECT artifact_id, title, body, confidence, status, valid_from, valid_to, source_event_id "
+        "FROM memory_artifacts WHERE artifact_key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        artifact_id = _new_event_id()
+        conn.execute(
+            "INSERT INTO memory_artifacts ("
+            "artifact_id, artifact_key, artifact_kind, scope_kind, scope_ref, title, body, "
+            "confidence, status, valid_from, valid_to, source_event_id, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                artifact_id,
+                key,
+                artifact_kind,
+                scope_kind,
+                scope_ref,
+                title,
+                body,
+                confidence,
+                status,
+                valid_from,
+                valid_to,
+                source_event_id,
+                created_at or now,
+                now,
+            ),
+        )
+        changed = True
+    else:
+        artifact_id = row["artifact_id"]
+        changed = any(
+            (
+                row["title"] != title,
+                row["body"] != body,
+                float(row["confidence"] or 0.0) != float(confidence),
+                row["status"] != status,
+                row["valid_from"] != valid_from,
+                row["valid_to"] != valid_to,
+                row["source_event_id"] != source_event_id,
+            )
+        )
+        if changed:
+            conn.execute(
+                "UPDATE memory_artifacts SET title = ?, body = ?, confidence = ?, "
+                "status = ?, valid_from = ?, valid_to = ?, source_event_id = ?, updated_at = ? "
+                "WHERE artifact_id = ?",
+                (
+                    title,
+                    body,
+                    confidence,
+                    status,
+                    valid_from,
+                    valid_to,
+                    source_event_id,
+                    now,
+                    artifact_id,
+                ),
+            )
+
+    for prov in provenance or []:
+        add_provenance_link(
+            conn,
+            subject_kind="artifact",
+            subject_ref=artifact_id,
+            source_kind=str(prov.get("source_kind") or "artifact"),
+            source_ref=str(prov.get("source_ref") or scope_ref),
+            span_start=prov.get("span_start"),
+            span_end=prov.get("span_end"),
+            excerpt=prov.get("excerpt"),
+            confidence=float(prov.get("confidence", 1.0) or 1.0),
+            created_at=now,
+        )
+
+    if emit_event and changed:
+        record_memory_event(
+            conn,
+            event_type="artifact_upserted",
+            aggregate_kind="artifact",
+            aggregate_id=artifact_id,
+            tool_name=tool_name or "db_utils.upsert_memory_artifact",
+            event_ts=now,
+            old_value=dict(row) if row is not None else None,
+            new_value={
+                "artifact_kind": artifact_kind,
+                "scope_kind": scope_kind,
+                "scope_ref": scope_ref,
+                "title": title,
+                "status": status,
+            },
+            payload={
+                "artifact_key": key,
+                "artifact_kind": artifact_kind,
+                "scope_kind": scope_kind,
+                "scope_ref": scope_ref,
+            },
+            source_kind=scope_kind,
+            source_ref=scope_ref,
+            source_excerpt=title or body[:200],
+            parent_event_id=source_event_id,
+        )
+
+    return {
+        "artifact_id": artifact_id,
+        "artifact_key": key,
+        "changed": changed,
+    }
+
+
+def record_memory_conflict(
+    conn: sqlite3.Connection,
+    *,
+    aggregate_kind: str,
+    aggregate_id: str,
+    winner: str,
+    field_name: str | None = None,
+    local_value: Any = None,
+    remote_value: Any = None,
+    local_updated_at: str | None = None,
+    remote_updated_at: str | None = None,
+    local_updated_order: int = 0,
+    remote_updated_order: int = 0,
+    local_source_event_id: str | None = None,
+    remote_source_event_id: str | None = None,
+    rationale: str | None = None,
+    created_at: str | None = None,
+) -> str | None:
+    if not _sqlite_table_exists(conn, "memory_conflicts"):
+        return None
+    now = created_at or now_iso()
+    key_payload = {
+        "aggregate_kind": aggregate_kind,
+        "aggregate_id": aggregate_id,
+        "field_name": field_name,
+        "local_source_event_id": local_source_event_id,
+        "remote_source_event_id": remote_source_event_id,
+        "local_updated_at": local_updated_at,
+        "remote_updated_at": remote_updated_at,
+        "winner": winner,
+        "local_value": _json_text(local_value),
+        "remote_value": _json_text(remote_value),
+    }
+    conflict_key = hashlib.sha256(
+        json_dumps(key_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    row = conn.execute(
+        "SELECT conflict_id FROM memory_conflicts WHERE conflict_key = ?",
+        (conflict_key,),
+    ).fetchone()
+    local_text = _json_text(local_value)
+    remote_text = _json_text(remote_value)
+    if row is None:
+        conflict_id = _new_event_id()
+        conn.execute(
+            "INSERT INTO memory_conflicts ("
+            "conflict_id, conflict_key, aggregate_kind, aggregate_id, field_name, "
+            "local_value, remote_value, local_updated_at, remote_updated_at, "
+            "local_updated_order, remote_updated_order, local_source_event_id, "
+            "remote_source_event_id, winner, status, rationale, created_at, updated_at, resolved_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL)",
+            (
+                conflict_id,
+                conflict_key,
+                aggregate_kind,
+                aggregate_id,
+                field_name,
+                local_text,
+                remote_text,
+                local_updated_at,
+                remote_updated_at,
+                int(local_updated_order or 0),
+                int(remote_updated_order or 0),
+                local_source_event_id,
+                remote_source_event_id,
+                winner,
+                rationale,
+                now,
+                now,
+            ),
+        )
+    else:
+        conflict_id = row["conflict_id"]
+        conn.execute(
+            "UPDATE memory_conflicts SET local_value = ?, remote_value = ?, "
+            "local_updated_at = ?, remote_updated_at = ?, local_updated_order = ?, "
+            "remote_updated_order = ?, local_source_event_id = ?, remote_source_event_id = ?, "
+            "winner = ?, status = 'open', rationale = ?, updated_at = ?, resolved_at = NULL "
+            "WHERE conflict_id = ?",
+            (
+                local_text,
+                remote_text,
+                local_updated_at,
+                remote_updated_at,
+                int(local_updated_order or 0),
+                int(remote_updated_order or 0),
+                local_source_event_id,
+                remote_source_event_id,
+                winner,
+                rationale,
+                now,
+                conflict_id,
+            ),
+        )
+    return conflict_id
+
+
 def promote_pending_public_entities(
     conn: sqlite3.Connection,
     cutoff_ts: str,
@@ -1647,12 +1878,14 @@ class TaskDAO:
         ids = [r["id"] for r in rows]
         if ids:
             now = now_iso()
-            conn.execute(
-                "UPDATE tasks SET status = 'archived', updated_at = ? "
-                "WHERE status = 'done' AND type = 'task' "
-                "AND updated_at < datetime('now', ?)",
-                (now, f"-{older_than_days} days"),
-            )
+            for task_id in ids:
+                apply_task_mutation(
+                    conn,
+                    task_id,
+                    {"status": "archived"},
+                    timestamp=now,
+                    tool_name="db_utils.TaskDAO.archive_done",
+                )
         return ids
 
     @staticmethod
@@ -1663,12 +1896,22 @@ class TaskDAO:
     ) -> int:
         """Promote pending_public tasks to public. Returns count promoted."""
         ts = updated_at or now_iso()
-        cur = conn.execute(
-            "UPDATE tasks SET visibility = 'public', updated_at = ? "
-            "WHERE visibility = 'pending_public' AND publish_requested_at <= ?",
-            (ts, cutoff_ts),
-        )
-        return cur.rowcount
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE visibility = 'pending_public' "
+            "AND publish_requested_at <= ?",
+            (cutoff_ts,),
+        ).fetchall()
+        promoted = 0
+        for row in rows:
+            result = apply_task_mutation(
+                conn,
+                row["id"],
+                {"visibility": "public"},
+                timestamp=ts,
+                tool_name="db_utils.TaskDAO.promote_pending_public",
+            )
+            promoted += int(result.get("updated", 0))
+        return promoted
 
     # ── Task-Entity Link operations ──
 
@@ -1799,12 +2042,245 @@ class TaskDAO:
     @staticmethod
     def promote_due_today(conn: sqlite3.Connection) -> int:
         """Auto-move tasks with due_date <= today from inbox/next to today."""
-        cur = conn.execute(
-            "UPDATE tasks SET section = 'today' "
+        rows = conn.execute(
+            "SELECT id FROM tasks "
             "WHERE due_date <= date('now') AND section IN ('inbox', 'next') "
             "AND status <> 'done' AND type = 'task'"
+        ).fetchall()
+        if not rows:
+            return 0
+        ts = now_iso()
+        moved = 0
+        for row in rows:
+            result = apply_task_mutation(
+                conn,
+                row["id"],
+                {"section": "today"},
+                timestamp=ts,
+                tool_name="db_utils.TaskDAO.promote_due_today",
+            )
+            moved += int(result.get("updated", 0))
+        return moved
+
+
+# ── Authoritative task mutation helpers ─────────────────────────────────
+
+
+def _task_initial_values(
+    *,
+    title: str,
+    description: str | None = None,
+    status: str = "not_started",
+    priority: str = "medium",
+    section: str = "inbox",
+    due_date: str | None = None,
+    project: str | None = None,
+    parent_id: str | None = None,
+    notes: str | None = None,
+    recurring: str | None = None,
+    reminder_at: str | None = None,
+    type: str = "task",
+    assignee: str | None = None,
+    shared_by: str | None = None,
+    visibility: str = "private",
+    publish_requested_at: str | None = None,
+) -> dict[str, Any]:
+    values = {field: None for field in MERGEABLE_FIELDS}
+    values.update(
+        {
+            "title": title,
+            "description": description,
+            "status": status,
+            "priority": priority,
+            "section": section,
+            "due_date": due_date,
+            "project": project,
+            "parent_id": parent_id,
+            "notes": notes,
+            "recurring": recurring,
+            "reminder_at": reminder_at,
+            "type": type,
+            "assignee": assignee,
+            "shared_by": shared_by,
+            "visibility": visibility,
+            "publish_requested_at": publish_requested_at,
+        }
+    )
+    return values
+
+
+def create_task_with_ledger(
+    conn: sqlite3.Connection,
+    task_id: str,
+    title: str,
+    now: str,
+    *,
+    description: str | None = None,
+    status: str = "not_started",
+    priority: str = "medium",
+    section: str = "inbox",
+    due_date: str | None = None,
+    project: str | None = None,
+    parent_id: str | None = None,
+    notes: str | None = None,
+    recurring: str | None = None,
+    reminder_at: str | None = None,
+    type: str = "task",
+    assignee: str | None = None,
+    shared_by: str | None = None,
+    visibility: str = "private",
+    publish_requested_at: str | None = None,
+    created_at: str | None = None,
+    tool_name: str | None = None,
+    actor_type: str = "system",
+    actor_id: str | None = None,
+    source_kind: str = "task",
+    source_ref: str | None = None,
+    provenance_map: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Create a task row and seed authoritative field/event history in one call."""
+    TaskDAO.create(
+        conn,
+        task_id,
+        title,
+        now,
+        description=description,
+        status=status,
+        priority=priority,
+        section=section,
+        due_date=due_date,
+        project=project,
+        parent_id=parent_id,
+        notes=notes,
+        recurring=recurring,
+        reminder_at=reminder_at,
+        type=type,
+        assignee=assignee,
+        shared_by=shared_by,
+        visibility=visibility,
+        publish_requested_at=publish_requested_at,
+        created_at=created_at,
+    )
+    upsert_field_versions(
+        conn,
+        task_id,
+        MERGEABLE_FIELDS,
+        now,
+        old_values={},
+        new_values=_task_initial_values(
+            title=title,
+            description=description,
+            status=status,
+            priority=priority,
+            section=section,
+            due_date=due_date,
+            project=project,
+            parent_id=parent_id,
+            notes=notes,
+            recurring=recurring,
+            reminder_at=reminder_at,
+            type=type,
+            assignee=assignee,
+            shared_by=shared_by,
+            visibility=visibility,
+            publish_requested_at=publish_requested_at,
+        ),
+        tool_name=tool_name,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        source_kind=source_kind,
+        source_ref=source_ref or task_id,
+        provenance_map=provenance_map,
+    )
+
+
+def apply_task_mutation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    changes: dict[str, Any],
+    *,
+    timestamp: str | None = None,
+    machine_id: str | None = None,
+    tool_name: str | None = None,
+    actor_type: str = "system",
+    actor_id: str | None = None,
+    source_kind: str = "task",
+    source_ref: str | None = None,
+    provenance_map: dict[str, dict[str, Any]] | None = None,
+    record_events: bool = True,
+    touch_updated_at: bool = True,
+) -> dict[str, Any]:
+    """Apply task changes and persist matching field/event history.
+
+    This is the preferred write path for any task update outside low-level merge code.
+    """
+    raw_changes = {k: v for k, v in changes.items() if k != "updated_at"}
+    if not raw_changes:
+        return {
+            "updated": 0,
+            "changed_fields": (),
+            "updated_at": timestamp or now_iso(),
+        }
+    unknown = set(raw_changes) - (TaskDAO.ALLOWED_UPDATE_COLUMNS - {"updated_at"})
+    if unknown:
+        raise ValueError(f"Unknown task columns: {sorted(unknown)}")
+
+    changed_fields = tuple(k for k in raw_changes if k in MERGEABLE_FIELDS)
+    select_cols = sorted(set(raw_changes) | {"updated_at"})
+    row = conn.execute(
+        f"SELECT {', '.join(select_cols)} FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {"updated": 0, "changed_fields": (), "missing": True}
+
+    old_values = {field: row[field] for field in changed_fields}
+    effective_changes = {
+        field: value for field, value in raw_changes.items() if row[field] != value
+    }
+    effective_fields = tuple(
+        field for field in changed_fields if field in effective_changes
+    )
+    if not effective_changes:
+        return {
+            "updated": 0,
+            "changed_fields": (),
+            "updated_at": row["updated_at"],
+            "old_values": old_values,
+            "new_values": {},
+        }
+
+    ts = timestamp or now_iso()
+    if touch_updated_at:
+        effective_changes["updated_at"] = ts
+
+    set_clause = ", ".join(f"{field} = ?" for field in effective_changes)
+    values = list(effective_changes.values()) + [task_id]
+    cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
+    if cur.rowcount and effective_fields:
+        upsert_field_versions(
+            conn,
+            task_id,
+            effective_fields,
+            ts,
+            machine_id=machine_id,
+            old_values={field: old_values[field] for field in effective_fields},
+            new_values={field: raw_changes[field] for field in effective_fields},
+            tool_name=tool_name,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source_kind=source_kind,
+            source_ref=source_ref or task_id,
+            provenance_map=provenance_map,
+            record_events=record_events,
         )
-        return cur.rowcount
+    return {
+        "updated": cur.rowcount,
+        "changed_fields": effective_fields,
+        "updated_at": ts,
+        "old_values": {field: old_values[field] for field in effective_fields},
+        "new_values": {field: raw_changes[field] for field in effective_fields},
+    }
 
 
 # ── Bridge Sync v2: Field version tracking ───────────────────────────────
@@ -2682,19 +3158,37 @@ def merge_import_tasks(
                 )
 
                 local_fv = local_fvs.get(field)
+                local_val = task_content_map.get(local_id, {}).get(field)
                 local_ts = local_fv[0] if local_fv else ""
                 local_by = local_fv[1] if local_fv else ""
                 local_order = local_fv[2] if local_fv else 0
+                local_event_id = local_fv[3] if local_fv and len(local_fv) > 3 else None
+                remote_key = _field_version_sort_key(remote_ts, remote_by, remote_order)
+                local_key = _field_version_sort_key(local_ts, local_by, local_order)
 
-                if _field_version_sort_key(
-                    remote_ts, remote_by, remote_order
-                ) > _field_version_sort_key(local_ts, local_by, local_order):
+                if remote_key > local_key:
                     # Content protection: never nullify or drastically shrink local content
                     if field in CONTENT_FIELDS:
-                        local_val = task_content_map.get(local_id, {}).get(field)
                         if has_meaningful_content(
                             local_val
                         ) and not has_meaningful_content(remote_val):
+                            if local_val != remote_val:
+                                record_memory_conflict(
+                                    conn,
+                                    aggregate_kind="task",
+                                    aggregate_id=local_id,
+                                    field_name=field,
+                                    local_value=local_val,
+                                    remote_value=remote_val,
+                                    local_updated_at=local_ts,
+                                    remote_updated_at=remote_ts,
+                                    local_updated_order=local_order,
+                                    remote_updated_order=remote_order,
+                                    local_source_event_id=local_event_id,
+                                    remote_source_event_id=remote_event_id,
+                                    winner="guard_local",
+                                    rationale="content protection kept non-empty local content",
+                                )
                             _log.warning(
                                 "LWW content protection: keeping local %s for task %s "
                                 "(remote is empty but local has %d chars)",
@@ -2704,6 +3198,22 @@ def merge_import_tasks(
                             )
                             continue
                         if is_suspicious_content_shrink(local_val, remote_val):
+                            record_memory_conflict(
+                                conn,
+                                aggregate_kind="task",
+                                aggregate_id=local_id,
+                                field_name=field,
+                                local_value=local_val,
+                                remote_value=remote_val,
+                                local_updated_at=local_ts,
+                                remote_updated_at=remote_ts,
+                                local_updated_order=local_order,
+                                remote_updated_order=remote_order,
+                                local_source_event_id=local_event_id,
+                                remote_source_event_id=remote_event_id,
+                                winner="guard_local",
+                                rationale="shrink guard kept larger local content",
+                            )
                             _log.warning(
                                 "LWW shrink guard: keeping local %s for task %s "
                                 "(remote would shrink %d -> %d chars)",
@@ -2724,6 +3234,40 @@ def merge_import_tasks(
                         source_event_id=remote_event_id,
                     )
                     updated_fields += 1
+                    if local_val != remote_val:
+                        record_memory_conflict(
+                            conn,
+                            aggregate_kind="task",
+                            aggregate_id=local_id,
+                            field_name=field,
+                            local_value=local_val,
+                            remote_value=remote_val,
+                            local_updated_at=local_ts,
+                            remote_updated_at=remote_ts,
+                            local_updated_order=local_order,
+                            remote_updated_order=remote_order,
+                            local_source_event_id=local_event_id,
+                            remote_source_event_id=remote_event_id,
+                            winner="remote",
+                            rationale="remote field version outranked local field version",
+                        )
+                elif local_val != remote_val and (local_ts or remote_ts):
+                    record_memory_conflict(
+                        conn,
+                        aggregate_kind="task",
+                        aggregate_id=local_id,
+                        field_name=field,
+                        local_value=local_val,
+                        remote_value=remote_val,
+                        local_updated_at=local_ts,
+                        remote_updated_at=remote_ts,
+                        local_updated_order=local_order,
+                        remote_updated_order=remote_order,
+                        local_source_event_id=local_event_id,
+                        remote_source_event_id=remote_event_id,
+                        winner="local",
+                        rationale="local field version outranked remote field version",
+                    )
 
             # NULL-fill: adopt remote content fields when local is NULL
             # (non-LWW — only fills gaps, never overwrites existing content)
@@ -4020,6 +4564,172 @@ def import_memory_audit_issues(conn: sqlite3.Connection, issues: list[dict]) -> 
     return imported
 
 
+def export_memory_artifacts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "memory_artifacts"):
+        return []
+    rows = conn.execute(
+        "SELECT artifact_id, artifact_key, artifact_kind, scope_kind, scope_ref, title, "
+        "body, confidence, status, valid_from, valid_to, source_event_id, created_at, updated_at "
+        "FROM memory_artifacts ORDER BY updated_at, artifact_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_memory_artifacts(conn: sqlite3.Connection, artifacts: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "memory_artifacts"):
+        return 0
+    imported = 0
+    for artifact in artifacts:
+        conn.execute(
+            "INSERT INTO memory_artifacts ("
+            "artifact_id, artifact_key, artifact_kind, scope_kind, scope_ref, title, body, "
+            "confidence, status, valid_from, valid_to, source_event_id, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(artifact_key) DO UPDATE SET "
+            "artifact_kind = excluded.artifact_kind, "
+            "scope_kind = excluded.scope_kind, "
+            "scope_ref = excluded.scope_ref, "
+            "title = excluded.title, "
+            "body = excluded.body, "
+            "confidence = excluded.confidence, "
+            "status = excluded.status, "
+            "valid_from = excluded.valid_from, "
+            "valid_to = excluded.valid_to, "
+            "source_event_id = excluded.source_event_id, "
+            "updated_at = excluded.updated_at",
+            (
+                artifact.get("artifact_id") or _new_event_id(),
+                artifact.get("artifact_key"),
+                artifact.get("artifact_kind"),
+                artifact.get("scope_kind"),
+                artifact.get("scope_ref"),
+                artifact.get("title"),
+                artifact.get("body", ""),
+                artifact.get("confidence", 1.0),
+                artifact.get("status", "active"),
+                artifact.get("valid_from"),
+                artifact.get("valid_to"),
+                artifact.get("source_event_id"),
+                artifact.get("created_at") or now_iso(),
+                artifact.get("updated_at") or now_iso(),
+            ),
+        )
+        imported += 1
+    return imported
+
+
+def export_memory_conflicts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "memory_conflicts"):
+        return []
+    rows = conn.execute(
+        "SELECT conflict_id, conflict_key, aggregate_kind, aggregate_id, field_name, "
+        "local_value, remote_value, local_updated_at, remote_updated_at, "
+        "local_updated_order, remote_updated_order, local_source_event_id, remote_source_event_id, "
+        "winner, status, rationale, created_at, updated_at, resolved_at "
+        "FROM memory_conflicts ORDER BY updated_at, conflict_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_memory_conflicts(conn: sqlite3.Connection, conflicts: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "memory_conflicts"):
+        return 0
+    imported = 0
+    for conflict in conflicts:
+        conn.execute(
+            "INSERT INTO memory_conflicts ("
+            "conflict_id, conflict_key, aggregate_kind, aggregate_id, field_name, "
+            "local_value, remote_value, local_updated_at, remote_updated_at, "
+            "local_updated_order, remote_updated_order, local_source_event_id, remote_source_event_id, "
+            "winner, status, rationale, created_at, updated_at, resolved_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(conflict_key) DO UPDATE SET "
+            "aggregate_kind = excluded.aggregate_kind, "
+            "aggregate_id = excluded.aggregate_id, "
+            "field_name = excluded.field_name, "
+            "local_value = excluded.local_value, "
+            "remote_value = excluded.remote_value, "
+            "local_updated_at = excluded.local_updated_at, "
+            "remote_updated_at = excluded.remote_updated_at, "
+            "local_updated_order = excluded.local_updated_order, "
+            "remote_updated_order = excluded.remote_updated_order, "
+            "local_source_event_id = excluded.local_source_event_id, "
+            "remote_source_event_id = excluded.remote_source_event_id, "
+            "winner = excluded.winner, "
+            "status = excluded.status, "
+            "rationale = excluded.rationale, "
+            "updated_at = excluded.updated_at, "
+            "resolved_at = excluded.resolved_at",
+            (
+                conflict.get("conflict_id") or _new_event_id(),
+                conflict.get("conflict_key"),
+                conflict.get("aggregate_kind"),
+                conflict.get("aggregate_id"),
+                conflict.get("field_name"),
+                conflict.get("local_value"),
+                conflict.get("remote_value"),
+                conflict.get("local_updated_at"),
+                conflict.get("remote_updated_at"),
+                conflict.get("local_updated_order", 0),
+                conflict.get("remote_updated_order", 0),
+                conflict.get("local_source_event_id"),
+                conflict.get("remote_source_event_id"),
+                conflict.get("winner", "local"),
+                conflict.get("status", "open"),
+                conflict.get("rationale"),
+                conflict.get("created_at") or now_iso(),
+                conflict.get("updated_at") or now_iso(),
+                conflict.get("resolved_at"),
+            ),
+        )
+        imported += 1
+    return imported
+
+
+def export_memory_audit_state(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _sqlite_table_exists(conn, "memory_audit_state"):
+        return []
+    rows = conn.execute(
+        "SELECT runner_name, cadence_minutes, last_started_at, last_finished_at, "
+        "next_run_after, last_status, last_summary_json, updated_at "
+        "FROM memory_audit_state ORDER BY runner_name"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def import_memory_audit_state(conn: sqlite3.Connection, rows: list[dict]) -> int:
+    if not _sqlite_table_exists(conn, "memory_audit_state"):
+        return 0
+    imported = 0
+    for row in rows:
+        conn.execute(
+            "INSERT INTO memory_audit_state ("
+            "runner_name, cadence_minutes, last_started_at, last_finished_at, next_run_after, "
+            "last_status, last_summary_json, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(runner_name) DO UPDATE SET "
+            "cadence_minutes = excluded.cadence_minutes, "
+            "last_started_at = excluded.last_started_at, "
+            "last_finished_at = excluded.last_finished_at, "
+            "next_run_after = excluded.next_run_after, "
+            "last_status = excluded.last_status, "
+            "last_summary_json = excluded.last_summary_json, "
+            "updated_at = excluded.updated_at",
+            (
+                row.get("runner_name"),
+                row.get("cadence_minutes", 60),
+                row.get("last_started_at"),
+                row.get("last_finished_at"),
+                row.get("next_run_after"),
+                row.get("last_status", "never"),
+                row.get("last_summary_json"),
+                row.get("updated_at") or now_iso(),
+            ),
+        )
+        imported += 1
+    return imported
+
+
 def import_remote_bridge_data(
     conn: sqlite3.Connection,
     bridge_dir: str,
@@ -4044,6 +4754,9 @@ def import_remote_bridge_data(
         "knowledge_links": 0,
         "events": 0,
         "audit_issues": 0,
+        "artifacts": 0,
+        "conflicts": 0,
+        "audit_state": 0,
     }
     remote_events = (
         remote_payload.get("memory_events", [])
@@ -4177,6 +4890,33 @@ def import_remote_bridge_data(
         except sqlite3.Error as exc:
             if logger:
                 logger.warning("Audit issue import failed: %s", exc)
+
+    if isinstance(remote_payload.get("memory_artifacts"), list):
+        try:
+            result["artifacts"] = import_memory_artifacts(
+                conn, remote_payload["memory_artifacts"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Memory artifact import failed: %s", exc)
+
+    if isinstance(remote_payload.get("memory_conflicts"), list):
+        try:
+            result["conflicts"] = import_memory_conflicts(
+                conn, remote_payload["memory_conflicts"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Memory conflict import failed: %s", exc)
+
+    if isinstance(remote_payload.get("memory_audit_state"), list):
+        try:
+            result["audit_state"] = import_memory_audit_state(
+                conn, remote_payload["memory_audit_state"]
+            )
+        except sqlite3.Error as exc:
+            if logger:
+                logger.warning("Memory audit state import failed: %s", exc)
 
     return result
 
