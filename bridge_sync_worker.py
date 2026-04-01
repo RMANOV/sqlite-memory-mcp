@@ -30,6 +30,7 @@ from db_utils import (
     DB_PATH,
     PUBLISH_STANDBY_MINUTES,
     TASK_EXPORT_COLS,
+    canonicalize_exported_task_statuses,
     git_run,
     git_retry,
     _NOWIN,
@@ -308,7 +309,9 @@ def _export_tasks(conn: sqlite3.Connection) -> list[dict]:
         f"SELECT {TASK_EXPORT_COLS} "
         "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
     ).fetchall()
-    return [dict(r) for r in rows]
+    tasks = [dict(r) for r in rows]
+    canonicalize_exported_task_statuses(conn, tasks)
+    return tasks
 
 
 def _export_public_knowledge(conn: sqlite3.Connection) -> tuple[list, list]:
@@ -351,6 +354,7 @@ def _export_public_knowledge(conn: sqlite3.Connection) -> tuple[list, list]:
         "FROM tasks WHERE visibility='public' ORDER BY created_at"
     ).fetchall()
     pub_tasks = [dict(r) for r in task_rows]
+    canonicalize_exported_task_statuses(conn, pub_tasks)
     return pub_entities, pub_tasks
 
 
@@ -602,7 +606,10 @@ def _main_locked(
         if remote_tasks:
             try:
                 new_t, upd_t = merge_import_tasks(
-                    conn, remote_tasks, import_content=True
+                    conn,
+                    remote_tasks,
+                    import_content=True,
+                    remote_events=remote_payload.get("memory_events", []),
                 )
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
             except (

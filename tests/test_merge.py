@@ -833,3 +833,102 @@ def test_packed_logical_clock_order_is_globally_comparable():
     assert _field_version_sort_key("2026-03-31T10:00:01+00:00", "machine-B", newer) > (
         _field_version_sort_key("2026-03-31T10:00:00+00:00", "machine-A", older)
     )
+
+
+def test_merge_repairs_local_stale_status_from_field_event_authority(conn):
+    tid = "task-status-repair"
+    task_ts = "2026-04-01T06:09:06.748385+00:00"
+    status_ts = "2026-03-31T16:06:01.347617+00:00"
+    clock = 116324641102036992
+
+    conn.execute(
+        "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute(
+        "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
+    )
+    conn.execute(
+        """
+        CREATE TABLE memory_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT,
+            aggregate_kind TEXT,
+            aggregate_id TEXT,
+            field_name TEXT,
+            machine_id TEXT,
+            logical_clock INTEGER,
+            event_ts TEXT,
+            new_value TEXT
+        )
+        """
+    )
+
+    _insert_task(conn, tid, title="Repair me", status="not_started", updated_at=task_ts)
+    conn.execute(
+        "INSERT INTO task_field_versions "
+        "(task_id, field_name, updated_at, updated_by, old_value, new_value, updated_order, source_event_id) "
+        "VALUES (?, 'status', ?, ?, ?, ?, ?, ?)",
+        (
+            tid,
+            status_ts,
+            "fedora",
+            "not_started",
+            "done",
+            clock,
+            "event-status-1",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO memory_events "
+        "(event_id, event_type, aggregate_kind, aggregate_id, field_name, machine_id, logical_clock, event_ts, new_value) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "event-status-1",
+            "task_field_set",
+            "task",
+            tid,
+            "status",
+            "fedora",
+            clock,
+            status_ts,
+            "done",
+        ),
+    )
+
+    remote_events = [
+        {
+            "event_id": "event-status-1",
+            "event_type": "task_field_set",
+            "aggregate_kind": "task",
+            "aggregate_id": tid,
+            "field_name": "status",
+            "machine_id": "fedora",
+            "logical_clock": clock,
+            "event_ts": status_ts,
+            "new_value": "done",
+        }
+    ]
+    remote = [
+        {
+            "id": tid,
+            "title": "Repair me",
+            "status": "not_started",
+            "section": "inbox",
+            "priority": "medium",
+            "type": "task",
+            "updated_at": status_ts,
+            "_field_ts": {
+                "status": [status_ts, "fedora", clock, "event-status-1"],
+            },
+        }
+    ]
+
+    _, updated = merge_import_tasks(
+        conn,
+        remote,
+        import_content=False,
+        remote_events=remote_events,
+    )
+
+    assert _task(conn, tid)["status"] == "done"
+    assert updated >= 1

@@ -231,6 +231,35 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
 
 
+def test_export_tasks_prefers_authoritative_status_event(tmp_path):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    task_ts = "2026-04-01T06:09:06.748385+00:00"
+    status_ts = "2026-03-31T16:06:01.347617+00:00"
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        ("task-001", "Task", "not_started", task_ts, task_ts),
+    )
+    db_utils.upsert_field_versions(
+        conn,
+        "task-001",
+        ["status"],
+        timestamp=status_ts,
+        machine_id="fedora",
+        old_values={"status": "not_started"},
+        new_values={"status": "done"},
+        tool_name="task_tray.mark_done",
+    )
+
+    tasks = bridge_sync_worker._export_tasks(conn)
+
+    assert tasks[0]["status"] == "done"
+    conn.close()
+
+
 def test_bridge_sync_worker_exports_memory_ledger_sections(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     bridge_dir = tmp_path / "bridge"

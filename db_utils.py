@@ -1975,6 +1975,294 @@ def _field_version_entry(
     return entry
 
 
+def _normalize_task_status_value(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw == "completed":
+        raw = "done"
+    elif raw == "open":
+        raw = "not_started"
+    return raw if raw in TASK_STATUSES else None
+
+
+def _field_ts_entry_from_status(
+    updated_at: str,
+    updated_by: str,
+    updated_order: int = 0,
+    source_event_id: str | None = None,
+) -> list[Any]:
+    entry: list[Any] = [str(updated_at or ""), str(updated_by or "")]
+    if int(updated_order or 0) or source_event_id is not None:
+        entry.append(int(updated_order or 0))
+    if source_event_id is not None:
+        if len(entry) == 2:
+            entry.append(int(updated_order or 0))
+        entry.append(source_event_id)
+    return entry
+
+
+def _build_event_lookup_by_id(
+    events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    if not events:
+        return lookup
+    for event in events:
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            lookup[event_id] = dict(event)
+    return lookup
+
+
+def _build_task_field_event_heads(
+    events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+    field_name: str,
+) -> dict[str, dict[str, Any]]:
+    heads: dict[str, dict[str, Any]] = {}
+    if not events:
+        return heads
+    for event in events:
+        if (
+            event.get("aggregate_kind") != "task"
+            or event.get("field_name") != field_name
+        ):
+            continue
+        aggregate_id = str(event.get("aggregate_id") or "")
+        if not aggregate_id:
+            continue
+        candidate = dict(event)
+        current = heads.get(aggregate_id)
+        if current is None or _event_sort_key(
+            candidate.get("event_ts"),
+            candidate.get("machine_id"),
+            int(candidate.get("logical_clock") or 0),
+        ) > _event_sort_key(
+            current.get("event_ts"),
+            current.get("machine_id"),
+            int(current.get("logical_clock") or 0),
+        ):
+            heads[aggregate_id] = candidate
+    return heads
+
+
+def _load_memory_events_by_id(
+    conn: sqlite3.Connection,
+    event_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not event_ids or not _sqlite_table_exists(conn, "memory_events"):
+        return {}
+    placeholders = ",".join("?" * len(event_ids))
+    rows = conn.execute(
+        "SELECT event_id, aggregate_id, field_name, machine_id, logical_clock, "
+        "event_ts, new_value FROM memory_events WHERE event_id IN ("
+        + placeholders
+        + ")",
+        tuple(event_ids),
+    ).fetchall()
+    return {row["event_id"]: dict(row) for row in rows}
+
+
+def _load_task_field_event_heads(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    field_name: str,
+) -> dict[str, dict[str, Any]]:
+    if not task_ids or not _sqlite_table_exists(conn, "memory_events"):
+        return {}
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        "SELECT event_id, aggregate_id, field_name, machine_id, logical_clock, "
+        "event_ts, new_value FROM memory_events WHERE aggregate_kind = 'task' "
+        "AND field_name = ? AND aggregate_id IN (" + placeholders + ")",
+        (field_name, *task_ids),
+    ).fetchall()
+    heads: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        aggregate_id = row["aggregate_id"]
+        candidate = dict(row)
+        current = heads.get(aggregate_id)
+        if current is None or _event_sort_key(
+            candidate.get("event_ts"),
+            candidate.get("machine_id"),
+            int(candidate.get("logical_clock") or 0),
+        ) > _event_sort_key(
+            current.get("event_ts"),
+            current.get("machine_id"),
+            int(current.get("logical_clock") or 0),
+        ):
+            heads[aggregate_id] = candidate
+    return heads
+
+
+def _resolve_task_status_authority(
+    current_status: Any,
+    *,
+    field_updated_at: str | None = None,
+    field_updated_by: str | None = None,
+    field_updated_order: int = 0,
+    source_event_id: str | None = None,
+    source_new_value: Any = None,
+    event_by_id: dict[str, dict[str, Any]] | None = None,
+    event_head: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw_status = _normalize_task_status_value(current_status)
+    best = {
+        "value": raw_status or str(current_status or ""),
+        "updated_at": str(field_updated_at or ""),
+        "updated_by": str(field_updated_by or ""),
+        "updated_order": int(field_updated_order or 0),
+        "source_event_id": source_event_id,
+    }
+
+    candidates: list[dict[str, Any]] = []
+    field_value = _normalize_task_status_value(source_new_value)
+    if field_value is not None and field_updated_at:
+        candidates.append(
+            {
+                "value": field_value,
+                "updated_at": str(field_updated_at or ""),
+                "updated_by": str(field_updated_by or ""),
+                "updated_order": int(field_updated_order or 0),
+                "source_event_id": source_event_id,
+                "_sort_key": _field_version_sort_key(
+                    str(field_updated_at or ""),
+                    str(field_updated_by or ""),
+                    int(field_updated_order or 0),
+                ),
+            }
+        )
+
+    seen_events: set[str] = set()
+    for event in (
+        (event_by_id or {}).get(source_event_id) if source_event_id else None,
+        event_head,
+    ):
+        if not event:
+            continue
+        event_id = str(event.get("event_id") or "")
+        if event_id and event_id in seen_events:
+            continue
+        if event_id:
+            seen_events.add(event_id)
+        event_value = _normalize_task_status_value(event.get("new_value"))
+        if event_value is None:
+            continue
+        candidates.append(
+            {
+                "value": event_value,
+                "updated_at": str(event.get("event_ts") or ""),
+                "updated_by": str(event.get("machine_id") or ""),
+                "updated_order": int(event.get("logical_clock") or 0),
+                "source_event_id": event_id or None,
+                "_sort_key": _event_sort_key(
+                    event.get("event_ts"),
+                    event.get("machine_id"),
+                    int(event.get("logical_clock") or 0),
+                ),
+            }
+        )
+
+    if not candidates:
+        return best
+
+    chosen = max(candidates, key=lambda item: item["_sort_key"])
+    return {
+        "value": chosen["value"],
+        "updated_at": chosen["updated_at"],
+        "updated_by": chosen["updated_by"],
+        "updated_order": chosen["updated_order"],
+        "source_event_id": chosen["source_event_id"],
+    }
+
+
+def _compute_authoritative_task_statuses(
+    conn: sqlite3.Connection,
+    tasks: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    task_map = {
+        str(task.get("id") or ""): task
+        for task in tasks
+        if isinstance(task, dict) and task.get("id")
+    }
+    task_ids = list(task_map)
+    if not task_ids:
+        return {}
+
+    placeholders = ",".join("?" * len(task_ids))
+    status_rows: dict[str, sqlite3.Row] = {}
+    if _sqlite_table_exists(conn, "task_field_versions"):
+        cols = ["task_id", "updated_at", "updated_by"]
+        has_new = _sqlite_has_column(conn, "task_field_versions", "new_value")
+        has_order = _sqlite_has_column(conn, "task_field_versions", "updated_order")
+        has_event = _sqlite_has_column(conn, "task_field_versions", "source_event_id")
+        if has_new:
+            cols.append("new_value")
+        if has_order:
+            cols.append("updated_order")
+        if has_event:
+            cols.append("source_event_id")
+        rows = conn.execute(
+            f"SELECT {', '.join(cols)} FROM task_field_versions "
+            "WHERE field_name = 'status' AND task_id IN (" + placeholders + ")",
+            tuple(task_ids),
+        ).fetchall()
+        status_rows = {row["task_id"]: row for row in rows}
+    else:
+        has_new = has_order = has_event = False
+
+    event_ids = [
+        str(row["source_event_id"])
+        for row in status_rows.values()
+        if has_event and row["source_event_id"]
+    ]
+    events_by_id = _load_memory_events_by_id(conn, event_ids)
+    event_heads = _load_task_field_event_heads(conn, task_ids, "status")
+
+    resolved: dict[str, dict[str, Any]] = {}
+    for tid, task in task_map.items():
+        row = status_rows.get(tid)
+        state = _resolve_task_status_authority(
+            task.get("status"),
+            field_updated_at=row["updated_at"] if row else None,
+            field_updated_by=row["updated_by"] if row else None,
+            field_updated_order=int(row["updated_order"] or 0)
+            if row and has_order
+            else 0,
+            source_event_id=row["source_event_id"] if row and has_event else None,
+            source_new_value=row["new_value"] if row and has_new else None,
+            event_by_id=events_by_id,
+            event_head=event_heads.get(tid),
+        )
+        resolved[tid] = state
+    return resolved
+
+
+def canonicalize_exported_task_statuses(
+    conn: sqlite3.Connection,
+    tasks: list[dict[str, Any]],
+) -> None:
+    status_map = _compute_authoritative_task_statuses(conn, tasks)
+    for task in tasks:
+        tid = str(task.get("id") or "")
+        if not tid:
+            continue
+        state = status_map.get(tid)
+        if not state:
+            continue
+        resolved_status = _normalize_task_status_value(state.get("value"))
+        if resolved_status is None:
+            continue
+        task["status"] = resolved_status
+        if "_field_ts" in task and state.get("updated_at"):
+            task["_field_ts"]["status"] = _field_ts_entry_from_status(
+                state.get("updated_at", ""),
+                state.get("updated_by", ""),
+                int(state.get("updated_order") or 0),
+                state.get("source_event_id"),
+            )
+
+
 def export_task_files(
     conn: sqlite3.Connection,
     bridge_dir: str,
@@ -2041,10 +2329,17 @@ def export_task_files(
             }
         )
 
+    tasks_for_export: list[dict[str, Any]] = []
     for tid in task_ids:
         task = task_map[tid]
         task["_field_ts"] = fv_map.get(tid, {})
         task["_links"] = link_map.get(tid, [])
+        tasks_for_export.append(task)
+
+    canonicalize_exported_task_statuses(conn, tasks_for_export)
+
+    for tid in task_ids:
+        task = task_map[tid]
         task_path = tasks_dir / f"{tid}.json"
 
         # Content-aware export: preserve bridge descriptions/notes if local is NULL
@@ -2122,6 +2417,8 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
         entry["_field_ts"] = fv_map.get(r["id"], {})
         tasks.append(entry)
 
+    canonicalize_exported_task_statuses(conn, tasks)
+
     index = {
         "version": 4,
         "format": "bridge_v2",
@@ -2178,6 +2475,7 @@ def merge_import_tasks(
     conn: sqlite3.Connection,
     remote_tasks: list[dict],
     import_content: bool = False,
+    remote_events: list[dict] | None = None,
 ) -> tuple[int, int]:
     """Per-field causal/LWW merge. Returns (new_count, updated_field_count).
 
@@ -2187,6 +2485,8 @@ def merge_import_tasks(
 
     import_content=False: only merge metadata fields (for index.json pull).
     import_content=True: also merge description/notes (for on-demand load).
+    remote_events: optional bridge payload event ledger; used to resolve stale
+    remote[field] values against newer field/event status metadata.
     """
     fields_to_merge = (
         list(MERGEABLE_FIELDS)
@@ -2207,6 +2507,8 @@ def merge_import_tasks(
 
     # Pre-fetch: collect remote IDs that exist locally + their field versions
     remote_ids = [r.get("id") for r in tasks_sorted if r.get("id")]
+    remote_event_by_id = _build_event_lookup_by_id(remote_events)
+    remote_status_heads = _build_task_field_event_heads(remote_events, "status")
     if remote_ids:
         placeholders = ",".join("?" * len(remote_ids))
         existing_rows = conn.execute(
@@ -2239,6 +2541,10 @@ def merge_import_tasks(
         fv_map = {}
         task_content_map = {}
 
+    local_status_authority = _compute_authoritative_task_statuses(
+        conn, list(task_content_map.values())
+    )
+
     for remote in tasks_sorted:
         tid = remote.get("id")
         if not tid or not _SAFE_TASK_ID.match(tid):
@@ -2247,6 +2553,38 @@ def merge_import_tasks(
         sanitize_task_enums(remote)
         remote_fts = remote.get("_field_ts", {})
         fallback_ts = remote.get("updated_at", "")
+        (
+            remote_status_ts,
+            remote_status_by,
+            remote_status_order,
+            remote_status_event_id,
+        ) = _parse_field_ts(remote_fts, "status", fallback_ts)
+        remote_status_state = _resolve_task_status_authority(
+            remote.get("status"),
+            field_updated_at=remote_status_ts,
+            field_updated_by=remote_status_by,
+            field_updated_order=remote_status_order,
+            source_event_id=remote_status_event_id,
+            event_by_id=remote_event_by_id,
+            event_head=remote_status_heads.get(tid),
+        )
+        resolved_remote_status = _normalize_task_status_value(
+            remote_status_state.get("value")
+        )
+        if resolved_remote_status is not None:
+            remote["status"] = resolved_remote_status
+            remote_fts = dict(remote_fts or {})
+            if remote_status_state.get("updated_at"):
+                remote_fts["status"] = _field_ts_entry_from_status(
+                    remote_status_state.get("updated_at", ""),
+                    remote_status_state.get("updated_by", ""),
+                    int(remote_status_state.get("updated_order") or 0),
+                    remote_status_state.get("source_event_id"),
+                )
+                remote["_field_ts"] = remote_fts
+                if remote_status_state.get("updated_at", "") > fallback_ts:
+                    remote["updated_at"] = remote_status_state["updated_at"]
+                    fallback_ts = remote["updated_at"]
 
         # Clock skew detection: warn if remote timestamp is >5s ahead of local
         if not _clock_skew_warned and fallback_ts > now:
@@ -2323,6 +2661,18 @@ def merge_import_tasks(
 
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
+            local_status_state = local_status_authority.get(local_id)
+            local_status_value = _normalize_task_status_value(
+                (local_status_state or {}).get("value")
+            )
+            if (
+                local_status_value is not None
+                and local_status_value
+                != task_content_map.get(local_id, {}).get("status")
+            ):
+                fields_to_update["status"] = local_status_value
+                task_content_map[local_id]["status"] = local_status_value
+                updated_fields += 1
             for field in fields_to_merge:
                 if field not in remote:
                     continue

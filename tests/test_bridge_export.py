@@ -272,6 +272,88 @@ class TestExportTaskFiles:
         assert fts["title"] == ["2026-01-01T00:00:00+00:00", "testmachine"]
         assert "status" in fts
 
+    def test_status_prefers_authoritative_field_event_over_stale_task_row(self, setup):
+        """Export must trust newer field/event status when tasks.status is stale."""
+        conn, bridge_dir = setup
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
+        )
+        conn.execute(
+            """
+            CREATE TABLE memory_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT,
+                aggregate_kind TEXT,
+                aggregate_id TEXT,
+                field_name TEXT,
+                machine_id TEXT,
+                logical_clock INTEGER,
+                event_ts TEXT,
+                new_value TEXT
+            )
+            """
+        )
+
+        task_id = "task-status-sync"
+        task_ts = "2026-04-01T06:09:06.748385+00:00"
+        status_ts = "2026-03-31T16:06:01.347617+00:00"
+        clock = 116324641102036992
+
+        _insert_task(conn, task_id, "Task with stale row", status="not_started")
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            (task_ts, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_field_versions "
+            "(task_id, field_name, updated_at, updated_by, old_value, new_value, updated_order, source_event_id) "
+            "VALUES (?, 'status', ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                status_ts,
+                "fedora",
+                "not_started",
+                "done",
+                clock,
+                "event-status-1",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO memory_events "
+            "(event_id, event_type, aggregate_kind, aggregate_id, field_name, machine_id, logical_clock, event_ts, new_value) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "event-status-1",
+                "task_field_set",
+                "task",
+                task_id,
+                "status",
+                "fedora",
+                clock,
+                status_ts,
+                "done",
+            ),
+        )
+
+        export_task_files(conn, bridge_dir)
+
+        data = json_loads(
+            open(
+                os.path.join(bridge_dir, "tasks", f"{task_id}.json"),
+                encoding="utf-8",
+            ).read()
+        )
+        assert data["status"] == "done"
+        assert data["_field_ts"]["status"] == [
+            status_ts,
+            "fedora",
+            clock,
+            "event-status-1",
+        ]
+
 
 # ── Tests: export_index_json ──────────────────────────────────────────────
 
