@@ -123,6 +123,7 @@ def conn(tmp_path):
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
+
 def _make_task(conn, task_id="t1", title="Test task", **kwargs):
     """Insert a task and seed field versions. Returns task_id."""
     ts = kwargs.pop("now", now_iso())
@@ -142,6 +143,7 @@ def _make_entity(conn, name="EntityA", entity_type="concept"):
 
 
 # ── create / get_by_id ────────────────────────────────────────────────────
+
 
 def test_create_and_get_roundtrip(conn):
     _make_task(conn, "t1", "Buy milk", priority="high", section="today")
@@ -174,6 +176,7 @@ def test_get_by_id_missing(conn):
 
 # ── exists ────────────────────────────────────────────────────────────────
 
+
 def test_exists_true(conn):
     _make_task(conn, "t1")
     assert TaskDAO.exists(conn, "t1") is True
@@ -184,6 +187,7 @@ def test_exists_false(conn):
 
 
 # ── update ────────────────────────────────────────────────────────────────
+
 
 def test_update_single_field(conn):
     _make_task(conn, "t1", "Original")
@@ -196,7 +200,9 @@ def test_update_single_field(conn):
 def test_update_multiple_fields(conn):
     _make_task(conn, "t1", "Task")
     ts = now_iso()
-    rc = TaskDAO.update(conn, "t1", {"status": "done", "priority": "critical", "updated_at": ts})
+    rc = TaskDAO.update(
+        conn, "t1", {"status": "done", "priority": "critical", "updated_at": ts}
+    )
     assert rc == 1
     row = TaskDAO.get_by_id(conn, "t1")
     assert row["status"] == "done"
@@ -215,6 +221,7 @@ def test_update_empty_fields_returns_zero(conn):
 
 # ── delete ────────────────────────────────────────────────────────────────
 
+
 def test_delete_existing(conn):
     _make_task(conn, "t1")
     rc = TaskDAO.delete(conn, "t1")
@@ -228,12 +235,13 @@ def test_delete_missing_returns_zero(conn):
 
 # ── get_active ────────────────────────────────────────────────────────────
 
+
 def test_get_active_excludes_terminal_statuses(conn):
     _make_task(conn, "active", "Active task", status="not_started")
     _make_task(conn, "inprog", "In progress", status="in_progress")
-    _make_task(conn, "done",   "Done task",   status="done")
-    _make_task(conn, "arch",   "Archived",    status="archived")
-    _make_task(conn, "cancel", "Cancelled",   status="cancelled")
+    _make_task(conn, "done", "Done task", status="done")
+    _make_task(conn, "arch", "Archived", status="archived")
+    _make_task(conn, "cancel", "Cancelled", status="cancelled")
 
     active = TaskDAO.get_active(conn)
     ids = {r["id"] for r in active}
@@ -250,6 +258,7 @@ def test_get_active_empty_db(conn):
 
 # ── search (FTS5) ─────────────────────────────────────────────────────────
 
+
 def test_search_finds_by_title(conn):
     _make_task(conn, "t1", "Refactor authentication module")
     _make_task(conn, "t2", "Write unit tests")
@@ -259,7 +268,9 @@ def test_search_finds_by_title(conn):
 
 
 def test_search_finds_by_notes(conn):
-    _make_task(conn, "t1", "Generic task", notes="Remember to check the budget forecast")
+    _make_task(
+        conn, "t1", "Generic task", notes="Remember to check the budget forecast"
+    )
     results = TaskDAO.search(conn, "budget")
     assert len(results) == 1
 
@@ -277,6 +288,7 @@ def test_search_no_match_returns_empty(conn):
 
 # ── count_active ──────────────────────────────────────────────────────────
 
+
 def test_count_active_empty(conn):
     assert TaskDAO.count_active(conn) == 0
 
@@ -284,19 +296,20 @@ def test_count_active_empty(conn):
 def test_count_active_includes_done_excludes_archived(conn):
     # count_active excludes only 'archived' and 'cancelled', NOT 'done'
     _make_task(conn, "t1", "Not started", status="not_started")
-    _make_task(conn, "t2", "Done",        status="done")
-    _make_task(conn, "t3", "Archived",    status="archived")
-    _make_task(conn, "t4", "Cancelled",   status="cancelled")
+    _make_task(conn, "t2", "Done", status="done")
+    _make_task(conn, "t3", "Archived", status="archived")
+    _make_task(conn, "t4", "Cancelled", status="cancelled")
     assert TaskDAO.count_active(conn) == 2  # t1 + t2
 
 
 # ── count_by_visibility ───────────────────────────────────────────────────
 
+
 def test_count_by_visibility(conn):
-    _make_task(conn, "t1", "Private",        visibility="private")
+    _make_task(conn, "t1", "Private", visibility="private")
     _make_task(conn, "t2", "Pending public", visibility="pending_public")
-    _make_task(conn, "t3", "Public",         visibility="public")
-    _make_task(conn, "t4", "Also private",   visibility="private")
+    _make_task(conn, "t3", "Public", visibility="public")
+    _make_task(conn, "t4", "Also private", visibility="private")
 
     assert TaskDAO.count_by_visibility(conn, "private") == 2
     assert TaskDAO.count_by_visibility(conn, "pending_public") == 1
@@ -305,6 +318,7 @@ def test_count_by_visibility(conn):
 
 
 # ── archive_done ──────────────────────────────────────────────────────────
+
 
 def _old_ts(days=10):
     """ISO timestamp N days in the past."""
@@ -340,12 +354,52 @@ def test_archive_done_skips_notes_type(conn):
 
 # ── promote_pending_public ────────────────────────────────────────────────
 
+
+def test_promote_due_today_skips_archived_and_cancelled(conn):
+    today = datetime.now(timezone.utc).date().isoformat()
+    _make_task(
+        conn,
+        "todo",
+        "Due today",
+        due_date=today,
+        section="next",
+        status="not_started",
+    )
+    _make_task(
+        conn,
+        "arch",
+        "Archived due",
+        due_date=today,
+        section="next",
+        status="archived",
+    )
+    _make_task(
+        conn,
+        "cancel",
+        "Cancelled due",
+        due_date=today,
+        section="inbox",
+        status="cancelled",
+    )
+
+    moved = TaskDAO.promote_due_today(conn)
+
+    assert moved == 1
+    assert TaskDAO.get_by_id(conn, "todo")["section"] == "today"
+    assert TaskDAO.get_by_id(conn, "arch")["section"] == "next"
+    assert TaskDAO.get_by_id(conn, "cancel")["section"] == "inbox"
+
+
 def test_promote_pending_public(conn):
     past = _old_ts(1)
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
 
-    _make_task(conn, "t1", "Ready",   visibility="pending_public", publish_requested_at=past)
-    _make_task(conn, "t2", "NotYet",  visibility="pending_public", publish_requested_at=future)
+    _make_task(
+        conn, "t1", "Ready", visibility="pending_public", publish_requested_at=past
+    )
+    _make_task(
+        conn, "t2", "NotYet", visibility="pending_public", publish_requested_at=future
+    )
     _make_task(conn, "t3", "Private", visibility="private")
 
     cutoff = now_iso()
@@ -357,6 +411,7 @@ def test_promote_pending_public(conn):
 
 
 # ── link_entity / unlink_entity / get_task_links / get_entity_tasks / get_linked_entity_ids
+
 
 def test_link_and_get_task_links(conn):
     _make_task(conn, "t1", "Task")
@@ -374,7 +429,7 @@ def test_link_upsert_updates_existing(conn):
     _make_task(conn, "t1", "Task")
     eid = _make_entity(conn, "EntityX")
     TaskDAO.link_entity(conn, "t1", eid, link_type="manual", score=0.5)
-    TaskDAO.link_entity(conn, "t1", eid, link_type="auto",   score=0.8)
+    TaskDAO.link_entity(conn, "t1", eid, link_type="auto", score=0.8)
 
     links = TaskDAO.get_task_links(conn, "t1")
     assert len(links) == 1  # upsert, not duplicate

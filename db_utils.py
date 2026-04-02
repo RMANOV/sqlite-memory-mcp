@@ -2150,7 +2150,7 @@ class TaskDAO:
         rows = conn.execute(
             "SELECT id FROM tasks "
             "WHERE due_date <= date('now') AND section IN ('inbox', 'next') "
-            "AND status <> 'done' AND type = 'task'"
+            "AND status NOT IN ('done', 'archived', 'cancelled') AND type = 'task'"
         ).fetchall()
         if not rows:
             return 0
