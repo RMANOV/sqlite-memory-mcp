@@ -2687,6 +2687,40 @@ def create_task_with_ledger(
     )
 
 
+def mark_tasks_done_by_title(
+    conn: sqlite3.Connection,
+    title_query: str,
+    *,
+    timestamp: str | None = None,
+    tool_name: str | None = None,
+    actor_type: str = "system",
+    actor_id: str | None = None,
+) -> int:
+    """Mark all non-done tasks matching a title substring via the mutation API."""
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE title LIKE ? AND status != 'done'",
+        (f"%{title_query}%",),
+    ).fetchall()
+    if not rows:
+        return 0
+    ts = timestamp or now_iso()
+    marked = 0
+    for row in rows:
+        result = apply_task_mutation(
+            conn,
+            row["id"],
+            {"status": "done", "section": "done"},
+            timestamp=ts,
+            tool_name=tool_name or "db_utils.mark_tasks_done_by_title",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source_kind="task",
+            source_ref=row["id"],
+        )
+        marked += int(result.get("updated", 0))
+    return marked
+
+
 def apply_task_mutation(
     conn: sqlite3.Connection,
     task_id: str,

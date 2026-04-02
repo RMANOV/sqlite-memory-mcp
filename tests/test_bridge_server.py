@@ -190,7 +190,9 @@ def test_bridge_pull_falls_back_to_shared_json_when_index_is_corrupt(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
 
     result = json.loads(bridge_server.bridge_pull.fn())
@@ -229,7 +231,9 @@ def test_bridge_pull_falls_back_to_shared_json_when_entities_index_is_corrupt(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
 
     result = json.loads(bridge_server.bridge_pull.fn())
@@ -255,7 +259,16 @@ def test_bridge_push_merges_remote_entities_task_content_and_ratings(
         conn.execute(
             "INSERT INTO tasks (id, title, description, status, priority, section, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("task-1", "Synced task", "old desc", "not_started", "medium", "inbox", old, old),
+            (
+                "task-1",
+                "Synced task",
+                "old desc",
+                "not_started",
+                "medium",
+                "inbox",
+                old,
+                old,
+            ),
         )
         for field in db_utils.MERGEABLE_FIELDS:
             conn.execute(
@@ -351,10 +364,14 @@ def test_bridge_push_merges_remote_entities_task_content_and_ratings(
 
     def fake_git(*args):
         if args == ("status", "--porcelain"):
-            return _cp(args, stdout="M shared.json\nM index.json\nM entities_index.json\n")
+            return _cp(
+                args, stdout="M shared.json\nM index.json\nM entities_index.json\n"
+            )
         return _cp(args)
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", fake_git)
 
     result = json.loads(bridge_server.bridge_push.fn(force=True))
@@ -424,7 +441,9 @@ def test_bridge_push_does_not_skip_relation_only_changes(bridge_env, monkeypatch
             return _cp(args, stdout="M shared.json\n")
         return _cp(args)
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", fake_git)
 
     result = json.loads(bridge_server.bridge_push.fn())
@@ -475,7 +494,9 @@ def test_bridge_push_promotes_ready_pending_public_tasks_before_skip(
             return _cp(args, stdout="M shared.json\nM index.json\n")
         return _cp(args)
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", fake_git)
 
     result = json.loads(bridge_server.bridge_push.fn())
@@ -551,18 +572,20 @@ def test_bridge_pull_skips_spoofed_collaboration_payloads(bridge_env, monkeypatc
             (entity_id, "existing observation", now),
         )
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
 
     result = json.loads(bridge_server.bridge_pull.fn())
 
     with _db_conn(db_path) as conn:
-        pending = conn.execute("SELECT COUNT(*) AS cnt FROM pending_shared_entities").fetchone()[
-            "cnt"
-        ]
-        ratings = conn.execute("SELECT COUNT(*) AS cnt FROM knowledge_ratings").fetchone()[
-            "cnt"
-        ]
+        pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM pending_shared_entities"
+        ).fetchone()["cnt"]
+        ratings = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM knowledge_ratings"
+        ).fetchone()["cnt"]
 
     assert "staged_shared_knowledge" not in result
     assert "staged_public_knowledge" not in result
@@ -631,18 +654,20 @@ def test_bridge_pull_accepts_bound_collaboration_payloads(bridge_env, monkeypatc
             (entity_id, "existing observation", now),
         )
 
-    monkeypatch.setattr(bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None))
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
     monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
 
     result = json.loads(bridge_server.bridge_pull.fn())
 
     with _db_conn(db_path) as conn:
-        pending = conn.execute("SELECT COUNT(*) AS cnt FROM pending_shared_entities").fetchone()[
-            "cnt"
-        ]
-        ratings = conn.execute("SELECT COUNT(*) AS cnt FROM knowledge_ratings").fetchone()[
-            "cnt"
-        ]
+        pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM pending_shared_entities"
+        ).fetchone()["cnt"]
+        ratings = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM knowledge_ratings"
+        ).fetchone()["cnt"]
 
     assert result["staged_shared_knowledge"] == 1
     assert result["staged_public_knowledge"] == 1
@@ -663,3 +688,110 @@ def test_assign_task_rejects_invalid_github_user(bridge_env):
     result = json.loads(bridge_server.assign_task.fn("task-1", "../bad-user"))
 
     assert "Invalid GitHub username" in result["error"]
+
+
+def test_assign_task_records_field_history_and_events(bridge_env, monkeypatch):
+    db_path, _ = bridge_env
+    now = "2026-03-28T12:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("task-1", "Task", now, now),
+        )
+
+    monkeypatch.setattr(
+        bridge_server.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="alice\n", stderr=""
+        ),
+    )
+
+    result = json.loads(bridge_server.assign_task.fn("task-1", "alice"))
+
+    with _db_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT assignee, shared_by FROM tasks WHERE id = ?",
+            ("task-1",),
+        ).fetchone()
+        fields = conn.execute(
+            "SELECT field_name, source_event_id, new_value FROM task_field_versions "
+            "WHERE task_id = ? AND field_name IN ('assignee', 'shared_by') "
+            "ORDER BY field_name",
+            ("task-1",),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM memory_events "
+            "WHERE aggregate_kind = 'task' AND aggregate_id = ? AND tool_name = ?",
+            ("task-1", "bridge_server.assign_task"),
+        ).fetchone()["cnt"]
+
+    assert result["assignee"] == "alice"
+    assert row["assignee"] == "alice"
+    assert row["shared_by"] == "alice"
+    assert len(fields) == 2
+    assert all(field["source_event_id"] for field in fields)
+    assert {field["new_value"] for field in fields} == {"alice"}
+    assert events == 2
+
+
+def test_review_shared_tasks_approve_creates_ledgered_task(bridge_env):
+    db_path, _ = bridge_env
+    now = "2026-03-28T12:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO pending_shared_tasks "
+            "(id, title, description, status, priority, section, due_date, project, "
+            "parent_id, notes, recurring, type, assignee, shared_by, created_at, updated_at, received_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "shared-task-1",
+                "Shared task",
+                "Bridge description",
+                "not_started",
+                "high",
+                "today",
+                "2026-03-29",
+                "mapping_studio",
+                None,
+                "Bridge notes",
+                None,
+                "task",
+                "alice",
+                "alice",
+                now,
+                now,
+                now,
+            ),
+        )
+
+    result = json.loads(bridge_server.review_shared_tasks.fn(action="approve"))
+
+    with _db_conn(db_path) as conn:
+        task = conn.execute(
+            "SELECT title, project, section, assignee, shared_by FROM tasks WHERE id = ?",
+            ("shared-task-1",),
+        ).fetchone()
+        fields = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM task_field_versions WHERE task_id = ? AND source_event_id IS NOT NULL",
+            ("shared-task-1",),
+        ).fetchone()["cnt"]
+        events = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM memory_events "
+            "WHERE aggregate_kind = 'task' AND aggregate_id = ? AND tool_name = ?",
+            ("shared-task-1", "bridge_server.review_shared_tasks.approve"),
+        ).fetchone()["cnt"]
+        pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM pending_shared_tasks WHERE id = ?",
+            ("shared-task-1",),
+        ).fetchone()["cnt"]
+
+    assert result["approved"] == 1
+    assert task["title"] == "Shared task"
+    assert task["project"] == "mapping-studio"
+    assert task["section"] == "today"
+    assert task["assignee"] == "alice"
+    assert task["shared_by"] == "alice"
+    assert fields > 0
+    assert events > 0
+    assert pending == 0

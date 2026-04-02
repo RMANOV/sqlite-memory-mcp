@@ -21,22 +21,22 @@ from typing import Any
 from fastmcp_compat import FastMCP
 
 from db_utils import (
+    apply_task_mutation as _apply_task_mutation,
     json_dumps as _json_dumps,
     json_loads as _json_loads,
     get_conn as _get_conn,
+    create_task_with_ledger as _create_task_with_ledger,
     get_entity_id as _get_entity_id,
     fts_sync_entity as _fts_sync,
     TaskDAO,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
     bridge_change_summary as _bridge_change_summary,
     promote_pending_public_entities as _promote_pending_public_entities,
-    MERGEABLE_FIELDS as _MERGEABLE_FIELDS,
     _NOWIN,
     now_iso as _now,
     parse_iso_datetime_for_compare as _parse_iso_dt,
     sanitize_task_enums as _sanitize_task_enums,
     setup_logger,
-    upsert_field_versions as _upsert_field_versions,
     merge_import_tasks as _merge_import_tasks,
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
@@ -1068,48 +1068,33 @@ def bridge_pull() -> str:
                             if task.get("notes") is not None
                             else (local_content["notes"] if local_content else None)
                         )
-                        old_row = conn.execute(
-                            f"SELECT {', '.join(_MERGEABLE_FIELDS)} FROM tasks WHERE id = ?",
-                            (tid,),
-                        ).fetchone()
-                        old_values = dict(old_row) if old_row else {}
-                        conn.execute(
-                            "UPDATE tasks SET title=?, description=?, status=?, "
-                            "priority=?, section=?, due_date=?, project=?, "
-                            "parent_id=?, notes=?, recurring=?, type=?, "
-                            "assignee=?, shared_by=?, updated_at=? WHERE id=?",
-                            (
-                                task["title"],
-                                safe_desc,
-                                task["status"],
-                                task["priority"],
-                                task["section"],
-                                task.get("due_date"),
-                                task.get("project"),
-                                task.get("parent_id"),
-                                safe_notes,
-                                task.get("recurring"),
-                                task.get("type", "task"),
-                                task.get("assignee"),
-                                task.get("shared_by"),
-                                task["updated_at"],
-                                tid,
-                            ),
-                        )
-                        new_values = {f: task.get(f) for f in _MERGEABLE_FIELDS}
-                        new_values["description"] = safe_desc
-                        new_values["notes"] = safe_notes
-                        _upsert_field_versions(
+                        result = _apply_task_mutation(
                             conn,
                             tid,
-                            _MERGEABLE_FIELDS,
-                            task.get("updated_at", now),
-                            old_values=old_values,
-                            new_values=new_values,
+                            {
+                                "title": task["title"],
+                                "description": safe_desc,
+                                "status": task["status"],
+                                "priority": task["priority"],
+                                "section": task["section"],
+                                "due_date": task.get("due_date"),
+                                "project": task.get("project"),
+                                "parent_id": task.get("parent_id"),
+                                "notes": safe_notes,
+                                "recurring": task.get("recurring"),
+                                "type": task.get("type", "task"),
+                                "assignee": task.get("assignee"),
+                                "shared_by": task.get("shared_by"),
+                            },
+                            timestamp=task.get("updated_at", now),
+                            tool_name="bridge_server.bridge_pull.legacy_import",
+                            actor_type="system",
+                            source_kind="bridge_task",
+                            source_ref=tid,
                         )
-                        updated_tasks += 1
+                        updated_tasks += int(result.get("updated", 0))
                 else:
-                    TaskDAO.create(
+                    _create_task_with_ledger(
                         conn,
                         tid,
                         task["title"],
@@ -1127,6 +1112,10 @@ def bridge_pull() -> str:
                         assignee=task.get("assignee"),
                         shared_by=task.get("shared_by"),
                         created_at=task.get("created_at", now),
+                        tool_name="bridge_server.bridge_pull.legacy_import",
+                        actor_type="system",
+                        source_kind="bridge_task",
+                        source_ref=tid,
                     )
                     new_tasks += 1
 
@@ -1513,9 +1502,6 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
         if not existing:
             return _error(f"Task {task_id} not found")
 
-        old_assignee = existing["assignee"]
-        old_shared_by = existing["shared_by"]
-
         shared_by = None
         if assignee:
             try:
@@ -1530,18 +1516,19 @@ def assign_task(task_id: str, assignee: str | None = None) -> str:
             except (subprocess.TimeoutExpired, OSError):
                 pass
 
-        conn.execute(
-            "UPDATE tasks SET assignee = ?, shared_by = ?, updated_at = ? WHERE id = ?",
-            (assignee, shared_by, now, task_id),
-        )
-        _upsert_field_versions(
+        result = _apply_task_mutation(
             conn,
             task_id,
-            ("assignee", "shared_by"),
-            now,
-            old_values={"assignee": old_assignee, "shared_by": old_shared_by},
-            new_values={"assignee": assignee, "shared_by": shared_by},
+            {"assignee": assignee, "shared_by": shared_by},
+            timestamp=now,
+            tool_name="bridge_server.assign_task",
+            actor_type="user",
+            actor_id=shared_by,
+            source_kind="task",
+            source_ref=task_id,
         )
+        if result.get("missing"):
+            return _error(f"Task {task_id} not found")
 
     action = f"assigned to {assignee}" if assignee else "unassigned"
     logger.info("assign_task: %s %s", task_id, action)
@@ -1626,48 +1613,33 @@ def review_shared_tasks(
                             if t.get("notes") is not None
                             else (local_content["notes"] if local_content else None)
                         )
-                        old_row = conn.execute(
-                            f"SELECT {', '.join(_MERGEABLE_FIELDS)} FROM tasks WHERE id = ?",
-                            (tid,),
-                        ).fetchone()
-                        old_values = dict(old_row) if old_row else {}
-                        conn.execute(
-                            "UPDATE tasks SET title=?, description=?, status=?, priority=?, "
-                            "section=?, due_date=?, project=?, parent_id=?, notes=?, "
-                            "recurring=?, type=?, assignee=?, shared_by=?, updated_at=? "
-                            "WHERE id=?",
-                            (
-                                t["title"],
-                                safe_desc,
-                                t["status"],
-                                t["priority"],
-                                t["section"],
-                                t.get("due_date"),
-                                t.get("project"),
-                                t.get("parent_id"),
-                                safe_notes,
-                                t.get("recurring"),
-                                t.get("type", "task"),
-                                t.get("assignee"),
-                                t.get("shared_by"),
-                                t["updated_at"],
-                                tid,
-                            ),
-                        )
-                        new_values = {f: t.get(f) for f in _MERGEABLE_FIELDS}
-                        new_values["description"] = safe_desc
-                        new_values["notes"] = safe_notes
-                        _upsert_field_versions(
+                        result = _apply_task_mutation(
                             conn,
                             tid,
-                            _MERGEABLE_FIELDS,
-                            t.get("updated_at", _now()),
-                            old_values=old_values,
-                            new_values=new_values,
+                            {
+                                "title": t["title"],
+                                "description": safe_desc,
+                                "status": t["status"],
+                                "priority": t["priority"],
+                                "section": t["section"],
+                                "due_date": t.get("due_date"),
+                                "project": t.get("project"),
+                                "parent_id": t.get("parent_id"),
+                                "notes": safe_notes,
+                                "recurring": t.get("recurring"),
+                                "type": t.get("type", "task"),
+                                "assignee": t.get("assignee"),
+                                "shared_by": t.get("shared_by"),
+                            },
+                            timestamp=t.get("updated_at", _now()),
+                            tool_name="bridge_server.review_shared_tasks.approve",
+                            actor_type="system",
+                            source_kind="pending_shared_task",
+                            source_ref=tid,
                         )
-                        imported += 1
+                        imported += int(result.get("updated", 0))
                 else:
-                    TaskDAO.create(
+                    _create_task_with_ledger(
                         conn,
                         tid,
                         t["title"],
@@ -1685,9 +1657,10 @@ def review_shared_tasks(
                         assignee=t.get("assignee"),
                         shared_by=t.get("shared_by"),
                         created_at=t.get("created_at"),
-                    )
-                    _upsert_field_versions(
-                        conn, tid, _MERGEABLE_FIELDS, t.get("updated_at", _now())
+                        tool_name="bridge_server.review_shared_tasks.approve",
+                        actor_type="system",
+                        source_kind="pending_shared_task",
+                        source_ref=tid,
                     )
                     imported += 1
                 conn.execute("DELETE FROM pending_shared_tasks WHERE id = ?", (tid,))

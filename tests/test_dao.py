@@ -12,7 +12,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from db_utils import MERGEABLE_FIELDS, TaskDAO, now_iso, upsert_field_versions
+from db_utils import (
+    MERGEABLE_FIELDS,
+    TaskDAO,
+    mark_tasks_done_by_title,
+    now_iso,
+    upsert_field_versions,
+)
 
 # ── Minimal schema required by TaskDAO ───────────────────────────────────
 
@@ -217,6 +223,37 @@ def test_update_missing_task_returns_zero(conn):
 def test_update_empty_fields_returns_zero(conn):
     _make_task(conn, "t1")
     assert TaskDAO.update(conn, "t1", {}) == 0
+
+
+def test_mark_tasks_done_by_title_uses_mutation_path(conn):
+    _make_task(conn, "t1", "Ship release", section="today")
+    _make_task(conn, "t2", "Ship docs", section="next")
+    ts = now_iso()
+
+    changed = mark_tasks_done_by_title(
+        conn,
+        "Ship",
+        timestamp=ts,
+        tool_name="bin.task.done",
+    )
+
+    assert changed == 2
+    rows = conn.execute(
+        "SELECT id, status, section, updated_at FROM tasks WHERE id IN ('t1', 't2') "
+        "ORDER BY id"
+    ).fetchall()
+    assert [row["status"] for row in rows] == ["done", "done"]
+    assert [row["section"] for row in rows] == ["done", "done"]
+    assert all(row["updated_at"] == ts for row in rows)
+
+    field_rows = conn.execute(
+        "SELECT task_id, field_name, updated_at, new_value FROM task_field_versions "
+        "WHERE task_id IN ('t1', 't2') AND field_name IN ('status', 'section') "
+        "ORDER BY task_id, field_name"
+    ).fetchall()
+    assert len(field_rows) == 4
+    assert all(row["updated_at"] == ts for row in field_rows)
+    assert {row["new_value"] for row in field_rows} == {"done"}
 
 
 def test_create_normalizes_project_alias(conn):

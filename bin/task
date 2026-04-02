@@ -9,6 +9,7 @@ set -euo pipefail
 
 export TASK_DB="$HOME/.claude/memory/memory.db"
 REFRESH="$HOME/.claude/memory/.task_refresh"
+export TASK_REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Find working python (python3 is broken Windows Store alias)
 PY="python"
@@ -20,6 +21,7 @@ shift 2>/dev/null || true
 case "$cmd" in
 add|note)
     export TASK_TITLE="${1:?Usage: task $cmd \"title\"}"
+    export TASK_CMD="$cmd"
     shift
     export TASK_PRIORITY="medium"
     export TASK_SECTION="inbox"
@@ -42,7 +44,9 @@ add|note)
         esac
     done
     $PY -c "
-import sqlite3, uuid, datetime, json, os
+import datetime, json, os, sqlite3, sys, uuid
+sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
+from db_utils import create_task_with_ledger
 c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
 c.execute('PRAGMA busy_timeout=10000')
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -56,11 +60,26 @@ if recur:
             raise ValueError(f'every must be one of {valid_every}')
     except (json.JSONDecodeError, ValueError) as e:
         print(f'Invalid --recurring JSON: {e}'); import sys; sys.exit(1)
-c.execute(
-    'INSERT INTO tasks (id,title,description,status,section,priority,due_date,project,type,recurring,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-    (str(uuid.uuid4()), t, os.environ['TASK_DESC'] or None, 'not_started', s, p,
-     os.environ['TASK_DUE'] or None, os.environ['TASK_PROJECT'] or None,
-     os.environ['TASK_TYPE'], recur, now, now))
+task_id = str(uuid.uuid4())
+create_task_with_ledger(
+    c,
+    task_id,
+    t,
+    now,
+    description=os.environ['TASK_DESC'] or None,
+    status='not_started',
+    section=s,
+    priority=p,
+    due_date=os.environ['TASK_DUE'] or None,
+    project=os.environ['TASK_PROJECT'] or None,
+    recurring=recur,
+    type=os.environ['TASK_TYPE'],
+    created_at=now,
+    tool_name=f'bin.task.{os.environ[\"TASK_CMD\"]}',
+    actor_type='system',
+    source_kind='task',
+    source_ref=task_id,
+)
 c.close()
 suffix = f' (recurring: {recur})' if recur else ''
 print(f'Created {os.environ[\"TASK_TYPE\"]}: {t} [{s}/{p}]{suffix}')
@@ -71,15 +90,21 @@ print(f'Created {os.environ[\"TASK_TYPE\"]}: {t} [{s}/{p}]{suffix}')
 done)
     export TASK_TITLE="${1:?Usage: task done \"title\"}"
     $PY -c "
-import sqlite3, datetime, os
+import datetime, os, sqlite3, sys
+sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
+from db_utils import mark_tasks_done_by_title
 c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
 c.execute('PRAGMA busy_timeout=10000')
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-cur = c.execute(
-    \"UPDATE tasks SET status='done', section='done', updated_at=? WHERE title LIKE ? AND status != 'done'\",
-    (now, '%' + os.environ['TASK_TITLE'] + '%'))
+count = mark_tasks_done_by_title(
+    c,
+    os.environ['TASK_TITLE'],
+    timestamp=now,
+    tool_name='bin.task.done',
+    actor_type='system',
+)
 c.close()
-print(f'Marked {cur.rowcount} task(s) done matching: {os.environ[\"TASK_TITLE\"]}')
+print(f'Marked {count} task(s) done matching: {os.environ[\"TASK_TITLE\"]}')
 "
     touch "$REFRESH"
     ;;
