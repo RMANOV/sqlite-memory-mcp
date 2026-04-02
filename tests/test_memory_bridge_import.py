@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from db_utils import (
+    add_task_attachment,
     export_index_json,
     export_task_files,
     import_remote_bridge_data,
@@ -16,6 +17,7 @@ from db_utils import (
     merge_import_tasks,
     now_iso,
     record_memory_event,
+    sync_task_attachments_from_remote,
 )
 from schema import init_db
 
@@ -352,5 +354,77 @@ def test_bridge_roundtrip_keeps_unsafe_ids_and_recent_tombstones(conn):
         assert by_id["cancelled-1"]["status"] == "cancelled"
         assert by_id["archived-1"]["description"] == "Archived description"
         assert by_id["cancelled-1"]["notes"] == "Cancelled notes"
+    finally:
+        recovered.close()
+
+
+def test_bridge_roundtrip_keeps_task_attachments(conn):
+    source_db, base_dir = conn
+    bridge_dir = os.path.join(base_dir, "bridge_attachments")
+    os.makedirs(bridge_dir, exist_ok=True)
+    local_root = os.path.join(base_dir, "local_attachments")
+    recovered_root = os.path.join(base_dir, "recovered_attachments")
+
+    created = now_iso()
+    source_db.execute(
+        "INSERT INTO tasks (id, title, description, notes, status, section, priority, "
+        "type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "task-attach",
+            "Attachment task",
+            "Task description",
+            None,
+            "not_started",
+            "inbox",
+            "medium",
+            "task",
+            created,
+            created,
+        ),
+    )
+    source_file = os.path.join(base_dir, "sample.pdf")
+    with open(source_file, "wb") as fh:
+        fh.write(b"fake-pdf")
+
+    attachment = add_task_attachment(
+        source_db,
+        "task-attach",
+        source_file,
+        local_root=local_root,
+    )
+
+    export_task_files(source_db, bridge_dir, attachment_root=local_root)
+    export_index_json(source_db, bridge_dir)
+    remote_tasks, loaded = load_remote_tasks_for_merge(bridge_dir, {})
+
+    recovered_db_path = os.path.join(base_dir, "recovered_attachments.db")
+    init_db(recovered_db_path)
+    recovered = sqlite3.connect(recovered_db_path, isolation_level=None)
+    recovered.row_factory = sqlite3.Row
+    recovered.execute("PRAGMA foreign_keys=ON")
+    try:
+        merge_import_tasks(recovered, remote_tasks, import_content=True)
+        imported, removed = sync_task_attachments_from_remote(
+            recovered,
+            remote_tasks,
+            bridge_dir,
+            local_root=recovered_root,
+        )
+        row = recovered.execute(
+            "SELECT file_name, stored_relpath, status FROM task_attachments WHERE task_id = 'task-attach'"
+        ).fetchone()
+        local_copy = os.path.join(
+            recovered_root,
+            attachment["stored_relpath"].replace("/", os.sep),
+        )
+        assert loaded is True
+        assert imported == 1
+        assert removed == 0
+        assert row is not None
+        assert row["file_name"] == "sample.pdf"
+        assert row["status"] == "active"
+        assert os.path.isfile(local_copy)
+        with open(local_copy, "rb") as fh:
+            assert fh.read() == b"fake-pdf"
     finally:
         recovered.close()

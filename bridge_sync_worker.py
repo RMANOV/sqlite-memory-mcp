@@ -73,6 +73,7 @@ from db_utils import (
     ensure_bridge_repo_ready,
     bridge_change_summary,
     promote_pending_public_entities,
+    sync_task_attachments_from_remote,
 )
 
 log = logging.getLogger("bridge_sync_worker")
@@ -716,6 +717,7 @@ def _main_locked(
                     import_content=True,
                     remote_events=remote_payload.get("memory_events", []),
                 )
+                sync_task_attachments_from_remote(conn, remote_tasks, bridge_dir)
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
             except (
                 sqlite3.OperationalError,
@@ -917,6 +919,7 @@ def _main_locked(
         "shared.js",
         "index.json",
         "tasks/",
+        "attachments/",
         "entities/",
         "entities_index.json",
     )

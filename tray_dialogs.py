@@ -54,8 +54,9 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QStyledItemDelegate,
     QDateTimeEdit,
+    QFileDialog,
 )
-from PyQt6.QtGui import QColor, QFont, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPixmap
 from PyQt6.QtCore import (
     QDate,
     QDateTime,
@@ -65,6 +66,7 @@ from PyQt6.QtCore import (
     QTimer,
     QPoint,
     QTime,
+    QUrl,
     pyqtSignal,
 )
 
@@ -138,6 +140,20 @@ def _clipboard_write(text):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def _format_file_size(size: int | None) -> str:
+    """Render a file size for compact attachment labels."""
+    value = max(0, int(size or 0))
+    units = ("B", "KB", "MB", "GB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{value} B"
 
 
 def create_tray_icon_pixmap(overdue_count=0):
@@ -1174,6 +1190,9 @@ class EditTaskDialog(QDialog):
     def __init__(self, task, parent=None, db=None):
         super().__init__(parent)
         self._db = db
+        self._task_id = task.get("id")
+        self._attachment_items: list[dict] = []
+        self._removed_attachment_ids: set[str] = set()
         self.setWindowTitle("Edit Task")
         self.setMinimumWidth(380)
         self.setStyleSheet(_build_dialog_style())
@@ -1295,12 +1314,44 @@ class EditTaskDialog(QDialog):
         self.project_combo.setCurrentText(current_project)
         layout.addRow("Project:", self.project_combo)
 
+        self.attachments_list = QListWidget()
+        self.attachments_list.setMaximumHeight(120)
+        self.attachments_list.itemSelectionChanged.connect(
+            self._update_attachment_buttons
+        )
+        self.attachments_list.itemDoubleClicked.connect(
+            lambda _item: self._open_selected_attachment()
+        )
+        att_row = QVBoxLayout()
+        att_row.setSpacing(6)
+        att_row.addWidget(self.attachments_list)
+        att_btns = QHBoxLayout()
+        self.attach_add_btn = QPushButton("Attach…")
+        self.attach_add_btn.clicked.connect(self._on_add_attachments)
+        self.attach_open_btn = QPushButton("Open")
+        self.attach_open_btn.clicked.connect(self._open_selected_attachment)
+        self.attach_remove_btn = QPushButton("Remove")
+        self.attach_remove_btn.clicked.connect(self._remove_selected_attachment)
+        att_btns.addWidget(self.attach_add_btn)
+        att_btns.addWidget(self.attach_open_btn)
+        att_btns.addWidget(self.attach_remove_btn)
+        att_btns.addStretch()
+        att_row.addLayout(att_btns)
+        layout.addRow("Attachments:", att_row)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
+
+        if self._task_id and self._db:
+            self._attachment_items = [
+                {**meta, "_kind": "existing"}
+                for meta in self._db.get_task_attachments(self._task_id)
+            ]
+        self._refresh_attachment_list()
 
     def _set_smart_date(self, section):
         """Set due date based on section intelligence."""
@@ -1323,6 +1374,95 @@ class EditTaskDialog(QDialog):
         self.due_edit.setDate(self.due_edit.minimumDate())
         self._due_cleared = True
 
+    def _refresh_attachment_list(self):
+        self.attachments_list.clear()
+        for attachment in self._attachment_items:
+            label = attachment.get("file_name") or "attachment"
+            if attachment.get("_kind") == "pending":
+                detail = attachment.get("source_path") or ""
+                text = f"{label}  [pending]"
+                if detail:
+                    text += f" — {detail}"
+            else:
+                text = f"{label}  ({_format_file_size(attachment.get('file_size'))})"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, attachment)
+            self.attachments_list.addItem(item)
+        if self.attachments_list.count() == 0:
+            placeholder = QListWidgetItem("No attachments")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            placeholder.setForeground(QColor("#888"))
+            self.attachments_list.addItem(placeholder)
+        self._update_attachment_buttons()
+
+    def _update_attachment_buttons(self):
+        current = self._selected_attachment()
+        self.attach_open_btn.setEnabled(bool(current))
+        self.attach_remove_btn.setEnabled(bool(current))
+
+    def _selected_attachment(self):
+        items = self.attachments_list.selectedItems()
+        if not items:
+            return None
+        return items[0].data(Qt.ItemDataRole.UserRole)
+
+    def _on_add_attachments(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Attach Files")
+        existing_pending = {
+            item.get("source_path")
+            for item in self._attachment_items
+            if item.get("_kind") == "pending"
+        }
+        existing_names = {
+            (item.get("file_name"), item.get("_kind"), item.get("attachment_id"))
+            for item in self._attachment_items
+        }
+        for path in paths:
+            if not path or path in existing_pending:
+                continue
+            name = os.path.basename(path) or "attachment"
+            key = (name, "pending", None)
+            if key in existing_names:
+                continue
+            self._attachment_items.append(
+                {
+                    "_kind": "pending",
+                    "file_name": name,
+                    "source_path": path,
+                    "file_size": os.path.getsize(path) if os.path.exists(path) else 0,
+                }
+            )
+            existing_pending.add(path)
+            existing_names.add(key)
+        self._refresh_attachment_list()
+
+    def _open_selected_attachment(self):
+        attachment = self._selected_attachment()
+        if not attachment:
+            return
+        if attachment.get("_kind") == "pending":
+            path = attachment.get("source_path")
+        elif self._db:
+            path = self._db.resolve_attachment_path(attachment)
+        else:
+            path = None
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Attachment Missing", "File not found.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            QMessageBox.warning(self, "Open Failed", path)
+
+    def _remove_selected_attachment(self):
+        attachment = self._selected_attachment()
+        if not attachment:
+            return
+        if attachment.get("_kind") == "existing" and attachment.get("attachment_id"):
+            self._removed_attachment_ids.add(attachment["attachment_id"])
+        self._attachment_items = [
+            item for item in self._attachment_items if item is not attachment
+        ]
+        self._refresh_attachment_list()
+
     def get_values(self):
         vals = {
             "title": self.title_edit.text().strip(),
@@ -1340,6 +1480,16 @@ class EditTaskDialog(QDialog):
         vals["type"] = self.type_combo.currentText().lower()
         vals["status"] = "done" if self.status_check.isChecked() else "not_started"
         return vals
+
+    def get_attachment_changes(self):
+        return {
+            "add_paths": [
+                item["source_path"]
+                for item in self._attachment_items
+                if item.get("_kind") == "pending"
+            ],
+            "remove_ids": sorted(self._removed_attachment_ids),
+        }
 
 
 # ── EntityLinkDialog ─────────────────────────────────────────────────
@@ -1789,6 +1939,30 @@ class TaskReaderDialog(QDialog):
         self._scroll = scroll
         layout.addWidget(scroll, 1)
 
+        self._attachments_frame = QFrame()
+        attachments_layout = QVBoxLayout(self._attachments_frame)
+        attachments_layout.setContentsMargins(16, 8, 16, 8)
+        attachments_layout.setSpacing(6)
+        attachments_label = QLabel("Attachments")
+        attachments_label.setObjectName("reader-meta")
+        attachments_layout.addWidget(attachments_label)
+        self._attachment_list = QListWidget()
+        self._attachment_list.setMaximumHeight(140)
+        self._attachment_list.itemDoubleClicked.connect(
+            lambda _item: self._open_selected_attachment()
+        )
+        self._attachment_list.itemSelectionChanged.connect(
+            self._update_attachment_actions
+        )
+        attachments_layout.addWidget(self._attachment_list)
+        attachments_btns = QHBoxLayout()
+        self._attachment_open_btn = QPushButton("Open")
+        self._attachment_open_btn.clicked.connect(self._open_selected_attachment)
+        attachments_btns.addWidget(self._attachment_open_btn)
+        attachments_btns.addStretch()
+        attachments_layout.addLayout(attachments_btns)
+        layout.addWidget(self._attachments_frame)
+
         # Button bar
         btn_bar = QHBoxLayout()
         btn_bar.setContentsMargins(16, 8, 16, 8)
@@ -1956,12 +2130,54 @@ class TaskReaderDialog(QDialog):
             )
 
         self._body_label.setText(body_html)
+        self._refresh_attachments()
+
+    def _refresh_attachments(self):
+        self._attachment_list.clear()
+        attachments = self.db.get_task_attachments(self.task.get("id", ""))
+        if not attachments:
+            self._attachments_frame.hide()
+            return
+        for attachment in attachments:
+            text = (
+                f"{attachment.get('file_name', 'attachment')}  "
+                f"({_format_file_size(attachment.get('file_size'))})"
+            )
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, attachment)
+            self._attachment_list.addItem(item)
+        self._attachments_frame.show()
+        self._update_attachment_actions()
+
+    def _update_attachment_actions(self):
+        items = self._attachment_list.selectedItems()
+        self._attachment_open_btn.setEnabled(bool(items))
+
+    def _open_selected_attachment(self):
+        items = self._attachment_list.selectedItems()
+        if not items:
+            return
+        attachment = items[0].data(Qt.ItemDataRole.UserRole)
+        path = self.db.resolve_attachment_path(attachment)
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Attachment Missing", "File not found.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            QMessageBox.warning(self, "Open Failed", path)
 
     def _on_edit(self):
         dlg = EditTaskDialog(self.task, self, db=self.db)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
-            self.db.update_task(self.task["id"], **vals)
+            attachment_changes = dlg.get_attachment_changes()
+            if vals:
+                self.db.update_task(self.task["id"], **vals)
+            if attachment_changes["add_paths"] or attachment_changes["remove_ids"]:
+                self.db.apply_attachment_changes(
+                    self.task["id"],
+                    add_paths=attachment_changes["add_paths"],
+                    remove_ids=attachment_changes["remove_ids"],
+                )
             self.task.update(vals)
             self._refresh_display()
 

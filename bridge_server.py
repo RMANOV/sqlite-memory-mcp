@@ -47,6 +47,7 @@ from db_utils import (
     load_remote_tasks_for_merge as _load_remote_tasks_for_merge,
     import_remote_bridge_data as _import_remote_bridge_data,
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
+    sync_task_attachments_from_remote as _sync_task_attachments_from_remote,
     BRIDGE_REPO,
     BRIDGE_SYNC_DELAY,
     git_run as _git_run,
@@ -460,11 +461,14 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         _import_remote_bridge_data(conn, BRIDGE_REPO, remote_payload, logger)
 
         remote_tasks, _tasks_from_index = _load_remote_tasks_for_merge(
-            BRIDGE_REPO, remote_payload, logger,
+            BRIDGE_REPO,
+            remote_payload,
+            logger,
         )
         if remote_tasks:
             try:
                 _merge_import_tasks(conn, remote_tasks, import_content=True)
+                _sync_task_attachments_from_remote(conn, remote_tasks, BRIDGE_REPO)
             except (sqlite3.Error, ValueError) as exc:
                 logger.warning("bridge_push: task merge failed: %s", exc)
 
@@ -800,6 +804,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         "shared.js",
         "index.json",
         "tasks/",
+        "attachments/",
         "entities/",
         "entities_index.json",
     )
@@ -1018,6 +1023,7 @@ def bridge_pull() -> str:
                 new_tasks, updated_tasks = _merge_import_tasks(
                     conn, remote_tasks, import_content=True
                 )
+                _sync_task_attachments_from_remote(conn, remote_tasks, BRIDGE_REPO)
             except (
                 sqlite3.OperationalError,
                 sqlite3.IntegrityError,

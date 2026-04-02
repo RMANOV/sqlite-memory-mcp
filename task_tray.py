@@ -82,12 +82,15 @@ from db_utils import (
     DB_PATH,
     MERGEABLE_FIELDS,
     TaskDAO,
+    add_task_attachment,
     apply_task_mutation,
     create_task_with_ledger,
     get_conn,
     is_overdue,
     now_iso,
     priority_sort_key,
+    remove_task_attachment,
+    resolve_task_attachment_path,
 )
 from schema import init_db
 
@@ -256,6 +259,7 @@ class TaskDB:
         status="not_started",
         description=None,
         type="task",
+        attachments=None,
     ):
         """Insert new task, return its ID."""
         task_id = str(uuid.uuid4())
@@ -275,6 +279,13 @@ class TaskDB:
                 type=type,
                 tool_name="task_tray.add_task",
             )
+            for file_path in attachments or []:
+                add_task_attachment(
+                    self._conn,
+                    task_id,
+                    file_path,
+                    tool_name="task_tray.add_task_attachment",
+                )
         if self.on_change:
             self.on_change()
         return task_id
@@ -330,6 +341,47 @@ class TaskDB:
         if self.on_change:
             self.on_change()
         return True
+
+    def get_task_attachments(self, task_id, include_removed=False):
+        """Return attachment metadata for a task."""
+        return TaskDAO.get_attachments(
+            self._conn,
+            task_id,
+            include_removed=include_removed,
+        )
+
+    def resolve_attachment_path(self, attachment):
+        """Resolve best local path for an attachment."""
+        return resolve_task_attachment_path(attachment)
+
+    def apply_attachment_changes(self, task_id, add_paths=None, remove_ids=None):
+        """Apply attachment additions/removals atomically for a task."""
+        add_paths = [p for p in (add_paths or []) if p]
+        remove_ids = [aid for aid in (remove_ids or []) if aid]
+        if not add_paths and not remove_ids:
+            return False
+        changed = False
+        with self._transact(self._conn):
+            for file_path in add_paths:
+                add_task_attachment(
+                    self._conn,
+                    task_id,
+                    file_path,
+                    tool_name="task_tray.add_task_attachment",
+                )
+                changed = True
+            for attachment_id in remove_ids:
+                changed = (
+                    remove_task_attachment(
+                        self._conn,
+                        attachment_id,
+                        tool_name="task_tray.remove_task_attachment",
+                    )
+                    or changed
+                )
+        if changed and self.on_change:
+            self.on_change()
+        return changed
 
     def delete_task(self, task_id):
         """Soft-delete: cancel task (creates tombstone for bridge sync).
@@ -1669,9 +1721,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         dlg.setWindowTitle("Add Task")
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
+            attachment_changes = dlg.get_attachment_changes()
             title = vals.pop("title", "")
             if title:
-                self.db.add_task(title, **vals)
+                self.db.add_task(
+                    title,
+                    attachments=attachment_changes["add_paths"],
+                    **vals,
+                )
                 self.refresh()
 
     def showEvent(self, event):
@@ -1822,9 +1879,14 @@ class TaskTrayApp:
         dlg.setWindowTitle("Add Task")
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
+            attachment_changes = dlg.get_attachment_changes()
             title = vals.pop("title", "")
             if title:
-                self.db.add_task(title, **vals)
+                self.db.add_task(
+                    title,
+                    attachments=attachment_changes["add_paths"],
+                    **vals,
+                )
 
     def _open_full(self):
         if self.popup:

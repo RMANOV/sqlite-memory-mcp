@@ -233,6 +233,19 @@ CREATE TABLE IF NOT EXISTS task_entity_links (
 );
 CREATE INDEX IF NOT EXISTS idx_tel_entity ON task_entity_links(entity_id);
 
+CREATE TABLE IF NOT EXISTS task_attachments (
+    attachment_id  TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    file_name      TEXT NOT NULL,
+    stored_relpath TEXT NOT NULL UNIQUE,
+    media_type     TEXT DEFAULT NULL,
+    file_size      INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_attachments_task ON task_attachments(task_id, status, created_at);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     name, entity_type, observations_text,
     tokenize = "unicode61 remove_diacritics 2"
@@ -817,6 +830,21 @@ _MIGRATIONS = [
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tel_entity'",
         "CREATE INDEX idx_tel_entity ON task_entity_links(entity_id)",
         "idx_tel_entity index (v2.2.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_attachments'",
+        "CREATE TABLE task_attachments ("
+        "attachment_id TEXT PRIMARY KEY, "
+        "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
+        "file_name TEXT NOT NULL, stored_relpath TEXT NOT NULL UNIQUE, "
+        "media_type TEXT DEFAULT NULL, file_size INTEGER NOT NULL DEFAULT 0, "
+        "status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        "task_attachments table (v7.0.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_task_attachments_task'",
+        "CREATE INDEX idx_task_attachments_task ON task_attachments(task_id, status, created_at)",
+        "idx_task_attachments_task index (v7.0.0)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_chunks'",

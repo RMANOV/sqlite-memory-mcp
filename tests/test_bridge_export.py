@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from db_utils import (
     _task_storage_stem,
+    add_task_attachment,
     export_index_json,
     export_task_files,
     json_loads,
@@ -81,6 +82,20 @@ CREATE TABLE task_entity_links (
 );
 """
 
+_ATTACHMENTS_DDL = """
+CREATE TABLE task_attachments (
+    attachment_id  TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    file_name      TEXT NOT NULL,
+    stored_relpath TEXT NOT NULL UNIQUE,
+    media_type     TEXT DEFAULT NULL,
+    file_size      INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+"""
+
 
 def _insert_task(conn, task_id, title, *, status="not_started", description=None):
     now = now_iso()
@@ -105,7 +120,9 @@ def setup(tmp_path):
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(_TASKS_DDL + _FIELD_VERSIONS_DDL + _ENTITIES_DDL + _LINKS_DDL)
+    conn.executescript(
+        _TASKS_DDL + _FIELD_VERSIONS_DDL + _ENTITIES_DDL + _LINKS_DDL + _ATTACHMENTS_DDL
+    )
     conn.execute("BEGIN")
     yield conn, bridge_dir
     conn.execute("COMMIT")
@@ -205,6 +222,38 @@ class TestExportTaskFiles:
         assert task["_tombstone"] is True
         assert task["description"] == "Cancelled task details"
         assert task["notes"] == "Cancelled task notes"
+
+    def test_task_file_exports_attachment_metadata_and_bridge_copy(
+        self, setup, tmp_path
+    ):
+        """Per-task export includes attachment metadata and copies bytes to bridge."""
+        conn, bridge_dir = setup
+        task_id = "task-attach"
+        _insert_task(conn, task_id, "Task with file")
+        source_file = tmp_path / "sample.txt"
+        source_file.write_text("attachment body", encoding="utf-8")
+        local_root = str(tmp_path / "local_attachments")
+
+        attachment = add_task_attachment(
+            conn,
+            task_id,
+            str(source_file),
+            local_root=local_root,
+        )
+
+        export_task_files(conn, bridge_dir, attachment_root=local_root)
+        task = load_task_content(task_id, bridge_dir)
+        bridge_copy = os.path.join(
+            bridge_dir,
+            "attachments",
+            attachment["stored_relpath"].replace("/", os.sep),
+        )
+
+        assert task is not None
+        assert task["_attachments"][0]["attachment_id"] == attachment["attachment_id"]
+        assert task["_attachments"][0]["file_name"] == "sample.txt"
+        assert os.path.isfile(bridge_copy)
+        assert open(bridge_copy, encoding="utf-8").read() == "attachment body"
 
     def test_content_aware_preserves_bridge_description(self, setup):
         """NULL local description is filled from existing bridge file, not overwritten."""

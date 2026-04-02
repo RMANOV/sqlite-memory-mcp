@@ -11,8 +11,10 @@ import hashlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -60,6 +62,11 @@ DB_PATH = os.environ.get(
 BRIDGE_REPO = os.environ.get(
     "BRIDGE_REPO",
     os.path.expanduser("~/.claude/memory/bridge"),
+)
+
+TASK_ATTACHMENT_ROOT = os.environ.get(
+    "TASK_ATTACHMENT_ROOT",
+    os.path.expanduser("~/.claude/memory/task_attachments"),
 )
 
 # ── Task constants (canonical ordering) ──────────────────────────────────
@@ -287,6 +294,7 @@ METADATA_FIELDS = (
 )
 
 CONTENT_FIELDS = ("description", "notes")
+TASK_FILE_HYDRATION_FIELDS = ("_attachments", "_field_ts", "_links", "_tombstone")
 
 CONTENT_SHRINK_GUARD_MIN_CHARS = 1000
 CONTENT_SHRINK_GUARD_RATIO = 0.5
@@ -375,6 +383,49 @@ def _task_storage_stem(task_id: str) -> str:
 def _task_storage_path(task_id: str, bridge_dir: str) -> Path:
     """Return the canonical per-task bridge file path for a task id."""
     return Path(bridge_dir) / "tasks" / f"{_task_storage_stem(task_id)}.json"
+
+
+_ATTACHMENT_NAME_SANITIZE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]+')
+
+
+def _safe_attachment_name(file_name: str) -> str:
+    """Return a filesystem-safe attachment file name."""
+    base = os.path.basename((file_name or "").strip()) or "attachment"
+    cleaned = _ATTACHMENT_NAME_SANITIZE_RE.sub("_", base).strip(" .")
+    return cleaned or "attachment"
+
+
+def _task_attachment_relpath(task_id: str, attachment_id: str, file_name: str) -> str:
+    """Return attachment relpath shared by local store and bridge export."""
+    safe_name = _safe_attachment_name(file_name)
+    return f"{_task_storage_stem(task_id)}/{attachment_id}__{safe_name}"
+
+
+def _resolve_attachment_path(root_dir: str, stored_relpath: str) -> Path:
+    """Resolve a stored attachment path under a root dir with traversal defense."""
+    root = Path(root_dir).resolve()
+    target = (root / stored_relpath).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(f"Attachment path escapes root: {stored_relpath!r}")
+    return target
+
+
+def _local_attachment_path(stored_relpath: str, root_dir: str | None = None) -> Path:
+    return _resolve_attachment_path(root_dir or TASK_ATTACHMENT_ROOT, stored_relpath)
+
+
+def _bridge_attachment_path(stored_relpath: str, bridge_dir: str) -> Path:
+    return _resolve_attachment_path(
+        os.path.join(bridge_dir, "attachments"), stored_relpath
+    )
+
+
+def _copy_attachment_file(src: Path, dst: Path) -> None:
+    """Copy attachment bytes atomically, creating parent dirs as needed."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.with_suffix(dst.suffix + ".tmp")
+    shutil.copy2(src, tmp_path)
+    os.replace(tmp_path, dst)
 
 
 def setup_logger(name: str, log_file: str = "server.log") -> logging.Logger:
@@ -548,7 +599,9 @@ BRIDGE_GENERATED_FILES = frozenset(
         ".bridge_sync.lock",  # legacy in-repo lock path; safe to discard
     }
 )
-BRIDGE_GENERATED_DIRS = frozenset({"tasks", "entities", "public_knowledge"})
+BRIDGE_GENERATED_DIRS = frozenset(
+    {"tasks", "entities", "attachments", "public_knowledge"}
+)
 
 
 def validate_github_username(username: str) -> None:
@@ -755,6 +808,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         ".bridge_sync.lock",
         "tasks",
         "entities",
+        "attachments",
         "public_knowledge",
     )
     clean = git_run(
@@ -769,6 +823,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         ".bridge_sync.lock",
         "tasks",
         "entities",
+        "attachments",
         "public_knowledge",
     )
     if restore.returncode != 0 and clean.returncode != 0:
@@ -1994,6 +2049,41 @@ class TaskDAO:
         ).fetchall()
         return {r["entity_id"] for r in rows}
 
+    @staticmethod
+    def get_attachments(
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        include_removed: bool = False,
+    ) -> list[dict]:
+        """Return attachment metadata for a task."""
+        if not _sqlite_table_exists(conn, "task_attachments"):
+            return []
+        sql = (
+            "SELECT attachment_id, task_id, file_name, stored_relpath, media_type, "
+            "file_size, status, created_at, updated_at "
+            "FROM task_attachments WHERE task_id = ?"
+        )
+        params: list[Any] = [task_id]
+        if not include_removed:
+            sql += " AND status = 'active'"
+        sql += " ORDER BY created_at, attachment_id"
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_attachment(conn: sqlite3.Connection, attachment_id: str) -> dict | None:
+        """Return attachment metadata by id."""
+        if not _sqlite_table_exists(conn, "task_attachments"):
+            return None
+        row = conn.execute(
+            "SELECT attachment_id, task_id, file_name, stored_relpath, media_type, "
+            "file_size, status, created_at, updated_at "
+            "FROM task_attachments WHERE attachment_id = ?",
+            (attachment_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # ── UI-oriented queries (centralized from TaskDB) ──
 
     @staticmethod
@@ -2076,6 +2166,305 @@ class TaskDAO:
             )
             moved += int(result.get("updated", 0))
         return moved
+
+
+# ── Task attachments ─────────────────────────────────────────────────────
+
+
+def _touch_task_updated_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+    timestamp: str,
+) -> None:
+    """Bump task.updated_at when related attachment metadata changes."""
+    conn.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (timestamp, task_id))
+
+
+def upsert_task_attachment_metadata(
+    conn: sqlite3.Connection,
+    *,
+    attachment_id: str,
+    task_id: str,
+    file_name: str,
+    stored_relpath: str,
+    media_type: str | None,
+    file_size: int,
+    status: str = "active",
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> dict[str, Any]:
+    """Insert or update a task attachment metadata row."""
+    if not _sqlite_table_exists(conn, "task_attachments"):
+        return {"attachment_id": attachment_id, "changed": False}
+    now = updated_at or now_iso()
+    row = conn.execute(
+        "SELECT file_name, stored_relpath, media_type, file_size, status, created_at, updated_at "
+        "FROM task_attachments WHERE attachment_id = ?",
+        (attachment_id,),
+    ).fetchone()
+    file_size_int = int(file_size or 0)
+    if row is None:
+        conn.execute(
+            "INSERT INTO task_attachments "
+            "(attachment_id, task_id, file_name, stored_relpath, media_type, file_size, "
+            "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attachment_id,
+                task_id,
+                file_name,
+                stored_relpath,
+                media_type,
+                file_size_int,
+                status,
+                created_at or now,
+                now,
+            ),
+        )
+        return {"attachment_id": attachment_id, "changed": True, "created": True}
+
+    changed = any(
+        (
+            row["file_name"] != file_name,
+            row["stored_relpath"] != stored_relpath,
+            row["media_type"] != media_type,
+            int(row["file_size"] or 0) != file_size_int,
+            row["status"] != status,
+        )
+    )
+    if changed:
+        conn.execute(
+            "UPDATE task_attachments SET file_name = ?, stored_relpath = ?, media_type = ?, "
+            "file_size = ?, status = ?, updated_at = ? WHERE attachment_id = ?",
+            (
+                file_name,
+                stored_relpath,
+                media_type,
+                file_size_int,
+                status,
+                now,
+                attachment_id,
+            ),
+        )
+    return {"attachment_id": attachment_id, "changed": changed, "created": False}
+
+
+def resolve_task_attachment_path(
+    attachment: dict[str, Any] | sqlite3.Row,
+    *,
+    local_root: str | None = None,
+    bridge_repo: str | None = None,
+) -> str | None:
+    """Resolve the best available on-disk path for an attachment."""
+    stored_relpath = (dict(attachment).get("stored_relpath") or "").strip()
+    if not stored_relpath:
+        return None
+    candidates = []
+    try:
+        candidates.append(_local_attachment_path(stored_relpath, local_root))
+    except ValueError:
+        return None
+    try:
+        candidates.append(
+            _bridge_attachment_path(stored_relpath, bridge_repo or BRIDGE_REPO)
+        )
+    except ValueError:
+        return None
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0])
+
+
+def add_task_attachment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    source_path: str,
+    *,
+    tool_name: str | None = None,
+    local_root: str | None = None,
+) -> dict[str, Any]:
+    """Copy a file into managed attachment storage and attach it to a task."""
+    row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"Task {task_id} not found")
+    src = Path(source_path).expanduser().resolve()
+    if not src.exists() or not src.is_file():
+        raise FileNotFoundError(source_path)
+
+    ts = now_iso()
+    attachment_id = str(uuid.uuid4())
+    file_name = src.name
+    stored_relpath = _task_attachment_relpath(task_id, attachment_id, file_name)
+    dst = _local_attachment_path(stored_relpath, local_root)
+    _copy_attachment_file(src, dst)
+    media_type = mimetypes.guess_type(file_name)[0]
+    file_size = dst.stat().st_size
+    upsert_task_attachment_metadata(
+        conn,
+        attachment_id=attachment_id,
+        task_id=task_id,
+        file_name=file_name,
+        stored_relpath=stored_relpath,
+        media_type=media_type,
+        file_size=file_size,
+        status="active",
+        created_at=ts,
+        updated_at=ts,
+    )
+    _touch_task_updated_at(conn, task_id, ts)
+    record_memory_event(
+        conn,
+        event_type="attachment_add",
+        aggregate_kind="task_attachment",
+        aggregate_id=attachment_id,
+        tool_name=tool_name or "db_utils.add_task_attachment",
+        event_ts=ts,
+        new_value={
+            "task_id": task_id,
+            "file_name": file_name,
+            "stored_relpath": stored_relpath,
+            "file_size": file_size,
+        },
+        payload={
+            "task_id": task_id,
+            "attachment_id": attachment_id,
+            "file_name": file_name,
+            "stored_relpath": stored_relpath,
+            "file_size": file_size,
+            "media_type": media_type,
+        },
+        source_kind="file",
+        source_ref=str(src),
+        source_excerpt=file_name,
+    )
+    return TaskDAO.get_attachment(conn, attachment_id) or {
+        "attachment_id": attachment_id,
+        "task_id": task_id,
+        "file_name": file_name,
+        "stored_relpath": stored_relpath,
+        "media_type": media_type,
+        "file_size": file_size,
+        "status": "active",
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def remove_task_attachment(
+    conn: sqlite3.Connection,
+    attachment_id: str,
+    *,
+    tool_name: str | None = None,
+    local_root: str | None = None,
+) -> bool:
+    """Soft-remove an attachment metadata row and delete the local managed copy."""
+    attachment = TaskDAO.get_attachment(conn, attachment_id)
+    if not attachment:
+        return False
+    if attachment.get("status") == "removed":
+        return False
+    ts = now_iso()
+    conn.execute(
+        "UPDATE task_attachments SET status = 'removed', updated_at = ? WHERE attachment_id = ?",
+        (ts, attachment_id),
+    )
+    try:
+        local_path = _local_attachment_path(attachment["stored_relpath"], local_root)
+    except ValueError:
+        local_path = None
+    if local_path and local_path.exists():
+        try:
+            local_path.unlink()
+        except OSError:
+            pass
+    _touch_task_updated_at(conn, attachment["task_id"], ts)
+    record_memory_event(
+        conn,
+        event_type="attachment_remove",
+        aggregate_kind="task_attachment",
+        aggregate_id=attachment_id,
+        tool_name=tool_name or "db_utils.remove_task_attachment",
+        event_ts=ts,
+        old_value=attachment,
+        new_value={"status": "removed"},
+        payload={
+            "task_id": attachment["task_id"],
+            "attachment_id": attachment_id,
+            "stored_relpath": attachment["stored_relpath"],
+        },
+        source_kind="task",
+        source_ref=attachment["task_id"],
+        source_excerpt=attachment["file_name"],
+    )
+    return True
+
+
+def sync_task_attachments_from_remote(
+    conn: sqlite3.Connection,
+    remote_tasks: list[dict[str, Any]],
+    bridge_dir: str,
+    *,
+    local_root: str | None = None,
+) -> tuple[int, int]:
+    """Merge attachment metadata/files from remote hydrated task payloads."""
+    if not _sqlite_table_exists(conn, "task_attachments"):
+        return (0, 0)
+    imported = 0
+    removed = 0
+    local_root_dir = local_root or TASK_ATTACHMENT_ROOT
+    for task in remote_tasks:
+        task_id = task.get("id")
+        if not task_id:
+            continue
+        exists = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if exists is None:
+            continue
+        for attachment in task.get("_attachments", []) or []:
+            attachment_id = attachment.get("attachment_id")
+            stored_relpath = attachment.get("stored_relpath")
+            file_name = attachment.get("file_name")
+            if not attachment_id or not stored_relpath or not file_name:
+                continue
+            status = attachment.get("status") or "active"
+            result = upsert_task_attachment_metadata(
+                conn,
+                attachment_id=attachment_id,
+                task_id=task_id,
+                file_name=file_name,
+                stored_relpath=stored_relpath,
+                media_type=attachment.get("media_type"),
+                file_size=int(attachment.get("file_size") or 0),
+                status=status,
+                created_at=attachment.get("created_at"),
+                updated_at=attachment.get("updated_at"),
+            )
+            if result.get("changed"):
+                if status == "removed":
+                    removed += 1
+                else:
+                    imported += 1
+            if status == "active":
+                try:
+                    remote_path = _bridge_attachment_path(stored_relpath, bridge_dir)
+                    local_path = _local_attachment_path(stored_relpath, local_root_dir)
+                except ValueError:
+                    continue
+                if remote_path.exists():
+                    if not local_path.exists() or local_path.stat().st_size != int(
+                        attachment.get("file_size") or remote_path.stat().st_size
+                    ):
+                        _copy_attachment_file(remote_path, local_path)
+            else:
+                try:
+                    local_path = _local_attachment_path(stored_relpath, local_root_dir)
+                except ValueError:
+                    continue
+                if local_path.exists():
+                    try:
+                        local_path.unlink()
+                    except OSError:
+                        pass
+    return (imported, removed)
 
 
 # ── Authoritative task mutation helpers ─────────────────────────────────
@@ -2758,10 +3147,14 @@ def export_task_files(
     conn: sqlite3.Connection,
     bridge_dir: str,
     changed_since: str | None = None,
+    *,
+    attachment_root: str | None = None,
 ) -> list[str]:
     """Export active tasks plus recent tombstones to per-task bridge files."""
     tasks_dir = Path(bridge_dir) / "tasks"
     tasks_dir.mkdir(exist_ok=True)
+    attachments_dir = Path(bridge_dir) / "attachments"
+    attachments_dir.mkdir(exist_ok=True)
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
     export_filter = (
@@ -2826,11 +3219,47 @@ def export_task_files(
             }
         )
 
+    attachment_map: dict[str, list[dict]] = {}
+    active_attachment_paths: set[str] = set()
+    if _sqlite_table_exists(conn, "task_attachments"):
+        attachment_rows = conn.execute(
+            "SELECT attachment_id, task_id, file_name, stored_relpath, media_type, file_size, "
+            "status, created_at, updated_at "
+            "FROM task_attachments WHERE task_id IN ({})".format(ph),
+            task_ids,
+        ).fetchall()
+        for ar in attachment_rows:
+            meta = {
+                "attachment_id": ar["attachment_id"],
+                "file_name": ar["file_name"],
+                "stored_relpath": ar["stored_relpath"],
+                "media_type": ar["media_type"],
+                "file_size": int(ar["file_size"] or 0),
+                "status": ar["status"],
+                "created_at": ar["created_at"],
+                "updated_at": ar["updated_at"],
+            }
+            attachment_map.setdefault(ar["task_id"], []).append(meta)
+            if ar["status"] == "active" and ar["stored_relpath"]:
+                active_attachment_paths.add(ar["stored_relpath"])
+                try:
+                    src_path = _local_attachment_path(
+                        ar["stored_relpath"], attachment_root
+                    )
+                    dst_path = _bridge_attachment_path(ar["stored_relpath"], bridge_dir)
+                except ValueError:
+                    continue
+                if src_path.exists():
+                    _copy_attachment_file(src_path, dst_path)
+                elif not dst_path.exists():
+                    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
     tasks_for_export: list[dict[str, Any]] = []
     for tid in task_ids:
         task = task_map[tid]
         task["_field_ts"] = fv_map.get(tid, {})
         task["_links"] = link_map.get(tid, [])
+        task["_attachments"] = attachment_map.get(tid, [])
         tasks_for_export.append(task)
 
     canonicalize_exported_task_statuses(conn, tasks_for_export)
@@ -2865,6 +3294,18 @@ def export_task_files(
         for stale in tasks_dir.iterdir():
             if stale.suffix == ".json" and stale.stem not in active_stems:
                 stale.unlink()
+        for stale in attachments_dir.rglob("*"):
+            if not stale.is_file():
+                continue
+            rel = stale.relative_to(attachments_dir).as_posix()
+            if rel not in active_attachment_paths:
+                stale.unlink()
+        for maybe_empty in sorted(attachments_dir.rglob("*"), reverse=True):
+            if maybe_empty.is_dir():
+                try:
+                    maybe_empty.rmdir()
+                except OSError:
+                    pass
 
     return exported
 
@@ -3807,6 +4248,9 @@ def load_remote_tasks_for_merge(
         if not content:
             continue
         for field in CONTENT_FIELDS:
+            if field in content:
+                task[field] = content[field]
+        for field in TASK_FILE_HYDRATION_FIELDS:
             if field in content:
                 task[field] = content[field]
         if content.get("description") or content.get("notes"):
