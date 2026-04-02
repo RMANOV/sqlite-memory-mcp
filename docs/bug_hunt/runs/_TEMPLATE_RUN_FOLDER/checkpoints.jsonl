@@ -1,0 +1,2 @@
+{"timestamp":"<ISO_TIMESTAMP>","doc":"DOC-001/1.1/1","status":"code_verified","finding":"<short finding>","file":"<file:function_or_line>","fixed":false,"commit":null}
+{"timestamp":"<ISO_TIMESTAMP>","doc":"DOC-004/3.1/1","status":"open_risk","finding":"<short finding>","file":"<file:function_or_line>","fixed":false,"commit":null}

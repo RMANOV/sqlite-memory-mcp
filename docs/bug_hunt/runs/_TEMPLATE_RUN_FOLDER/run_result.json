@@ -1,0 +1,23 @@
+{
+  "run_id": "<RUN_ID>",
+  "pack_id": "<PACK_ID>",
+  "started_at": "<ISO_TIMESTAMP>",
+  "ended_at": "<ISO_TIMESTAMP>",
+  "operator": "<human_or_agent>",
+  "method": "<methodology>",
+  "status": "completed",
+  "docs_touched": [
+    "DOC-001",
+    "DOC-004"
+  ],
+  "checkpoints_checked": 0,
+  "code_verified": 0,
+  "recently_hardened": 0,
+  "open_risks": 0,
+  "manual_followups": 0,
+  "spofs_reviewed": 0,
+  "overall_assessment": "<one_line_judgement>",
+  "key_commits": [],
+  "files_reviewed": [],
+  "notes": "<short narrative>"
+}

@@ -1,0 +1,81 @@
+{
+  "pack_id": "BH-PACK-2026-04-02-SQLITE-MEMORY",
+  "repo": "sqlite-memory-mcp",
+  "created_at": "2026-04-02T12:15:00+03:00",
+  "purpose": "Deep strategic bug-hunt pack for sqlite_memory with mandatory SPOF analysis and time-traceable runs.",
+  "recommended_order": [
+    "DOC-001",
+    "DOC-002",
+    "DOC-003",
+    "DOC-004"
+  ],
+  "total_estimated_checkpoints": 44,
+  "docs": [
+    {
+      "doc_id": "DOC-001",
+      "file": "DOC-001_SYNC_CAUSAL_BRIDGE_GUARANTEES.md",
+      "title": "Sync, causal ordering, bridge guarantees",
+      "priority": "critical",
+      "estimated_checkpoints": 12,
+      "themes": [
+        "event authority",
+        "bridge export/import",
+        "cross-machine merge",
+        "bootstrap recovery",
+        "attachments parity"
+      ]
+    },
+    {
+      "doc_id": "DOC-002",
+      "file": "DOC-002_TASK_TRAY_AND_OPERATOR_SURFACES.md",
+      "title": "Task Tray runtime and operator surfaces",
+      "priority": "high",
+      "estimated_checkpoints": 10,
+      "themes": [
+        "startup writes",
+        "edit semantics",
+        "filters",
+        "ui profile persistence",
+        "attachments UX"
+      ]
+    },
+    {
+      "doc_id": "DOC-003",
+      "file": "DOC-003_MEMORY_GOVERNANCE_RETRIEVAL_AUDIT.md",
+      "title": "Memory governance, retrieval, audit",
+      "priority": "high",
+      "estimated_checkpoints": 10,
+      "themes": [
+        "provenance",
+        "truth maintenance",
+        "retrieval contract",
+        "replay",
+        "audit cadence"
+      ]
+    },
+    {
+      "doc_id": "DOC-004",
+      "file": "DOC-004_SPOF_OPERATIONAL_RESILIENCE.md",
+      "title": "SPOF and operational resilience",
+      "priority": "critical",
+      "estimated_checkpoints": 12,
+      "themes": [
+        "singletons",
+        "detection",
+        "recovery drills",
+        "operational choke points",
+        "residual risk"
+      ]
+    }
+  ],
+  "run_protocol": {
+    "registry_file": "../../runs/RUN_REGISTRY.jsonl",
+    "template_folder": "../../runs/_TEMPLATE_RUN_FOLDER",
+    "required_outputs": [
+      "run_result.json",
+      "checkpoints.jsonl",
+      "summary.md"
+    ],
+    "mandatory_doc": "DOC-004"
+  }
+}

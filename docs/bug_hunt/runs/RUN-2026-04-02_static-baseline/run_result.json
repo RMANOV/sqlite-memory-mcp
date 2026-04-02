@@ -1,0 +1,48 @@
+{
+  "run_id": "RUN-2026-04-02_static-baseline",
+  "pack_id": "BH-PACK-2026-04-02-SQLITE-MEMORY",
+  "started_at": "2026-04-02T12:15:00+03:00",
+  "ended_at": "2026-04-02T12:45:00+03:00",
+  "operator": "Codex static architecture analysis",
+  "method": "git_history + code_path_tracing + live_db_state_review",
+  "status": "completed",
+  "docs_touched": [
+    "DOC-001",
+    "DOC-002",
+    "DOC-003",
+    "DOC-004"
+  ],
+  "checkpoints_checked": 20,
+  "code_verified": 7,
+  "recently_hardened": 9,
+  "open_risks": 2,
+  "manual_followups": 2,
+  "spofs_reviewed": 7,
+  "overall_assessment": "hardened_but_not_immortal",
+  "key_commits": [
+    "5f25af2",
+    "7cb8cd0",
+    "bd6cb72",
+    "af7fc76",
+    "3daa33d",
+    "2276729",
+    "7e1c051",
+    "761667b",
+    "1235ec9",
+    "f36f0bb",
+    "b0e4503",
+    "a42f625"
+  ],
+  "files_reviewed": [
+    "db_utils.py",
+    "bridge_sync_worker.py",
+    "bridge_server.py",
+    "task_tray.py",
+    "tray_dialogs.py",
+    "tray_sync.py",
+    "tray_filters.py",
+    "context_packer.py",
+    "memory_audit.py"
+  ],
+  "notes": "Baseline run establishes the hardening corridor after the recent sync, audit, attachment, tray and project-alias fixes. Main residual risks are operational: physical DB survivability, bridge/auth dependency, and discipline of multi-machine recovery drills."
+}
