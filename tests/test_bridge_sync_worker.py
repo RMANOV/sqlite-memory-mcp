@@ -241,6 +241,51 @@ def test_bridge_repo_ready_recovers_detached_head(monkeypatch):
     assert ("checkout", "main") in calls
 
 
+def test_ensure_bridge_git_identity_copies_source_repo_identity(monkeypatch):
+    calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append((repo_dir, args))
+        if repo_dir == "bridge" and args == ("config", "--get", "user.name"):
+            return _cp(args, returncode=1, stderr="missing")
+        if repo_dir == "bridge" and args == ("config", "--get", "user.email"):
+            return _cp(args, stdout="r.manov@gmail.com\n")
+        if repo_dir == "source" and args == ("config", "--get", "user.name"):
+            return _cp(args, stdout="RMANOV\n")
+        if repo_dir == "source" and args == ("config", "--get", "user.email"):
+            return _cp(args, stdout="96174405+RMANOV@users.noreply.github.com\n")
+        if repo_dir == "bridge" and args[:2] == ("config", "user.name"):
+            return _cp(args)
+        if repo_dir == "bridge" and args[:2] == ("config", "user.email"):
+            return _cp(args)
+        return _cp(args, returncode=1, stderr="unexpected")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    result = db_utils.ensure_bridge_git_identity("bridge", source_repo_dir="source")
+
+    assert result["changed"] is True
+    assert result["user_name"] == "RMANOV"
+    assert result["user_email"] == "96174405+RMANOV@users.noreply.github.com"
+    assert ("bridge", ("config", "user.name", "RMANOV")) in calls
+    assert (
+        "bridge",
+        ("config", "user.email", "96174405+RMANOV@users.noreply.github.com"),
+    ) in calls
+
+
+def test_git_retry_returns_timeout_result(monkeypatch):
+    def fake_git_run(repo_dir, *args, timeout=30):
+        raise subprocess.TimeoutExpired(["git", *args], timeout)
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    result = db_utils.git_retry("bridge", "push", max_retries=1, timeout=7)
+
+    assert result.returncode == 124
+    assert "timed out after 7s" in result.stderr
+
+
 def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     bridge_dir = tmp_path / "bridge"

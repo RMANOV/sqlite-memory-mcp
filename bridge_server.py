@@ -51,6 +51,7 @@ from db_utils import (
     BRIDGE_REPO,
     BRIDGE_SYNC_DELAY,
     git_run as _git_run,
+    ensure_bridge_git_identity as _ensure_bridge_git_identity,
     ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
     source_hash as _source_hash,
     validate_github_username as _validate_github_user,
@@ -112,7 +113,9 @@ def _run_bridge_sync():
 
 def _git(*args: str) -> subprocess.CompletedProcess:
     """Run git in BRIDGE_REPO. Thin wrapper around db_utils.git_run."""
-    return _git_run(BRIDGE_REPO, *args)
+    timeouts = {"pull": 120, "push": 300, "commit": 60}
+    timeout = timeouts.get(args[0], 30) if args else 30
+    return _git_run(BRIDGE_REPO, *args, timeout=timeout)
 
 
 def _bridge_repo_blocked_error(message: str) -> str:
@@ -426,6 +429,14 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     if not repo_ok:
         logger.warning("bridge_push: preflight blocked push: %s", repo_msg)
         return _bridge_repo_blocked_error(repo_msg or "bridge repo is not ready")
+
+    identity = _ensure_bridge_git_identity(BRIDGE_REPO)
+    if identity.get("changed"):
+        logger.info(
+            "bridge_push: bridge git identity set to %s <%s>",
+            identity.get("user_name") or "",
+            identity.get("user_email") or "",
+        )
 
     # v2.0.0: Pull before push (prevents overwriting remote changes)
     pull_result = _git("pull", "--rebase", "--autostash")

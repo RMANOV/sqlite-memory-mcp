@@ -669,7 +669,15 @@ def git_retry(
     delays = [2, 4, 8]
     last_result = None
     for attempt in range(max_retries):
-        last_result = git_run(repo_dir, *args, timeout=timeout)
+        try:
+            last_result = git_run(repo_dir, *args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            last_result = subprocess.CompletedProcess(
+                ["git", *args],
+                124,
+                "",
+                f"git {' '.join(args)} timed out after {timeout}s",
+            )
         if last_result.returncode == 0:
             return last_result
         if attempt < max_retries - 1:
@@ -683,6 +691,53 @@ def git_retry(
             )
             time.sleep(delays[attempt])
     return last_result
+
+
+def ensure_bridge_git_identity(
+    repo_dir: str,
+    *,
+    source_repo_dir: str | None = None,
+) -> dict[str, Any]:
+    """Copy the source repo git identity into the bridge repo as local config."""
+    source_dir = source_repo_dir or str(Path(__file__).resolve().parent)
+
+    def _cfg(repo: str, *cfg_args: str) -> str | None:
+        result = git_run(repo, *cfg_args, timeout=10)
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        return value or None
+
+    bridge_name = _cfg(repo_dir, "config", "--get", "user.name")
+    bridge_email = _cfg(repo_dir, "config", "--get", "user.email")
+    target_name = (
+        _cfg(source_dir, "config", "--get", "user.name")
+        or _cfg(source_dir, "config", "--global", "user.name")
+        or bridge_name
+    )
+    target_email = (
+        _cfg(source_dir, "config", "--get", "user.email")
+        or _cfg(source_dir, "config", "--global", "user.email")
+        or bridge_email
+    )
+
+    changed = False
+    if target_name and bridge_name != target_name:
+        result = git_run(repo_dir, "config", "user.name", target_name, timeout=10)
+        if result.returncode == 0:
+            bridge_name = target_name
+            changed = True
+    if target_email and bridge_email != target_email:
+        result = git_run(repo_dir, "config", "user.email", target_email, timeout=10)
+        if result.returncode == 0:
+            bridge_email = target_email
+            changed = True
+
+    return {
+        "changed": changed,
+        "user_name": bridge_name,
+        "user_email": bridge_email,
+    }
 
 
 def _bridge_status_path(line: str) -> str:

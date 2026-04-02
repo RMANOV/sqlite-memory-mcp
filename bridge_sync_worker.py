@@ -71,6 +71,7 @@ from db_utils import (
     import_remote_bridge_data,
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
+    ensure_bridge_git_identity,
     bridge_change_summary,
     promote_pending_public_entities,
     sync_task_attachments_from_remote,
@@ -84,6 +85,9 @@ log = logging.getLogger("bridge_sync_worker")
 
 _SAFETY_THRESHOLD = 10  # Block sync if this many descriptions would be removed
 _SYNC_THREAD_LOCK = threading.Lock()
+_GIT_PULL_TIMEOUT = 120
+_GIT_PUSH_TIMEOUT = 300
+_GIT_COMMIT_TIMEOUT = 60
 
 
 class _RepoSyncLock:
@@ -611,6 +615,14 @@ def _main_locked(
     _db_path = db_path
     export_started_at = now_iso()
 
+    identity = ensure_bridge_git_identity(bridge_dir)
+    if identity.get("changed"):
+        log.info(
+            "Bridge git identity set to %s <%s>",
+            identity.get("user_name") or "",
+            identity.get("user_email") or "",
+        )
+
     repo_ok, repo_msg = ensure_bridge_repo_ready(bridge_dir)
     if not repo_ok:
         log.warning("Bridge repo preflight blocked sync: %s", repo_msg)
@@ -647,7 +659,13 @@ def _main_locked(
 
     # Phase 2: Git pull (no transaction held)
     _progress(progress_callback, 5, "git pull...")
-    pull_result = git_retry(bridge_dir, "pull", "--rebase", "--autostash")
+    pull_result = git_retry(
+        bridge_dir,
+        "pull",
+        "--rebase",
+        "--autostash",
+        timeout=_GIT_PULL_TIMEOUT,
+    )
     if pull_result.returncode != 0:
         log.error("git pull failed: %s", pull_result.stderr)
         # Log conflict for debugging
@@ -928,7 +946,7 @@ def _main_locked(
     n_ent = len(entities_out)
     n_tasks = len(payload["tasks"])
     msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {machine_id}"
-    result = git_run(bridge_dir, "commit", "-m", msg)
+    result = git_run(bridge_dir, "commit", "-m", msg, timeout=_GIT_COMMIT_TIMEOUT)
 
     if result.returncode != 0:
         if "nothing to commit" not in (result.stdout + result.stderr):
@@ -943,8 +961,11 @@ def _main_locked(
             }
 
     _progress(progress_callback, 95, "git push...")
-    push_result = git_retry(bridge_dir, "push")
+    push_result = git_retry(bridge_dir, "push", timeout=_GIT_PUSH_TIMEOUT)
     pushed = push_result.returncode == 0
+    push_message = (push_result.stderr or push_result.stdout or "").strip()
+    if not pushed and push_message:
+        log.warning("git push failed: %s", push_message)
 
     # Record last_push_at so incremental check can skip next time
     if pushed:
@@ -990,4 +1011,5 @@ def _main_locked(
         "deployed": deployed,
         "imported_new": new_t,
         "imported_updated": upd_t,
+        "message": push_message if not pushed else None,
     }

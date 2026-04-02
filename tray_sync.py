@@ -145,9 +145,13 @@ class BridgeSyncMixin:
                 elif stats.get("skipped"):
                     self._bridge_done.emit("Already in sync — no changes to push")
                 elif not stats.get("pushed", False):
-                    self._bridge_done.emit(
-                        "Sync incomplete — pull/import finished but push did not"
-                    )
+                    detail = stats.get("message")
+                    if detail:
+                        self._bridge_done.emit(f"Sync incomplete — {detail}")
+                    else:
+                        self._bridge_done.emit(
+                            "Sync incomplete — pull/import finished but push did not"
+                        )
                 else:
                     n_ent = stats.get("entities", 0)
                     n_tasks = stats.get("tasks", 0)
