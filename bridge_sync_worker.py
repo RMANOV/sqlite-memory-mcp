@@ -557,6 +557,7 @@ def main(
     db_path: str | None = None,
     bridge_repo: str | None = None,
     force: bool = False,
+    pull_only: bool = False,
     ui_profile: dict | None = None,
 ) -> dict:
     """Run full bridge sync: pull → LWW merge → export → push.
@@ -595,6 +596,7 @@ def main(
             db_path=_db_path,
             bridge_dir=bridge_dir,
             force=force,
+            pull_only=pull_only,
             ui_profile=ui_profile,
             machine_id=machine_id,
         )
@@ -608,6 +610,7 @@ def _main_locked(
     db_path: str,
     bridge_dir: str,
     force: bool,
+    pull_only: bool,
     ui_profile: dict | None,
     machine_id: str,
 ) -> dict:
@@ -615,13 +618,14 @@ def _main_locked(
     _db_path = db_path
     export_started_at = now_iso()
 
-    identity = ensure_bridge_git_identity(bridge_dir)
-    if identity.get("changed"):
-        log.info(
-            "Bridge git identity set to %s <%s>",
-            identity.get("user_name") or "",
-            identity.get("user_email") or "",
-        )
+    if not pull_only:
+        identity = ensure_bridge_git_identity(bridge_dir)
+        if identity.get("changed"):
+            log.info(
+                "Bridge git identity set to %s <%s>",
+                identity.get("user_name") or "",
+                identity.get("user_email") or "",
+            )
 
     repo_ok, repo_msg = ensure_bridge_repo_ready(bridge_dir)
     if not repo_ok:
@@ -638,24 +642,25 @@ def _main_locked(
         }
 
     # Phase 1: Promote pending_public (short transaction)
-    with get_conn(_db_path) as conn:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
-        ).isoformat()
-        promote_pending_public_entities(conn, cutoff, export_started_at)
-        rows = conn.execute(
-            "SELECT id FROM tasks WHERE visibility='pending_public' "
-            "AND publish_requested_at <= ?",
-            (cutoff,),
-        ).fetchall()
-        for row in rows:
-            apply_task_mutation(
-                conn,
-                row["id"],
-                {"visibility": "public"},
-                timestamp=export_started_at,
-                tool_name="bridge_sync_worker.promote_pending_public",
-            )
+    if not pull_only:
+        with get_conn(_db_path) as conn:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
+            ).isoformat()
+            promote_pending_public_entities(conn, cutoff, export_started_at)
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE visibility='pending_public' "
+                "AND publish_requested_at <= ?",
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                apply_task_mutation(
+                    conn,
+                    row["id"],
+                    {"visibility": "public"},
+                    timestamp=export_started_at,
+                    tool_name="bridge_sync_worker.promote_pending_public",
+                )
 
     # Phase 2: Git pull (no transaction held)
     _progress(progress_callback, 5, "git pull...")
@@ -744,6 +749,17 @@ def _main_locked(
             ) as exc:
                 log.warning("Task merge failed: %s", exc)
     # Task import transaction closed — DB lock released
+
+    if pull_only:
+        _progress(progress_callback, 100, "Pull complete")
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "pull_only": True,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+        }
 
     audit_summary: dict | None = None
     try:

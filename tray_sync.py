@@ -89,9 +89,10 @@ class BridgeSyncMixin:
                 import bridge_sync_worker
 
                 stats = bridge_sync_worker.main(
+                    pull_only=True,
                     progress_callback=lambda pct, label: self._bridge_progress.emit(
                         pct, label
-                    )
+                    ),
                 )
                 imported = stats.get("imported_new", 0) + stats.get(
                     "imported_updated", 0

@@ -207,3 +207,28 @@ def test_sync_bridge_skips_when_thread_already_running(bridge_env):
         window._bridge_thread_lock.release()
 
     assert window.status.messages[-1][0] == "Sync already running"
+
+
+def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
+    captured = {}
+    bridge_sync_worker = SimpleNamespace(
+        main=lambda **kwargs: (
+            captured.update(kwargs) or {"imported_new": 0, "imported_updated": 0}
+        )
+    )
+    monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
+
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._db_refresh_debounce = SimpleNamespace(start=lambda: None)
+    window._bridge_progress = SimpleNamespace(emit=lambda *args: None)
+    window._bridge_done = SimpleNamespace(emit=lambda *args: None)
+    monkeypatch.setattr(
+        window,
+        "_start_bridge_sync_thread",
+        lambda target, busy_message=None: (target(), True)[1],
+    )
+
+    window._periodic_pull()
+
+    assert captured["pull_only"] is True

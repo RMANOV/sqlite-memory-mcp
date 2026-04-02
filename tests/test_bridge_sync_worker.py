@@ -286,6 +286,47 @@ def test_git_retry_returns_timeout_result(monkeypatch):
     assert "timed out after 7s" in result.stderr
 
 
+def test_bridge_sync_worker_pull_only_skips_export_and_push(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    git_calls = []
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        git_calls.append(args)
+        if args[:3] == ("pull", "--rebase", "--autostash"):
+            return _cp(args)
+        raise AssertionError(f"Unexpected git_retry call: {args}")
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker, "load_remote_tasks_for_merge", lambda *a, **k: ([], True)
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "import_remote_bridge_data",
+        lambda *a, **k: {"entities": 0, "relations": 0, "ratings": 0},
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker, "sync_task_attachments_from_remote", lambda *a, **k: (0, 0)
+    )
+
+    result = bridge_sync_worker.main(
+        db_path=db_path,
+        bridge_repo=str(bridge_dir),
+        pull_only=True,
+    )
+
+    assert result["pull_only"] is True
+    assert result["pushed"] is False
+    assert git_calls == [("pull", "--rebase", "--autostash")]
+
+
 def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     bridge_dir = tmp_path / "bridge"
