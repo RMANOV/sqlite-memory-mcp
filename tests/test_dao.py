@@ -219,6 +219,53 @@ def test_update_empty_fields_returns_zero(conn):
     assert TaskDAO.update(conn, "t1", {}) == 0
 
 
+def test_create_normalizes_project_alias(conn):
+    _make_task(conn, "proj-create", "Aliased project", project="mapping_studio")
+
+    assert TaskDAO.get_by_id(conn, "proj-create")["project"] == "mapping-studio"
+
+
+def test_update_normalizes_project_alias(conn):
+    _make_task(conn, "proj-update", "Project update")
+
+    TaskDAO.update(
+        conn,
+        "proj-update",
+        {
+            "project": "smartkey",
+            "updated_at": now_iso(),
+        },
+    )
+
+    assert TaskDAO.get_by_id(conn, "proj-update")["project"] == "SmartKey"
+
+
+def test_get_project_names_collapses_alias_variants(conn):
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, project, type, visibility, created_at, updated_at) "
+        "VALUES (?, ?, 'not_started', 'medium', 'inbox', ?, 'task', 'private', ?, ?)",
+        ("proj-1", "Mapping hyphen", "mapping-studio", ts, ts),
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, project, type, visibility, created_at, updated_at) "
+        "VALUES (?, ?, 'not_started', 'medium', 'inbox', ?, 'task', 'private', ?, ?)",
+        ("proj-2", "Mapping underscore", "mapping_studio", ts, ts),
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, project, type, visibility, created_at, updated_at) "
+        "VALUES (?, ?, 'not_started', 'medium', 'inbox', ?, 'task', 'private', ?, ?)",
+        ("proj-3", "Smart lower", "smartkey", ts, ts),
+    )
+
+    projects = TaskDAO.get_project_names(conn)
+
+    assert projects.count("mapping-studio") == 1
+    assert "mapping_studio" not in projects
+    assert projects.count("SmartKey") == 1
+    assert "smartkey" not in projects
+
+
 # ── delete ────────────────────────────────────────────────────────────────
 
 

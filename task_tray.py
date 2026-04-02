@@ -87,6 +87,7 @@ from db_utils import (
     create_task_with_ledger,
     get_conn,
     is_overdue,
+    normalize_project_filter_values,
     now_iso,
     priority_sort_key,
     remove_task_attachment,
@@ -740,6 +741,16 @@ _DEFAULT_TAB_VIEW = {
 }
 
 
+def _normalize_filter_payload(filter_payload):
+    """Normalize persisted include/exclude filter payloads."""
+    payload = filter_payload or {}
+    return {
+        "priority": set(payload.get("priority", [])),
+        "due": set(payload.get("due", [])),
+        "project": normalize_project_filter_values(payload.get("project", [])),
+    }
+
+
 class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     """Full task manager window with tabs, search, sort, and suggested view."""
 
@@ -848,14 +859,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 if key in self._tab_views:
                     if view.get("sort") in self._SORT_MODES:
                         self._tab_views[key]["sort"] = view["sort"]
-                    self._tab_views[key]["active"] = {
-                        k: set(view.get("active", {}).get(k, []))
-                        for k in ("priority", "due", "project")
-                    }
-                    self._tab_views[key]["excluded"] = {
-                        k: set(view.get("excluded", {}).get(k, []))
-                        for k in ("priority", "due", "project")
-                    }
+                    self._tab_views[key]["active"] = _normalize_filter_payload(
+                        view.get("active", {})
+                    )
+                    self._tab_views[key]["excluded"] = _normalize_filter_payload(
+                        view.get("excluded", {})
+                    )
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             pass
 
@@ -1156,8 +1165,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             if key in self._tab_views:
                 self._tab_views[key] = {
                     "sort": self._sort_mode,
-                    "active": copy.deepcopy(self._active_filters),
-                    "excluded": copy.deepcopy(self._excluded_filters),
+                    "active": _normalize_filter_payload(self._active_filters),
+                    "excluded": _normalize_filter_payload(self._excluded_filters),
                 }
 
         # Serialize per-tab views
@@ -1165,8 +1174,20 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         for key, view in self._tab_views.items():
             serializable[key] = {
                 "sort": view["sort"],
-                "active": {k: list(v) for k, v in view["active"].items()},
-                "excluded": {k: list(v) for k, v in view["excluded"].items()},
+                "active": {
+                    "priority": list(view["active"]["priority"]),
+                    "due": list(view["active"]["due"]),
+                    "project": sorted(
+                        normalize_project_filter_values(view["active"]["project"])
+                    ),
+                },
+                "excluded": {
+                    "priority": list(view["excluded"]["priority"]),
+                    "due": list(view["excluded"]["due"]),
+                    "project": sorted(
+                        normalize_project_filter_values(view["excluded"]["project"])
+                    ),
+                },
             }
         self._settings.setValue("tab_views", json.dumps(serializable))
         self._settings.setValue("active_tab", self.tabs.currentIndex())
@@ -1612,8 +1633,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             if new_key in self._tab_views:
                 v = self._tab_views[new_key]
                 self._sort_mode = v["sort"]
-                self._active_filters = copy.deepcopy(v["active"])
-                self._excluded_filters = copy.deepcopy(v["excluded"])
+                self._active_filters = _normalize_filter_payload(v["active"])
+                self._excluded_filters = _normalize_filter_payload(v["excluded"])
             else:
                 self._sort_mode = "priority"
                 self._active_filters = {

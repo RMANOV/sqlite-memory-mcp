@@ -107,6 +107,39 @@ RATING_BURST_WINDOW_HOURS = 24
 
 PRIORITY_RANK = {p: i for i, p in enumerate(TASK_PRIORITIES)}
 
+_PROJECT_ALIAS_CANONICAL = {
+    "mappingstudio": "mapping-studio",
+    "smartkey": "SmartKey",
+}
+
+
+def _project_alias_key(project: str) -> str:
+    """Build a punctuation-insensitive key for project alias matching."""
+    return re.sub(r"[-_\s]+", "", project.strip().casefold())
+
+
+def normalize_project_name(project: str | None) -> str | None:
+    """Normalize known project aliases while preserving unrelated names."""
+    if project is None:
+        return None
+    cleaned = re.sub(r"\s+", " ", str(project)).strip()
+    if not cleaned:
+        return None
+    return _PROJECT_ALIAS_CANONICAL.get(_project_alias_key(cleaned), cleaned)
+
+
+def normalize_project_filter_values(values: Any) -> set[str]:
+    """Normalize a project filter collection into canonical project names."""
+    result: set[str] = set()
+    if not values:
+        return result
+    for value in values:
+        normalized = normalize_project_name(value)
+        if normalized:
+            result.add(normalized)
+    return result
+
+
 PRIORITY_COLORS = {
     "critical": "#e53e3e",
     "high": "#dd6b20",
@@ -1835,6 +1868,7 @@ class TaskDAO:
         created_at: str | None = None,
     ) -> None:
         """Insert a new task. Caller must also call upsert_field_versions."""
+        project = normalize_project_name(project)
         conn.execute(
             "INSERT INTO tasks "
             "(id, title, description, status, priority, section, due_date, "
@@ -1874,6 +1908,9 @@ class TaskDAO:
         """
         if not fields:
             return 0
+        fields = dict(fields)
+        if "project" in fields:
+            fields["project"] = normalize_project_name(fields.get("project"))
         unknown = set(fields) - TaskDAO.ALLOWED_UPDATE_COLUMNS
         if unknown:
             raise ValueError(f"Unknown task columns: {sorted(unknown)}")
@@ -2142,7 +2179,18 @@ class TaskDAO:
             "WHERE project IS NOT NULL AND status NOT IN ('archived','cancelled') "
             "GROUP BY project ORDER BY cnt DESC"
         ).fetchall()
-        return [r["project"] for r in rows]
+        aggregated: dict[str, int] = {}
+        for row in rows:
+            canonical = normalize_project_name(row["project"])
+            if not canonical:
+                continue
+            aggregated[canonical] = aggregated.get(canonical, 0) + int(row["cnt"] or 0)
+        return [
+            name
+            for name, _count in sorted(
+                aggregated.items(), key=lambda item: (-item[1], item[0].casefold())
+            )
+        ]
 
     @staticmethod
     def promote_due_today(conn: sqlite3.Connection) -> int:
@@ -2467,6 +2515,45 @@ def sync_task_attachments_from_remote(
     return (imported, removed)
 
 
+def normalize_task_projects(
+    conn: sqlite3.Connection,
+    *,
+    tool_name: str = "db_utils.normalize_task_projects",
+    actor_type: str = "system",
+    actor_id: str | None = None,
+) -> list[dict[str, str]]:
+    """Canonicalize existing task project values via the authoritative mutation path."""
+    rows = conn.execute(
+        "SELECT id, project FROM tasks WHERE project IS NOT NULL AND TRIM(project) <> '' "
+        "ORDER BY created_at, id"
+    ).fetchall()
+    changed: list[dict[str, str]] = []
+    for row in rows:
+        old_project = row["project"]
+        new_project = normalize_project_name(old_project)
+        if new_project == old_project:
+            continue
+        result = apply_task_mutation(
+            conn,
+            row["id"],
+            {"project": new_project},
+            tool_name=tool_name,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source_kind="task",
+            source_ref=row["id"],
+        )
+        if result.get("updated"):
+            changed.append(
+                {
+                    "task_id": row["id"],
+                    "old_project": old_project,
+                    "new_project": new_project or "",
+                }
+            )
+    return changed
+
+
 # ── Authoritative task mutation helpers ─────────────────────────────────
 
 
@@ -2489,6 +2576,7 @@ def _task_initial_values(
     visibility: str = "private",
     publish_requested_at: str | None = None,
 ) -> dict[str, Any]:
+    project = normalize_project_name(project)
     values = {field: None for field in MERGEABLE_FIELDS}
     values.update(
         {
@@ -2543,6 +2631,7 @@ def create_task_with_ledger(
     provenance_map: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Create a task row and seed authoritative field/event history in one call."""
+    project = normalize_project_name(project)
     TaskDAO.create(
         conn,
         task_id,
@@ -2619,6 +2708,8 @@ def apply_task_mutation(
     This is the preferred write path for any task update outside low-level merge code.
     """
     raw_changes = {k: v for k, v in changes.items() if k != "updated_at"}
+    if "project" in raw_changes:
+        raw_changes["project"] = normalize_project_name(raw_changes.get("project"))
     if not raw_changes:
         return {
             "updated": 0,
@@ -3496,6 +3587,7 @@ def merge_import_tasks(
             continue
 
         sanitize_task_enums(remote)
+        remote["project"] = normalize_project_name(remote.get("project"))
         remote_fts = remote.get("_field_ts", {})
         fallback_ts = remote.get("updated_at", "")
         parent_id = remote.get("parent_id")

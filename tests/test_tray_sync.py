@@ -85,12 +85,12 @@ def test_restore_profile_from_bridge_uses_tab_views_and_ignores_legacy_flat_fiel
                 "active": {
                     "priority": ["high"],
                     "due": ["today"],
-                    "project": ["ops"],
+                    "project": ["mapping_studio"],
                 },
                 "excluded": {
                     "priority": ["low"],
                     "due": ["overdue"],
-                    "project": [],
+                    "project": ["smartkey"],
                 },
             }
         },
@@ -119,12 +119,12 @@ def test_restore_profile_from_bridge_uses_tab_views_and_ignores_legacy_flat_fiel
     assert window._tab_views["inbox"]["active"] == {
         "priority": {"high"},
         "due": {"today"},
-        "project": {"ops"},
+        "project": {"mapping-studio"},
     }
     assert window._tab_views["inbox"]["excluded"] == {
         "priority": {"low"},
         "due": {"overdue"},
-        "project": set(),
+        "project": {"SmartKey"},
     }
     assert window._sort_mode == "due"
     assert window._active_filters == window._tab_views["inbox"]["active"]
@@ -177,7 +177,8 @@ def test_build_ui_profile_serializes_current_window_state(bridge_env, monkeypatc
     )
     window._tab_views["inbox"]["sort"] = "due"
     window._tab_views["inbox"]["active"]["priority"] = {"high"}
-    window._tab_views["inbox"]["excluded"]["project"] = {"ops"}
+    window._tab_views["inbox"]["active"]["project"] = {"mapping_studio"}
+    window._tab_views["inbox"]["excluded"]["project"] = {"smartkey"}
     monkeypatch.setattr(task_tray, "_theme_name", "blue")
     monkeypatch.setattr(task_tray, "_font_size", 15)
     monkeypatch.setattr(task_tray, "_bold", True)
@@ -190,7 +191,8 @@ def test_build_ui_profile_serializes_current_window_state(bridge_env, monkeypatc
     assert profile["active_tab"] == 1
     assert profile["tab_views"]["inbox"]["sort"] == "due"
     assert profile["tab_views"]["inbox"]["active"]["priority"] == ["high"]
-    assert profile["tab_views"]["inbox"]["excluded"]["project"] == ["ops"]
+    assert profile["tab_views"]["inbox"]["active"]["project"] == ["mapping-studio"]
+    assert profile["tab_views"]["inbox"]["excluded"]["project"] == ["SmartKey"]
     assert profile["geometry_b64"]
 
 

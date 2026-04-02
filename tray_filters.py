@@ -30,7 +30,7 @@ from datetime import date, timedelta
 
 from PyQt6.QtWidgets import QToolButton
 
-from db_utils import PRIORITY_COLORS, parse_iso_date
+from db_utils import PRIORITY_COLORS, normalize_project_name, parse_iso_date
 from tray_dialogs import PRIORITIES, _T, _font_size
 
 
@@ -285,7 +285,14 @@ class FilterMixin:
                 ]
 
         if af["project"]:
-            tasks = [t for t in tasks if t.get("project") in af["project"]]
+            wanted = {
+                normalized
+                for normalized in (normalize_project_name(p) for p in af["project"])
+                if normalized
+            }
+            tasks = [
+                t for t in tasks if normalize_project_name(t.get("project")) in wanted
+            ]
 
         # ── Exclude filters (remove matching) ──
         if ef["priority"]:
@@ -294,6 +301,15 @@ class FilterMixin:
             ]
 
         if ef["project"]:
-            tasks = [t for t in tasks if t.get("project") not in ef["project"]]
+            unwanted = {
+                normalized
+                for normalized in (normalize_project_name(p) for p in ef["project"])
+                if normalized
+            }
+            tasks = [
+                t
+                for t in tasks
+                if normalize_project_name(t.get("project")) not in unwanted
+            ]
 
         return tasks

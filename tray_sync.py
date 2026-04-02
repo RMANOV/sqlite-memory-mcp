@@ -37,6 +37,18 @@ from pathlib import Path
 logger = logging.getLogger("task_tray")
 
 
+def _normalize_filter_payload(filter_payload):
+    """Normalize persisted include/exclude filter payloads."""
+    from db_utils import normalize_project_filter_values
+
+    payload = filter_payload or {}
+    return {
+        "priority": set(payload.get("priority", [])),
+        "due": set(payload.get("due", [])),
+        "project": normalize_project_filter_values(payload.get("project", [])),
+    }
+
+
 class BridgeSyncMixin:
     """Bridge sync methods for FullWindow. Mixin — requires Qt signals and _BRIDGE_DIR."""
 
@@ -212,14 +224,12 @@ class BridgeSyncMixin:
                     if key in self._tab_views:
                         if view.get("sort") in self._SORT_MODES:
                             self._tab_views[key]["sort"] = view["sort"]
-                        self._tab_views[key]["active"] = {
-                            k: set(view.get("active", {}).get(k, []))
-                            for k in ("priority", "due", "project")
-                        }
-                        self._tab_views[key]["excluded"] = {
-                            k: set(view.get("excluded", {}).get(k, []))
-                            for k in ("priority", "due", "project")
-                        }
+                        self._tab_views[key]["active"] = _normalize_filter_payload(
+                            view.get("active", {})
+                        )
+                        self._tab_views[key]["excluded"] = _normalize_filter_payload(
+                            view.get("excluded", {})
+                        )
                 # Sync working state from current tab
                 cur_key = self._tab_keys[
                     min(getattr(self, "_saved_active_tab", 0), len(self._tab_keys) - 1)
@@ -227,8 +237,8 @@ class BridgeSyncMixin:
                 if cur_key in self._tab_views:
                     v = self._tab_views[cur_key]
                     self._sort_mode = v["sort"]
-                    self._active_filters = v["active"]
-                    self._excluded_filters = v["excluded"]
+                    self._active_filters = _normalize_filter_payload(v["active"])
+                    self._excluded_filters = _normalize_filter_payload(v["excluded"])
 
             geo_b64 = profile.get("geometry_b64")
             if geo_b64:
@@ -251,8 +261,20 @@ class BridgeSyncMixin:
         for key, view in self._tab_views.items():
             serializable_views[key] = {
                 "sort": view["sort"],
-                "active": {k: list(v) for k, v in view["active"].items()},
-                "excluded": {k: list(v) for k, v in view["excluded"].items()},
+                "active": {
+                    "priority": list(view["active"]["priority"]),
+                    "due": list(view["active"]["due"]),
+                    "project": sorted(
+                        _normalize_filter_payload(view["active"])["project"]
+                    ),
+                },
+                "excluded": {
+                    "priority": list(view["excluded"]["priority"]),
+                    "due": list(view["excluded"]["due"]),
+                    "project": sorted(
+                        _normalize_filter_payload(view["excluded"])["project"]
+                    ),
+                },
             }
 
         profile = {
