@@ -118,6 +118,11 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     return _git_run(BRIDGE_REPO, *args, timeout=timeout)
 
 
+def _tmp_write_path(path: Path) -> Path:
+    """Use a per-target temp name so shared.json and shared.js never collide."""
+    return path.with_name(f"{path.name}.tmp")
+
+
 def _bridge_repo_blocked_error(message: str) -> str:
     """Return a structured bridge repo preflight error."""
     return json.dumps({"error": message, "blocked_by_repo_state": True})
@@ -201,7 +206,7 @@ def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
                 shared_tasks[t["id"]] = t
         existing["shared_tasks"] = list(shared_tasks.values())
 
-        tmp_path = shared_path.with_suffix(".tmp")
+        tmp_path = _tmp_write_path(shared_path)
         tmp_path.write_text(
             json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -359,7 +364,7 @@ def _push_knowledge_to(conn: sqlite3.Connection, target_user: str) -> int:
             current[entry["sourceHash"]] = entry
         existing["shared_knowledge"] = list(current.values())
 
-        tmp_path = shared_path.with_suffix(".tmp")
+        tmp_path = _tmp_write_path(shared_path)
         tmp_path.write_text(
             json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -748,7 +753,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             logger.warning("bridge_push: ignoring corrupt existing shared.json: %s", e)
 
     payload_json = _json_dumps(payload)
-    tmp_path = shared_path.with_suffix(".tmp")
+    tmp_path = _tmp_write_path(shared_path)
     tmp_path.write_text(payload_json, encoding="utf-8")
     os.replace(tmp_path, shared_path)
     _write_shared_js(shared_path, payload_text=payload_json)

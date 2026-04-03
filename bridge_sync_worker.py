@@ -139,9 +139,14 @@ def _progress(cb: Callable[[int, str], None] | None, pct: int, label: str) -> No
         cb(pct, label)
 
 
+def _tmp_write_path(path: Path) -> Path:
+    """Use a per-target temp name so parallel bridge writers never share one tmp file."""
+    return path.with_name(f"{path.name}.tmp")
+
+
 def _write_shared_js(shared_path: Path, payload_text: str) -> None:
     js_path = shared_path.with_name("shared.js")
-    tmp_path = js_path.with_suffix(".tmp")
+    tmp_path = _tmp_write_path(js_path)
     tmp_path.write_text(f"window.__BRIDGE_DATA__ = {payload_text};", encoding="utf-8")
     os.replace(tmp_path, js_path)
 
@@ -940,7 +945,7 @@ def _main_locked(
 
     _progress(progress_callback, 70, "Writing shared.json...")
     payload_json = _json_dumps(payload)
-    tmp_shared_path = shared_path.with_suffix(".tmp")
+    tmp_shared_path = _tmp_write_path(shared_path)
     tmp_shared_path.write_text(payload_json, encoding="utf-8")
     os.replace(tmp_shared_path, shared_path)
     _write_shared_js(shared_path, payload_json)
