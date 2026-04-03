@@ -550,7 +550,14 @@ def _format_task_text(task, include_project=True, prefix=""):
     due = f" | Due: {task['due_date']}" if task.get("due_date") else ""
     proj = f" | {task['project']}" if include_project and task.get("project") else ""
     desc = task.get("description") or ""
-    preview = f" — {desc[:50]}..." if len(desc) > 50 else (f" — {desc}" if desc else "")
+    preview_source = desc
+    if not preview_source and task.get("notes"):
+        preview_source = f"[notes] {task['notes']}"
+    preview = (
+        f" — {preview_source[:50]}..."
+        if len(preview_source) > 50
+        else (f" — {preview_source}" if preview_source else "")
+    )
     return f"{prefix}{type_prefix}{recur}{vis_badge}{ts_badge}[{priority}] {task['title']}{due}{proj}{preview}"
 
 
@@ -574,6 +581,8 @@ def _build_rich_tooltip(task):
         parts.append(f"\U0001f504 {rl}")
     if task.get("description"):
         parts.append(task["description"])
+    if task.get("notes"):
+        parts.append(f"Notes: {task['notes']}")
     if task.get("priority"):
         parts.append(f"Priority: {task['priority']}")
     if task.get("due_date"):
@@ -817,9 +826,13 @@ class TrayPopup(QWidget):
         self._add_title.setPlaceholderText("Title...")
         form_layout.addWidget(self._add_title)
         self._add_desc = QTextEdit()
-        self._add_desc.setPlaceholderText("Description...")
+        self._add_desc.setPlaceholderText("Description (main task/note body)...")
         self._add_desc.setMaximumHeight(60)
         form_layout.addWidget(self._add_desc)
+        self._add_notes = QTextEdit()
+        self._add_notes.setPlaceholderText("Notes (internal / metadata, optional)...")
+        self._add_notes.setMaximumHeight(48)
+        form_layout.addWidget(self._add_notes)
         self._add_due = QLineEdit()
         self._add_due.setPlaceholderText("Due date (YYYY-MM-DD)")
         form_layout.addWidget(self._add_due)
@@ -1118,15 +1131,21 @@ class TrayPopup(QWidget):
             return
         kwargs = {"section": "inbox", "priority": self._add_priority.currentText()}
         desc = self._add_desc.toPlainText().strip()
+        notes = self._add_notes.toPlainText().strip()
         due = self._add_due.text().strip()
         if due:
             kwargs["due_date"] = due
         task_type = self._add_type.currentText().lower()
         task_id = self.db.add_task(
-            title, type=task_type, description=desc or None, **kwargs
+            title,
+            type=task_type,
+            description=desc or None,
+            notes=notes or None,
+            **kwargs,
         )
         self._add_title.clear()
         self._add_desc.clear()
+        self._add_notes.clear()
         self._add_due.clear()
         self._add_priority.setCurrentText("medium")
         self._add_type.setCurrentText("Task")
@@ -1213,8 +1232,14 @@ class EditTaskDialog(QDialog):
         self.desc_edit = QTextEdit()
         self.desc_edit.setPlainText(task.get("description", "") or "")
         self.desc_edit.setMaximumHeight(80)
-        self.desc_edit.setPlaceholderText("Description...")
+        self.desc_edit.setPlaceholderText("Description (main task/note body)...")
         layout.addRow("Description:", self.desc_edit)
+
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setPlainText(task.get("notes", "") or "")
+        self.notes_edit.setMaximumHeight(70)
+        self.notes_edit.setPlaceholderText("Notes (internal / metadata, optional)...")
+        layout.addRow("Notes:", self.notes_edit)
 
         self.section_combo = QComboBox()
         self.section_combo.addItems(SECTIONS)
@@ -1467,6 +1492,7 @@ class EditTaskDialog(QDialog):
         vals = {
             "title": self.title_edit.text().strip(),
             "description": self.desc_edit.toPlainText().strip() or None,
+            "notes": self.notes_edit.toPlainText().strip() or None,
             "section": self.section_combo.currentText(),
             "priority": self.priority_combo.currentText(),
         }
@@ -2024,6 +2050,7 @@ class TaskReaderDialog(QDialog):
 
         # Body
         desc = self.task.get("description") or ""
+        notes = self.task.get("notes") or ""
         if desc:
             escaped = _html.escape(desc)
             paragraphs = escaped.split("\n\n")
@@ -2070,6 +2097,16 @@ class TaskReaderDialog(QDialog):
             )
             self._body_label.setStyleSheet("")
             self._scroll.setStyleSheet("")
+
+        if notes:
+            notes_html = _html.escape(notes).replace("\n", "<br>")
+            body_html += (
+                '<div style="margin-top:16px; padding-top:12px; border-top:1px solid #444;">'
+                '<div style="font-weight:bold; color:#a0aec0; margin-bottom:8px; '
+                'font-size:12px;">Notes</div>'
+                f'<div style="font-family: Segoe UI; font-size: {_font_size}px; '
+                f'line-height: 160%; color: #cbd5e1;">{notes_html}</div></div>'
+            )
 
         # Linked entities section
         links = self.db.get_task_links(self.task.get("id", ""))

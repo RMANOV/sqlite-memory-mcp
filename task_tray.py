@@ -259,6 +259,7 @@ class TaskDB:
         project=None,
         status="not_started",
         description=None,
+        notes=None,
         type="task",
         attachments=None,
     ):
@@ -277,6 +278,7 @@ class TaskDB:
                 priority=priority,
                 due_date=due_date,
                 project=project,
+                notes=notes,
                 type=type,
                 tool_name="task_tray.add_task",
             )

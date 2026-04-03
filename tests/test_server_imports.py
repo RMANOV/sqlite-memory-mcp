@@ -40,6 +40,19 @@ def test_unified_server_imports_and_exposes_mcp_instance():
     assert hasattr(unified_server, "mcp")
 
 
+def test_task_server_instructions_make_description_the_default_body_field():
+    assert "description as the default primary body" in task_server.mcp.instructions
+    assert "main long-form task/note text in ``description`` by default" in (
+        task_server.create_task_or_note.description or ""
+    )
+    assert "Secondary/internal notes or machine-readable metadata." in (
+        task_server.create_task_or_note.description or ""
+    )
+    assert "put the main long-form body in description by default" in (
+        unified_server.mcp.instructions
+    )
+
+
 def test_setup_logger_falls_back_when_primary_log_path_is_unwritable(monkeypatch):
     logger_name = "sqlite-test-fallback-logger"
     logger = logging.getLogger(logger_name)

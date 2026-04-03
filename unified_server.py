@@ -50,7 +50,9 @@ mcp = FastMCP(
         "Unified SQLite knowledge graph server with all tools: "
         "entity/observation/relation CRUD, FTS5 search, task management, "
         "session persistence, entity linking, intelligence v2, "
-        "bridge sync, and knowledge collaboration."
+        "bridge sync, and knowledge collaboration. For tasks/notes, "
+        "put the main long-form body in description by default; "
+        "use notes only for auxiliary/internal metadata."
     ),
 )
 

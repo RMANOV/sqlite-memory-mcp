@@ -56,7 +56,9 @@ mcp = FastMCP(
     "sqlite-tasks",
     instructions=(
         "Task management tools for SQLite-backed persistent memory. "
-        "Create, update, query, and digest tasks. Shares DB with sqlite-kb."
+        "Create, update, query, and digest tasks. "
+        "Use description as the default primary body for task/note content; "
+        "use notes only for auxiliary/internal metadata. Shares DB with sqlite-kb."
     ),
 )
 
@@ -80,16 +82,19 @@ def create_task_or_note(
 ) -> str:
     """Create a new task or note. Returns the UUID.
 
+    Put the main long-form task/note text in ``description`` by default.
+    Use ``notes`` only for auxiliary, internal, or machine-readable metadata.
+
     Args:
         title: Task title (required).
         type: task | note.
-        description: Task description/details.
+        description: Primary task/note body and main long-form content.
         section: inbox | today | next | someday | waiting.
         priority: low | medium | high | critical.
         due_date: YYYY-MM-DD format or empty to skip.
         project: Project tag for grouping.
         parent_id: UUID of parent task (for subtasks).
-        notes: Freeform notes.
+        notes: Secondary/internal notes or machine-readable metadata.
         recurring: JSON config for recurrence (e.g. '{"every":"week","day":"monday"}').
         reminder_at: ISO datetime for reminder (e.g. '2026-03-15T14:00:00').
     """
@@ -168,17 +173,20 @@ def update_task(
 
     Pass special value "CLEAR" to set a field to NULL.
 
+    ``description`` is the primary body field for task/note text.
+    ``notes`` is reserved for secondary/internal metadata.
+
     Args:
         task_id: UUID of the task to update (required).
         title: New title.
-        description: New description.
+        description: New main task/note body.
         status: not_started | in_progress | done | archived | cancelled.
         priority: low | medium | high | critical.
         section: inbox | today | next | someday | waiting.
         due_date: YYYY-MM-DD or "CLEAR" to remove.
         project: Project tag or "CLEAR" to remove.
         parent_id: Parent UUID or "CLEAR" to remove.
-        notes: New notes or "CLEAR" to remove.
+        notes: New auxiliary/internal notes or "CLEAR" to remove.
         recurring: JSON config or "CLEAR" to remove.
         reminder_at: ISO datetime or "CLEAR" to remove.
         type: task | note.

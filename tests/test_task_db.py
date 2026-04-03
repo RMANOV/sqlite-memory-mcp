@@ -67,6 +67,16 @@ class TestTaskDB:
         assert tasks[0]["priority"] == "high"
         assert tasks[0]["due_date"] == "2026-03-04"
 
+    def test_add_task_persists_notes(self, db):
+        task_id = db.add_task(
+            "Task with notes",
+            description="Main body",
+            notes="Internal details",
+        )
+        row = next(t for t in db.get_tasks() if t["id"] == task_id)
+        assert row["description"] == "Main body"
+        assert row["notes"] == "Internal details"
+
     def test_mark_done(self, db):
         tid = db.add_task("To complete")
         db.mark_done(tid)
@@ -187,7 +197,9 @@ class TestTaskDB:
         assert rows[same_series_id] == "cancelled"
         assert rows[other_series_id] == "done"
 
-    def test_search_entities_hybrid_tolerates_missing_task_link_table(self, db, monkeypatch):
+    def test_search_entities_hybrid_tolerates_missing_task_link_table(
+        self, db, monkeypatch
+    ):
         db._conn.execute("DROP TABLE task_entity_links")
         monkeypatch.setattr(
             db,
