@@ -594,12 +594,31 @@ CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON entities BEGIN
     DELETE FROM memory_fts WHERE rowid = old.rowid;
 END;
 
--- NOTE: observations_text is always '' because triggers cannot aggregate child rows.
--- Full-text search on observations relies on name/entity_type columns only.
 CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON entities BEGIN
     DELETE FROM memory_fts WHERE rowid = old.rowid;
     INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
-    VALUES (new.rowid, new.name, new.entity_type, '');
+    SELECT new.rowid, new.name, new.entity_type,
+           COALESCE(GROUP_CONCAT(o.content, ' '), '')
+    FROM (SELECT 1) LEFT JOIN observations o ON o.entity_id = new.id;
+END;
+
+-- FTS sync triggers on observations table (FT-01/FT-02 fix)
+CREATE TRIGGER IF NOT EXISTS memory_fts_obs_ai AFTER INSERT ON observations BEGIN
+    DELETE FROM memory_fts WHERE rowid = new.entity_id;
+    INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+    SELECT e.id, e.name, e.entity_type,
+           COALESCE(GROUP_CONCAT(o.content, ' '), '')
+    FROM entities e LEFT JOIN observations o ON o.entity_id = e.id
+    WHERE e.id = new.entity_id GROUP BY e.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_fts_obs_ad AFTER DELETE ON observations BEGIN
+    DELETE FROM memory_fts WHERE rowid = old.entity_id;
+    INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+    SELECT e.id, e.name, e.entity_type,
+           COALESCE(GROUP_CONCAT(o.content, ' '), '')
+    FROM entities e LEFT JOIN observations o ON o.entity_id = e.id
+    WHERE e.id = old.entity_id GROUP BY e.id;
 END;
 """
 
@@ -1279,6 +1298,36 @@ _MIGRATIONS = [
         "SELECT 1 FROM pragma_table_info('context_packs') WHERE name='contract_version'",
         "ALTER TABLE context_packs ADD COLUMN contract_version TEXT NOT NULL DEFAULT 'legacy'",
         "context_packs.contract_version column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='memory_fts_obs_ai'",
+        """
+        CREATE TRIGGER IF NOT EXISTS memory_fts_obs_ai AFTER INSERT ON observations BEGIN
+            DELETE FROM memory_fts WHERE rowid = new.entity_id;
+            INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+            SELECT e.id, e.name, e.entity_type,
+                   COALESCE(GROUP_CONCAT(o.content, ' '), '')
+            FROM entities e LEFT JOIN observations o ON o.entity_id = e.id
+            WHERE e.id = new.entity_id GROUP BY e.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_fts_obs_ad AFTER DELETE ON observations BEGIN
+            DELETE FROM memory_fts WHERE rowid = old.entity_id;
+            INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+            SELECT e.id, e.name, e.entity_type,
+                   COALESCE(GROUP_CONCAT(o.content, ' '), '')
+            FROM entities e LEFT JOIN observations o ON o.entity_id = e.id
+            WHERE e.id = old.entity_id GROUP BY e.id;
+        END;
+        DROP TRIGGER IF EXISTS memory_fts_au;
+        CREATE TRIGGER memory_fts_au AFTER UPDATE ON entities BEGIN
+            DELETE FROM memory_fts WHERE rowid = old.rowid;
+            INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
+            SELECT new.rowid, new.name, new.entity_type,
+                   COALESCE(GROUP_CONCAT(o.content, ' '), '')
+            FROM (SELECT 1) LEFT JOIN observations o ON o.entity_id = new.id;
+        END
+        """,
+        "FTS observation triggers + entity trigger update (FT-01/FT-02 fix)",
     ),
 ]
 

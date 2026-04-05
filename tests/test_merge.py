@@ -370,12 +370,11 @@ def test_clock_skew_still_merges(conn):
 
 
 def test_null_fill_description_from_remote(conn):
-    """Local task with NULL description adopts remote content, even with import_content=False."""
+    """Local task with NULL description adopts remote content only when import_content=True."""
     tid = "task-iii"
     ts = "2026-01-01T10:00:00"
 
     _insert_task(conn, tid, description=None, updated_at=ts)
-    # Give local a *newer* field version so LWW would not apply
     upsert_field_versions(
         conn,
         tid,
@@ -392,9 +391,12 @@ def test_null_fill_description_from_remote(conn):
             "_field_ts": {"description": [ts, "machine-B"]},
         }
     ]
+    # PF-02 fix: import_content=False must NOT null-fill content
     merge_import_tasks(conn, remote, import_content=False)
+    assert _task(conn, tid)["description"] is None
 
-    # NULL-fill should have run despite import_content=False and local winning on LWW
+    # But import_content=True SHOULD null-fill
+    merge_import_tasks(conn, remote, import_content=True)
     assert _task(conn, tid)["description"] == "Remote content adopted"
 
 

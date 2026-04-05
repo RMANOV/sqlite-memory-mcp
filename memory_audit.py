@@ -181,12 +181,17 @@ def rebuild_task_from_events(
             }
 
     repaired_fields: list[str] = []
-    if (
-        repair
-        and drift
-        and max_event_ts
-        and str(row["updated_at"] or "") <= max_event_ts
-    ):
+    row_updated = str(row["updated_at"] or "")
+    if repair and drift and max_event_ts:
+        if row_updated > max_event_ts:
+            _log.warning(
+                "Task %s: updated_at (%s) is ahead of max event ts (%s) — "
+                "likely manual UPDATE bypass. Repairing anyway (EB-01 fix).",
+                task_id,
+                row_updated,
+                max_event_ts,
+            )
+    if repair and drift and max_event_ts:
         set_clause = ", ".join(f"{field} = ?" for field in drift)
         values = [rebuilt[field] for field in drift] + [max_event_ts, task_id]
         conn.execute(

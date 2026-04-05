@@ -3735,20 +3735,30 @@ def merge_import_tasks(
                     remote["updated_at"] = remote_status_state["updated_at"]
                     fallback_ts = remote["updated_at"]
 
-        # Clock skew detection: warn if remote timestamp is >5s ahead of local
-        if not _clock_skew_warned and fallback_ts > now:
+        # Clock skew detection + clamping: prevent future timestamps from
+        # permanently winning all LWW merges (LW-02 fix)
+        if fallback_ts > now:
             try:
                 delta = (
                     datetime.fromisoformat(fallback_ts) - datetime.fromisoformat(now)
                 ).total_seconds()
                 if delta > 5:
-                    _log.warning(
-                        "Clock skew detected: remote is %.1fs ahead (task %s). "
-                        "LWW merge may produce unexpected results.",
-                        delta,
-                        tid,
-                    )
-                    _clock_skew_warned = True
+                    if not _clock_skew_warned:
+                        _log.warning(
+                            "Clock skew detected: remote is %.1fs ahead (task %s). "
+                            "Clamping future timestamps to now.",
+                            delta,
+                            tid,
+                        )
+                        _clock_skew_warned = True
+                    # Clamp all future field timestamps to now
+                    fallback_ts = now
+                    if remote.get("updated_at", "") > now:
+                        remote["updated_at"] = now
+                    fts = remote.get("_field_ts", {})
+                    for f_key, f_val in fts.items():
+                        if isinstance(f_val, list) and f_val and str(f_val[0]) > now:
+                            f_val[0] = now
             except (ValueError, TypeError):
                 pass
 
@@ -3803,7 +3813,7 @@ def merge_import_tasks(
                 created_at = remote.get("created_at") or fallback_ts or now
                 updated_at = remote.get("updated_at") or fallback_ts or created_at
                 tombstone_status = remote.get("status", "archived")
-                if tombstone_status not in TASK_HIDDEN_STATUSES:
+                if tombstone_status not in (*TASK_HIDDEN_STATUSES, "done"):
                     tombstone_status = "archived"
                 conn.execute(
                     "INSERT OR IGNORE INTO tasks "
@@ -3813,7 +3823,7 @@ def merge_import_tasks(
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         tid,
-                        remote.get("title", ""),
+                        remote.get("title") or "",
                         desc,
                         tombstone_status,
                         remote.get("priority", "medium"),
@@ -3874,6 +3884,9 @@ def merge_import_tasks(
                 updated_fields += 1
             for field in fields_to_merge:
                 if field not in remote:
+                    continue
+                # Skip fields already corrected by status authority (PF-01 fix)
+                if field in fields_to_update:
                     continue
                 remote_val = remote.get(field)
                 remote_ts, remote_by, remote_order, remote_event_id = _parse_field_ts(
@@ -3994,9 +4007,8 @@ def merge_import_tasks(
 
             # NULL-fill: adopt remote content fields when local is NULL
             # (non-LWW — only fills gaps, never overwrites existing content)
-            # Always applied regardless of import_content: LWW may skip content
-            # when local has newer timestamp but NULL value (e.g. freshly created task).
-            for content_field in CONTENT_FIELDS:
+            # Only applied when import_content=True to respect metadata-only sync.
+            for content_field in CONTENT_FIELDS if import_content else ():
                 if content_field in fields_to_update:
                     continue  # already handled by LWW above
                 remote_val = remote.get(content_field)
