@@ -46,6 +46,7 @@ from db_utils import (
     load_remote_entities_for_import as _load_remote_entities_for_import,
     load_remote_tasks_for_merge as _load_remote_tasks_for_merge,
     import_remote_bridge_data as _import_remote_bridge_data,
+    EXTENDED_MEMORY_KEYS as _EXTENDED_MEMORY_KEYS,  # noqa: F401
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     sync_task_attachments_from_remote as _sync_task_attachments_from_remote,
     BRIDGE_REPO,
@@ -740,7 +741,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "public_knowledge",
                 "knowledge_ratings",
                 "team_manifest",
-            }
+            } | set(_EXTENDED_MEMORY_KEYS)
             for key, val in existing.items():
                 if key not in known_keys and isinstance(val, (list, dict)):
                     payload[key] = val
@@ -823,6 +824,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         "attachments/",
         "entities/",
         "entities_index.json",
+        "extended_memory/",
     )
     # Use --porcelain to check staged changes without locale-dependent text parsing
     status_result = _git("status", "--porcelain")

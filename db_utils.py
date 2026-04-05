@@ -78,6 +78,23 @@ TASK_TYPES = ("task", "note")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
 TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 
+# v5: Extended memory keys — written to separate files during bridge export
+EXTENDED_MEMORY_KEYS = (
+    "context_chunks",
+    "context_annotations",
+    "context_questions",
+    "candidate_claims",
+    "claim_evidence",
+    "canonical_facts",
+    "provenance_links",
+    "knowledge_links",
+    "memory_events",
+    "memory_audit_issues",
+    "memory_artifacts",
+    "memory_conflicts",
+    "memory_audit_state",
+)
+
 # v0.7.0: Public knowledge visibility
 VISIBILITY_LEVELS = ("private", "pending_public", "public")
 PUBLISH_STANDBY_MINUTES = 15
@@ -5440,6 +5457,54 @@ def import_memory_audit_state(conn: sqlite3.Connection, rows: list[dict]) -> int
     return imported
 
 
+def write_extended_memory_files(
+    bridge_dir: str,
+    extended_memory: dict[str, list],
+) -> list[str]:
+    """Write each extended memory section to extended_memory/<key>.json.
+
+    Returns list of written file paths (relative to bridge_dir).
+    """
+    em_dir = Path(bridge_dir) / "extended_memory"
+    em_dir.mkdir(exist_ok=True)
+    written: list[str] = []
+    for key in EXTENDED_MEMORY_KEYS:
+        data = extended_memory.get(key, [])
+        file_path = em_dir / f"{key}.json"
+        tmp_path = file_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json_dumps(data), encoding="utf-8")
+        os.replace(tmp_path, file_path)
+        written.append(f"extended_memory/{key}.json")
+    return written
+
+
+def load_extended_memory_files(
+    bridge_dir: str,
+    logger: logging.Logger | None = None,
+) -> dict[str, list]:
+    """Load extended memory sections from extended_memory/<key>.json files.
+
+    Returns dict of key -> list. Missing files are omitted (caller falls back to payload).
+    """
+    em_dir = Path(bridge_dir) / "extended_memory"
+    result: dict[str, list] = {}
+    for key in EXTENDED_MEMORY_KEYS:
+        file_path = em_dir / f"{key}.json"
+        if not file_path.exists():
+            continue
+        try:
+            data = json_loads(file_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                result[key] = data
+            else:
+                if logger:
+                    logger.warning("extended_memory/%s.json: expected list, got %s", key, type(data).__name__)
+        except (ValueError, OSError, TypeError) as exc:
+            if logger:
+                logger.warning("extended_memory/%s.json read failed: %s", key, exc)
+    return result
+
+
 def import_remote_bridge_data(
     conn: sqlite3.Connection,
     bridge_dir: str,
@@ -5468,6 +5533,13 @@ def import_remote_bridge_data(
         "conflicts": 0,
         "audit_state": 0,
     }
+    # v5: augment payload with extended memory from separate files
+    em_files = load_extended_memory_files(bridge_dir, logger)
+    for key in EXTENDED_MEMORY_KEYS:
+        if key not in remote_payload or remote_payload[key] == []:
+            if key in em_files:
+                remote_payload[key] = em_files[key]
+
     remote_events = (
         remote_payload.get("memory_events", [])
         if isinstance(remote_payload.get("memory_events"), list)

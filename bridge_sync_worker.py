@@ -69,6 +69,8 @@ from db_utils import (
     export_memory_conflicts,
     export_memory_audit_state,
     import_remote_bridge_data,
+    write_extended_memory_files,  # noqa: F401
+    EXTENDED_MEMORY_KEYS,  # noqa: F401
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
     ensure_bridge_git_identity,
@@ -907,7 +909,10 @@ def _main_locked(
         "relations": relations_out,
         "tasks": tasks_out,
     }
-    payload.update(extended_memory)
+    # v5: write extended memory to separate files (keeps shared.json under CF Pages 25 MB limit)
+    write_extended_memory_files(bridge_dir, extended_memory)
+    for key in EXTENDED_MEMORY_KEYS:
+        payload[key] = []  # empty placeholders for backward compat
     if pub_entities or pub_tasks:
         payload["public_knowledge"] = {
             "entities": pub_entities,
@@ -961,6 +966,7 @@ def _main_locked(
         "attachments/",
         "entities/",
         "entities_index.json",
+        "extended_memory/",
     )
 
     _progress(progress_callback, 90, "git commit...")
