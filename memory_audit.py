@@ -214,6 +214,16 @@ def rebuild_task_from_events(
                     source_event_id=version_row["source_event_id"],
                 )
         repaired_fields = sorted(drift)
+        # EB-03 fix: record repair in event ledger so future audits see it
+        for field in drift:
+            record_memory_event(
+                conn,
+                event_type="repair",
+                aggregate_kind="task",
+                aggregate_id=task_id,
+                field_name=field,
+                new_value=str(rebuilt[field]) if rebuilt[field] is not None else None,
+            )
 
     return {
         "task_id": task_id,

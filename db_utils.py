@@ -4034,6 +4034,20 @@ def merge_import_tasks(
                     set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
                     values = list(safe_fields.values()) + [local_id]
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
+                    # PF-03 fix: record merge in event ledger
+                    for merged_field in safe_fields:
+                        if merged_field == "updated_at":
+                            continue
+                        record_memory_event(
+                            conn,
+                            event_type="merge",
+                            aggregate_kind="task",
+                            aggregate_id=local_id,
+                            field_name=merged_field,
+                            new_value=str(safe_fields[merged_field])
+                            if safe_fields[merged_field] is not None
+                            else None,
+                        )
             elif remote_updated_at > local_updated_at:
                 conn.execute(
                     "UPDATE tasks SET updated_at = ? WHERE id = ?",
@@ -5548,7 +5562,7 @@ def import_remote_bridge_data(
     # v5: augment payload with extended memory from separate files
     em_files = load_extended_memory_files(bridge_dir, logger)
     for key in EXTENDED_MEMORY_KEYS:
-        if key not in remote_payload or remote_payload[key] == []:
+        if not remote_payload.get(key):
             if key in em_files:
                 remote_payload[key] = em_files[key]
 

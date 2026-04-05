@@ -1413,10 +1413,18 @@ def init_db(db_path: str | None = None) -> None:
     _path = db_path or DB_PATH
     Path(_path).parent.mkdir(parents=True, exist_ok=True)
     raw = sqlite3.connect(_path, isolation_level=None)
+    raw.row_factory = sqlite3.Row
     raw.execute("BEGIN EXCLUSIVE;")
     try:
         for stmt in _split_schema_sql(_SCHEMA_SQL):
             raw.execute(stmt)
+        # Run migrations under same EXCLUSIVE lock (SM-01 fix: prevents race)
+        for check_q, migrate_q, desc in _MIGRATIONS:
+            if not raw.execute(check_q).fetchone():
+                for stmt in _split_schema_sql(migrate_q):
+                    raw.execute(stmt)
+                logger.info("Migration applied: %s", desc)
+        _repair_memory_fts_triggers(raw)
         raw.execute("COMMIT;")
     except Exception:
         raw.execute("ROLLBACK;")
@@ -1425,11 +1433,6 @@ def init_db(db_path: str | None = None) -> None:
         raw.close()
 
     with _get_conn(_path) as conn:
-        for check_q, migrate_q, desc in _MIGRATIONS:
-            if not conn.execute(check_q).fetchone():
-                conn.execute(migrate_q)
-                logger.info("Migration applied: %s", desc)
-        _repair_memory_fts_triggers(conn)
         # Index + prune access log entries older than 30 days
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_access_log_accessed ON entity_access_log(accessed_at)"

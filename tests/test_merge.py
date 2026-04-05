@@ -65,6 +65,21 @@ def conn(tmp_path):
             score REAL DEFAULT NULL, created_at TEXT NOT NULL,
             PRIMARY KEY (task_id, entity_id)
         );
+        CREATE TABLE IF NOT EXISTS memory_events (
+            event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
+            aggregate_kind TEXT NOT NULL, aggregate_id TEXT NOT NULL,
+            field_name TEXT NULL, actor_type TEXT NOT NULL DEFAULT 'system',
+            actor_id TEXT NULL, machine_id TEXT NOT NULL DEFAULT '',
+            tool_name TEXT NOT NULL DEFAULT 'merge',
+            logical_clock INTEGER NOT NULL DEFAULT 0, event_ts TEXT NOT NULL DEFAULT '',
+            old_value TEXT NULL, new_value TEXT NULL, payload_json TEXT NULL,
+            parent_event_id TEXT NULL, source_kind TEXT NULL, source_ref TEXT NULL,
+            source_excerpt TEXT NULL, source_start INTEGER NULL, source_end INTEGER NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_cursors (
+            machine_id TEXT PRIMARY KEY, last_clock INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
     """)
     yield c
     c.close()
@@ -854,15 +869,23 @@ def test_merge_repairs_local_stale_status_from_field_event_authority(conn):
     status_ts = "2026-03-31T16:06:01.347617+00:00"
     clock = 116324641102036992
 
-    conn.execute(
-        "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
-    )
-    conn.execute(
-        "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
-    )
+    # Ensure extra columns exist (fixture now includes full schema)
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
+        )
+    except sqlite3.OperationalError:
+        pass
+    # memory_events already created by fixture; this is a no-op
     conn.execute(
         """
-        CREATE TABLE memory_events (
+        CREATE TABLE IF NOT EXISTS memory_events (
             event_id TEXT PRIMARY KEY,
             event_type TEXT,
             aggregate_kind TEXT,
