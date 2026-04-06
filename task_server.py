@@ -9,6 +9,7 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -50,6 +51,68 @@ def _vec_sync_task_safe(conn, task_id: str) -> None:
         logger.debug("vec_sync_task(%s) skipped: %s", task_id, e)
 
 
+_TITLE_LOOKUP_SPLIT_RE = re.compile(r"[\s\-_]+")
+
+
+def _normalize_title_lookup(text: str | None) -> str:
+    """Normalize title/name text for forgiving partial matching."""
+    return " ".join(
+        part for part in _TITLE_LOOKUP_SPLIT_RE.split((text or "").casefold()) if part
+    )
+
+
+def _title_lookup_score(query: str, candidate: str | None) -> float:
+    """Score a candidate title/name against a partial user fragment."""
+    raw_q = (query or "").casefold().strip()
+    raw_c = (candidate or "").casefold().strip()
+    if not raw_q or not raw_c:
+        return 0.0
+
+    norm_q = _normalize_title_lookup(raw_q)
+    norm_c = _normalize_title_lookup(raw_c)
+
+    if raw_q == raw_c or (norm_q and norm_q == norm_c):
+        return 400.0
+    if raw_q in raw_c:
+        return 320.0 + min(len(raw_q), 80) / 100.0
+    if norm_q and norm_q in norm_c:
+        return 280.0 + min(len(norm_q), 80) / 100.0
+
+    q_words = [w for w in norm_q.split() if w]
+    if q_words and all(w in norm_c for w in q_words):
+        return 220.0 + len(q_words)
+
+    return 0.0
+
+
+def _text_lookup_score(
+    query: str,
+    candidate: str | None,
+    *,
+    exact_score: float,
+    normalized_score: float,
+    all_words_score: float,
+) -> float:
+    """Score a non-title text field against a remembered phrase."""
+    raw_q = (query or "").casefold().strip()
+    raw_c = (candidate or "").casefold().strip()
+    if not raw_q or not raw_c:
+        return 0.0
+
+    norm_q = _normalize_title_lookup(raw_q)
+    norm_c = _normalize_title_lookup(raw_c)
+
+    if raw_q in raw_c:
+        return exact_score + min(len(raw_q), 80) / 100.0
+    if norm_q and norm_q in norm_c:
+        return normalized_score + min(len(norm_q), 80) / 100.0
+
+    q_words = [w for w in norm_q.split() if w]
+    if q_words and all(w in norm_c for w in q_words):
+        return all_words_score + len(q_words)
+    return 0.0
+
+
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -57,6 +120,9 @@ mcp = FastMCP(
     instructions=(
         "Task management tools for SQLite-backed persistent memory. "
         "Create, update, query, and digest tasks. "
+        "Use find_by_title when only a remembered phrase is known: it searches tasks, notes, "
+        "and entities across title/name, description, notes, observations, and project "
+        "regardless of status, section, or project filters. "
         "Use description as the default primary body for task/note content; "
         "use notes only for auxiliary/internal metadata. Shares DB with sqlite-kb."
     ),
@@ -398,6 +464,208 @@ def query_tasks(
         result["has_more"] = True
         result["next_offset"] = offset + limit
     return json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 3b: find_by_title
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def find_by_title(title_fragment: str, limit: int = 20) -> str:
+    """Find tasks, notes, or entities by partial title or remembered phrase.
+
+    This is the cross-surface lookup tool when the caller only remembers a
+    phrase, not the storage surface. It searches across task titles,
+    descriptions, notes, projects, entity names, and entity observations.
+    It ignores task status, section, type, and project filters.
+
+    Args:
+        title_fragment: Any distinctive substring or remembered phrase.
+        limit: Maximum number of matches to return.
+    """
+    query = (title_fragment or "").strip()
+    if not query:
+        return json.dumps(
+            {"matches": [], "count": 0, "message": "Empty title fragment"}
+        )
+
+    limit = max(1, min(int(limit), 100))
+    matches: list[dict[str, Any]] = []
+
+    with _get_conn() as conn:
+        task_rows = conn.execute(
+            "SELECT id, title, description, notes, type, status, section, priority, due_date, project, updated_at, created_at "
+            "FROM tasks"
+        ).fetchall()
+        for row in task_rows:
+            title = row["title"] or ""
+            matched_in: list[str] = []
+            score = 0.0
+
+            title_score = _title_lookup_score(query, title)
+            if title_score > 0:
+                score = max(score, title_score)
+                matched_in.append("title")
+
+            desc_score = _text_lookup_score(
+                query,
+                row["description"],
+                exact_score=185.0,
+                normalized_score=165.0,
+                all_words_score=135.0,
+            )
+            if desc_score > 0:
+                score = max(score, desc_score)
+                matched_in.append("description")
+
+            notes_score = _text_lookup_score(
+                query,
+                row["notes"],
+                exact_score=165.0,
+                normalized_score=145.0,
+                all_words_score=120.0,
+            )
+            if notes_score > 0:
+                score = max(score, notes_score)
+                matched_in.append("notes")
+
+            project_score = _text_lookup_score(
+                query,
+                row["project"],
+                exact_score=150.0,
+                normalized_score=130.0,
+                all_words_score=110.0,
+            )
+            if project_score > 0:
+                score = max(score, project_score)
+                matched_in.append("project")
+
+            if score <= 0:
+                continue
+            kind = "note" if row["type"] == "note" else "task"
+            matches.append(
+                {
+                    "kind": kind,
+                    "id": row["id"],
+                    "title": title,
+                    "type": row["type"],
+                    "status": row["status"],
+                    "section": row["section"],
+                    "priority": row["priority"],
+                    "due_date": row["due_date"],
+                    "project": row["project"],
+                    "updated_at": row["updated_at"],
+                    "created_at": row["created_at"],
+                    "score": score,
+                    "matched_in": matched_in,
+                }
+            )
+
+        obs_by_entity: dict[int, list[str]] = {}
+        for row in conn.execute(
+            "SELECT entity_id, content FROM observations ORDER BY entity_id, id"
+        ):
+            obs_by_entity.setdefault(row["entity_id"], []).append(row["content"])
+        entity_rows = conn.execute(
+            "SELECT id, name, entity_type, project, updated_at, created_at FROM entities"
+        ).fetchall()
+        for row in entity_rows:
+            name = row["name"] or ""
+            matched_in: list[str] = []
+            score = 0.0
+
+            name_score = _title_lookup_score(query, name)
+            if name_score > 0:
+                score = max(score, name_score)
+                matched_in.append("name")
+
+            obs_text = "\n".join(obs_by_entity.get(row["id"], []))
+            obs_score = _text_lookup_score(
+                query,
+                obs_text,
+                exact_score=180.0,
+                normalized_score=160.0,
+                all_words_score=130.0,
+            )
+            if obs_score > 0:
+                score = max(score, obs_score)
+                matched_in.append("observations")
+
+            project_score = _text_lookup_score(
+                query,
+                row["project"],
+                exact_score=150.0,
+                normalized_score=130.0,
+                all_words_score=110.0,
+            )
+            if project_score > 0:
+                score = max(score, project_score)
+                matched_in.append("project")
+
+            type_score = _text_lookup_score(
+                query,
+                row["entity_type"],
+                exact_score=120.0,
+                normalized_score=110.0,
+                all_words_score=95.0,
+            )
+            if type_score > 0:
+                score = max(score, type_score)
+                matched_in.append("entity_type")
+
+            if score <= 0:
+                continue
+            matches.append(
+                {
+                    "kind": "entity",
+                    "id": row["id"],
+                    "title": name,
+                    "entityType": row["entity_type"],
+                    "project": row["project"],
+                    "updated_at": row["updated_at"],
+                    "created_at": row["created_at"],
+                    "score": score,
+                    "matched_in": matched_in,
+                }
+            )
+
+    matches.sort(
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            1 if item.get("kind") in {"task", "note"} else 0,
+            item.get("updated_at") or "",
+            item.get("created_at") or "",
+        ),
+        reverse=True,
+    )
+    matches = matches[:limit]
+
+    lines = [
+        "| # | Kind | Title | Status/Type | Section | Project | Matched In |",
+        "|---|------|-------|-------------|---------|---------|------------|",
+    ]
+    for idx, item in enumerate(matches, 1):
+        if item["kind"] == "entity":
+            status_or_type = item.get("entityType") or "entity"
+            section = "—"
+        else:
+            status_or_type = (
+                f"{item.get('status') or '—'} / {item.get('type') or 'task'}"
+            )
+            section = item.get("section") or "—"
+        lines.append(
+            f"| {idx} | {item['kind']} | {item['title']} | {status_or_type} | "
+            f"{section} | {item.get('project') or '—'} | {', '.join(item.get('matched_in') or []) or '—'} |"
+        )
+
+    return json.dumps(
+        {
+            "matches": matches,
+            "count": len(matches),
+            "query": query,
+            "markdown": "\n".join(lines) if matches else "",
+            "message": None if matches else "No title matches",
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

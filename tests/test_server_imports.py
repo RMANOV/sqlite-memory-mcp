@@ -25,6 +25,7 @@ def test_tool_decorators_keep_fn_alias_for_direct_invocation_regressions():
     assert server.create_entities.fn is server.create_entities
     assert server.create_entities([]) == server.create_entities.__wrapped__([])
     assert task_server.create_task_or_note.fn is task_server.create_task_or_note
+    assert task_server.find_by_title.fn is task_server.find_by_title
     assert callable(task_server.create_task_or_note.fn)
     assert session_server.session_save.fn is session_server.session_save
     assert bridge_server.bridge_push.fn is bridge_server.bridge_push
@@ -42,6 +43,9 @@ def test_unified_server_imports_and_exposes_mcp_instance():
 
 def test_task_server_instructions_make_description_the_default_body_field():
     assert "description as the default primary body" in task_server.mcp.instructions
+    assert "Use find_by_title when only a remembered phrase is known" in (
+        task_server.mcp.instructions
+    )
     assert "main long-form task/note text in ``description`` by default" in (
         task_server.create_task_or_note.description or ""
     )
@@ -49,6 +53,9 @@ def test_task_server_instructions_make_description_the_default_body_field():
         task_server.create_task_or_note.description or ""
     )
     assert "put the main long-form body in description by default" in (
+        unified_server.mcp.instructions
+    )
+    assert "title/name, description, notes, observations" in (
         unified_server.mcp.instructions
     )
 
