@@ -1,0 +1,71 @@
+{
+  "pack_id": "BH-PACK-2026-04-07-SQLITE-MEMORY-PREDICTIVE",
+  "repo": "sqlite-memory-mcp",
+  "created_at": "2026-04-07T16:20:00+03:00",
+  "purpose": "Short predictive risk pack for sqlite_memory. Use before changes that can reopen authority, sync, recovery, retrieval or deploy regressions.",
+  "recommended_order": [
+    "DOC-004",
+    "DOC-001",
+    "DOC-002",
+    "DOC-003"
+  ],
+  "total_estimated_checkpoints": 43,
+  "docs": [
+    {
+      "doc_id": "DOC-001",
+      "file": "DOC-001_WRITE_AUTHORITY_RISK_QUESTIONS.md",
+      "title": "Write authority and mutation risk questions",
+      "priority": "critical",
+      "estimated_checkpoints": 11,
+      "themes": [
+        "mutation API",
+        "ledger",
+        "field history",
+        "merge precedence",
+        "bypass detection"
+      ]
+    },
+    {
+      "doc_id": "DOC-002",
+      "file": "DOC-002_BRIDGE_DEPLOY_RECOVERY_RISK_QUESTIONS.md",
+      "title": "Bridge, deploy and recovery risk questions",
+      "priority": "critical",
+      "estimated_checkpoints": 12,
+      "themes": [
+        "export/import parity",
+        "generated artifacts",
+        "recovery",
+        "Pages publish surface",
+        "cross-machine continuity"
+      ]
+    },
+    {
+      "doc_id": "DOC-003",
+      "file": "DOC-003_OPERATOR_RETRIEVAL_RISK_QUESTIONS.md",
+      "title": "Operator and retrieval risk questions",
+      "priority": "high",
+      "estimated_checkpoints": 10,
+      "themes": [
+        "tray semantics",
+        "hidden writes",
+        "search",
+        "description vs notes",
+        "project/filter drift"
+      ]
+    },
+    {
+      "doc_id": "DOC-004",
+      "file": "DOC-004_PREDICTIVE_SYSTEM_CHECKLIST.md",
+      "title": "Predictive system checklist",
+      "priority": "critical",
+      "estimated_checkpoints": 10,
+      "themes": [
+        "change-type routing",
+        "generator activation",
+        "severity triage",
+        "stop conditions",
+        "follow-up protocol"
+      ]
+    }
+  ]
+}

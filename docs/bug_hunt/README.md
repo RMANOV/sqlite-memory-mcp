@@ -34,6 +34,8 @@
 
 ```text
 docs/bug_hunt/
+├─ BUG_PATTERN_ANALYSIS.md
+├─ BUG_PATTERN_GRAPH.md
 ├─ questionnaire_packs/
 │  └─ 2026-04-02/
 │     ├─ MANIFEST.json
@@ -42,6 +44,13 @@ docs/bug_hunt/
 │     ├─ DOC-002_TASK_TRAY_AND_OPERATOR_SURFACES.md
 │     ├─ DOC-003_MEMORY_GOVERNANCE_RETRIEVAL_AUDIT.md
 │     └─ DOC-004_SPOF_OPERATIONAL_RESILIENCE.md
+│  └─ 2026-04-07/
+│     ├─ MANIFEST.json
+│     ├─ INDEX.md
+│     ├─ DOC-001_WRITE_AUTHORITY_RISK_QUESTIONS.md
+│     ├─ DOC-002_BRIDGE_DEPLOY_RECOVERY_RISK_QUESTIONS.md
+│     ├─ DOC-003_OPERATOR_RETRIEVAL_RISK_QUESTIONS.md
+│     └─ DOC-004_PREDICTIVE_SYSTEM_CHECKLIST.md
 └─ runs/
    ├─ RUN_REGISTRY.jsonl
    ├─ _TEMPLATE_RUN_FOLDER/
@@ -62,6 +71,20 @@ docs/bug_hunt/
 4. `DOC-004` — SPOF inventory, failure drills, residual risk.
 
 Това не е случайна подредба. Ако `DOC-001` е счупен, останалите могат да изглеждат коректни локално, но да се разпаднат cross-machine.
+
+## Predictive Layer
+
+От `2026-04-07` пакетът има и отделен predictive слой:
+
+- `BUG_PATTERN_ANALYSIS.md` — повторяеми генератори, gravity wells и regression checkpoints;
+- `BUG_PATTERN_GRAPH.md` — причинна карта, root causes и вероятни следващи bug класове;
+- `questionnaire_packs/2026-04-07/` — кратки risk-questionnaire docs в `DOC-004` стил, предназначени за pre-change triage, не за дълъг post-mortem.
+
+Практическото правило е:
+
+1. За нов fix cluster или feature branch — отвори първо predictive pack `2026-04-07`.
+2. За вече възникнал sync/recovery incident — отвори базовия pack `2026-04-02`.
+3. За архитектурен обзор или planning — чети pattern docs на root ниво.
 
 ## When to Rerun
 
