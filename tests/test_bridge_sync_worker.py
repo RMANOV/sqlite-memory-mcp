@@ -252,6 +252,45 @@ def test_bridge_repo_ready_discards_stale_generated_tmp_files(monkeypatch):
     assert any("shared.tmp" in args for args in clean_calls)
 
 
+def test_bridge_repo_ready_discards_extended_memory_artifacts(monkeypatch):
+    calls = []
+    statuses = iter(
+        [
+            _cp(
+                ("status", "--porcelain"),
+                stdout=(
+                    " M extended_memory/context_chunks.json\n"
+                    "?? extended_memory/memory_events.json.tmp\n"
+                ),
+            ),
+            _cp(("status", "--porcelain"), stdout=""),
+        ]
+    )
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _cp(args, stdout="main\n")
+        if args == ("status", "--porcelain"):
+            return next(statuses)
+        if args[:2] in {("checkout", "--"), ("clean", "-fd")}:
+            return _cp(args)
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready("bridge")
+
+    assert ok is True
+    assert msg is None
+    assert any(
+        "extended_memory" in args for args in calls if args[:2] == ("checkout", "--")
+    )
+    assert any(
+        "extended_memory" in args for args in calls if args[:2] == ("clean", "-fd")
+    )
+
+
 def test_tmp_write_path_uses_distinct_target_names(tmp_path):
     shared_json = tmp_path / "shared.json"
     shared_js = tmp_path / "shared.js"

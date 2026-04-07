@@ -18,12 +18,14 @@ from db_utils import (
     MERGEABLE_FIELDS,
     _event_sort_key,
     _store_task_field_version,
+    _normalize_task_status_value,
     _sqlite_has_column,
     _sqlite_table_exists,
     add_knowledge_link,
     add_provenance_link,
     json_dumps,
     json_loads,
+    normalize_project_name,
     now_iso,
     record_memory_event,
     upsert_memory_artifact,
@@ -100,6 +102,25 @@ def _parse_event_value(raw: Any) -> Any:
         return raw
 
 
+def _materialize_task_field_value(field: str, value: Any) -> str | None:
+    """Coerce replayed task field values back into DB-safe task row values."""
+    if value is None:
+        return None
+    if field == "status":
+        return _normalize_task_status_value(value)
+    if field == "project":
+        return normalize_project_name(value)
+    if field == "recurring":
+        if isinstance(value, str):
+            return value
+        return json_dumps(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json_dumps(value)
+    return str(value)
+
+
 def _load_task_event_heads(
     conn: sqlite3.Connection,
     task_id: str,
@@ -169,10 +190,13 @@ def rebuild_task_from_events(
         head = event_heads.get(field)
         if head is not None:
             value = _parse_event_value(head.get("new_value"))
-            rebuilt[field] = value
+            rebuilt[field] = _materialize_task_field_value(field, value)
             max_event_ts = max(max_event_ts, str(head.get("event_ts") or ""))
         elif field in versions and versions[field]["new_value"] is not None:
-            rebuilt[field] = _parse_event_value(versions[field]["new_value"])
+            rebuilt[field] = _materialize_task_field_value(
+                field,
+                _parse_event_value(versions[field]["new_value"]),
+            )
             max_event_ts = max(max_event_ts, str(versions[field]["updated_at"] or ""))
         if field in rebuilt and row[field] != rebuilt[field]:
             drift[field] = {
@@ -184,7 +208,7 @@ def rebuild_task_from_events(
     row_updated = str(row["updated_at"] or "")
     if repair and drift and max_event_ts:
         if row_updated > max_event_ts:
-            _log.warning(
+            logger.warning(
                 "Task %s: updated_at (%s) is ahead of max event ts (%s) — "
                 "likely manual UPDATE bypass. Repairing anyway (EB-01 fix).",
                 task_id,

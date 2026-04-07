@@ -659,7 +659,7 @@ BRIDGE_GENERATED_TEMP_FILES = frozenset(
     }
 )
 BRIDGE_GENERATED_DIRS = frozenset(
-    {"tasks", "entities", "attachments", "public_knowledge"}
+    {"tasks", "entities", "attachments", "public_knowledge", "extended_memory"}
 )
 
 
@@ -779,6 +779,8 @@ def is_generated_bridge_path(path: str) -> bool:
     rel = path.replace("\\", "/").strip("/")
     if rel in BRIDGE_GENERATED_FILES or rel in BRIDGE_GENERATED_TEMP_FILES:
         return True
+    if rel.endswith(".tmp"):
+        return any(rel.startswith(f"{dirname}/") for dirname in BRIDGE_GENERATED_DIRS)
     return any(rel == d or rel.startswith(f"{d}/") for d in BRIDGE_GENERATED_DIRS)
 
 
@@ -926,6 +928,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         "entities",
         "attachments",
         "public_knowledge",
+        "extended_memory",
     ]
     restore = git_run(repo_dir, "checkout", "--", *generated_paths)
     clean = git_run(repo_dir, "clean", "-fd", "--", *generated_paths)

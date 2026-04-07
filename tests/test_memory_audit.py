@@ -1,5 +1,6 @@
 """Tests for memory audit, replay, and truth-maintenance helpers."""
 
+import json
 import os
 import sqlite3
 import sys
@@ -251,6 +252,35 @@ def test_run_memory_audit_detects_task_write_bypass(conn):
     result = run_memory_audit(conn, repair=False)
 
     assert any(issue["issue_type"] == "task_write_bypass" for issue in result["issues"])
+
+
+def test_rebuild_task_from_events_repairs_structured_recurring_value(conn):
+    ts = "2026-03-31T11:00:00+00:00"
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, recurring, type, created_at, updated_at) "
+        "VALUES ('task-recurring', 'Recurring task', 'not_started', 'medium', 'inbox', ?, 'task', ?, ?)",
+        ('{"every":"week","day":1}', ts, ts),
+    )
+    from db_utils import upsert_field_versions
+
+    upsert_field_versions(
+        conn,
+        "task-recurring",
+        ("recurring",),
+        timestamp="2026-03-31T11:05:00+00:00",
+        machine_id="fedora",
+        old_values={"recurring": '{"every":"week","day":1}'},
+        new_values={"recurring": {"every": "month", "day": 15}},
+        tool_name="test.rebuild_task_recurring",
+    )
+
+    result = rebuild_task_from_events(conn, "task-recurring", repair=True)
+    row = conn.execute(
+        "SELECT recurring FROM tasks WHERE id = 'task-recurring'"
+    ).fetchone()
+
+    assert "recurring" in result["repaired_fields"]
+    assert json.loads(row["recurring"]) == {"every": "month", "day": 15}
 
 
 def test_maybe_run_memory_audit_respects_schedule(conn):
