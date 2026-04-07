@@ -78,6 +78,7 @@ docs/bug_hunt/
 
 - `BUG_PATTERN_ANALYSIS.md` — повторяеми генератори, gravity wells и regression checkpoints;
 - `BUG_PATTERN_GRAPH.md` — причинна карта, root causes и вероятни следващи bug класове;
+- `BUG_HUNT_ANALYSIS_GRAPHS.md` — количествен deep dive: process metrics, co-change graph, predictive probability matrix;
 - `questionnaire_packs/2026-04-07/` — кратки risk-questionnaire docs в `DOC-004` стил, предназначени за pre-change triage, не за дълъг post-mortem.
 
 Практическото правило е:
