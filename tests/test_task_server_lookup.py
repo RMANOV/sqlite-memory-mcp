@@ -2,12 +2,14 @@ import json
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import task_server
+from retrieval_contract import RETRIEVAL_CONTRACT_VERSION
 from schema import init_db
 
 
@@ -30,7 +32,7 @@ def task_env(tmp_path, monkeypatch):
     return db_path
 
 
-def test_find_by_title_matches_done_notes_and_entities_by_partial_title(task_env):
+def _seed_lookup_corpus():
     task_server.create_task_or_note.fn(
         title="Bug Hunt Финален Доклад",
         type="note",
@@ -45,6 +47,25 @@ def test_find_by_title_matches_done_notes_and_entities_by_partial_title(task_env
         )
     )
     task_server.update_task.fn(created["task_id"], status="done")
+    task_server.create_task_or_note.fn(
+        title="reports_generator phase-2 followup",
+        type="task",
+    )
+    general = json.loads(
+        task_server.create_task_or_note.fn(
+            title="Напълно общо заглавие",
+            type="task",
+            description="Тук вътре стои фразата Byzantine gossip",
+            notes="вътрешна бележка за fallback path",
+            project="deep-research",
+        )
+    )
+    task_server.update_task.fn(general["task_id"], status="done")
+    task_server.create_task_or_note.fn(
+        title="Research Note Rollout",
+        type="task",
+        description="strong remembered phrase path",
+    )
 
     with task_server._get_conn() as conn:
         conn.execute(
@@ -52,6 +73,25 @@ def test_find_by_title_matches_done_notes_and_entities_by_partial_title(task_env
             "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
             ("Мапинг Студио Архитектура", "project-doc", "mapping-studio"),
         )
+        cur = conn.execute(
+            "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+            ("Общо име", "research-note", "reports_generator"),
+        )
+        entity_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, datetime('now'))",
+            (entity_id, "Специфична фраза: strategic shortfall window"),
+        )
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+            ("Шумен елемент", "research-note", "general"),
+        )
+
+
+def test_find_by_title_matches_done_notes_and_entities_by_partial_title(task_env):
+    _seed_lookup_corpus()
 
     result = json.loads(task_server.find_by_title.fn("мапинг студ"))
 
@@ -64,10 +104,7 @@ def test_find_by_title_matches_done_notes_and_entities_by_partial_title(task_env
 
 
 def test_find_by_title_normalizes_hyphens_and_underscores(task_env):
-    task_server.create_task_or_note.fn(
-        title="reports_generator phase-2 followup",
-        type="task",
-    )
+    _seed_lookup_corpus()
 
     result = json.loads(task_server.find_by_title.fn("reports generator phase 2"))
 
@@ -76,54 +113,73 @@ def test_find_by_title_normalizes_hyphens_and_underscores(task_env):
 
 
 def test_find_by_title_matches_description_notes_and_project(task_env):
-    created = json.loads(
-        task_server.create_task_or_note.fn(
-            title="Напълно общо заглавие",
-            type="task",
-            description="Тук вътре стои фразата Byzantine gossip",
-            notes="вътрешна бележка за fallback path",
-            project="deep-research",
-        )
-    )
-    task_server.update_task.fn(created["task_id"], status="done")
+    _seed_lookup_corpus()
 
     by_desc = json.loads(task_server.find_by_title.fn("Byzantine gossip"))
     by_notes = json.loads(task_server.find_by_title.fn("fallback path"))
     by_project = json.loads(task_server.find_by_title.fn("deep research"))
 
-    assert any(item["id"] == created["task_id"] for item in by_desc["matches"])
+    expected_title = "Напълно общо заглавие"
+    assert any(item["title"] == expected_title for item in by_desc["matches"])
     assert any(
         "description" in (item.get("matched_in") or []) for item in by_desc["matches"]
     )
-    assert any(item["id"] == created["task_id"] for item in by_notes["matches"])
+    assert any(item["title"] == expected_title for item in by_notes["matches"])
     assert any(
         "notes" in (item.get("matched_in") or []) for item in by_notes["matches"]
     )
-    assert any(item["id"] == created["task_id"] for item in by_project["matches"])
+    assert any(item["title"] == expected_title for item in by_project["matches"])
     assert any(
         "project" in (item.get("matched_in") or []) for item in by_project["matches"]
     )
 
 
 def test_find_by_title_matches_entity_observations(task_env):
-    with task_server._get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
-            "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
-            ("Общо име", "research-note", "reports_generator"),
-        )
-        entity_id = cur.lastrowid
-        conn.execute(
-            "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, datetime('now'))",
-            (entity_id, "Специфична фраза: strategic shortfall window"),
-        )
+    _seed_lookup_corpus()
 
     result = json.loads(task_server.find_by_title.fn("strategic shortfall window"))
 
     assert any(
-        item["kind"] == "entity" and item["id"] == entity_id
+        item["kind"] == "entity" and item["title"] == "Общо име"
         for item in result["matches"]
     )
     assert any(
         "observations" in (item.get("matched_in") or []) for item in result["matches"]
     )
+
+
+def test_find_by_title_returns_contract_metadata_and_hides_low_confidence_noise(
+    task_env,
+):
+    _seed_lookup_corpus()
+
+    result = json.loads(task_server.find_by_title.fn("research note"))
+
+    assert result["ranking_contract_version"] == RETRIEVAL_CONTRACT_VERSION
+    assert result["matches"][0]["title"] == "Research Note Rollout"
+    assert result["matches"][0]["primary_surface"] == "title"
+    assert result["matches"][0]["confidence"] == "high"
+    assert result["hidden_low_confidence_count"] >= 1
+    assert all(item["confidence"] != "low" for item in result["matches"])
+
+
+def test_find_by_title_eval_corpus_keeps_top1_and_top3_hit_rate(task_env):
+    _seed_lookup_corpus()
+    corpus_path = Path(__file__).with_name("fixtures") / "retrieval_eval_corpus.json"
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+
+    top1_hits = 0
+    top3_hits = 0
+    for case in corpus:
+        result = json.loads(task_server.find_by_title.fn(case["query"]))
+        titles = [item["title"] for item in result["matches"]]
+        top1_title = titles[0] if titles else None
+        top3 = set(titles[:3])
+        if top1_title == case["expect_top1_title"]:
+            top1_hits += 1
+        if set(case["expect_top3_titles"]).issubset(top3):
+            top3_hits += 1
+
+    total = len(corpus)
+    assert top1_hits == total
+    assert top3_hits == total

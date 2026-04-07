@@ -29,6 +29,7 @@ def test_tool_decorators_keep_fn_alias_for_direct_invocation_regressions():
     assert callable(task_server.create_task_or_note.fn)
     assert session_server.session_save.fn is session_server.session_save
     assert bridge_server.bridge_push.fn is bridge_server.bridge_push
+    assert bridge_server.bridge_doctor.fn is bridge_server.bridge_doctor
     assert collab_server.manage_collaborators.fn is collab_server.manage_collaborators
     assert entity_server.link_task_entity.fn is entity_server.link_task_entity
     assert intel_server.assess_context.fn is intel_server.assess_context
@@ -46,6 +47,7 @@ def test_task_server_instructions_make_description_the_default_body_field():
     assert "Use find_by_title when only a remembered phrase is known" in (
         task_server.mcp.instructions
     )
+    assert "confidence gating" in task_server.mcp.instructions
     assert "main long-form task/note text in ``description`` by default" in (
         task_server.create_task_or_note.description or ""
     )
@@ -58,6 +60,7 @@ def test_task_server_instructions_make_description_the_default_body_field():
     assert "title/name, description, notes, observations" in (
         unified_server.mcp.instructions
     )
+    assert "confidence gating" in unified_server.mcp.instructions
 
 
 def test_setup_logger_falls_back_when_primary_log_path_is_unwritable(monkeypatch):

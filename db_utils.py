@@ -3959,7 +3959,6 @@ def merge_import_tasks(
                                 content_length(remote_val),
                             )
                             continue
-                    fields_to_update[field] = remote_val
                     _store_task_field_version(
                         conn,
                         local_id,
@@ -3969,8 +3968,9 @@ def merge_import_tasks(
                         updated_order=remote_order,
                         source_event_id=remote_event_id,
                     )
-                    updated_fields += 1
                     if local_val != remote_val:
+                        fields_to_update[field] = remote_val
+                        updated_fields += 1
                         record_memory_conflict(
                             conn,
                             aggregate_kind="task",
@@ -5524,7 +5524,11 @@ def load_extended_memory_files(
                 result[key] = data
             else:
                 if logger:
-                    logger.warning("extended_memory/%s.json: expected list, got %s", key, type(data).__name__)
+                    logger.warning(
+                        "extended_memory/%s.json: expected list, got %s",
+                        key,
+                        type(data).__name__,
+                    )
         except (ValueError, OSError, TypeError) as exc:
             if logger:
                 logger.warning("extended_memory/%s.json read failed: %s", key, exc)

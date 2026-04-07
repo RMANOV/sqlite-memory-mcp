@@ -164,6 +164,38 @@ def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
 
 
+def test_bridge_doctor_returns_runtime_parity_and_surface_contract(
+    bridge_env, monkeypatch
+):
+    _, bridge_dir = bridge_env
+    monkeypatch.setattr(
+        bridge_server,
+        "_write_runtime_parity_manifest",
+        lambda: {
+            "version": "bridge_runtime_v1",
+            "all_synced": False,
+            "warnings": ["bridge_auto_sync.py: mismatch"],
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        bridge_server,
+        "_runtime_warning_summary",
+        lambda report: "BRIDGE WARNING: runtime drift detected",
+    )
+
+    result = json.loads(bridge_server.bridge_doctor.fn())
+
+    assert result["repo_exists"] is True
+    assert result["bridge_repo"] == str(bridge_dir)
+    assert result["runtime_parity"]["all_synced"] is False
+    assert result["runtime_warning"] == "BRIDGE WARNING: runtime drift detected"
+    assert (
+        result["surface_contract"]["bridge_artifacts"]["shared.json"]["git_stage"]
+        is True
+    )
+
+
 def test_bridge_pull_falls_back_to_shared_json_when_index_is_corrupt(
     bridge_env, monkeypatch
 ):

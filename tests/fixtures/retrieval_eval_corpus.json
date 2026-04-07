@@ -1,0 +1,45 @@
+[
+  {
+    "query": "мапинг студ",
+    "expect_top1_title": "Работна среща за мапинг студио",
+    "expect_top3_titles": [
+      "Работна среща за мапинг студио",
+      "Мапинг Студио Архитектура"
+    ]
+  },
+  {
+    "query": "Byzantine gossip",
+    "expect_top1_title": "Напълно общо заглавие",
+    "expect_top3_titles": [
+      "Напълно общо заглавие"
+    ]
+  },
+  {
+    "query": "fallback path",
+    "expect_top1_title": "Напълно общо заглавие",
+    "expect_top3_titles": [
+      "Напълно общо заглавие"
+    ]
+  },
+  {
+    "query": "deep research",
+    "expect_top1_title": "Напълно общо заглавие",
+    "expect_top3_titles": [
+      "Напълно общо заглавие"
+    ]
+  },
+  {
+    "query": "strategic shortfall window",
+    "expect_top1_title": "Общо име",
+    "expect_top3_titles": [
+      "Общо име"
+    ]
+  },
+  {
+    "query": "reports generator phase 2",
+    "expect_top1_title": "reports_generator phase-2 followup",
+    "expect_top3_titles": [
+      "reports_generator phase-2 followup"
+    ]
+  }
+]

@@ -62,6 +62,16 @@ from schema import (
     clamp_score as _clamp_score,
     is_valid_timestamp as _is_valid_timestamp,
 )
+from runtime_parity import (
+    collect_runtime_parity as _collect_runtime_parity,
+    runtime_warning_summary as _runtime_warning_summary,
+    write_runtime_parity_manifest as _write_runtime_parity_manifest,
+)
+from surface_contract import (
+    BRIDGE_GIT_STAGE_PATHS as _BRIDGE_GIT_STAGE_PATHS,
+    BRIDGE_SHARED_PAYLOAD_KEYS as _BRIDGE_SHARED_PAYLOAD_KEYS,
+    build_surface_contract_report as _build_surface_contract_report,
+)
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -73,7 +83,8 @@ mcp = FastMCP(
     "sqlite-bridge",
     instructions=(
         "Bridge sync tools: cross-machine push/pull, task assignment, shared task review, "
-        "recurring tasks. Shares DB with sqlite-kb."
+        "recurring tasks, and bridge_doctor self-checks for runtime parity and surface contract. "
+        "Shares DB with sqlite-kb."
     ),
 )
 
@@ -728,20 +739,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                     )
 
             # Preserve extra keys (e.g. reading_tasks, shared_knowledge)
-            known_keys = {
-                "version",
-                "pushed_at",
-                "machine_id",
-                "owner",
-                "entities",
-                "relations",
-                "tasks",
-                "shared_tasks",
-                "shared_knowledge",
-                "public_knowledge",
-                "knowledge_ratings",
-                "team_manifest",
-            } | set(_EXTENDED_MEMORY_KEYS)
+            known_keys = set(_BRIDGE_SHARED_PAYLOAD_KEYS)
             for key, val in existing.items():
                 if key not in known_keys and isinstance(val, (list, dict)):
                     payload[key] = val
@@ -815,17 +813,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         f"{len(tasks_out)} tasks from {hostname}"
     )
 
-    _git(
-        "add",
-        "shared.json",
-        "shared.js",
-        "index.json",
-        "tasks/",
-        "attachments/",
-        "entities/",
-        "entities_index.json",
-        "extended_memory/",
-    )
+    _git("add", *_BRIDGE_GIT_STAGE_PATHS)
     # Use --porcelain to check staged changes without locale-dependent text parsing
     status_result = _git("status", "--porcelain")
     if not status_result.stdout.strip():
@@ -1491,6 +1479,29 @@ def bridge_status() -> str:
             "total_ratings": total_ratings,
             "rated_entities": rated_entities,
             "anomalies": anomaly_count,
+        }
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 3b: bridge_doctor
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def bridge_doctor(write_manifest: bool = True) -> str:
+    """Inspect runtime parity and the active bridge surface contract."""
+    if write_manifest:
+        parity = _write_runtime_parity_manifest()
+    else:
+        parity = _collect_runtime_parity()
+    warning = _runtime_warning_summary(parity)
+    repo_exists = Path(BRIDGE_REPO).is_dir()
+    return json.dumps(
+        {
+            "repo_exists": repo_exists,
+            "bridge_repo": BRIDGE_REPO,
+            "runtime_parity": parity,
+            "runtime_warning": warning,
+            "surface_contract": _build_surface_contract_report(),
         }
     )
 

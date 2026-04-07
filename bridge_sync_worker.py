@@ -78,6 +78,7 @@ from db_utils import (
     promote_pending_public_entities,
     sync_task_attachments_from_remote,
 )
+from surface_contract import BRIDGE_GIT_STAGE_PATHS
 
 log = logging.getLogger("bridge_sync_worker")
 
@@ -959,14 +960,7 @@ def _main_locked(
     git_run(
         bridge_dir,
         "add",
-        "shared.json",
-        "shared.js",
-        "index.json",
-        "tasks/",
-        "attachments/",
-        "entities/",
-        "entities_index.json",
-        "extended_memory/",
+        *BRIDGE_GIT_STAGE_PATHS,
     )
 
     _progress(progress_callback, 90, "git commit...")

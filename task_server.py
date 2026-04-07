@@ -9,7 +9,6 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from typing import Any
 
@@ -26,6 +25,13 @@ from db_utils import (
     setup_logger,
     apply_task_mutation as _apply_task_mutation,
     create_task_with_ledger as _create_task_with_ledger,
+)
+from retrieval_contract import (
+    RETRIEVAL_CONTRACT_VERSION,
+    classify_lookup_confidence,
+    is_visible_lookup_match,
+    order_surface_hits,
+    score_lookup_surface,
 )
 
 # Pre-built SQL for active-task exclusion
@@ -51,68 +57,6 @@ def _vec_sync_task_safe(conn, task_id: str) -> None:
         logger.debug("vec_sync_task(%s) skipped: %s", task_id, e)
 
 
-_TITLE_LOOKUP_SPLIT_RE = re.compile(r"[\s\-_]+")
-
-
-def _normalize_title_lookup(text: str | None) -> str:
-    """Normalize title/name text for forgiving partial matching."""
-    return " ".join(
-        part for part in _TITLE_LOOKUP_SPLIT_RE.split((text or "").casefold()) if part
-    )
-
-
-def _title_lookup_score(query: str, candidate: str | None) -> float:
-    """Score a candidate title/name against a partial user fragment."""
-    raw_q = (query or "").casefold().strip()
-    raw_c = (candidate or "").casefold().strip()
-    if not raw_q or not raw_c:
-        return 0.0
-
-    norm_q = _normalize_title_lookup(raw_q)
-    norm_c = _normalize_title_lookup(raw_c)
-
-    if raw_q == raw_c or (norm_q and norm_q == norm_c):
-        return 400.0
-    if raw_q in raw_c:
-        return 320.0 + min(len(raw_q), 80) / 100.0
-    if norm_q and norm_q in norm_c:
-        return 280.0 + min(len(norm_q), 80) / 100.0
-
-    q_words = [w for w in norm_q.split() if w]
-    if q_words and all(w in norm_c for w in q_words):
-        return 220.0 + len(q_words)
-
-    return 0.0
-
-
-def _text_lookup_score(
-    query: str,
-    candidate: str | None,
-    *,
-    exact_score: float,
-    normalized_score: float,
-    all_words_score: float,
-) -> float:
-    """Score a non-title text field against a remembered phrase."""
-    raw_q = (query or "").casefold().strip()
-    raw_c = (candidate or "").casefold().strip()
-    if not raw_q or not raw_c:
-        return 0.0
-
-    norm_q = _normalize_title_lookup(raw_q)
-    norm_c = _normalize_title_lookup(raw_c)
-
-    if raw_q in raw_c:
-        return exact_score + min(len(raw_q), 80) / 100.0
-    if norm_q and norm_q in norm_c:
-        return normalized_score + min(len(norm_q), 80) / 100.0
-
-    q_words = [w for w in norm_q.split() if w]
-    if q_words and all(w in norm_c for w in q_words):
-        return all_words_score + len(q_words)
-    return 0.0
-
-
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -122,7 +66,8 @@ mcp = FastMCP(
         "Create, update, query, and digest tasks. "
         "Use find_by_title when only a remembered phrase is known: it searches tasks, notes, "
         "and entities across title/name, description, notes, observations, and project "
-        "regardless of status, section, or project filters. "
+        "regardless of status, section, or project filters, using retrieval contract "
+        f"{RETRIEVAL_CONTRACT_VERSION} with confidence gating. "
         "Use description as the default primary body for task/note content; "
         "use notes only for auxiliary/internal metadata. Shares DB with sqlite-kb."
     ),
@@ -498,49 +443,25 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
         ).fetchall()
         for row in task_rows:
             title = row["title"] or ""
-            matched_in: list[str] = []
-            score = 0.0
-
-            title_score = _title_lookup_score(query, title)
-            if title_score > 0:
-                score = max(score, title_score)
-                matched_in.append("title")
-
-            desc_score = _text_lookup_score(
-                query,
-                row["description"],
-                exact_score=185.0,
-                normalized_score=165.0,
-                all_words_score=135.0,
-            )
-            if desc_score > 0:
-                score = max(score, desc_score)
-                matched_in.append("description")
-
-            notes_score = _text_lookup_score(
-                query,
-                row["notes"],
-                exact_score=165.0,
-                normalized_score=145.0,
-                all_words_score=120.0,
-            )
-            if notes_score > 0:
-                score = max(score, notes_score)
-                matched_in.append("notes")
-
-            project_score = _text_lookup_score(
-                query,
-                row["project"],
-                exact_score=150.0,
-                normalized_score=130.0,
-                all_words_score=110.0,
-            )
-            if project_score > 0:
-                score = max(score, project_score)
-                matched_in.append("project")
-
-            if score <= 0:
+            surface_scores = {
+                surface: score
+                for surface, score in (
+                    ("title", score_lookup_surface("title", query, title)),
+                    (
+                        "description",
+                        score_lookup_surface("description", query, row["description"]),
+                    ),
+                    ("notes", score_lookup_surface("notes", query, row["notes"])),
+                    ("project", score_lookup_surface("project", query, row["project"])),
+                )
+                if score > 0
+            }
+            if not surface_scores:
                 continue
+            ordered_hits = order_surface_hits(surface_scores)
+            matched_in = [surface for surface, _ in ordered_hits]
+            score = float(ordered_hits[0][1])
+            confidence = classify_lookup_confidence(surface_scores)
             kind = "note" if row["type"] == "note" else "task"
             matches.append(
                 {
@@ -557,6 +478,10 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
                     "created_at": row["created_at"],
                     "score": score,
                     "matched_in": matched_in,
+                    "surface_scores": surface_scores,
+                    "primary_surface": matched_in[0],
+                    "confidence": confidence,
+                    "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
                 }
             )
 
@@ -570,50 +495,29 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
         ).fetchall()
         for row in entity_rows:
             name = row["name"] or ""
-            matched_in: list[str] = []
-            score = 0.0
-
-            name_score = _title_lookup_score(query, name)
-            if name_score > 0:
-                score = max(score, name_score)
-                matched_in.append("name")
-
             obs_text = "\n".join(obs_by_entity.get(row["id"], []))
-            obs_score = _text_lookup_score(
-                query,
-                obs_text,
-                exact_score=180.0,
-                normalized_score=160.0,
-                all_words_score=130.0,
-            )
-            if obs_score > 0:
-                score = max(score, obs_score)
-                matched_in.append("observations")
-
-            project_score = _text_lookup_score(
-                query,
-                row["project"],
-                exact_score=150.0,
-                normalized_score=130.0,
-                all_words_score=110.0,
-            )
-            if project_score > 0:
-                score = max(score, project_score)
-                matched_in.append("project")
-
-            type_score = _text_lookup_score(
-                query,
-                row["entity_type"],
-                exact_score=120.0,
-                normalized_score=110.0,
-                all_words_score=95.0,
-            )
-            if type_score > 0:
-                score = max(score, type_score)
-                matched_in.append("entity_type")
-
-            if score <= 0:
+            surface_scores = {
+                surface: score
+                for surface, score in (
+                    ("name", score_lookup_surface("name", query, name)),
+                    (
+                        "observations",
+                        score_lookup_surface("observations", query, obs_text),
+                    ),
+                    ("project", score_lookup_surface("project", query, row["project"])),
+                    (
+                        "entity_type",
+                        score_lookup_surface("entity_type", query, row["entity_type"]),
+                    ),
+                )
+                if score > 0
+            }
+            if not surface_scores:
                 continue
+            ordered_hits = order_surface_hits(surface_scores)
+            matched_in = [surface for surface, _ in ordered_hits]
+            score = float(ordered_hits[0][1])
+            confidence = classify_lookup_confidence(surface_scores)
             matches.append(
                 {
                     "kind": "entity",
@@ -625,6 +529,10 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
                     "created_at": row["created_at"],
                     "score": score,
                     "matched_in": matched_in,
+                    "surface_scores": surface_scores,
+                    "primary_surface": matched_in[0],
+                    "confidence": confidence,
+                    "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
                 }
             )
 
@@ -637,11 +545,20 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
         ),
         reverse=True,
     )
-    matches = matches[:limit]
+    confident_matches = [
+        item
+        for item in matches
+        if is_visible_lookup_match(item.get("surface_scores") or {})
+    ]
+    hidden_low_confidence = (
+        len(matches) - len(confident_matches) if confident_matches else 0
+    )
+    visible_matches = confident_matches if confident_matches else matches
+    matches = visible_matches[:limit]
 
     lines = [
-        "| # | Kind | Title | Status/Type | Section | Project | Matched In |",
-        "|---|------|-------|-------------|---------|---------|------------|",
+        "| # | Kind | Title | Status/Type | Section | Project | Match | Confidence |",
+        "|---|------|-------|-------------|---------|---------|-------|------------|",
     ]
     for idx, item in enumerate(matches, 1):
         if item["kind"] == "entity":
@@ -654,7 +571,8 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
             section = item.get("section") or "—"
         lines.append(
             f"| {idx} | {item['kind']} | {item['title']} | {status_or_type} | "
-            f"{section} | {item.get('project') or '—'} | {', '.join(item.get('matched_in') or []) or '—'} |"
+            f"{section} | {item.get('project') or '—'} | {', '.join(item.get('matched_in') or []) or '—'} | "
+            f"{item.get('confidence') or 'low'} |"
         )
 
     return json.dumps(
@@ -662,6 +580,8 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
             "matches": matches,
             "count": len(matches),
             "query": query,
+            "hidden_low_confidence_count": hidden_low_confidence,
+            "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
             "markdown": "\n".join(lines) if matches else "",
             "message": None if matches else "No title matches",
         }

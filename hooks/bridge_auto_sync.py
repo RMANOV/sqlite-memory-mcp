@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TextIO
 
 DIRTY_FLAG = os.path.expanduser("~/.claude/memory/.bridge_dirty")
@@ -21,6 +22,18 @@ WORKER_SCRIPT = os.path.expanduser(
     "~/.claude/mcp_servers/sqlite_memory/hooks/bridge_sync_worker.py"
 )
 WORKER_FALLBACK_SCRIPT = os.path.expanduser("~/.claude/hooks/bridge_sync_worker.py")
+REPO_ROOT = Path(os.path.expanduser("~/.claude/mcp_servers/sqlite_memory"))
+if REPO_ROOT.is_dir() and str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from runtime_parity import (
+        runtime_warning_summary as _runtime_warning_summary,
+        write_runtime_parity_manifest as _write_runtime_parity_manifest,
+    )
+except Exception:  # pragma: no cover - best-effort only
+    _runtime_warning_summary = None
+    _write_runtime_parity_manifest = None
 
 WRITE_TOOLS = {
     "mcp__sqlite_memory__create_entities",
@@ -145,6 +158,16 @@ def _resolve_worker_script() -> str | None:
     return None
 
 
+def _runtime_parity_message() -> str | None:
+    if _write_runtime_parity_manifest is None or _runtime_warning_summary is None:
+        return None
+    try:
+        report = _write_runtime_parity_manifest()
+    except OSError:
+        return None
+    return _runtime_warning_summary(report)
+
+
 def _launch_worker() -> str | None:
     worker_path = _resolve_worker_script()
     if worker_path is None:
@@ -182,6 +205,9 @@ def main(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
     extra_messages: list[str] = []
     if notification_msg:
         extra_messages.append(notification_msg)
+    runtime_msg = _runtime_parity_message()
+    if runtime_msg:
+        extra_messages.append(runtime_msg)
     if _should_sync(now):
         launch_msg = _launch_worker()
         if launch_msg:

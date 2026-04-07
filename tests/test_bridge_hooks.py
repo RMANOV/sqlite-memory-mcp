@@ -57,6 +57,15 @@ def test_bridge_auto_sync_tracks_new_collab_writes_without_retriggering_bridge_p
         return types.SimpleNamespace(pid=1234)
 
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        module,
+        "_write_runtime_parity_manifest",
+        lambda: {"all_synced": True},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module, "_runtime_warning_summary", lambda report: None, raising=False
+    )
 
     out = io.StringIO()
     rc = module.main(
@@ -106,6 +115,15 @@ def test_bridge_auto_sync_tracks_unified_and_collab_writes(
         return types.SimpleNamespace(pid=1234)
 
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        module,
+        "_write_runtime_parity_manifest",
+        lambda: {"all_synced": True},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module, "_runtime_warning_summary", lambda report: None, raising=False
+    )
 
     out = io.StringIO()
     rc = module.main(
@@ -188,6 +206,46 @@ def test_bridge_auto_sync_prefers_repo_worker_path(tmp_path, monkeypatch):
 
     assert module._launch_worker() is None
     assert launches == [[sys.executable, str(repo_worker)]]
+
+
+def test_bridge_auto_sync_emits_runtime_drift_warning(tmp_path, monkeypatch):
+    module = _load_module(
+        "bridge_auto_sync_runtime_drift_test", ROOT / "hooks" / "bridge_auto_sync.py"
+    )
+    module.DIRTY_FLAG = str(tmp_path / ".bridge_dirty")
+    module.LAST_SYNC = str(tmp_path / ".bridge_last_sync")
+    module.NOTIFY_FILE = str(tmp_path / ".bridge_notification")
+    module.WORKER_SCRIPT = str(tmp_path / "bridge_sync_worker.py")
+    Path(module.WORKER_SCRIPT).write_text("print('worker')\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        module,
+        "_write_runtime_parity_manifest",
+        lambda: {"all_synced": False, "warnings": ["bridge_auto_sync.py: mismatch"]},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_runtime_warning_summary",
+        lambda report: "BRIDGE WARNING: runtime drift detected",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda args, **kwargs: types.SimpleNamespace(pid=999),
+    )
+
+    out = io.StringIO()
+    rc = module.main(
+        stdin=io.StringIO(
+            json.dumps({"tool_name": "mcp__sqlite_unified__create_task_or_note"})
+        ),
+        stdout=out,
+    )
+
+    assert rc == 0
+    assert "runtime drift detected" in out.getvalue()
 
 
 def test_hook_worker_retries_after_previous_failures(tmp_path, monkeypatch):
