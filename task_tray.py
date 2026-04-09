@@ -1092,6 +1092,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._periodic_pull_timer.setInterval(5 * 60_000)  # 5 minutes
         self._periodic_pull_timer.timeout.connect(self._periodic_pull)
         self._periodic_pull_timer.start()
+        self._sync_cooldown_until: float = 0.0  # monotonic; suppresses watcher→sync cascade
         self._db_refresh_debounce = QTimer(self)
         self._db_refresh_debounce.setSingleShot(True)
         self._db_refresh_debounce.setInterval(500)  # 500ms UI debounce
@@ -1104,15 +1105,19 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _on_db_changed(self, path):
         """DB file changed — start/restart debounce timers."""
-        self._auto_sync_timer.start()  # 60s bridge sync debounce
         self._db_refresh_debounce.start()  # 500ms UI refresh debounce
         self._refresh_db_watch_paths()
+        if time.monotonic() < self._sync_cooldown_until:
+            return  # suppress sync cascade from own sync operations
+        self._auto_sync_timer.start()  # 60s bridge sync debounce
 
     def _on_db_dir_changed(self, path):
         """Directory changed — catch WAL create/rotate events."""
-        self._auto_sync_timer.start()
         self._db_refresh_debounce.start()
         self._refresh_db_watch_paths()
+        if time.monotonic() < self._sync_cooldown_until:
+            return
+        self._auto_sync_timer.start()
 
     def _refresh_db_watch_paths(self):
         """Ensure DB watcher tracks the DB, WAL, and parent directory."""

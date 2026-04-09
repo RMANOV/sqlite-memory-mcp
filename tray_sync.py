@@ -74,6 +74,7 @@ class BridgeSyncMixin:
             try:
                 target()
             finally:
+                self._sync_cooldown_until = time.monotonic() + 5.0
                 self._bridge_thread_lock.release()
 
         threading.Thread(target=_wrapped, daemon=True).start()
