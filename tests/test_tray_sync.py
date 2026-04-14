@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -232,3 +233,18 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     window._periodic_pull()
 
     assert captured["pull_only"] is True
+
+
+def test_start_bridge_sync_thread_releases_lock_after_worker_finishes(bridge_env):
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    completed = []
+
+    assert window._start_bridge_sync_thread(lambda: completed.append(True)) is True
+    deadline = time.time() + 1.0
+    while time.time() < deadline and window._bridge_thread_lock.locked():
+        time.sleep(0.01)
+
+    assert completed == [True]
+    assert window._bridge_thread_lock.locked() is False
+    assert window._sync_cooldown_until > 0
