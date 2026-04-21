@@ -1,3 +1,7 @@
+> Legacy draft. Kept for tone/history reference only. This version predates the
+> shipped `password_protected_views` premium surface. Use the `v3` draft for
+> current publishing.
+
 # The Next Premium Layer for AI Software Is Not More Intelligence. It Is Better Memory Under Fire.
 
 If the first chapter of agentic software was "give the machine a brain," the

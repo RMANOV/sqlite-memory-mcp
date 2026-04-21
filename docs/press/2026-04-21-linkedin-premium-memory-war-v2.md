@@ -1,3 +1,7 @@
+> Legacy draft. Kept for tone/history reference only. This version predates the
+> shipped `password_protected_views` premium surface. Use the `v3` draft for
+> current publishing.
+
 # The Next Premium AI Product Will Not Win by Thinking Harder. It Will Win by Remembering Under Fire.
 
 For a while, the premium story in AI software was easy:

@@ -1,3 +1,7 @@
+> Legacy draft. Kept for tone/history reference only. This version predates the
+> shipped `password_protected_views` premium surface. Use the `v3` draft for
+> current publishing.
+
 # The premium AI battle is moving away from "more model" and toward "better memory under pressure."
 
 That shift is already visible.

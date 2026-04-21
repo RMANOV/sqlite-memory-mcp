@@ -1,3 +1,7 @@
+> Legacy draft. Kept for tone/history reference only. This version predates the
+> shipped `password_protected_views` premium surface. Use the `v3` draft for
+> current publishing.
+
 # The Next Battle in AI Software Will Be Fought Over Memory, Not Intelligence
 
 The first wave of agentic tooling taught us something simple:
