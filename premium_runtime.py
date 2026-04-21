@@ -30,6 +30,7 @@ from db_utils import (
     record_memory_event,
     setup_logger,
 )
+from premium_contract import build_mount_context
 
 logger = setup_logger("sqlite-premium", "premium_runtime.log")
 
@@ -738,6 +739,12 @@ def _resolve_module_from_entrypoint(entrypoint: str):
 def _register_loaded_module(
     module: Any, mcp: Any, server_name: str, attr_name: str | None
 ):
+    mount_context = build_mount_context(
+        server_name=server_name,
+        feature_id="private_extension_runtime",
+        machine_id=MACHINE_ID,
+        config=load_premium_config(),
+    )
     if attr_name:
         target = getattr(module, attr_name, None)
         if target is None:
@@ -758,9 +765,16 @@ def _register_loaded_module(
 
     if callable(target):
         try:
-            return target(mcp, server_name=server_name)
+            return target(
+                mcp,
+                server_name=server_name,
+                mount_context=mount_context,
+            )
         except TypeError:
-            return target(mcp)
+            try:
+                return target(mcp, server_name=server_name)
+            except TypeError:
+                return target(mcp)
     if hasattr(mcp, "mount"):
         mcp.mount(target)
         return {"mounted": True}

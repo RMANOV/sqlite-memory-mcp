@@ -6,6 +6,7 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import premium_runtime
+from premium_contract import PREMIUM_RUNTIME_CONTRACT_VERSION
 from schema import init_db
 
 
@@ -217,3 +218,41 @@ def test_maybe_mount_premium_extensions_loads_private_module_when_allowed(
 
     assert audit["decision"] == "load_success"
     assert audit["reason"] == "premium_extensions_loaded"
+
+
+def test_maybe_mount_premium_extensions_passes_mount_context(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    premium_file = tmp_path / "premium_plugin_ctx.py"
+    premium_file.write_text(
+        "def register_premium_extensions(mcp, *, server_name=None, mount_context=None):\n"
+        "    mcp.loaded_server_name = server_name\n"
+        "    mcp.contract_version = mount_context.contract_version\n"
+        "    mcp.feature_id = mount_context.feature_id\n"
+        "    return {'mounted': True, 'contract_version': mount_context.contract_version}\n",
+        encoding="utf-8",
+    )
+    mcp = DummyMCP()
+    monkeypatch.setenv("SQLITE_MEMORY_PREMIUM_ENTRYPOINT", str(premium_file))
+    monkeypatch.setattr(premium_runtime, "_get_conn", lambda: _conn_ctx(db_path))
+    monkeypatch.setattr(
+        premium_runtime,
+        "evaluate_feature_gate",
+        lambda conn, **kwargs: {
+            "allowed": True,
+            "decision": "allowed",
+            "reason": "entitlement_valid",
+            "feature_id": "private_extension_runtime",
+            "entitlement_id": "ent-ctx",
+            "customer_id": "cust-ctx",
+        },
+    )
+
+    result = premium_runtime.maybe_mount_premium_extensions(
+        mcp, server_name="sqlite-unified"
+    )
+
+    assert result["status"] == "loaded"
+    assert mcp.loaded_server_name == "sqlite-unified"
+    assert mcp.contract_version == PREMIUM_RUNTIME_CONTRACT_VERSION
+    assert mcp.feature_id == "private_extension_runtime"

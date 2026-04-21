@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RMANOV/sqlite-memory-mcp/docs/premium/entitlement.schema.json",
+  "title": "sqlite-memory premium entitlement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "entitlement_id",
+    "customer_id",
+    "plan",
+    "features",
+    "signature"
+  ],
+  "properties": {
+    "entitlement_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "customer_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan": {
+      "type": "string",
+      "minLength": 1
+    },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "machine_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "org_id": {
+      "type": "string"
+    },
+    "seat_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "not_before": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "owner_approval_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "alg",
+        "value"
+      ],
+      "properties": {
+        "alg": {
+          "type": "string",
+          "const": "ed25519"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Base64-encoded Ed25519 signature over the canonical JSON payload excluding this signature object."
+        },
+        "key_id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
