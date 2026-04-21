@@ -69,6 +69,7 @@ What is **not** in this OSS repo:
 - partner digests and management summaries
 - advanced ranking / orchestration
 - governance / audit workflows beyond the OSS baseline
+- premium tray/search surfaces for entitled operators
 
 ### Premium-only runtime behavior
 
@@ -139,7 +140,18 @@ This pack is for cases where the public retrieval baseline is not enough.
 
 The public repo exposes the runtime boundary for this. The proprietary heuristics and orchestration logic stay outside the OSS tree.
 
-#### 6. High-control deployment surfaces
+#### 6. Premium tray/search surfaces
+
+This is the premium operator UI layer for paid, explicitly entitled users who need the desktop task surface to span premium-only operational memory as well.
+
+- extend advanced search so premium records can participate when the premium runtime is active
+- extend filters and sort modes so premium rows are not a separate blind spot from the main tray workflow
+- add a premium-only `Custom Design` tab, similar in spirit to `Suggested`, but parameterized by focus, grouping, mailbox, client, follow-up state, risk, and other operator-selected constraints
+- keep this surface behind the same entitlement and private-runtime boundary as the underlying premium packs
+
+This is intentionally not a cosmetic UI add-on. The point is to let an entitled operator shape a live working view over communication memory, governance decisions, and other premium-only records without flattening them back into the OSS task model.
+
+#### 7. High-control deployment surfaces
 
 This is the control layer for customers that need stronger operational guarantees.
 
@@ -160,6 +172,16 @@ The current private premium bootstrap is organized around three real pack famili
 - `multi_mailbox_ingestion`
 
 That bootstrap is intentionally separate from the OSS repo. The public repo ships the airlock, contract, schema hooks, and template. The premium logic itself stays outside the OSS tree.
+
+### Planned premium UI layer
+
+The next premium-facing UI surface is designed around a gated `custom_design_tab` capability.
+
+- it is intended to activate only when the premium runtime is entitled and the private runtime is actually available
+- it is intended to make advanced search, filters, and sorting span premium rows as well, instead of stopping at OSS-only tasks and notes
+- it is intended to provide a parameterized tray tab that behaves like an operator-defined version of `Suggested`, rather than a hard-coded one-size-fits-all view
+
+This README describes that UI surface as a premium design direction, not as OSS functionality shipped in this repository by default.
 
 See:
 
