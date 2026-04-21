@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "mount_private_extensions": true,
+  "private_entrypoint_env_var": "SQLITE_MEMORY_PREMIUM_ENTRYPOINT",
+  "entitlement_inline_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_JSON",
+  "entitlement_path_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_PATH",
+  "public_key_env_var": "SQLITE_MEMORY_PREMIUM_PUBLIC_KEY",
+  "owner_approval_env_var": "SQLITE_MEMORY_OWNER_APPROVAL",
+  "record_allowed_events": true,
+  "record_denied_events": true
+}

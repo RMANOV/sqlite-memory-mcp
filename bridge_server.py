@@ -67,6 +67,7 @@ from runtime_parity import (
     runtime_warning_summary as _runtime_warning_summary,
     write_runtime_parity_manifest as _write_runtime_parity_manifest,
 )
+from premium_runtime import maybe_mount_premium_extensions
 from surface_contract import (
     BRIDGE_GIT_STAGE_PATHS as _BRIDGE_GIT_STAGE_PATHS,
     BRIDGE_SHARED_PAYLOAD_KEYS as _BRIDGE_SHARED_PAYLOAD_KEYS,
@@ -1741,4 +1742,5 @@ def process_recurring_tasks(dry_run: bool = False) -> str:
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-bridge")
     mcp.run(transport="stdio")

@@ -30,6 +30,7 @@ from db_utils import (
     export_relations as _export_relations,
     record_memory_event,
 )
+from premium_runtime import maybe_mount_premium_extensions
 
 # Optional vector search (graceful fallback to FTS5-only)
 try:
@@ -719,4 +720,5 @@ def open_nodes(names: list[str]) -> str:
 
 if __name__ == "__main__":
     _migrate_jsonl()
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-kb")
     mcp.run(transport="stdio")

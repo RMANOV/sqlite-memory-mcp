@@ -584,6 +584,36 @@ CREATE INDEX IF NOT EXISTS idx_lc_entity ON lazy_claims(entity_id, status);
 CREATE INDEX IF NOT EXISTS idx_lc_obs    ON lazy_claims(observation_id);
 CREATE INDEX IF NOT EXISTS idx_lc_status ON lazy_claims(status, confidence DESC);
 
+CREATE TABLE IF NOT EXISTS premium_gate_audit (
+    audit_id            TEXT PRIMARY KEY,
+    feature_id          TEXT NOT NULL,
+    decision            TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    entitlement_id      TEXT DEFAULT NULL,
+    customer_id         TEXT DEFAULT NULL,
+    server_name         TEXT DEFAULT NULL,
+    tool_name           TEXT DEFAULT NULL,
+    actor_id            TEXT DEFAULT NULL,
+    machine_id          TEXT NOT NULL,
+    checked_at          TEXT NOT NULL,
+    payload_json        TEXT DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_premium_gate_audit_feature
+    ON premium_gate_audit(feature_id, checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS premium_revocations (
+    revocation_id       TEXT PRIMARY KEY,
+    entitlement_id      TEXT NOT NULL,
+    feature_id          TEXT DEFAULT NULL,
+    customer_id         TEXT DEFAULT NULL,
+    reason              TEXT DEFAULT NULL,
+    revoked_at          TEXT NOT NULL,
+    revoked_by          TEXT DEFAULT NULL,
+    active              INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_premium_revocations_lookup
+    ON premium_revocations(entitlement_id, feature_id, active);
+
 -- Auto-sync triggers: keep memory_fts in lockstep with entities table
 CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON entities BEGIN
     INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
@@ -1298,6 +1328,46 @@ _MIGRATIONS = [
         "SELECT 1 FROM pragma_table_info('context_packs') WHERE name='contract_version'",
         "ALTER TABLE context_packs ADD COLUMN contract_version TEXT NOT NULL DEFAULT 'legacy'",
         "context_packs.contract_version column (v3.4.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='premium_gate_audit'",
+        """
+        CREATE TABLE premium_gate_audit (
+            audit_id            TEXT PRIMARY KEY,
+            feature_id          TEXT NOT NULL,
+            decision            TEXT NOT NULL,
+            reason              TEXT NOT NULL,
+            entitlement_id      TEXT DEFAULT NULL,
+            customer_id         TEXT DEFAULT NULL,
+            server_name         TEXT DEFAULT NULL,
+            tool_name           TEXT DEFAULT NULL,
+            actor_id            TEXT DEFAULT NULL,
+            machine_id          TEXT NOT NULL,
+            checked_at          TEXT NOT NULL,
+            payload_json        TEXT DEFAULT NULL
+        );
+        CREATE INDEX idx_premium_gate_audit_feature
+            ON premium_gate_audit(feature_id, checked_at DESC);
+        """,
+        "premium_gate_audit table (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='premium_revocations'",
+        """
+        CREATE TABLE premium_revocations (
+            revocation_id       TEXT PRIMARY KEY,
+            entitlement_id      TEXT NOT NULL,
+            feature_id          TEXT DEFAULT NULL,
+            customer_id         TEXT DEFAULT NULL,
+            reason              TEXT DEFAULT NULL,
+            revoked_at          TEXT NOT NULL,
+            revoked_by          TEXT DEFAULT NULL,
+            active              INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX idx_premium_revocations_lookup
+            ON premium_revocations(entitlement_id, feature_id, active);
+        """,
+        "premium_revocations table (v3.5.0)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='memory_fts_obs_ai'",

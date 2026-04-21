@@ -22,6 +22,7 @@ from db_utils import (
     now_iso as _now_iso,
     TaskDAO,
 )
+from premium_runtime import maybe_mount_premium_extensions
 from schema import error as _error
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
@@ -446,4 +447,5 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-entity")
     mcp.run(transport="stdio")

@@ -14,6 +14,7 @@ from __future__ import annotations
 from fastmcp import FastMCP
 
 from db_utils import ensure_db_initialized, setup_logger
+from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 logger = setup_logger("sqlite-unified", "unified_server.log")
@@ -75,4 +76,5 @@ logger.info(
 
 if __name__ == "__main__":
     ensure_db_initialized()
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-unified")
     mcp.run(transport="stdio")

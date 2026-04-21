@@ -41,6 +41,7 @@ from db_utils import (
 from schema import (
     error as _error,
 )
+from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -1180,4 +1181,5 @@ def update_verification(
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-collab")
     mcp.run(transport="stdio")

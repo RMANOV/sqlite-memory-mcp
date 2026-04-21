@@ -38,6 +38,7 @@ from memory_audit import (
     replay_memory_events as _replay_memory_events,
     run_memory_audit as _run_memory_audit,
 )
+from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -504,4 +505,5 @@ def enrich_context(depth: str = "quick") -> str:
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-intel")
     mcp.run(transport="stdio")

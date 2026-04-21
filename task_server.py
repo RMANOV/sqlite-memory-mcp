@@ -33,6 +33,7 @@ from retrieval_contract import (
     order_surface_hits,
     score_lookup_surface,
 )
+from premium_runtime import maybe_mount_premium_extensions
 
 # Pre-built SQL for active-task exclusion
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
@@ -748,4 +749,5 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-tasks")
     mcp.run(transport="stdio")

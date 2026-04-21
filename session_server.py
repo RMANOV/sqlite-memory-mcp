@@ -19,6 +19,7 @@ from db_utils import (
     now_iso as _now,
     setup_logger,
 )
+from premium_runtime import maybe_mount_premium_extensions
 from schema import error as _error
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
@@ -34,6 +35,7 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: session_save
@@ -288,4 +290,5 @@ def resume_context(
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-session")
     mcp.run(transport="stdio")
