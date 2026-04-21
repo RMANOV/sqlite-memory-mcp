@@ -66,10 +66,13 @@ What is **not** in this OSS repo:
 
 - ACL / RBAC
 - multi-mailbox ingestion
+- action snapshots and client history overlays on top of the note/task layer
+- canonical facts, provenance digests, and human-approved note promotion
 - partner digests and management summaries
 - advanced ranking / orchestration
+- query templates and task-signal extraction
 - governance / audit workflows beyond the OSS baseline
-- premium tray/search surfaces for entitled operators
+- premium tray/search surfaces for entitled operators, including a parameterized `Custom Design` tab
 
 ### Premium-only runtime behavior
 
@@ -130,7 +133,28 @@ This is the premium summarization layer built on top of governance and communica
 
 These workflows are intentionally premium-only because they combine communication access, ranking, and decision framing in ways that should not run by default.
 
-#### 5. Advanced ranking / orchestration
+#### 5. Action snapshots, client history, and canonical facts
+
+This pack family turns premium memory into a more deliberate operational record instead of a loose pile of notes.
+
+- record action snapshots over important threads, escalations, and operational moments
+- keep client history notes as a governed overlay above the base note/task layer
+- store canonical facts with explicit fact type, provenance, and client scope
+- promote human-approved OSS notes into premium history records without mutating the OSS note model itself
+
+The goal is to preserve high-signal state transitions and trusted memory anchors without flattening everything into one generic task row.
+
+#### 6. Provenance pointers, query templates, and signal extraction
+
+This pack family makes the premium memory layer more usable under real operator pressure.
+
+- build provenance digests so the operator can see where premium records came from
+- run ready-made query templates such as commitments, chronology, problems, pending items, and critical communication
+- extract tasks, commitments, blockers, and deadlines from premium source text into dedicated memory objects
+
+These packs are meant to reduce "search and infer everything manually" work when the system is being used as operational memory rather than passive storage.
+
+#### 7. Advanced ranking / orchestration
 
 This pack is for cases where the public retrieval baseline is not enough.
 
@@ -138,20 +162,20 @@ This pack is for cases where the public retrieval baseline is not enough.
 - queue prioritization and escalation ordering
 - multi-step orchestration for premium-only retrieval and digest pipelines
 
-The public repo exposes the runtime boundary for this. The proprietary heuristics and orchestration logic stay outside the OSS tree.
+The public repo exposes the runtime boundary for this. The premium runtime now mounts a concrete ranking layer, while proprietary tuning and future orchestration logic still stay outside the OSS tree.
 
-#### 6. Premium tray/search surfaces
+#### 8. Premium tray/search surfaces
 
 This is the premium operator UI layer for paid, explicitly entitled users who need the desktop task surface to span premium-only operational memory as well.
 
-- extend advanced search so premium records can participate when the premium runtime is active
-- extend filters and sort modes so premium rows are not a separate blind spot from the main tray workflow
+- extend advanced search so premium records participate in the same search index when the premium runtime is active
+- extend sorting and grouping so premium rows are not a separate blind spot from the main tray workflow
 - add a premium-only `Custom Design` tab, similar in spirit to `Suggested`, but parameterized by focus, grouping, mailbox, client, follow-up state, risk, and other operator-selected constraints
 - keep this surface behind the same entitlement and private-runtime boundary as the underlying premium packs
 
 This is intentionally not a cosmetic UI add-on. The point is to let an entitled operator shape a live working view over communication memory, governance decisions, and other premium-only records without flattening them back into the OSS task model.
 
-#### 7. High-control deployment surfaces
+#### 9. High-control deployment surfaces
 
 This is the control layer for customers that need stronger operational guarantees.
 
@@ -163,25 +187,36 @@ This is the control layer for customers that need stronger operational guarantee
 
 This is where the premium design stops depending on trust in the local machine and starts depending on gated execution, auditability, and runtime separation.
 
-### Current premium bootstrap scope
+### Current premium runtime scope
 
-The current private premium bootstrap is organized around three real pack families:
+The current private premium runtime is no longer limited to the first three pack families. The active bootstrap contract now supports and mounts concrete packs for:
 
 - `acl_rbac`
 - `governance_audit`
 - `multi_mailbox_ingestion`
+- `memory_action_snapshots`
+- `client_history_notes`
+- `canonical_facts`
+- `provenance_pointers`
+- `partner_digest`
+- `advanced_ranking`
+- `query_templates`
+- `human_approved_notes`
+- `task_signal_extraction`
+- `custom_design_tab`
 
-That bootstrap is intentionally separate from the OSS repo. The public repo ships the airlock, contract, schema hooks, and template. The premium logic itself stays outside the OSS tree.
+That runtime is intentionally separate from the OSS repo. The public repo ships the airlock, contract, tray loader hooks, schema hooks, and bootstrap template. The premium logic itself stays outside the OSS tree.
 
-### Planned premium UI layer
+### Current premium tray/search surface
 
-The next premium-facing UI surface is designed around a gated `custom_design_tab` capability.
+The current premium-facing UI surface is built around a gated `custom_design_tab` capability.
 
-- it is intended to activate only when the premium runtime is entitled and the private runtime is actually available
-- it is intended to make advanced search, filters, and sorting span premium rows as well, instead of stopping at OSS-only tasks and notes
-- it is intended to provide a parameterized tray tab that behaves like an operator-defined version of `Suggested`, rather than a hard-coded one-size-fits-all view
+- it activates only when the premium runtime is entitled and the private runtime exposes the tray extension builder
+- premium rows can enter the same tray search index as OSS tasks and notes when the premium runtime is active
+- premium-specific grouping and sorting modes can be injected into the tray at runtime without changing the OSS data model
+- the `Custom Design` tab behaves like an operator-defined working view rather than a fixed canned tab
 
-This README describes that UI surface as a premium design direction, not as OSS functionality shipped in this repository by default.
+This remains premium-only functionality. The OSS repo contains the loader path and safe UI hooks, not the private business logic itself.
 
 See:
 

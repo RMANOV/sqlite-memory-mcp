@@ -25,6 +25,7 @@ def _default_tab_views(*keys):
             "sort": "priority",
             "active": _empty_filters(),
             "excluded": _empty_filters(),
+            "params": {},
         }
         for key in keys
     }
@@ -93,6 +94,11 @@ def test_restore_profile_from_bridge_uses_tab_views_and_ignores_legacy_flat_fiel
                     "due": ["overdue"],
                     "project": ["smartkey"],
                 },
+                "params": {
+                    "focus": "communication",
+                    "group_by": "mailbox",
+                    "limit": 15,
+                },
             }
         },
         "sort_mode": "updated",
@@ -126,6 +132,11 @@ def test_restore_profile_from_bridge_uses_tab_views_and_ignores_legacy_flat_fiel
         "priority": {"low"},
         "due": {"overdue"},
         "project": {"SmartKey"},
+    }
+    assert window._tab_views["inbox"]["params"] == {
+        "focus": "communication",
+        "group_by": "mailbox",
+        "limit": 15,
     }
     assert window._sort_mode == "due"
     assert window._active_filters == window._tab_views["inbox"]["active"]
@@ -180,6 +191,11 @@ def test_build_ui_profile_serializes_current_window_state(bridge_env, monkeypatc
     window._tab_views["inbox"]["active"]["priority"] = {"high"}
     window._tab_views["inbox"]["active"]["project"] = {"mapping_studio"}
     window._tab_views["inbox"]["excluded"]["project"] = {"smartkey"}
+    window._tab_views["inbox"]["params"] = {
+        "focus": "history",
+        "group_by": "client",
+        "limit": 20,
+    }
     monkeypatch.setattr(task_tray, "_theme_name", "blue")
     monkeypatch.setattr(task_tray, "_font_size", 15)
     monkeypatch.setattr(task_tray, "_bold", True)
@@ -194,6 +210,11 @@ def test_build_ui_profile_serializes_current_window_state(bridge_env, monkeypatc
     assert profile["tab_views"]["inbox"]["active"]["priority"] == ["high"]
     assert profile["tab_views"]["inbox"]["active"]["project"] == ["mapping-studio"]
     assert profile["tab_views"]["inbox"]["excluded"]["project"] == ["SmartKey"]
+    assert profile["tab_views"]["inbox"]["params"] == {
+        "focus": "history",
+        "group_by": "client",
+        "limit": 20,
+    }
     assert profile["geometry_b64"]
 
 

@@ -237,6 +237,15 @@ class BridgeSyncMixin:
                         self._tab_views[key]["excluded"] = _normalize_filter_payload(
                             view.get("excluded", {})
                         )
+                        normalizer = getattr(self, "_normalize_tab_params", None)
+                        if callable(normalizer):
+                            self._tab_views[key]["params"] = normalizer(
+                                key, view.get("params", {})
+                            )
+                        else:
+                            self._tab_views[key]["params"] = dict(
+                                view.get("params", {})
+                            )
                 # Sync working state from current tab
                 cur_key = self._tab_keys[
                     min(getattr(self, "_saved_active_tab", 0), len(self._tab_keys) - 1)
@@ -282,6 +291,7 @@ class BridgeSyncMixin:
                         _normalize_filter_payload(view["excluded"])["project"]
                     ),
                 },
+                "params": dict(view.get("params", {})),
             }
 
         profile = {

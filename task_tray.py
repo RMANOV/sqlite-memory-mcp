@@ -707,6 +707,7 @@ from PyQt6.QtCore import (
 from pathlib import Path
 
 from tray_filters import FilterMixin
+from premium_task_tray import maybe_load_task_tray_extension
 from tray_sync import BridgeSyncMixin
 import tray_dialogs as _td
 from tray_dialogs import (
@@ -725,6 +726,7 @@ from tray_dialogs import (
     _UI_COLS,
     # Dialog classes + TaskListWidget
     TrayPopup,
+    CustomDesignDialog,
     EditTaskDialog,
     ReminderPopupDialog,
     TaskListWidget,
@@ -740,6 +742,7 @@ _DEFAULT_TAB_VIEW = {
     "sort": "priority",
     "active": {"priority": set(), "due": set(), "project": set()},
     "excluded": {"priority": set(), "due": set(), "project": set()},
+    "params": {},
 }
 
 
@@ -790,6 +793,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._project_cache_time: float = 0.0  # monotonic time of last project query
         self._filtered_cache: dict[str, list] = {}  # lazy tab rendering cache
         self._search_engine = db.search_engine
+        self._premium_tray_extension = maybe_load_task_tray_extension(
+            server_name="sqlite-task-tray"
+        )
+        self._design_button_visible = False
         self.setWindowTitle("Task Manager \u2014 SQLite Memory")
         self.resize(800, 600)
 
@@ -817,6 +824,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
+        self._SORT_MODES = tuple(self._SORT_MODES)
+        self._SORT_LABELS = dict(self._SORT_LABELS)
+        if self._premium_tray_extension:
+            for mode, label in self._premium_tray_extension.extra_sort_modes.items():
+                if mode not in self._SORT_LABELS:
+                    self._SORT_MODES = (*self._SORT_MODES, mode)
+                    self._SORT_LABELS[mode] = label
+
         # Tab order: Suggested, Today, Inbox, Next, Notes, All, Done
         self._tab_keys = [
             "suggested",
@@ -828,6 +843,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "all",
             "done",
         ]
+        if self._premium_tray_extension:
+            self._tab_keys.insert(1, self._premium_tray_extension.tab_key)
         self._tab_labels = {
             "suggested": "Suggested",
             "today": "Today",
@@ -838,6 +855,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "all": "All",
             "done": "Done",
         }
+        if self._premium_tray_extension:
+            self._tab_labels[self._premium_tray_extension.tab_key] = (
+                self._premium_tray_extension.tab_label
+            )
         self.tab_lists = {}
         for key in self._tab_keys:
             lw = TaskListWidget(self.db)
@@ -850,6 +871,13 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._tab_views = {
             key: copy.deepcopy(_DEFAULT_TAB_VIEW) for key in self._tab_keys
         }
+        if self._premium_tray_extension:
+            premium_key = self._premium_tray_extension.tab_key
+            if premium_key in self._tab_views:
+                self._tab_views[premium_key]["params"] = self._normalize_tab_params(
+                    premium_key,
+                    self._premium_tray_extension.default_params,
+                )
         self._current_tab_idx = 0  # track for state swapping on tab change
 
         # B2: Restore per-tab state from QSettings
@@ -866,6 +894,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     )
                     self._tab_views[key]["excluded"] = _normalize_filter_payload(
                         view.get("excluded", {})
+                    )
+                    self._tab_views[key]["params"] = self._normalize_tab_params(
+                        key, view.get("params", {})
                     )
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             pass
@@ -933,24 +964,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._sort_btn = QToolButton()
         self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
         self._sort_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        sort_menu = QMenu(self)
-        self._sort_action_group = QActionGroup(self)
-        self._sort_action_group.setExclusive(True)
-        self._sort_actions = {}
-        for mode in self._SORT_MODES:
-            act = QAction(self._SORT_LABELS[mode].replace("Sort: ", ""), self)
-            act.setCheckable(True)
-            act.setChecked(mode == self._sort_mode)
-            act.triggered.connect(lambda checked, m=mode: self._set_sort(m))
-            self._sort_action_group.addAction(act)
-            sort_menu.addAction(act)
-            self._sort_actions[mode] = act
-        sort_menu.addSeparator()
-        reset_sort_act = QAction("Reset Sort && Filters", self)
-        reset_sort_act.triggered.connect(self._reset_sort_filters)
-        sort_menu.addAction(reset_sort_act)
-        self._sort_btn.setMenu(sort_menu)
+        self._rebuild_sort_menu()
         toolbar.addWidget(self._sort_btn)
+
+        self._design_btn = QToolButton()
+        self._design_btn.setText("Design...")
+        self._design_btn.clicked.connect(self._edit_custom_design)
+        self._design_btn.setVisible(False)
+        toolbar.addWidget(self._design_btn)
 
         toolbar.addSeparator()
 
@@ -1036,6 +1057,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         ]
         _is_fixed_initial = _initial_key in _FIXED_VIEW_TABS
         self._sort_btn.setVisible(not _is_fixed_initial)
+        self._update_design_button_visibility()
 
         # Status bar
         self.status = QStatusBar()
@@ -1092,7 +1114,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._periodic_pull_timer.setInterval(5 * 60_000)  # 5 minutes
         self._periodic_pull_timer.timeout.connect(self._periodic_pull)
         self._periodic_pull_timer.start()
-        self._sync_cooldown_until: float = 0.0  # monotonic; suppresses watcher→sync cascade
+        self._sync_cooldown_until: float = (
+            0.0  # monotonic; suppresses watcher→sync cascade
+        )
         self._db_refresh_debounce = QTimer(self)
         self._db_refresh_debounce.setSingleShot(True)
         self._db_refresh_debounce.setInterval(500)  # 500ms UI debounce
@@ -1163,6 +1187,57 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._save_ui_state()
         self.refresh()
 
+    def _normalize_tab_params(self, key, params):
+        if self._premium_tray_extension and key == self._premium_tray_extension.tab_key:
+            return self._premium_tray_extension.normalize_params(params)
+        return dict(params or {})
+
+    def _rebuild_sort_menu(self):
+        sort_menu = QMenu(self)
+        self._sort_action_group = QActionGroup(self)
+        self._sort_action_group.setExclusive(True)
+        self._sort_actions = {}
+        for mode in self._SORT_MODES:
+            act = QAction(self._SORT_LABELS[mode].replace("Sort: ", ""), self)
+            act.setCheckable(True)
+            act.setChecked(mode == self._sort_mode)
+            act.triggered.connect(lambda checked, m=mode: self._set_sort(m))
+            self._sort_action_group.addAction(act)
+            sort_menu.addAction(act)
+            self._sort_actions[mode] = act
+        sort_menu.addSeparator()
+        reset_sort_act = QAction("Reset Sort && Filters", self)
+        reset_sort_act.triggered.connect(self._reset_sort_filters)
+        sort_menu.addAction(reset_sort_act)
+        self._sort_btn.setMenu(sort_menu)
+
+    def _update_design_button_visibility(self):
+        if not hasattr(self, "_design_btn"):
+            return
+        current_key = ""
+        idx = self.tabs.currentIndex()
+        if 0 <= idx < len(self._tab_keys):
+            current_key = self._tab_keys[idx]
+        visible = bool(
+            self._premium_tray_extension
+            and current_key == self._premium_tray_extension.tab_key
+        )
+        self._design_btn.setVisible(visible)
+
+    def _edit_custom_design(self):
+        if not self._premium_tray_extension:
+            return
+        key = self._premium_tray_extension.tab_key
+        params = self._tab_views.get(key, {}).get("params", {})
+        dlg = CustomDesignDialog(params, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._tab_views[key]["params"] = self._normalize_tab_params(
+                key,
+                dlg.get_params(),
+            )
+            self._save_ui_state()
+            self.refresh()
+
     def _save_ui_state(self):
         """Persist all UI state to QSettings (per-tab views)."""
         # Sync working state back to current tab before serializing
@@ -1174,6 +1249,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     "sort": self._sort_mode,
                     "active": _normalize_filter_payload(self._active_filters),
                     "excluded": _normalize_filter_payload(self._excluded_filters),
+                    "params": self._normalize_tab_params(
+                        key,
+                        self._tab_views[key].get("params", {}),
+                    ),
                 }
 
         # Serialize per-tab views
@@ -1195,6 +1274,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                         normalize_project_filter_values(view["excluded"]["project"])
                     ),
                 },
+                "params": self._normalize_tab_params(key, view.get("params", {})),
             }
         self._settings.setValue("tab_views", json.dumps(serializable))
         self._settings.setValue("active_tab", self.tabs.currentIndex())
@@ -1486,6 +1566,42 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     priority_sort_key(t),
                 ),
             )
+        if mode == "updated":
+            return sorted(tasks, key=lambda t: t.get("updated_at") or "", reverse=True)
+        if mode == "mailbox":
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    t.get("mailbox_key") or "zzz_none",
+                    t.get("updated_at") or "",
+                ),
+                reverse=False,
+            )
+        if mode == "client":
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    t.get("client_ref") or t.get("project") or "zzz_none",
+                    t.get("updated_at") or "",
+                ),
+            )
+        if mode == "risk":
+            risk_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    risk_order.get(str(t.get("risk_level") or "").lower(), 4),
+                    priority_sort_key(t),
+                ),
+            )
+        if mode == "kind":
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    t.get("_premium_kind") or "zzz_none",
+                    t.get("updated_at") or "",
+                ),
+            )
         # mode == "created"
         return sorted(tasks, key=lambda t: t.get("created_at") or "", reverse=True)
 
@@ -1524,9 +1640,22 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # 2 DB queries instead of 4: derive suggested & notes in Python
         all_active = self.db.get_all_active()
         done = self.db.get_done_tasks()
+        premium_rows = []
+        premium_key = (
+            self._premium_tray_extension.tab_key if self._premium_tray_extension else ""
+        )
+        if self._premium_tray_extension:
+            try:
+                premium_rows = self._premium_tray_extension.build_rows(
+                    params=self._tab_views.get(premium_key, {}).get("params", {}),
+                    search_text="",
+                ).get("rows", [])
+            except Exception as exc:
+                logger.warning("premium tray rows unavailable: %s", exc, exc_info=True)
+                premium_rows = []
 
         # Rebuild SmartKey search index (skips if fingerprint unchanged)
-        self._search_engine.rebuild_index(all_active + done)
+        self._search_engine.rebuild_index(all_active + done + premium_rows)
 
         suggested = sorted(all_active, key=_suggested_sort_key)[:20]
         notes = [t for t in all_active if t.get("type") == "note"] + [
@@ -1543,12 +1672,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "all": all_active + done,
             "done": done,
         }
+        if premium_key:
+            raw[premium_key] = premium_rows
 
         # Pre-compute filtered+sorted data for all tabs (cheap Python ops)
         self._filtered_cache = {}
         if self._search_text:
             # Global search: search ALL tasks, then distribute into tabs
-            all_tasks = all_active + done
+            all_tasks = all_active + done + premium_rows
             global_results = self._search_engine.search(
                 self._search_text, all_tasks, conn=self.db._conn, use_vector=False
             )
@@ -1580,6 +1711,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
         # Update tab visibility (suggested, notes, projects always visible)
         always_visible = ("suggested", "today", "notes", "projects")
+        if premium_key:
+            always_visible = (*always_visible, premium_key)
         for i, key in enumerate(self._tab_keys):
             count = len(self._filtered_cache[key])
             self.tabs.setTabVisible(i, count > 0 or key in always_visible)
@@ -1607,6 +1740,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         note_count = len(notes)
         done_count = len(done)
         msg = f"Tasks: {task_count} | Notes: {note_count} | Done: {done_count} | Overdue: {s['overdue']}"
+        if premium_rows:
+            msg += f" | Premium: {len(premium_rows)}"
         if self._search_text:
             msg += f" | Filter: '{self._search_text}'"
         inc_count = sum(len(v) for v in self._active_filters.values())
@@ -1631,6 +1766,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     "sort": self._sort_mode,
                     "active": copy.deepcopy(self._active_filters),
                     "excluded": copy.deepcopy(self._excluded_filters),
+                    "params": self._normalize_tab_params(
+                        old_key,
+                        self._tab_views[old_key].get("params", {}),
+                    ),
                 }
 
         # Load incoming tab's state
@@ -1666,6 +1805,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             # Hide sort/filter UI for fixed tabs
             is_fixed = new_key in _FIXED_VIEW_TABS
             self._sort_btn.setVisible(not is_fixed)
+            self._update_design_button_visibility()
 
         self._save_ui_state()
         if idx < len(self._tab_keys):
@@ -1689,6 +1829,26 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         lw = self.tab_lists[key]
         if key == "suggested":
             lw.load_smart_grouped(tasks, entities=entities)
+        elif (
+            self._premium_tray_extension and key == self._premium_tray_extension.tab_key
+        ):
+            params = self._tab_views.get(key, {}).get("params", {})
+            group_by = str(params.get("group_by") or "smart").lower()
+            if group_by == "project":
+                proj_sorted = sorted(
+                    tasks, key=lambda t: t.get("project") or "zzz_none"
+                )
+                lw.load_grouped_by_project(proj_sorted)
+            elif group_by == "client":
+                lw.load_grouped_by_field(tasks, "client_ref", empty_label="Unscoped")
+            elif group_by == "mailbox":
+                lw.load_grouped_by_field(tasks, "mailbox_key", empty_label="No mailbox")
+            elif group_by == "risk":
+                lw.load_grouped_by_field(tasks, "risk_level", empty_label="No risk")
+            elif group_by == "kind":
+                lw.load_grouped_by_field(tasks, "_premium_kind", empty_label="Other")
+            else:
+                lw.load_smart_grouped(tasks)
         elif key == "projects":
             proj_sorted = sorted(tasks, key=lambda t: t.get("project") or "zzz_none")
             lw.load_grouped_by_project(proj_sorted)
@@ -1706,7 +1866,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if not task_id:
             return
         # Skip entity items (no checkbox behavior)
-        if isinstance(task_id, str) and task_id.startswith("entity:"):
+        if isinstance(task_id, str) and (
+            task_id.startswith("entity:") or task_id.startswith("premium:")
+        ):
             return
         checked = item.checkState() == Qt.CheckState.Checked
         # Defer DB write out of signal handler — immediate clear() during

@@ -79,6 +79,46 @@ PREMIUM_FEATURES: dict[str, dict[str, Any]] = {
         "requires_owner_approval": False,
         "description": "Extended governance, entitlement, and premium audit workflows.",
     },
+    "memory_action_snapshots": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Action snapshots and operational memory checkpoints over client work.",
+    },
+    "client_history_notes": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Client-scoped history notes layered on top of the shared memory core.",
+    },
+    "canonical_facts": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Human-approved canonical facts stored with premium provenance.",
+    },
+    "provenance_pointers": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Premium provenance pointers across mail, notes, facts, and action layers.",
+    },
+    "query_templates": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Predefined premium memory queries for partner/operator workflows.",
+    },
+    "human_approved_notes": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Promotion of human-approved task/note content into premium memory layers.",
+    },
+    "task_signal_extraction": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Extraction of commitments, blockers, deadlines, and task signals into memory objects.",
+    },
+    "custom_design_tab": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Premium Custom Design operator surface spanning premium memory rows in the task tray.",
+    },
 }
 
 

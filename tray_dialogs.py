@@ -594,6 +594,24 @@ def _build_rich_tooltip(task):
     return "\n".join(parts) if parts else None
 
 
+def _build_detail_sections_from_record(task):
+    """Fallback detail sections for premium read-only records."""
+    sections = []
+    for title, key in (
+        ("Description", "description"),
+        ("Notes", "notes"),
+        ("Project", "project"),
+        ("Client", "client_ref"),
+        ("Mailbox", "mailbox_key"),
+        ("Risk", "risk_level"),
+        ("Updated", "updated_at"),
+    ):
+        value = task.get(key)
+        if value:
+            sections.append({"title": title, "body": str(value)})
+    return sections
+
+
 def _build_copy_text(task):
     """Build clipboard text for task (title always included)."""
     parts = [task["title"]]
@@ -2219,6 +2237,180 @@ class TaskReaderDialog(QDialog):
             self._refresh_display()
 
 
+class PremiumRecordDialog(QDialog):
+    """Read-only dialog for premium memory records rendered in the tray."""
+
+    def __init__(self, record, parent=None):
+        super().__init__(parent)
+        self.record = record
+        self.setWindowTitle((record.get("title") or "Premium Record")[:80])
+        self.resize(720, 680)
+        self.setMinimumSize(640, 560)
+        self.setStyleSheet(_build_dialog_style())
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel(record.get("title") or "Premium Record")
+        title.setStyleSheet(f"font-size: {_font_size + 3}px; font-weight: bold;")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        meta_parts = []
+        for value in (
+            record.get("_premium_kind"),
+            record.get("client_ref"),
+            record.get("mailbox_key"),
+            record.get("risk_level"),
+            record.get("updated_at"),
+        ):
+            if value:
+                meta_parts.append(str(value))
+        if meta_parts:
+            meta = QLabel(" | ".join(meta_parts))
+            meta.setStyleSheet(
+                f"color: {_T()['text2']}; font-size: {_font_size - 1}px;"
+            )
+            meta.setWordWrap(True)
+            layout.addWidget(meta)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        sections = record.get("_detail_sections") or []
+        if not sections:
+            sections = _build_detail_sections_from_record(record)
+        fragments = []
+        for section in sections:
+            heading = _html.escape(str(section.get("title") or "Section"))
+            content = _html.escape(str(section.get("body") or "")).replace("\n", "<br>")
+            fragments.append(
+                f'<div style="margin: 0 0 16px 0;">'
+                f'<div style="font-weight: bold; margin-bottom: 6px;">{heading}</div>'
+                f"<div>{content}</div></div>"
+            )
+        body.setHtml("".join(fragments))
+        layout.addWidget(body, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+
+class CustomDesignDialog(QDialog):
+    """Parameter editor for the premium Custom Design task-tray tab."""
+
+    _FOCUS_CHOICES = (
+        ("mixed", "Mixed"),
+        ("communication", "Communication"),
+        ("governance", "Governance"),
+        ("history", "History"),
+        ("facts", "Facts"),
+        ("followup", "Follow-up"),
+        ("action", "Action"),
+        ("signals", "Signals"),
+    )
+    _GROUP_CHOICES = (
+        ("smart", "Smart"),
+        ("project", "Project"),
+        ("client", "Client"),
+        ("mailbox", "Mailbox"),
+        ("risk", "Risk"),
+        ("kind", "Kind"),
+    )
+
+    def __init__(self, params: dict[str, object] | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Design")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(_build_dialog_style())
+        values = dict(params or {})
+
+        layout = QFormLayout(self)
+
+        self.focus_combo = QComboBox()
+        for key, label in self._FOCUS_CHOICES:
+            self.focus_combo.addItem(label, key)
+        self._set_combo_value(self.focus_combo, str(values.get("focus") or "mixed"))
+        layout.addRow("Focus:", self.focus_combo)
+
+        self.group_combo = QComboBox()
+        for key, label in self._GROUP_CHOICES:
+            self.group_combo.addItem(label, key)
+        self._set_combo_value(self.group_combo, str(values.get("group_by") or "smart"))
+        layout.addRow("Group By:", self.group_combo)
+
+        self.limit_spin = QSpinBox()
+        self.limit_spin.setRange(1, 100)
+        self.limit_spin.setValue(int(values.get("limit") or 25))
+        layout.addRow("Limit:", self.limit_spin)
+
+        self.mailbox_edit = QLineEdit(str(values.get("mailbox_key") or ""))
+        layout.addRow("Mailbox:", self.mailbox_edit)
+
+        self.client_edit = QLineEdit(str(values.get("client_ref") or ""))
+        layout.addRow("Client:", self.client_edit)
+
+        self.risk_combo = QComboBox()
+        self.risk_combo.addItem("Any", "")
+        for value in ("critical", "high", "medium", "low"):
+            self.risk_combo.addItem(value.title(), value)
+        self._set_combo_value(self.risk_combo, str(values.get("risk_level") or ""))
+        layout.addRow("Risk:", self.risk_combo)
+
+        self.only_followup = QCheckBox("Only open follow-up")
+        self.only_followup.setChecked(bool(values.get("only_followup")))
+        layout.addRow(self.only_followup)
+
+        self.include_threads = QCheckBox("Include threads")
+        self.include_threads.setChecked(bool(values.get("include_threads", True)))
+        layout.addRow(self.include_threads)
+
+        self.include_notes = QCheckBox("Include history notes")
+        self.include_notes.setChecked(bool(values.get("include_notes", True)))
+        layout.addRow(self.include_notes)
+
+        self.include_snapshots = QCheckBox("Include action snapshots")
+        self.include_snapshots.setChecked(bool(values.get("include_snapshots", True)))
+        layout.addRow(self.include_snapshots)
+
+        self.include_facts = QCheckBox("Include canonical facts")
+        self.include_facts.setChecked(bool(values.get("include_facts", True)))
+        layout.addRow(self.include_facts)
+
+        self.include_extractions = QCheckBox("Include extracted signals")
+        self.include_extractions.setChecked(
+            bool(values.get("include_extractions", True))
+        )
+        layout.addRow(self.include_extractions)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    @staticmethod
+    def _set_combo_value(combo: QComboBox, value: str) -> None:
+        idx = combo.findData(value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def get_params(self) -> dict[str, object]:
+        return {
+            "focus": self.focus_combo.currentData(),
+            "group_by": self.group_combo.currentData(),
+            "limit": self.limit_spin.value(),
+            "mailbox_key": self.mailbox_edit.text().strip(),
+            "client_ref": self.client_edit.text().strip(),
+            "risk_level": self.risk_combo.currentData(),
+            "only_followup": self.only_followup.isChecked(),
+            "include_threads": self.include_threads.isChecked(),
+            "include_notes": self.include_notes.isChecked(),
+            "include_snapshots": self.include_snapshots.isChecked(),
+            "include_facts": self.include_facts.isChecked(),
+            "include_extractions": self.include_extractions.isChecked(),
+        }
+
+
 # ── RecurringDialog ──────────────────────────────────────────────────
 
 
@@ -2527,6 +2719,32 @@ class TaskListWidget(QListWidget):
     def _fingerprint(tasks):
         return tuple((t["id"], t.get("updated_at", "")) for t in tasks)
 
+    @staticmethod
+    def _item_is_readonly(task):
+        task_id = task.get("id")
+        return bool(task.get("_readonly")) or (
+            isinstance(task_id, str) and task_id.startswith("premium:")
+        )
+
+    def _apply_item_state(self, item, task, *, prefix="", include_project=True):
+        item.setData(Qt.ItemDataRole.UserRole, task["id"])
+        if self._item_is_readonly(task):
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        else:
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if task["status"] == "done"
+                else Qt.CheckState.Unchecked
+            )
+        item.setText(
+            _format_task_text(task, include_project=include_project, prefix=prefix)
+        )
+        tip = self._build_tooltip(task)
+        if tip:
+            item.setToolTip(tip)
+        _apply_task_item_colors(item, task)
+
     def load_tasks(self, tasks):
         fp = self._fingerprint(tasks)
         if fp == self._last_fp:
@@ -2537,18 +2755,7 @@ class TaskListWidget(QListWidget):
         self.clear()
         for task in tasks:
             item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, task["id"])
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(
-                Qt.CheckState.Checked
-                if task["status"] == "done"
-                else Qt.CheckState.Unchecked
-            )
-            item.setText(_format_task_text(task))
-            tip = self._build_tooltip(task)
-            if tip:
-                item.setToolTip(tip)
-            _apply_task_item_colors(item, task)
+            self._apply_item_state(item, task)
             self.addItem(item)
         self.blockSignals(False)
 
@@ -2583,20 +2790,45 @@ class TaskListWidget(QListWidget):
             # Tasks under this project
             for task in proj_tasks:
                 item = QListWidgetItem()
-                item.setData(Qt.ItemDataRole.UserRole, task["id"])
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.CheckState.Checked
-                    if task["status"] == "done"
-                    else Qt.CheckState.Unchecked
+                self._apply_item_state(
+                    item,
+                    task,
+                    prefix="  ",
+                    include_project=False,
                 )
-                item.setText(
-                    _format_task_text(task, include_project=False, prefix="  ")
-                )
-                tip = self._build_tooltip(task)
-                if tip:
-                    item.setToolTip(tip)
-                _apply_task_item_colors(item, task)
+                self.addItem(item)
+
+        self.blockSignals(False)
+
+    def load_grouped_by_field(self, tasks, field_name, *, empty_label="Other"):
+        """Load tasks grouped by a caller-selected field."""
+        from collections import OrderedDict
+
+        fp = (self._fingerprint(tasks), field_name)
+        if fp == self._last_fp:
+            return
+        self._last_fp = fp
+        self._tasks = tasks
+        self.blockSignals(True)
+        self.clear()
+
+        groups: OrderedDict[str, list] = OrderedDict()
+        for task in tasks:
+            key = task.get(field_name) or empty_label
+            groups.setdefault(str(key), []).append(task)
+
+        for group_name, group_tasks in groups.items():
+            header = QListWidgetItem(f"── {group_name} ({len(group_tasks)}) ──")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            header.setBackground(_CLR_HEADER_BG)
+            header.setForeground(_CLR_HEADER_FG)
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            self.addItem(header)
+            for task in group_tasks:
+                item = QListWidgetItem()
+                self._apply_item_state(item, task, prefix="  ")
                 self.addItem(item)
 
         self.blockSignals(False)
@@ -2634,18 +2866,7 @@ class TaskListWidget(QListWidget):
             self.addItem(header)
             for task in group_tasks:
                 item = QListWidgetItem()
-                item.setData(Qt.ItemDataRole.UserRole, task["id"])
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.CheckState.Checked
-                    if task["status"] == "done"
-                    else Qt.CheckState.Unchecked
-                )
-                item.setText(_format_task_text(task, prefix="  "))
-                tip = self._build_tooltip(task)
-                if tip:
-                    item.setToolTip(tip)
-                _apply_task_item_colors(item, task)
+                self._apply_item_state(item, task, prefix="  ")
                 self.addItem(item)
         # Append entity results after task groups
         if entities:
@@ -2732,6 +2953,12 @@ class TaskListWidget(QListWidget):
             label=f"entity detail for {entity_id}",
         )
 
+    def _open_premium_detail(self, record):
+        self._show_dialog_deferred(
+            lambda record=record: PremiumRecordDialog(record, self._dialog_parent()),
+            label=f"premium record detail for {record.get('id')}",
+        )
+
     def _on_double_click(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
         if not data:
@@ -2739,6 +2966,11 @@ class TaskListWidget(QListWidget):
         if isinstance(data, str) and data.startswith("entity:"):
             entity_id = int(data.split(":", 1)[1])
             self._open_entity_detail(entity_id)
+            return
+        if isinstance(data, str) and data.startswith("premium:"):
+            record = next((t for t in self._tasks if t["id"] == data), None)
+            if record:
+                self._open_premium_detail(record)
             return
         self._open_reader(data)
 
@@ -2760,6 +2992,17 @@ class TaskListWidget(QListWidget):
             action = menu.exec(self.mapToGlobal(pos))
             if action == view_action:
                 self._open_entity_detail(entity_id)
+            return
+        if isinstance(data, str) and data.startswith("premium:"):
+            record = next((t for t in self._tasks if t["id"] == data), None)
+            if not record:
+                return
+            menu = QMenu(self)
+            menu.setStyleSheet(_build_menu_style())
+            view_action = menu.addAction("View Premium Record")
+            action = menu.exec(self.mapToGlobal(pos))
+            if action == view_action:
+                self._open_premium_detail(record)
             return
         task_id = data
         menu = QMenu(self)
