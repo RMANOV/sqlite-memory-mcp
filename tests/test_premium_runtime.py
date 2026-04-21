@@ -201,6 +201,58 @@ def test_evaluate_feature_gate_expands_packs_and_dependencies(tmp_path, monkeypa
     assert denied["reason"] == "feature_not_entitled"
 
 
+def test_protected_operator_surface_pack_expands_password_view_dependency(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-pack-protected",
+        "customer_id": "cust-pack-protected",
+        "packs": ["protected_operator_surface"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "owner_approval_sha256": premium_runtime._hash_text("approve-protected"),
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-protected")
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        protected = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="password_protected_views",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.password_protected_views",
+        )
+        custom = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="custom_design_tab",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.custom_design_tab",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert protected["allowed"] is True
+    assert custom["allowed"] is True
+    assert protected["selected_packs"] == ["protected_operator_surface"]
+    assert "password_protected_views" in protected["effective_features"]
+    assert "custom_design_tab" in protected["effective_features"]
+
+
 def test_maybe_mount_premium_extensions_refuses_import_when_gate_denies(
     tmp_path, monkeypatch
 ):

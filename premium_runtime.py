@@ -119,6 +119,12 @@ PREMIUM_FEATURES: dict[str, dict[str, Any]] = {
         "requires_owner_approval": False,
         "description": "Premium Custom Design operator surface spanning premium memory rows in the task tray.",
     },
+    "password_protected_views": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Password-protected premium operator views for especially sensitive tray surfaces.",
+        "depends_on": ["custom_design_tab"],
+    },
     "instant_briefing": {
         "tier": "premium",
         "requires_owner_approval": False,
@@ -251,6 +257,11 @@ PREMIUM_PACKS: dict[str, dict[str, Any]] = {
         "label": "Custom Design Surface",
         "description": "Premium operator tray surface with parameterized views and premium row orchestration.",
         "features": ["custom_design_tab"],
+    },
+    "protected_operator_surface": {
+        "label": "Protected Operator Surface",
+        "description": "Password-protected premium views layered onto the Custom Design operator surface.",
+        "features": ["password_protected_views"],
     },
 }
 

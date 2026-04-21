@@ -19,12 +19,11 @@ These drafts move the story forward:
 
 Important truth boundary for these drafts:
 
-- `instant_briefing`, `commitment_radar`, and `custom_design_tab` are described
-  as current premium surfaces because they are already documented in the public
-  repo
-- `password-protected premium views` are described as a commercial next-layer
-  direction on top of the premium tray surface, not as a claim that they are
-  already shipped in the OSS repo
+- `instant_briefing`, `commitment_radar`, `custom_design_tab`, and
+  `password-protected premium views` are current premium runtime surfaces
+- the drafts should still keep the architecture boundary explicit: the OSS repo
+  exposes the airlock, catalog, and hooks, while the premium logic stays in the
+  separate gated runtime
 
 Core repo:
 
@@ -39,12 +38,14 @@ Drafts in this folder:
 
 - `2026-04-21-linkedin-premium-memory-war.md`
 - `2026-04-21-linkedin-premium-memory-war-v2.md`
+- `2026-04-21-linkedin-premium-memory-war-v3.md`
 - `2026-04-21-x-article-premium-memory-war.md`
 - `2026-04-21-x-article-premium-memory-war-v2.md`
+- `2026-04-21-x-article-premium-memory-war-v3.md`
 - `2026-04-21-devto-premium-memory-war.md`
 - `2026-04-21-medium-premium-memory-war.md`
 
 Recommended current top picks for publishing:
 
-- `2026-04-21-linkedin-premium-memory-war-v2.md`
-- `2026-04-21-x-article-premium-memory-war-v2.md`
+- `2026-04-21-linkedin-premium-memory-war-v3.md`
+- `2026-04-21-x-article-premium-memory-war-v3.md`

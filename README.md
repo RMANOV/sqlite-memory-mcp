@@ -154,11 +154,17 @@ This pack makes premium memory defensible. Important conclusions can be traced b
 
 This is the premium operator UI layer. It lets an entitled user shape a live working view over premium rows, grouping, risk, mailbox/client focus, and custom search/sort surfaces without flattening everything back into the OSS task model.
 
+#### 8. `protected_operator_surface`
+
+- `password_protected_views`
+
+This pack adds local password-gated premium views on top of the Custom Design surface for the highest-sensitivity operator slices, so a premium view can require an explicit per-session unlock before it renders its real rows.
+
 #### Feature-level premium surfaces
 
-On top of the pack structure, the private runtime now exposes concrete premium-only features for the most valuable operator workflows, and the commercial scope can additionally include password-protected premium views for the highest-sensitivity surfaces:
+On top of the pack structure, the private runtime now exposes concrete premium-only features for the most valuable operator workflows:
 
-- commercial add-on: password-protected premium views for especially sensitive client, governance, or operator-specific surfaces
+- `password_protected_views` for especially sensitive client, governance, or operator-specific surfaces inside the premium tray
 - `instant_briefing` for fast pre-call or pre-mail context
 - `commitment_radar` for open commitments, deadlines, blockers, and stale follow-ups
 - `client_memory_twin` for a scoped memory profile per client
@@ -175,7 +181,7 @@ The commercial design still assumes that the local machine may be untrusted.
 - explicit entitlements
 - local revocation
 - owner approval for protected runtime loading
-- optional password-protected premium views for the highest-sensitivity operator surfaces
+- password-protected premium views for the highest-sensitivity operator surfaces
 - separate private runtime packaging
 - optional extra service boundaries for the most sensitive premium logic
 
@@ -206,6 +212,7 @@ The current private premium runtime is no longer limited to the first three pack
 - `silence_drift_detection`
 - `cross_mailbox_context`
 - `custom_design_tab`
+- `password_protected_views`
 
 That runtime is intentionally separate from the OSS repo. The public repo ships the airlock, contract, tray loader hooks, schema hooks, and bootstrap template. The premium logic itself stays outside the OSS tree.
 
@@ -217,6 +224,7 @@ The current premium-facing UI surface is built around a gated `custom_design_tab
 - premium rows can enter the same tray search index as OSS tasks and notes when the premium runtime is active
 - premium-specific grouping and sorting modes can be injected into the tray at runtime without changing the OSS data model
 - the `Custom Design` tab behaves like an operator-defined working view rather than a fixed canned tab
+- protected premium views can be configured with a locally stored password hash and unlocked per session inside the premium tray
 - tray loading now carries the resolved entitlement selection into the private runtime, so a customer can activate `packs`, explicit `features`, or both without changing the public host code
 
 This remains premium-only functionality. The OSS repo contains the loader path and safe UI hooks, not the private business logic itself.

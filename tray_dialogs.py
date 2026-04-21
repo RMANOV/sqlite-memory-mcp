@@ -2320,7 +2320,7 @@ class CustomDesignDialog(QDialog):
     def __init__(self, params: dict[str, object] | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom Design")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(420)
         self.setStyleSheet(_build_dialog_style())
         values = dict(params or {})
 
@@ -2382,6 +2382,41 @@ class CustomDesignDialog(QDialog):
         )
         layout.addRow(self.include_extractions)
 
+        self.protected_enabled = QCheckBox("Password-protected premium view")
+        self.protected_enabled.setChecked(bool(values.get("protected_view_enabled")))
+        self.protected_enabled.toggled.connect(self._on_protection_toggled)
+        layout.addRow(self.protected_enabled)
+
+        self.protected_label = QLineEdit(str(values.get("protected_view_label") or ""))
+        self.protected_label.setPlaceholderText("Protected View")
+        layout.addRow("Protected label:", self.protected_label)
+
+        self.protected_hint = QLineEdit(str(values.get("protected_view_hint") or ""))
+        self.protected_hint.setPlaceholderText("Optional hint for trusted operators")
+        layout.addRow("Password hint:", self.protected_hint)
+
+        self.protected_password = QLineEdit()
+        self.protected_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.protected_password.setPlaceholderText(
+            "Leave blank to keep current password"
+        )
+        layout.addRow("Set password:", self.protected_password)
+
+        self.protected_password_confirm = QLineEdit()
+        self.protected_password_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        self.protected_password_confirm.setPlaceholderText("Confirm new password")
+        layout.addRow("Confirm password:", self.protected_password_confirm)
+
+        self.protected_unlock = QLineEdit()
+        self.protected_unlock.setEchoMode(QLineEdit.EchoMode.Password)
+        self.protected_unlock.setPlaceholderText(
+            "Unlock this view for the current session"
+        )
+        layout.addRow("Unlock password:", self.protected_unlock)
+
+        self._protected_hash = str(values.get("protected_view_password_sha256") or "")
+        self._on_protection_toggled(self.protected_enabled.isChecked())
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -2393,6 +2428,18 @@ class CustomDesignDialog(QDialog):
     def _set_combo_value(combo: QComboBox, value: str) -> None:
         idx = combo.findData(value)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _on_protection_toggled(self, checked: bool) -> None:
+        for widget in (
+            self.protected_label,
+            self.protected_hint,
+            self.protected_password,
+            self.protected_password_confirm,
+            self.protected_unlock,
+        ):
+            widget.setEnabled(checked)
+        if checked and not self.protected_label.text().strip():
+            self.protected_label.setText("Protected View")
 
     def get_params(self) -> dict[str, object]:
         return {
@@ -2408,6 +2455,13 @@ class CustomDesignDialog(QDialog):
             "include_snapshots": self.include_snapshots.isChecked(),
             "include_facts": self.include_facts.isChecked(),
             "include_extractions": self.include_extractions.isChecked(),
+            "protected_view_enabled": self.protected_enabled.isChecked(),
+            "protected_view_label": self.protected_label.text().strip(),
+            "protected_view_hint": self.protected_hint.text().strip(),
+            "protected_view_password_sha256": self._protected_hash,
+            "protected_view_password": self.protected_password.text(),
+            "protected_view_password_confirm": self.protected_password_confirm.text(),
+            "protected_view_unlock_password": self.protected_unlock.text(),
         }
 
 

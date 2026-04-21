@@ -1222,6 +1222,17 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._premium_tray_extension
             and current_key == self._premium_tray_extension.tab_key
         )
+        if visible and self._premium_tray_extension:
+            params = self._tab_views.get(current_key, {}).get("params", {})
+            label_builder = getattr(
+                self._premium_tray_extension,
+                "design_button_label",
+                None,
+            )
+            if callable(label_builder):
+                self._design_btn.setText(str(label_builder(params) or "Design..."))
+            else:
+                self._design_btn.setText("Design...")
         self._design_btn.setVisible(visible)
 
     def _edit_custom_design(self):
@@ -1231,10 +1242,22 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         params = self._tab_views.get(key, {}).get("params", {})
         dlg = CustomDesignDialog(params, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._tab_views[key]["params"] = self._normalize_tab_params(
-                key,
-                dlg.get_params(),
-            )
+            raw_params = dlg.get_params()
+            try:
+                apply_dialog = getattr(
+                    self._premium_tray_extension,
+                    "apply_dialog_params",
+                    None,
+                )
+                if callable(apply_dialog):
+                    new_params = apply_dialog(raw_params)
+                else:
+                    new_params = raw_params
+            except ValueError as exc:
+                self.status.showMessage(str(exc), 8000)
+                return
+            self._tab_views[key]["params"] = self._normalize_tab_params(key, new_params)
+            self._update_design_button_visibility()
             self._save_ui_state()
             self.refresh()
 
