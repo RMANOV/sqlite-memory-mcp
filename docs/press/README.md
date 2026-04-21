@@ -37,15 +37,35 @@ Full premium catalog in the public README:
 Current publish-ready short-form drafts:
 
 - `2026-04-21-linkedin-premium-memory-war-v3.md`
+  (archive/markdown version; for actual LinkedIn posting use the plain-text
+  publish version below)
+- `2026-04-21-linkedin-premium-memory-war-v3.publish.txt`
+  (plain-text copy-paste version, link-in-first-comment, 3 hashtags, per the
+  SmartKey LinkedIn template)
 - `2026-04-21-x-article-premium-memory-war-v3.md`
+- `2026-04-21-twitter-thread-premium-memory-war.md`
+  (8-tweet native thread, hashtags only in the last tweet)
 
 Current publish-ready long-form drafts
-(refreshed 2026-04-21 with 4-feature shortlist, v3.5.0 shipped state, and code
-snippets for the OSS-side boot hook and public feature registry):
+(refreshed 2026-04-21 with 4-feature shortlist, v3.5.0 shipped state, code
+snippets for the OSS-side boot hook and public feature registry, and an
+ASCII architecture diagram of the public-core / private-runtime boundary):
 
 - `2026-04-21-devto-premium-memory-war.md` (includes dev.to front matter;
   flip `published: false` → `true` when posting)
 - `2026-04-21-medium-premium-memory-war.md`
+
+Discovery / discussion drafts:
+
+- `2026-04-21-hn-submission.md`
+  (~200 words, two discussion prompts, Show HN format)
+- `2026-04-21-reddit-premium-memory-war.md`
+  (multi-subreddit tailored angles, comparison table, prepared FAQ)
+
+Operations:
+
+- `2026-04-21-publishing-guide.md`
+  (day-by-day calendar Day 0 → Day 7, per-channel rules, competitive notes)
 
 Legacy drafts kept for tone/history reference:
 
@@ -54,10 +74,4 @@ Legacy drafts kept for tone/history reference:
 - `2026-04-21-x-article-premium-memory-war.md`
 - `2026-04-21-x-article-premium-memory-war-v2.md`
 
-Suggested publication sequencing for same-day release:
-
-1. X Article first, plus a short teaser tweet pointing to it
-2. LinkedIn roughly 30–60 minutes later (different algorithms, different
-   audiences; avoid back-to-back publishing on the same minute)
-3. Long-form (dev.to, Medium) 1–3 days later to let the short-form momentum
-   settle and to give each channel its own moment
+For the full publication schedule, see `2026-04-21-publishing-guide.md`.

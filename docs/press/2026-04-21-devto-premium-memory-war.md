@@ -44,6 +44,33 @@ The public OSS repo is still explicit about the architecture:
 In other words, the open repo ships the airlock.
 The private runtime ships the premium tools.
 
+The boundary looks like this in practice:
+
+```
+┌─ Public OSS repo ───────────────────┐      ┌─ Private runtime ────────┐
+│                                     │      │                          │
+│   SQLite memory core  (WAL, FTS5)   │      │  Premium features:       │
+│   Entitlement contract              │      │  • instant_briefing      │
+│   Gate + premium_gate_audit table   │ ───► │  • commitment_radar      │
+│   premium_revocations table         │      │  • custom_design_tab     │
+│   Tray hooks                        │      │  • password_protected    │
+│                                     │      │    _views                │
+│   maybe_mount_premium_extensions()  │      │                          │
+│                                     │      │  register(mcp, ...)      │
+└─────────────────────────────────────┘      └──────────────────────────┘
+              │                                           ▲
+              ▼                                           │
+         gate check                                       │
+     (entitlement +                                       │
+      signature +                                         │
+      revocation?)     ───── allowed ────────────────────┘
+                       ───── denied  ───── audit row only
+```
+
+Everything on the left lives in the public MIT-licensed repo.
+Everything on the right lives in a separate private runtime that the public
+repo cannot read but can audit.
+
 That boundary matters because the valuable part is no longer just storage or
 recall.
 It is governed memory with selective exposure.

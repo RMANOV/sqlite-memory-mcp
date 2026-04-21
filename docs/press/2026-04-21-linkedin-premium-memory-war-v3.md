@@ -130,4 +130,15 @@ Full catalog:
 - Premium packs: https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#premium-feature-packs
 - Premium features: https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#feature-level-premium-surfaces
 
-#AI #MCP #ClaudeCode #LocalFirst #DevTools
+#AI #MCP #LocalFirst
+
+<!--
+LinkedIn publish notes (per SmartKey playbook):
+- Plain-text version for copy-paste lives at
+  2026-04-21-linkedin-premium-memory-war-v3.publish.txt
+- LinkedIn strips/garbles markdown — use that .publish.txt instead of this
+  archive version when posting.
+- Put the repo link in the FIRST COMMENT, not in the post body.
+- Max 3 hashtags.
+-->
+

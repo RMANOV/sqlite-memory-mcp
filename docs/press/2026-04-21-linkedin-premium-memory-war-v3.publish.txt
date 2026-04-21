@@ -1,0 +1,46 @@
+[ LinkedIn publish format — plain text, no markdown ]
+
+[ PASTE BELOW INTO THE POST BODY ]
+
+Premium AI will not be won by bigger models. It will be won by better memory discipline.
+
+Claude Code and Codex are making raw coding power cheaper, more common, and less mystical. That does not kill premium software. It relocates premium software — upward, toward workflow, toward control, toward memory under pressure.
+
+That is the direction behind the premium runtime around sqlite-memory-mcp.
+
+The architecture is the point. The OSS repo stays local-first and honest. It ships the SQLite memory core, the premium airlock, the entitlement contract, and the tray hooks. The premium logic runs behind a separate gated runtime.
+
+That boundary is not marketing. It is part of the product.
+
+The 4 premium surfaces that now make the strongest story:
+
+1. instant_briefing — anti-cold-start. Before the mail, call, or meeting: who, what changed, what was promised, what is open, what is risky. No ritual reconstruction.
+
+2. commitment_radar — anti-drift. Commitments, blockers, stale follow-ups, silent threads, deadline pressure. Memory with a pulse.
+
+3. custom_design_tab — anti-generic. Premium rows enter the live tray surface. Operator-shaped layouts around client, mailbox, risk, or follow-up pressure. The interface becomes a control room.
+
+4. password_protected_views — anti-casual-exposure. Some premium views should not open casually. Not on the wrong desk. Not in the wrong room. Local password hash, per-session unlock. This is not security theater. It is workflow restraint.
+
+When everyone can generate, the moat is no longer generation. The moat becomes memory quality, timing, prioritization, selective exposure, and controlled unlocks.
+
+Brief me. Warn me. Shape the room. Lock the wrong door.
+
+Shipped today in v3.5.0:
+• premium_gate_audit and premium_revocations tables with idempotent migrations
+• Entitlement-signed loader with local revocation honored at every gate check
+• Password-hash unlock on the Custom Design surface, per-session
+• OSS-side boot hook: maybe_mount_premium_extensions(mcp, server_name=...)
+• Full test suite green across gate denial, revocation, pack expansion, and mount-context propagation
+
+#AI #MCP #LocalFirst
+
+[ POST THE ABOVE. THEN IMMEDIATELY ADD THE FOLLOWING AS THE FIRST COMMENT. ]
+
+Repo: https://github.com/RMANOV/sqlite-memory-mcp
+v3.5.0 release notes: https://github.com/RMANOV/sqlite-memory-mcp/releases/tag/v3.5.0
+Premium packs catalog: https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#premium-feature-packs
+
+[ Why link-in-first-comment: LinkedIn's algorithm deprioritizes posts with
+external links in the body. Moving the link to the first comment preserves
+reach without hiding the link from engaged readers. ]

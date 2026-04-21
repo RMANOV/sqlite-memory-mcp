@@ -195,8 +195,28 @@ That is a cleaner vision of premium than "we added more AI."
 
 ## Shipped today: v3.5.0
 
-The architecture makes this claim concrete. The OSS repo ships the airlock
-itself:
+The architecture makes this claim concrete. The boundary looks like this:
+
+```
+┌─ Public OSS repo ─────────────────┐      ┌─ Private runtime ────────┐
+│                                   │      │                          │
+│  SQLite memory core  (WAL, FTS5)  │      │  Premium features:       │
+│  Entitlement contract             │      │  • instant_briefing      │
+│  Gate + premium_gate_audit table  │ ───► │  • commitment_radar      │
+│  premium_revocations table        │      │  • custom_design_tab     │
+│  Tray hooks                       │      │  • password_protected    │
+│                                   │      │    _views                │
+│  maybe_mount_premium_extensions() │      │                          │
+└───────────────────────────────────┘      └──────────────────────────┘
+             │                                         ▲
+             ▼                                         │
+        gate check                                     │
+    (entitlement + signature +                         │
+     revocation?)           ──── allowed ─────────────┘
+                            ──── denied  ──── audit row only
+```
+
+The OSS boot hook is one line of code:
 
 ```python
 # server.py
