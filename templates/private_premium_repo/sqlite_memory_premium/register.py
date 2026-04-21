@@ -1,65 +1,40 @@
-"""Minimal private premium registration template.
-
-Copy this file into a private repo and replace the placeholder tools with the
-real premium implementation.
-"""
+"""Bootstrap premium registration for the private sqlite-memory runtime."""
 
 from __future__ import annotations
 
-import json
+from typing import Any
 
-from fastmcp import FastMCP
-
-from premium_contract import (
-    PREMIUM_RUNTIME_CONTRACT_VERSION,
-    PremiumMountContext,
-    PremiumRegistrationResult,
-)
-
-premium_mcp = FastMCP(
-    "sqlite-premium-template",
-    instructions=(
-        "Template MCP mounted from a separate private premium repo. "
-        "Replace these placeholder tools with real premium-only features."
-    ),
-)
-
-
-@premium_mcp.tool()
-def premium_status() -> str:
-    """Template-only tool proving that private premium mounting works."""
-    return json.dumps(
-        {
-            "status": "template_loaded",
-            "note": "Replace this template tool with real premium-only tools.",
-        }
-    )
+from . import acl_governance  # noqa: F401
+from . import communication_memory  # noqa: F401
+from .app import premium_mcp
+from .runtime_state import configure_runtime
+from .schema import init_private_schema
 
 
 def register_premium_extensions(
-    mcp,
+    mcp: Any,
     *,
     server_name: str | None = None,
-    mount_context: PremiumMountContext | None = None,
-) -> PremiumRegistrationResult:
-    """Mount a placeholder premium MCP into the host runtime.
+    mount_context: Any | None = None,
+) -> dict[str, Any]:
+    """Mount placeholder premium MCP tools into the entitled host runtime."""
+    state = configure_runtime(server_name=server_name, mount_context=mount_context)
+    init_private_schema()
 
-    Real premium repos should keep the same outer contract and swap in their
-    proprietary tools and workflows here.
-    """
-    if mount_context is None:
-        raise RuntimeError("mount_context required")
-    if mount_context.contract_version != PREMIUM_RUNTIME_CONTRACT_VERSION:
-        raise RuntimeError(
-            "premium contract mismatch: "
-            f"{mount_context.contract_version} != {PREMIUM_RUNTIME_CONTRACT_VERSION}"
-        )
     if hasattr(mcp, "mount"):
         mcp.mount(premium_mcp)
+
     return {
         "mounted": True,
-        "contract_version": mount_context.contract_version,
-        "extension_name": "sqlite-memory-premium-template",
-        "features": ["template_status"],
-        "notes": f"Mounted into {server_name or mount_context.server_name}",
+        "contract_version": state.contract_version,
+        "extension_name": "sqlite-memory-mcp-premium-template",
+        "features": [
+            "acl_rbac",
+            "governance_audit",
+            "multi_mailbox_ingestion",
+        ],
+        "notes": (
+            "Mounted template premium packs into "
+            f"{state.server_name}; replace placeholder tools with real logic"
+        ),
     }

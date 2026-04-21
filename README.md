@@ -8,7 +8,7 @@
 
 A production-quality SQLite-backed MCP Memory stack with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system tray task manager.
 
-Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 41 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (50 tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
+Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 47 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (56 OSS tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
 
 ## Why SQLite?
 
@@ -37,7 +37,7 @@ SQLite hits the sweet spot:
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
 - **Premium runtime boundary** -- The OSS core can gate-load a separate private premium repo via signed entitlement checks, explicit owner approval, audit logging, and local revocation
-- **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with 41 more tools available from companion servers
+- **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with 47 more tools available from companion servers
 - **Zero required dependencies beyond stdlib** -- Only `fastmcp` is required for MCP protocol; `sqlite3` is Python stdlib. Optional `orjson`, `sqlite-vec`, and `sentence-transformers` add speed and semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
@@ -83,6 +83,84 @@ The public runtime will only attempt to mount them when all of the following are
 
 Without a valid entitlement and local approval path, the premium runtime stays off and private extensions are not mounted.
 
+### Premium feature packs
+
+The premium layer is not meant to be a vague "enterprise edition". It is structured as a set of **gated operational packs** that sit on top of the OSS memory core.
+
+#### 1. ACL / RBAC control plane
+
+This pack is for teams that need more than "who has the database file".
+
+- define premium roles per global, project, client, or mailbox scope
+- assign those roles to users, teams, or agents
+- evaluate whether a principal may read, write, ingest, publish, or escalate within a given scope
+
+The point is not cosmetic permissions. The point is to stop one shared memory instance from becoming a flat trust domain once multiple people, clients, mailboxes, and AI agents are involved.
+
+#### 2. Governance / audit decision layer
+
+This pack records why a high-impact memory action was allowed, rejected, escalated, or published.
+
+- record governance decisions with rationale, evidence, and risk level
+- summarize the active governance surface for review
+- keep premium review activity in an auditable path instead of burying it in ad hoc notes
+
+This matters when the system starts influencing partner communication, escalation handling, or management-facing summaries.
+
+#### 3. Communication memory / multi-mailbox ingestion
+
+This pack turns the memory layer into a client-thread and operational follow-up surface.
+
+- register multiple mailboxes or shared inboxes
+- ingest thread/message metadata with client scope and participants
+- build follow-up queues based on the latest thread state
+- keep communication memory separated by mailbox and client boundary
+
+This is the premium line where the product stops being only "knowledge memory" and starts acting like governed operational memory.
+
+#### 4. Partner digest / management summary pipelines
+
+This is the premium summarization layer built on top of governance and communication memory.
+
+- partner-grade digests
+- management summaries
+- unresolved-risk and escalation views
+- high-signal briefings over selected scopes rather than global memory dumps
+
+These workflows are intentionally premium-only because they combine communication access, ranking, and decision framing in ways that should not run by default.
+
+#### 5. Advanced ranking / orchestration
+
+This pack is for cases where the public retrieval baseline is not enough.
+
+- premium reranking over client, partner, and mailbox context
+- queue prioritization and escalation ordering
+- multi-step orchestration for premium-only retrieval and digest pipelines
+
+The public repo exposes the runtime boundary for this. The proprietary heuristics and orchestration logic stay outside the OSS tree.
+
+#### 6. High-control deployment surfaces
+
+This is the control layer for customers that need stronger operational guarantees.
+
+- explicit entitlements
+- local revocation
+- owner approval for protected premium features
+- separate private runtime packaging
+- optional extra service boundaries for the most sensitive premium logic
+
+This is where the premium design stops depending on trust in the local machine and starts depending on gated execution, auditability, and runtime separation.
+
+### Current premium bootstrap scope
+
+The current private premium bootstrap is organized around three real pack families:
+
+- `acl_rbac`
+- `governance_audit`
+- `multi_mailbox_ingestion`
+
+That bootstrap is intentionally separate from the OSS repo. The public repo ships the airlock, contract, schema hooks, and template. The premium logic itself stays outside the OSS tree.
+
 See:
 
 - [`premium_contract.py`](premium_contract.py)
@@ -122,7 +200,7 @@ pip install -e .
 # Add the core drop-in server
 claude mcp add sqlite_memory python /path/to/server.py
 
-# Add companion servers for the full 50-tool stack
+# Add companion servers for the full 56-tool OSS stack
 claude mcp add sqlite_tasks python /path/to/task_server.py
 claude mcp add sqlite_session python /path/to/session_server.py
 claude mcp add sqlite_bridge python /path/to/bridge_server.py
@@ -162,7 +240,7 @@ Add these server/file pairs to your `~/.claude/settings.json` under `mcpServers`
 | `sqlite_collab` | `collab_server.py` | Collaborator and public-knowledge workflows |
 | `sqlite_entity` | `entity_server.py` | Task-entity linking and merge helpers |
 | `sqlite_intel` | `intel_server.py` | Context assessment and enrichment tools |
-| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full 50-tool stack |
+| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full 56-tool OSS stack |
 
 Each server should share the same environment values:
 
@@ -269,17 +347,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 
 ## Tool Reference
 
-The 50 tools are grouped by MCP server:
+The 56 OSS tools are grouped by MCP server:
 
 | MCP server | Tool count | Tools |
 |---|---:|---|
 | `sqlite_memory` | 9 | `create_entities`, `add_observations`, `create_relations`, `delete_entities`, `delete_observations`, `delete_relations`, `read_graph`, `search_nodes`, `open_nodes` |
 | `sqlite_session` | 5 | `session_save`, `session_recall`, `search_by_project`, `knowledge_health`, `resume_context` |
-| `sqlite_tasks` | 6 | `create_task_or_note`, `update_task`, `query_tasks`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority` |
-| `sqlite_bridge` | 6 | `bridge_push`, `bridge_pull`, `bridge_status`, `assign_task`, `review_shared_tasks`, `process_recurring_tasks` |
+| `sqlite_tasks` | 7 | `create_task_or_note`, `update_task`, `query_tasks`, `find_by_title`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority` |
+| `sqlite_bridge` | 7 | `bridge_push`, `bridge_pull`, `bridge_status`, `bridge_doctor`, `assign_task`, `review_shared_tasks`, `process_recurring_tasks` |
 | `sqlite_collab` | 9 | `manage_collaborators`, `share_knowledge`, `review_shared_knowledge`, `request_publish`, `cancel_publish`, `search_public_knowledge`, `rate_public_knowledge`, `get_knowledge_ratings`, `update_verification` |
 | `sqlite_entity` | 7 | `link_task_entity`, `unlink_task_entity`, `get_task_links`, `get_entity_tasks`, `suggest_task_links`, `find_entity_overlaps`, `merge_entities` |
-| `sqlite_intel` | 8 | `assess_context`, `queue_clarification`, `record_human_answer`, `extract_candidate_claims`, `promote_candidate`, `build_context_pack`, `explain_impact`, `enrich_context` |
+| `sqlite_intel` | 12 | `assess_context`, `queue_clarification`, `record_human_answer`, `extract_candidate_claims`, `promote_candidate`, `build_context_pack`, `explain_impact`, `audit_memory`, `replay_memory`, `govern_fact`, `list_memory_issues`, `enrich_context` |
 
 ## Bridge Sync (Cross-Machine)
 

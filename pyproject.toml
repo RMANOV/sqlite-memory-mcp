@@ -1,7 +1,7 @@
 [project]
 name = "sqlite-memory-mcp"
-version = "3.4.0"
-description = "SQLite-backed MCP Memory Server with hybrid search (BM25 + semantic via sqlite-vec), Intelligence v2, causal event ledger, context state machine, knowledge tiers, WAL concurrent safety, cross-machine bridge sync, and 54 MCP tools"
+version = "3.5.0"
+description = "SQLite-backed MCP Memory Server with hybrid search (BM25 + semantic via sqlite-vec), Intelligence v2, causal event ledger, premium runtime boundary, context state machine, knowledge tiers, WAL concurrent safety, cross-machine bridge sync, and 56 OSS MCP tools"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=2.0.0"]
 license = {text = "MIT"}
