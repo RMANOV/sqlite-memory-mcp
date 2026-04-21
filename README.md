@@ -64,6 +64,7 @@ What is **not** in this OSS repo:
 
 **Premium-only capabilities** are for paid, explicitly entitled users only. They are expected to live in a separate private repo and be loaded through the gated runtime only. Typical premium-only modules include:
 
+- password-protected premium views and protected operator scopes for especially sensitive memory surfaces
 - ACL / RBAC
 - multi-mailbox ingestion
 - action snapshots and client history overlays on top of the note/task layer
@@ -99,6 +100,10 @@ Entitlements can now be **modular**:
 - rely on dependency expansion so high-level premium surfaces pull in the lower-level capabilities they need
 
 That means a customer can license one pack, one feature, or a hybrid bundle without forcing the whole private runtime scope on every deployment.
+
+Commercially, numeric pricing is intentionally **not published** in this OSS README.
+Serious paid prospects receive a scoped questionnaire first, then a customized offer
+that is valid for **7 working days**.
 
 #### 1. `access_governance`
 
@@ -151,8 +156,9 @@ This is the premium operator UI layer. It lets an entitled user shape a live wor
 
 #### Feature-level premium surfaces
 
-On top of the pack structure, the private runtime now exposes concrete premium-only features for the most valuable operator workflows:
+On top of the pack structure, the private runtime now exposes concrete premium-only features for the most valuable operator workflows, and the commercial scope can additionally include password-protected premium views for the highest-sensitivity surfaces:
 
+- commercial add-on: password-protected premium views for especially sensitive client, governance, or operator-specific surfaces
 - `instant_briefing` for fast pre-call or pre-mail context
 - `commitment_radar` for open commitments, deadlines, blockers, and stale follow-ups
 - `client_memory_twin` for a scoped memory profile per client
@@ -169,6 +175,7 @@ The commercial design still assumes that the local machine may be untrusted.
 - explicit entitlements
 - local revocation
 - owner approval for protected runtime loading
+- optional password-protected premium views for the highest-sensitivity operator surfaces
 - separate private runtime packaging
 - optional extra service boundaries for the most sensitive premium logic
 
