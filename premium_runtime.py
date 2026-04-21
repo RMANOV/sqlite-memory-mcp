@@ -119,6 +119,139 @@ PREMIUM_FEATURES: dict[str, dict[str, Any]] = {
         "requires_owner_approval": False,
         "description": "Premium Custom Design operator surface spanning premium memory rows in the task tray.",
     },
+    "instant_briefing": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "20-second executive/client briefing over facts, history, commitments, and recent communication.",
+        "depends_on": [
+            "partner_digest",
+            "advanced_ranking",
+            "query_templates",
+            "client_history_notes",
+            "canonical_facts",
+            "memory_action_snapshots",
+            "multi_mailbox_ingestion",
+            "governance_audit",
+            "task_signal_extraction",
+        ],
+    },
+    "commitment_radar": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Priority radar over commitments, deadlines, blockers, and unresolved follow-ups.",
+        "depends_on": [
+            "task_signal_extraction",
+            "query_templates",
+            "multi_mailbox_ingestion",
+            "advanced_ranking",
+        ],
+    },
+    "client_memory_twin": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Live client memory twin built from history notes, facts, snapshots, and communication context.",
+        "depends_on": [
+            "client_history_notes",
+            "canonical_facts",
+            "memory_action_snapshots",
+            "provenance_pointers",
+            "multi_mailbox_ingestion",
+        ],
+    },
+    "decision_ledger": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Unified decision ledger over governance decisions, provenance, and human-approved memory promotion.",
+        "depends_on": [
+            "governance_audit",
+            "provenance_pointers",
+            "human_approved_notes",
+            "canonical_facts",
+        ],
+    },
+    "chief_of_staff_queries": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Chief-of-staff style memory questions over risk, dependency, chronology, and unresolved work.",
+        "depends_on": [
+            "query_templates",
+            "advanced_ranking",
+            "task_signal_extraction",
+            "governance_audit",
+            "multi_mailbox_ingestion",
+        ],
+    },
+    "team_digest": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Team-facing digest surface that extends partner digests into operator and management handoff views.",
+        "depends_on": [
+            "partner_digest",
+            "advanced_ranking",
+            "query_templates",
+            "multi_mailbox_ingestion",
+            "governance_audit",
+        ],
+    },
+    "silence_drift_detection": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Detection of stale threads, communication silence, and operational drift before commitments slip.",
+        "depends_on": [
+            "multi_mailbox_ingestion",
+            "task_signal_extraction",
+            "advanced_ranking",
+        ],
+    },
+    "cross_mailbox_context": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Unified context across multiple mailboxes and memory layers for the same client or scope.",
+        "depends_on": [
+            "multi_mailbox_ingestion",
+            "client_history_notes",
+            "canonical_facts",
+            "memory_action_snapshots",
+        ],
+    },
+}
+
+PREMIUM_PACKS: dict[str, dict[str, Any]] = {
+    "access_governance": {
+        "label": "Access and Governance",
+        "description": "ACL/RBAC control plane plus auditable premium governance workflows.",
+        "features": ["acl_rbac", "governance_audit"],
+    },
+    "communication_context": {
+        "label": "Communication Context",
+        "description": "Cross-mailbox ingestion and unified premium context across client communication layers.",
+        "features": ["multi_mailbox_ingestion", "cross_mailbox_context"],
+    },
+    "client_memory_twin": {
+        "label": "Client Memory Twin",
+        "description": "Action snapshots, client history, canonical facts, and promoted human-approved memory.",
+        "features": ["client_memory_twin", "human_approved_notes"],
+    },
+    "briefing_suite": {
+        "label": "Instant Briefing Suite",
+        "description": "Executive/client briefing, team digests, and chief-of-staff query surfaces.",
+        "features": ["instant_briefing", "team_digest", "chief_of_staff_queries"],
+    },
+    "commitment_radar": {
+        "label": "Commitment Radar",
+        "description": "Signals, commitments, blockers, deadlines, and drift detection under operator pressure.",
+        "features": ["commitment_radar", "silence_drift_detection"],
+    },
+    "decision_ledger": {
+        "label": "Decision Ledger",
+        "description": "Decision trail, provenance, and explainable premium review history.",
+        "features": ["decision_ledger", "provenance_pointers"],
+    },
+    "custom_design_surface": {
+        "label": "Custom Design Surface",
+        "description": "Premium operator tray surface with parameterized views and premium row orchestration.",
+        "features": ["custom_design_tab"],
+    },
 }
 
 
@@ -138,6 +271,121 @@ def load_premium_config() -> dict[str, Any]:
             "premium_security_config.json missing or invalid; using safe defaults"
         )
         return dict(_DEFAULT_CONFIG)
+
+
+def _normalize_string_items(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        values.append(cleaned)
+    return values
+
+
+def _expand_feature_dependencies(feature_ids: set[str]) -> set[str]:
+    expanded = set(feature_ids)
+    queue = list(feature_ids)
+    while queue:
+        feature_id = queue.pop()
+        feature = PREMIUM_FEATURES.get(feature_id) or {}
+        for dependency in _normalize_string_items(feature.get("depends_on", [])):
+            if dependency in expanded or dependency not in PREMIUM_FEATURES:
+                continue
+            expanded.add(dependency)
+            queue.append(dependency)
+    return expanded
+
+
+def resolve_entitlement_selection(entitlement: dict[str, Any]) -> dict[str, Any]:
+    """Resolve pack + feature selection into the effective entitled feature set."""
+    raw_feature_ids = _normalize_string_items(entitlement.get("features", []))
+    raw_pack_ids = _normalize_string_items(entitlement.get("packs", []))
+    wildcard_features = "*" in raw_feature_ids
+    wildcard_packs = "*" in raw_pack_ids
+
+    requested_features = [item for item in raw_feature_ids if item != "*"]
+    requested_packs = [item for item in raw_pack_ids if item != "*"]
+    unknown_features = sorted(
+        feature_id
+        for feature_id in requested_features
+        if feature_id not in PREMIUM_FEATURES
+    )
+    unknown_packs = sorted(
+        pack_id for pack_id in requested_packs if pack_id not in PREMIUM_PACKS
+    )
+
+    effective_pack_ids = (
+        sorted(PREMIUM_PACKS.keys())
+        if wildcard_packs
+        else sorted(pack_id for pack_id in requested_packs if pack_id in PREMIUM_PACKS)
+    )
+    explicit_feature_ids = (
+        sorted(PREMIUM_FEATURES.keys())
+        if wildcard_features
+        else sorted(
+            feature_id
+            for feature_id in requested_features
+            if feature_id in PREMIUM_FEATURES
+        )
+    )
+
+    effective_feature_ids = set(explicit_feature_ids)
+    for pack_id in effective_pack_ids:
+        effective_feature_ids.update(
+            _normalize_string_items(PREMIUM_PACKS[pack_id].get("features", []))
+        )
+    effective_feature_ids = _expand_feature_dependencies(effective_feature_ids)
+    has_selection = bool(
+        wildcard_features
+        or wildcard_packs
+        or effective_feature_ids
+        or effective_pack_ids
+    )
+    if has_selection:
+        effective_feature_ids.add("private_extension_runtime")
+
+    return {
+        "selection_mode": (
+            "packs_and_features"
+            if effective_pack_ids and explicit_feature_ids
+            else "packs"
+            if effective_pack_ids
+            else "features"
+            if explicit_feature_ids or wildcard_features
+            else "none"
+        ),
+        "requested_packs": requested_packs,
+        "selected_packs": effective_pack_ids,
+        "explicit_features": explicit_feature_ids,
+        "effective_features": sorted(effective_feature_ids),
+        "unknown_features": unknown_features,
+        "unknown_packs": unknown_packs,
+        "wildcard": bool(wildcard_features or wildcard_packs),
+        "has_selection": has_selection,
+    }
+
+
+def build_mount_runtime_config(
+    *,
+    base_config: dict[str, Any] | None = None,
+    selection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach entitlement selection metadata to the mount context config."""
+    payload = dict(base_config or load_premium_config())
+    payload["_premium_selection"] = dict(selection or {})
+    payload["_premium_pack_catalog"] = {
+        pack_id: dict(pack) for pack_id, pack in PREMIUM_PACKS.items()
+    }
+    return payload
 
 
 def _new_id(prefix: str) -> str:
@@ -544,17 +792,16 @@ def evaluate_feature_gate(
             )
         return verdict
 
-    features = entitlement.get("features", [])
-    if not isinstance(features, list):
-        features = []
-    if feature_id not in features and "*" not in features:
+    selection = resolve_entitlement_selection(entitlement)
+    if not selection.get("has_selection"):
         verdict = {
             "allowed": False,
             "decision": "denied",
-            "reason": "feature_not_entitled",
+            "reason": "entitlement_selection_missing",
             "feature_id": feature_id,
             "entitlement_id": entitlement_id,
             "customer_id": customer_id,
+            "selection_mode": selection.get("selection_mode"),
         }
         if config.get("record_denied_events", True):
             _write_gate_audit(
@@ -567,7 +814,44 @@ def evaluate_feature_gate(
                 server_name=server_name,
                 tool_name=tool_name,
                 actor_id=actor_id,
-                payload={**(payload or {}), "entitlement_source": source_ref},
+                payload={
+                    **(payload or {}),
+                    "entitlement_source": source_ref,
+                    "selection_mode": selection.get("selection_mode"),
+                },
+            )
+        return verdict
+
+    effective_features = set(selection.get("effective_features", []))
+    if feature_id not in effective_features:
+        verdict = {
+            "allowed": False,
+            "decision": "denied",
+            "reason": "feature_not_entitled",
+            "feature_id": feature_id,
+            "entitlement_id": entitlement_id,
+            "customer_id": customer_id,
+            "selection_mode": selection.get("selection_mode"),
+            "selected_packs": selection.get("selected_packs", []),
+            "effective_features": selection.get("effective_features", []),
+        }
+        if config.get("record_denied_events", True):
+            _write_gate_audit(
+                conn,
+                feature_id=feature_id,
+                decision="denied",
+                reason=verdict["reason"],
+                entitlement_id=entitlement_id,
+                customer_id=customer_id,
+                server_name=server_name,
+                tool_name=tool_name,
+                actor_id=actor_id,
+                payload={
+                    **(payload or {}),
+                    "entitlement_source": source_ref,
+                    "selection_mode": selection.get("selection_mode"),
+                    "selected_packs": selection.get("selected_packs", []),
+                },
             )
         return verdict
 
@@ -706,6 +990,9 @@ def evaluate_feature_gate(
         "feature_id": feature_id,
         "entitlement_id": entitlement_id,
         "customer_id": customer_id,
+        "selection_mode": selection.get("selection_mode"),
+        "selected_packs": selection.get("selected_packs", []),
+        "effective_features": selection.get("effective_features", []),
     }
     if config.get("record_allowed_events", True):
         _write_gate_audit(
@@ -718,7 +1005,11 @@ def evaluate_feature_gate(
             server_name=server_name,
             tool_name=tool_name,
             actor_id=actor_id,
-            payload=payload,
+            payload={
+                **(payload or {}),
+                "selection_mode": selection.get("selection_mode"),
+                "selected_packs": selection.get("selected_packs", []),
+            },
         )
     return verdict
 
@@ -777,13 +1068,18 @@ def _resolve_module_from_entrypoint(entrypoint: str):
 
 
 def _register_loaded_module(
-    module: Any, mcp: Any, server_name: str, attr_name: str | None
+    module: Any,
+    mcp: Any,
+    server_name: str,
+    attr_name: str | None,
+    *,
+    mount_config: dict[str, Any] | None = None,
 ):
     mount_context = build_mount_context(
         server_name=server_name,
         feature_id="private_extension_runtime",
         machine_id=MACHINE_ID,
-        config=load_premium_config(),
+        config=build_mount_runtime_config(base_config=mount_config),
     )
     if attr_name:
         target = getattr(module, attr_name, None)
@@ -863,7 +1159,20 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
 
     try:
         module, attr_name = _resolve_module_from_entrypoint(entrypoint)
-        result = _register_loaded_module(module, mcp, server_name, attr_name)
+        result = _register_loaded_module(
+            module,
+            mcp,
+            server_name,
+            attr_name,
+            mount_config=build_mount_runtime_config(
+                base_config=config,
+                selection={
+                    key: value
+                    for key, value in verdict.items()
+                    if key in {"selection_mode", "selected_packs", "effective_features"}
+                },
+            ),
+        )
         logger.info("Premium runtime loaded for %s from %s", server_name, entry_env)
         with _get_conn() as conn:
             _write_gate_audit(

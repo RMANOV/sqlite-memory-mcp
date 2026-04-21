@@ -8,8 +8,19 @@
     "entitlement_id",
     "customer_id",
     "plan",
-    "features",
     "signature"
+  ],
+  "anyOf": [
+    {
+      "required": [
+        "features"
+      ]
+    },
+    {
+      "required": [
+        "packs"
+      ]
+    }
   ],
   "properties": {
     "entitlement_id": {
@@ -25,6 +36,14 @@
       "minLength": 1
     },
     "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "packs": {
       "type": "array",
       "minItems": 1,
       "items": {

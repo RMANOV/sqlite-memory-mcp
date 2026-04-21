@@ -67,6 +67,8 @@ def test_maybe_load_task_tray_extension_loads_builder(tmp_path, monkeypatch):
         "    ext = DemoExtension()\n"
         "    ext.server_name = server_name\n"
         "    ext.feature_id = mount_context.feature_id\n"
+        "    ext.selection_mode = mount_context.config.get('_premium_selection', {}).get('selection_mode')\n"
+        "    ext.selected_packs = mount_context.config.get('_premium_selection', {}).get('selected_packs', [])\n"
         "    return ext\n",
         encoding="utf-8",
     )
@@ -82,6 +84,9 @@ def test_maybe_load_task_tray_extension_loads_builder(tmp_path, monkeypatch):
             "feature_id": "custom_design_tab",
             "entitlement_id": "ent-ui",
             "customer_id": "cust-ui",
+            "selection_mode": "packs_and_features",
+            "selected_packs": ["custom_design_surface"],
+            "effective_features": ["custom_design_tab", "advanced_ranking"],
         },
     )
 
@@ -93,3 +98,5 @@ def test_maybe_load_task_tray_extension_loads_builder(tmp_path, monkeypatch):
     assert extension.tab_key == "custom_design"
     assert extension.server_name == "sqlite-task-tray"
     assert extension.feature_id == "custom_design_tab"
+    assert extension.selection_mode == "packs_and_features"
+    assert extension.selected_packs == ["custom_design_surface"]

@@ -29,7 +29,9 @@ class PremiumRegistrationResult(TypedDict, total=False):
     mounted: bool
     contract_version: str
     extension_name: str
+    packs: list[str]
     features: list[str]
+    selection_mode: str
     notes: str
 
 

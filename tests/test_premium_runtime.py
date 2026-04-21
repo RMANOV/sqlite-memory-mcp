@@ -141,6 +141,66 @@ def test_evaluate_feature_gate_honors_local_revocation(tmp_path, monkeypatch):
     assert verdict["reason"] == "entitlement_revoked"
 
 
+def test_evaluate_feature_gate_expands_packs_and_dependencies(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-pack-1",
+        "customer_id": "cust-pack-1",
+        "packs": ["briefing_suite"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "owner_approval_sha256": premium_runtime._hash_text("approve-pack"),
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-pack")
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        briefing = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="instant_briefing",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.instant_briefing",
+        )
+        runtime = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="private_extension_runtime",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.premium_runtime",
+        )
+        denied = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="client_memory_twin",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.client_memory_twin",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert briefing["allowed"] is True
+    assert briefing["selection_mode"] == "packs"
+    assert briefing["selected_packs"] == ["briefing_suite"]
+    assert "partner_digest" in briefing["effective_features"]
+    assert "advanced_ranking" in briefing["effective_features"]
+    assert runtime["allowed"] is True
+    assert "private_extension_runtime" in runtime["effective_features"]
+    assert denied["allowed"] is False
+    assert denied["reason"] == "feature_not_entitled"
+
+
 def test_maybe_mount_premium_extensions_refuses_import_when_gate_denies(
     tmp_path, monkeypatch
 ):

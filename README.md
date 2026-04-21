@@ -91,101 +91,88 @@ Without a valid entitlement and local approval path, the premium runtime stays o
 
 The premium layer is not meant to be a vague "enterprise edition". It is structured as a set of **gated operational packs** that sit on top of the OSS memory core.
 
-#### 1. ACL / RBAC control plane
+Entitlements can now be **modular**:
 
-This pack is for teams that need more than "who has the database file".
+- choose `packs`
+- choose explicit `features`
+- combine both in one entitlement
+- rely on dependency expansion so high-level premium surfaces pull in the lower-level capabilities they need
 
-- define premium roles per global, project, client, or mailbox scope
-- assign those roles to users, teams, or agents
-- evaluate whether a principal may read, write, ingest, publish, or escalate within a given scope
+That means a customer can license one pack, one feature, or a hybrid bundle without forcing the whole private runtime scope on every deployment.
 
-The point is not cosmetic permissions. The point is to stop one shared memory instance from becoming a flat trust domain once multiple people, clients, mailboxes, and AI agents are involved.
+#### 1. `access_governance`
 
-#### 2. Governance / audit decision layer
+- `acl_rbac`
+- `governance_audit`
 
-This pack records why a high-impact memory action was allowed, rejected, escalated, or published.
+This is the control plane for customers that need scoped trust, explainable decisions, and audit-safe premium workflows.
 
-- record governance decisions with rationale, evidence, and risk level
-- summarize the active governance surface for review
-- keep premium review activity in an auditable path instead of burying it in ad hoc notes
+#### 2. `communication_context`
 
-This matters when the system starts influencing partner communication, escalation handling, or management-facing summaries.
+- `multi_mailbox_ingestion`
+- `cross_mailbox_context`
 
-#### 3. Communication memory / multi-mailbox ingestion
+This pack turns memory into governed communication context instead of passive storage. It is where shared inboxes, thread memory, and client-scoped cross-mailbox views become first-class premium surfaces.
 
-This pack turns the memory layer into a client-thread and operational follow-up surface.
+#### 3. `client_memory_twin`
 
-- register multiple mailboxes or shared inboxes
-- ingest thread/message metadata with client scope and participants
-- build follow-up queues based on the latest thread state
-- keep communication memory separated by mailbox and client boundary
+- `client_memory_twin`
+- `human_approved_notes`
 
-This is the premium line where the product stops being only "knowledge memory" and starts acting like governed operational memory.
+Dependency expansion also brings in `memory_action_snapshots`, `client_history_notes`, `canonical_facts`, and provenance-aware context. The result is a live client twin built from trusted facts, approved notes, action checkpoints, and surrounding communication state.
 
-#### 4. Partner digest / management summary pipelines
+#### 4. `briefing_suite`
 
-This is the premium summarization layer built on top of governance and communication memory.
+- `instant_briefing`
+- `team_digest`
+- `chief_of_staff_queries`
 
-- partner-grade digests
-- management summaries
-- unresolved-risk and escalation views
-- high-signal briefings over selected scopes rather than global memory dumps
+This is the fastest-to-sell premium layer because it removes cold starts before calls, emails, or meetings. It combines ranking, query templates, partner/team digests, and scoped memory retrieval into concise operator briefings.
 
-These workflows are intentionally premium-only because they combine communication access, ranking, and decision framing in ways that should not run by default.
+#### 5. `commitment_radar`
 
-#### 5. Action snapshots, client history, and canonical facts
+- `commitment_radar`
+- `silence_drift_detection`
 
-This pack family turns premium memory into a more deliberate operational record instead of a loose pile of notes.
+This pack is about not dropping the ball. It detects commitments, blockers, deadlines, stale threads, and drift before they become visible operational failures.
 
-- record action snapshots over important threads, escalations, and operational moments
-- keep client history notes as a governed overlay above the base note/task layer
-- store canonical facts with explicit fact type, provenance, and client scope
-- promote human-approved OSS notes into premium history records without mutating the OSS note model itself
+#### 6. `decision_ledger`
 
-The goal is to preserve high-signal state transitions and trusted memory anchors without flattening everything into one generic task row.
+- `decision_ledger`
+- `provenance_pointers`
 
-#### 6. Provenance pointers, query templates, and signal extraction
+This pack makes premium memory defensible. Important conclusions can be traced back to governance decisions, human-approved promotion, and source-linked provenance instead of vague AI summaries.
 
-This pack family makes the premium memory layer more usable under real operator pressure.
+#### 7. `custom_design_surface`
 
-- build provenance digests so the operator can see where premium records came from
-- run ready-made query templates such as commitments, chronology, problems, pending items, and critical communication
-- extract tasks, commitments, blockers, and deadlines from premium source text into dedicated memory objects
+- `custom_design_tab`
 
-These packs are meant to reduce "search and infer everything manually" work when the system is being used as operational memory rather than passive storage.
+This is the premium operator UI layer. It lets an entitled user shape a live working view over premium rows, grouping, risk, mailbox/client focus, and custom search/sort surfaces without flattening everything back into the OSS task model.
 
-#### 7. Advanced ranking / orchestration
+#### Feature-level premium surfaces
 
-This pack is for cases where the public retrieval baseline is not enough.
+On top of the pack structure, the private runtime now exposes concrete premium-only features for the most valuable operator workflows:
 
-- premium reranking over client, partner, and mailbox context
-- queue prioritization and escalation ordering
-- multi-step orchestration for premium-only retrieval and digest pipelines
+- `instant_briefing` for fast pre-call or pre-mail context
+- `commitment_radar` for open commitments, deadlines, blockers, and stale follow-ups
+- `client_memory_twin` for a scoped memory profile per client
+- `decision_ledger` for governance plus provenance-backed review trails
+- `chief_of_staff_queries` for questions like `what depends on me`, `what is blocked`, `what changed recently`, and `who is risky`
+- `team_digest` for internal handoff and management-style summaries
+- `silence_drift_detection` for unanswered threads and slow-moving risk
+- `cross_mailbox_context` for unified client context across multiple inboxes
 
-The public repo exposes the runtime boundary for this. The premium runtime now mounts a concrete ranking layer, while proprietary tuning and future orchestration logic still stay outside the OSS tree.
+#### High-control deployment surface
 
-#### 8. Premium tray/search surfaces
-
-This is the premium operator UI layer for paid, explicitly entitled users who need the desktop task surface to span premium-only operational memory as well.
-
-- extend advanced search so premium records participate in the same search index when the premium runtime is active
-- extend sorting and grouping so premium rows are not a separate blind spot from the main tray workflow
-- add a premium-only `Custom Design` tab, similar in spirit to `Suggested`, but parameterized by focus, grouping, mailbox, client, follow-up state, risk, and other operator-selected constraints
-- keep this surface behind the same entitlement and private-runtime boundary as the underlying premium packs
-
-This is intentionally not a cosmetic UI add-on. The point is to let an entitled operator shape a live working view over communication memory, governance decisions, and other premium-only records without flattening them back into the OSS task model.
-
-#### 9. High-control deployment surfaces
-
-This is the control layer for customers that need stronger operational guarantees.
+The commercial design still assumes that the local machine may be untrusted.
 
 - explicit entitlements
 - local revocation
-- owner approval for protected premium features
+- owner approval for protected runtime loading
 - separate private runtime packaging
 - optional extra service boundaries for the most sensitive premium logic
 
-This is where the premium design stops depending on trust in the local machine and starts depending on gated execution, auditability, and runtime separation.
+The point is not obfuscation theater. The point is to keep premium execution gated, auditable, and operationally controllable.
 
 ### Current premium runtime scope
 
@@ -199,22 +186,31 @@ The current private premium runtime is no longer limited to the first three pack
 - `canonical_facts`
 - `provenance_pointers`
 - `partner_digest`
+- `team_digest`
 - `advanced_ranking`
 - `query_templates`
 - `human_approved_notes`
 - `task_signal_extraction`
+- `instant_briefing`
+- `commitment_radar`
+- `client_memory_twin`
+- `decision_ledger`
+- `chief_of_staff_queries`
+- `silence_drift_detection`
+- `cross_mailbox_context`
 - `custom_design_tab`
 
 That runtime is intentionally separate from the OSS repo. The public repo ships the airlock, contract, tray loader hooks, schema hooks, and bootstrap template. The premium logic itself stays outside the OSS tree.
 
 ### Current premium tray/search surface
 
-The current premium-facing UI surface is built around a gated `custom_design_tab` capability.
+The current premium-facing UI surface is built around a gated `custom_design_tab` capability plus pack-aware entitlement selection.
 
 - it activates only when the premium runtime is entitled and the private runtime exposes the tray extension builder
 - premium rows can enter the same tray search index as OSS tasks and notes when the premium runtime is active
 - premium-specific grouping and sorting modes can be injected into the tray at runtime without changing the OSS data model
 - the `Custom Design` tab behaves like an operator-defined working view rather than a fixed canned tab
+- tray loading now carries the resolved entitlement selection into the private runtime, so a customer can activate `packs`, explicit `features`, or both without changing the public host code
 
 This remains premium-only functionality. The OSS repo contains the loader path and safe UI hooks, not the private business logic itself.
 

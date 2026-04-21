@@ -12,6 +12,7 @@ from premium_runtime import (
     _get_conn,
     _resolve_module_from_entrypoint,
     _write_gate_audit,
+    build_mount_runtime_config,
     evaluate_feature_gate,
     load_premium_config,
     logger,
@@ -61,7 +62,15 @@ def maybe_load_task_tray_extension(*, server_name: str) -> Any | None:
                 server_name=server_name,
                 feature_id="custom_design_tab",
                 machine_id=MACHINE_ID,
-                config=config,
+                config=build_mount_runtime_config(
+                    base_config=config,
+                    selection={
+                        key: value
+                        for key, value in verdict.items()
+                        if key
+                        in {"selection_mode", "selected_packs", "effective_features"}
+                    },
+                ),
             ),
         )
         with _get_conn() as conn:
