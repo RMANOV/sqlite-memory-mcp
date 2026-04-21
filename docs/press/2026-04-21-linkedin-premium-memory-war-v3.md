@@ -114,8 +114,20 @@ Warn me.
 Shape the room.  
 Lock the wrong door.
 
+## Shipped today: v3.5.0
+
+- `premium_gate_audit` and `premium_revocations` tables with idempotent
+  migrations
+- Entitlement-signed loader with local revocation honored at every gate check
+- Password-hash unlock on the Custom Design surface, per-session
+- OSS-side boot hook: `maybe_mount_premium_extensions(mcp, server_name="sqlite-kb")`
+- Test suite passing green across premium runtime, gate decisions, and
+  pack-to-feature expansion
+
 Full catalog:
 
 - Repo: https://github.com/RMANOV/sqlite-memory-mcp
 - Premium packs: https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#premium-feature-packs
 - Premium features: https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#feature-level-premium-surfaces
+
+#AI #MCP #ClaudeCode #LocalFirst #DevTools

@@ -119,7 +119,7 @@ The difference matters.
 An archive tells you what happened.
 A radar tells you what is about to matter.
 
-### `custom_design_tab`, with protected views as the next layer
+### `custom_design_tab`
 
 This is the surface that changes the emotional tone of the product.
 
@@ -128,23 +128,29 @@ Because it understands that exposure is part of workflow design.
 
 Some information should be visible instantly.
 Some should be visible only to one role.
-Some should eventually require a deliberate unlock.
 
 That is where the premium `Custom Design` direction becomes more than a tab.
 It becomes a cockpit with compartments.
 
 An operator can keep a client-risk deck.
 A second operator can keep a commitments-first layout.
-And the next commercial layer on top of that would be a password-gated premium
-view so that the wrong room, the wrong desk, or the wrong moment does not
-casually widen the surface of exposure.
+A third can run a role-specific follow-up grid without exporting the entire
+premium surface into one shared view.
+
+### `password_protected_views`
+
+This is the surface that closes the loop.
+
+Some information should require a deliberate unlock.
+Not on the wrong desk.
+Not in the wrong room.
+Not for the wrong operator.
+
+The premium runtime now supports password-protected views on top of the Custom
+Design surface, with a local password hash and a per-session unlock.
 
 This is not security theater.
 It is interface ethics.
-
-To stay accurate: `custom_design_tab` is part of the current premium-facing UI
-surface. Password-protected premium views are the next commercial direction I
-would place on top of it, not a claim that the OSS repo already ships them.
 
 ## Why these are the future, not just add-ons
 
@@ -171,23 +177,50 @@ Better entrances to action.
 
 ## Shortlist
 
-If I had to reduce the premium story to a single three-item shortlist, I would
-choose:
+If I had to reduce the premium story to a four-item shortlist, I would choose:
 
 1. `instant_briefing`
 2. `commitment_radar`
 3. `custom_design_tab`
+4. `password_protected_views`
 
-Together they describe a product philosophy in three commands:
+Together they describe a product philosophy in four commands:
 
 - brief me
 - warn me
 - shape the room
-
-Then, where the workflow truly demands it, add protected views as the next
-commercial layer.
+- lock the wrong door
 
 That is a cleaner vision of premium than "we added more AI."
+
+## Shipped today: v3.5.0
+
+The architecture makes this claim concrete. The OSS repo ships the airlock
+itself:
+
+```python
+# server.py
+from premium_runtime import maybe_mount_premium_extensions
+
+if __name__ == "__main__":
+    _migrate_jsonl()
+    maybe_mount_premium_extensions(mcp, server_name="sqlite-kb")
+    mcp.run(transport="stdio")
+```
+
+The private runtime ships the premium logic. Between them sits a signed
+entitlement, a local revocation table, and an auditable gate that writes a row
+every time a decision is made.
+
+What landed in v3.5.0:
+
+- `premium_gate_audit` and `premium_revocations` tables, idempotent migrations
+- Entitlement-signed loader with local revocation honored at every gate check
+- Pack-to-feature expansion, including
+  `protected_operator_surface` → `password_protected_views` → `custom_design_tab`
+- Password-hash unlock on the Custom Design surface, per-session
+- Test suite green across gate denial, revocation, pack expansion, and
+  mount-context propagation
 
 ## Full catalog
 

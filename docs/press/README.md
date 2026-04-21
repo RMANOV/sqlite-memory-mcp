@@ -34,10 +34,18 @@ Full premium catalog in the public README:
 - https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#premium-feature-packs
 - https://github.com/RMANOV/sqlite-memory-mcp?tab=readme-ov-file#feature-level-premium-surfaces
 
-Current publish-ready drafts:
+Current publish-ready short-form drafts:
 
 - `2026-04-21-linkedin-premium-memory-war-v3.md`
 - `2026-04-21-x-article-premium-memory-war-v3.md`
+
+Current publish-ready long-form drafts
+(refreshed 2026-04-21 with 4-feature shortlist, v3.5.0 shipped state, and code
+snippets for the OSS-side boot hook and public feature registry):
+
+- `2026-04-21-devto-premium-memory-war.md` (includes dev.to front matter;
+  flip `published: false` → `true` when posting)
+- `2026-04-21-medium-premium-memory-war.md`
 
 Legacy drafts kept for tone/history reference:
 
@@ -46,7 +54,10 @@ Legacy drafts kept for tone/history reference:
 - `2026-04-21-x-article-premium-memory-war.md`
 - `2026-04-21-x-article-premium-memory-war-v2.md`
 
-Long-form archive drafts that should be refreshed before publishing:
+Suggested publication sequencing for same-day release:
 
-- `2026-04-21-devto-premium-memory-war.md`
-- `2026-04-21-medium-premium-memory-war.md`
+1. X Article first, plus a short teaser tweet pointing to it
+2. LinkedIn roughly 30–60 minutes later (different algorithms, different
+   audiences; avoid back-to-back publishing on the same minute)
+3. Long-form (dev.to, Medium) 1–3 days later to let the short-form momentum
+   settle and to give each channel its own moment
