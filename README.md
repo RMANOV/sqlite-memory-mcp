@@ -36,10 +36,59 @@ SQLite hits the sweet spot:
 - **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
+- **Premium runtime boundary** -- The OSS core can gate-load a separate private premium repo via signed entitlement checks, explicit owner approval, audit logging, and local revocation
 - **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with 41 more tools available from companion servers
 - **Zero required dependencies beyond stdlib** -- Only `fastmcp` is required for MCP protocol; `sqlite3` is Python stdlib. Optional `orjson`, `sqlite-vec`, and `sentence-transformers` add speed and semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
+
+## Premium / Enterprise Boundary
+
+This repository now includes the **public-core boundary** for a separate premium runtime.
+
+What is in this OSS repo:
+
+- entitlement-aware premium loader (`premium_runtime.py`)
+- premium audit + revoke tables in the shared schema
+- public contract for a separate private premium repo (`premium_contract.py`)
+- premium entitlement schema (`docs/premium/entitlement.schema.json`)
+- a public-safe bootstrap template for the separate private repo (`templates/private_premium_repo/`)
+
+What is **not** in this OSS repo:
+
+- private premium business logic
+- private connectors and ingestion code
+- customer entitlements
+- signing keys
+- proprietary ranking / governance rules
+
+**Premium-only capabilities** are for paid, explicitly entitled users only. They are expected to live in a separate private repo and be loaded through the gated runtime only. Typical premium-only modules include:
+
+- ACL / RBAC
+- multi-mailbox ingestion
+- partner digests and management summaries
+- advanced ranking / orchestration
+- governance / audit workflows beyond the OSS baseline
+
+### Premium-only runtime behavior
+
+Private premium extensions are **not loaded by default**.
+
+The public runtime will only attempt to mount them when all of the following are true:
+
+- a private premium entrypoint is configured
+- a valid entitlement is provided
+- local owner approval is present for protected premium features
+- the entitlement is not locally revoked
+
+Without a valid entitlement and local approval path, the premium runtime stays off and private extensions are not mounted.
+
+See:
+
+- [`premium_contract.py`](premium_contract.py)
+- [`docs/premium/entitlement.schema.json`](docs/premium/entitlement.schema.json)
+- [`docs/premium/private_extension_contract.md`](docs/premium/private_extension_contract.md)
+- [`templates/private_premium_repo/`](templates/private_premium_repo/)
 
 ## Competitor Comparison
 

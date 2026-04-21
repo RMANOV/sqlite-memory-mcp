@@ -1,0 +1,10 @@
+[project]
+name = "sqlite-memory-mcp-premium-template"
+version = "0.1.0"
+description = "Private premium repo template for sqlite-memory-mcp"
+requires-python = ">=3.10"
+dependencies = ["fastmcp>=2.0.0"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
