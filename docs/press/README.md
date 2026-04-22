@@ -51,6 +51,9 @@ Current publish-ready long-form drafts
 snippets for the OSS-side boot hook and public feature registry, and an
 ASCII architecture diagram of the public-core / private-runtime boundary):
 
+- `2026-04-22-linkedin-article-premium-memory-war-v1.md`
+  (LinkedIn Article adaptation of the Medium piece; long-form, no front matter,
+  tuned for LinkedIn's article reader rather than feed-post cadence)
 - `2026-04-21-devto-premium-memory-war.md` (includes dev.to front matter;
   flip `published: false` → `true` when posting)
 - `2026-04-21-medium-premium-memory-war.md`
