@@ -64,7 +64,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "control_plane_public_key_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_PUBLIC_KEY",
     "control_plane_timeout_seconds": 5,
     "control_plane_cache_ttl_seconds": 21600,
-    "control_plane_required": False,
+    "control_plane_required": True,
     "allow_cached_control_plane": True,
     "max_offline_grace_seconds": 604800,
     "minimum_protection_phase": 1,
@@ -571,12 +571,38 @@ def _load_remote_headers(config: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Disallow redirects on premium authority fetches.
+
+    Premium entitlement / manifest / policy endpoints are pinned URLs backed by
+    the owner's own control plane. An HTTP 3xx here is either misconfiguration or
+    hijack — both must fail closed, never silently follow to another host.
+    """
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise PremiumRuntimeError(
+            f"Remote premium fetch refused redirect {code} to {headers.get('Location', '?')!r}"
+        )
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def _load_remote_json(
     url: str,
     *,
     timeout_seconds: int,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if not url.lower().startswith("https://"):
+        raise PremiumRuntimeError(
+            f"Remote premium fetch requires HTTPS: {url!r}"
+        )
     request = urllib.request.Request(
         url,
         headers={
@@ -585,7 +611,7 @@ def _load_remote_json(
             **(headers or {}),
         },
     )
-    with urllib.request.urlopen(request, timeout=max(timeout_seconds, 1)) as response:
+    with _NO_REDIRECT_OPENER.open(request, timeout=max(timeout_seconds, 1)) as response:
         body = response.read().decode("utf-8")
     return json.loads(body)
 
@@ -961,7 +987,11 @@ def _cache_control_plane_policy(
     policy: dict[str, Any],
     source_ref: str,
     config: dict[str, Any],
-) -> None:
+) -> bool:
+    """Persist a verified control-plane policy.
+
+    Returns True on write, False if a rollback guard blocked the write.
+    """
     ttl_seconds = max(
         _parse_int(policy.get("cache_ttl_seconds"), 0),
         _parse_int(config.get("control_plane_cache_ttl_seconds"), 0),
@@ -975,6 +1005,38 @@ def _cache_control_plane_policy(
         if str(policy.get("customer_id") or "").strip()
         else "global"
     )
+
+    # Rollback guard: reject incoming policies that are older than the cached one.
+    # A signature alone is not enough — replay of an older, more-permissive policy
+    # must not overwrite a newer stricter one.
+    existing = conn.execute(
+        "SELECT payload_json FROM premium_control_plane_cache "
+        "WHERE scope_key = ? LIMIT 1",
+        (scope_key,),
+    ).fetchone()
+    if existing:
+        try:
+            existing_policy = json_loads(existing["payload_json"])
+        except Exception:
+            existing_policy = None
+        if isinstance(existing_policy, dict):
+            existing_issued = _iso_to_epoch(existing_policy.get("issued_at"))
+            incoming_issued = _iso_to_epoch(policy.get("issued_at"))
+            if (
+                existing_issued is not None
+                and incoming_issued is not None
+                and incoming_issued < existing_issued
+            ):
+                logger.warning(
+                    "control_plane_rollback_rejected scope=%s cached_issued_at=%s "
+                    "incoming_issued_at=%s source=%s",
+                    scope_key,
+                    existing_policy.get("issued_at"),
+                    policy.get("issued_at"),
+                    source_ref,
+                )
+                return False
+
     conn.execute(
         "INSERT OR REPLACE INTO premium_control_plane_cache ("
         "scope_key, policy_id, source_ref, fetched_at, expires_at, "
@@ -990,27 +1052,51 @@ def _cache_control_plane_policy(
             json.dumps(policy, ensure_ascii=False, sort_keys=True),
         ),
     )
+    return True
 
 
 def _load_cached_control_plane_policy(
     conn: sqlite3.Connection,
     *,
     customer_id: str | None,
+    config: dict[str, Any],
 ) -> dict[str, Any] | None:
+    # Re-verify signature on every cache read. The cache row lives in memory.db,
+    # which the OSS server writes — it must not be trusted just because it was
+    # once signed at write time. A direct DB tamper would otherwise bypass the moat.
+    public_key_value = _load_env_var_value(
+        config,
+        "control_plane_public_key_env_var",
+    )
     for scope_key in _control_scope_keys(customer_id):
         row = conn.execute(
             "SELECT scope_key, source_ref, fetched_at, expires_at, cache_deadline, payload_json "
             "FROM premium_control_plane_cache WHERE scope_key = ? LIMIT 1",
             (scope_key,),
         ).fetchone()
-        if row:
+        if not row:
+            continue
+        try:
             payload = json_loads(row["payload_json"])
-            payload["_cache_scope_key"] = row["scope_key"]
-            payload["_cache_source_ref"] = row["source_ref"]
-            payload["_cache_fetched_at"] = row["fetched_at"]
-            payload["_cache_expires_at"] = row["expires_at"]
-            payload["_cache_deadline"] = row["cache_deadline"]
-            return payload
+        except Exception:
+            logger.warning(
+                "control_plane_cache_unreadable scope=%s", row["scope_key"]
+            )
+            continue
+        sig_ok, sig_reason = _verify_signed_payload(payload, public_key_value)
+        if not sig_ok:
+            logger.warning(
+                "control_plane_cache_signature_rejected scope=%s reason=%s",
+                row["scope_key"],
+                sig_reason,
+            )
+            continue
+        payload["_cache_scope_key"] = row["scope_key"]
+        payload["_cache_source_ref"] = row["source_ref"]
+        payload["_cache_fetched_at"] = row["fetched_at"]
+        payload["_cache_expires_at"] = row["expires_at"]
+        payload["_cache_deadline"] = row["cache_deadline"]
+        return payload
     return None
 
 
@@ -1067,7 +1153,9 @@ def _resolve_control_plane_policy(
         load_reason = sig_reason
 
     if config.get("allow_cached_control_plane", True):
-        cached_policy = _load_cached_control_plane_policy(conn, customer_id=customer_id)
+        cached_policy = _load_cached_control_plane_policy(
+            conn, customer_id=customer_id, config=config
+        )
         if cached_policy and _policy_cache_is_usable(cached_policy, config=config):
             return {
                 "status": "cached",
@@ -1369,16 +1457,16 @@ def evaluate_feature_gate(
             effective_features=selection.get("effective_features", []),
         )
 
-    now_ts = _now()
-    not_before = _parse_iso(entitlement.get("not_before"))
-    expires_at = _parse_iso(entitlement.get("expires_at"))
-    if not_before and now_ts < not_before:
+    now_epoch = time.time()
+    not_before_epoch = _iso_to_epoch(entitlement.get("not_before"))
+    expires_at_epoch = _iso_to_epoch(entitlement.get("expires_at"))
+    if not_before_epoch is not None and now_epoch < not_before_epoch:
         return _deny(
             "entitlement_not_yet_valid",
             entitlement_id=entitlement_id,
             customer_id=customer_id,
         )
-    if expires_at and now_ts > expires_at:
+    if expires_at_epoch is not None and now_epoch > expires_at_epoch:
         return _deny(
             "entitlement_expired",
             entitlement_id=entitlement_id,

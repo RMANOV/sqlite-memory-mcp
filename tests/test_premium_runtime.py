@@ -164,6 +164,11 @@ def test_evaluate_feature_gate_expands_packs_and_dependencies(tmp_path, monkeypa
         "_verify_entitlement_signature",
         lambda entitlement, public_key_value: (True, "signature_valid"),
     )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {**premium_runtime._DEFAULT_CONFIG, "control_plane_required": False},
+    )
     monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-pack")
 
     conn = sqlite3.connect(db_path, isolation_level=None)
@@ -226,6 +231,11 @@ def test_protected_operator_surface_pack_expands_password_view_dependency(
         "_verify_entitlement_signature",
         lambda entitlement, public_key_value: (True, "signature_valid"),
     )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {**premium_runtime._DEFAULT_CONFIG, "control_plane_required": False},
+    )
     monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-protected")
 
     conn = sqlite3.connect(db_path, isolation_level=None)
@@ -283,6 +293,7 @@ def test_evaluate_feature_gate_denies_when_manifest_required_and_missing(
         "load_premium_config",
         lambda: {
             **premium_runtime._DEFAULT_CONFIG,
+            "control_plane_required": False,
             "require_artifact_manifest": True,
         },
     )
@@ -447,6 +458,11 @@ def test_evaluate_feature_gate_uses_cached_control_policy(tmp_path, monkeypatch)
         premium_runtime,
         "_verify_entitlement_signature",
         lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_signed_payload",
+        lambda payload, public_key_value: (True, "signature_valid"),
     )
     monkeypatch.setattr(
         premium_runtime,
@@ -685,3 +701,235 @@ def test_maybe_mount_premium_extensions_passes_mount_context(tmp_path, monkeypat
     assert mcp.installation_fingerprint == "sha256:test-ctx"
     assert mcp.manifest_id == "manifest-ctx"
     assert mcp.protection_phase == 4
+
+
+# ── Real-crypto invariants (no mocked signatures) ─────────────────────────────
+
+
+def _ed25519_keypair():
+    """Generate an Ed25519 keypair for test signing."""
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = Ed25519PrivateKey.generate()
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    public_key_b64 = base64.b64encode(public_bytes).decode("ascii")
+    return private_key, public_key_b64
+
+
+def _sign_payload(payload: dict, private_key) -> dict:
+    """Attach a real Ed25519 signature to a payload (in-place copy)."""
+    import base64
+
+    signed = {k: v for k, v in payload.items() if k != "signature"}
+    signature_bytes = private_key.sign(premium_runtime._canonical_signed_payload(signed))
+    signed["signature"] = {
+        "alg": "ed25519",
+        "value": base64.b64encode(signature_bytes).decode("ascii"),
+    }
+    return signed
+
+
+def test_real_ed25519_verify_accepts_genuine_and_rejects_tamper():
+    private_key, public_key_b64 = _ed25519_keypair()
+    payload = {"policy_id": "real-1", "allowed_features": ["instant_briefing"]}
+    signed = _sign_payload(payload, private_key)
+
+    ok, reason = premium_runtime._verify_signed_payload(signed, public_key_b64)
+    assert ok is True, reason
+
+    # Tamper: add a permissive feature AFTER signing — verification must fail
+    tampered = dict(signed)
+    tampered["allowed_features"] = ["instant_briefing", "private_extension_runtime"]
+    ok2, reason2 = premium_runtime._verify_signed_payload(tampered, public_key_b64)
+    assert ok2 is False
+    assert reason2.startswith("signature_invalid"), reason2
+
+
+def test_entitlement_with_z_format_expiry_is_correctly_denied(tmp_path, monkeypatch):
+    """Z-suffix ISO format must be interpreted via epoch, not string compare."""
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    # Expires one hour ago, serialised with Z (which sorts above "+" lexically)
+    from datetime import datetime, timedelta, timezone
+
+    expired_at = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    entitlement = {
+        "entitlement_id": "ent-z-expired",
+        "customer_id": "cust-z",
+        "features": ["instant_briefing"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "expires_at": expired_at,
+        "owner_approval_sha256": premium_runtime._hash_text("approve-z"),
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {**premium_runtime._DEFAULT_CONFIG, "control_plane_required": False},
+    )
+    monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-z")
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="instant_briefing",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.instant_briefing",
+        )
+
+    assert verdict["allowed"] is False
+    assert verdict["reason"] == "entitlement_expired"
+
+
+def test_cache_rollback_guard_rejects_older_policy(tmp_path):
+    """Replay of an older signed policy must not overwrite a newer cache entry."""
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    newer = {
+        "policy_id": "policy-newer",
+        "customer_id": "cust-rb",
+        "issued_at": "2026-04-22T12:00:00+00:00",
+        "allowed_features": ["instant_briefing"],  # stricter: only 1
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    older = {
+        "policy_id": "policy-older",
+        "customer_id": "cust-rb",
+        "issued_at": "2026-04-20T12:00:00+00:00",  # 2 days earlier
+        "allowed_features": [
+            "instant_briefing",
+            "private_extension_runtime",
+            "client_memory_twin",
+        ],
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+
+    with _conn_ctx(db_path) as conn:
+        wrote_newer = premium_runtime._cache_control_plane_policy(
+            conn,
+            policy=newer,
+            source_ref="test:newer",
+            config=premium_runtime._DEFAULT_CONFIG,
+        )
+        assert wrote_newer is True
+
+        wrote_older = premium_runtime._cache_control_plane_policy(
+            conn,
+            policy=older,
+            source_ref="test:older",
+            config=premium_runtime._DEFAULT_CONFIG,
+        )
+        assert wrote_older is False
+
+        row = conn.execute(
+            "SELECT policy_id FROM premium_control_plane_cache "
+            "WHERE scope_key = 'customer:cust-rb'"
+        ).fetchone()
+        assert row["policy_id"] == "policy-newer"
+
+
+def test_cached_control_policy_tamper_rejected_via_real_signature(tmp_path, monkeypatch):
+    """Direct DB tamper of cached policy must be rejected on read (C1)."""
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    private_key, public_key_b64 = _ed25519_keypair()
+
+    genuine_policy = _sign_payload(
+        {
+            "policy_id": "policy-real",
+            "customer_id": "cust-tamper",
+            "issued_at": "2026-04-22T10:00:00+00:00",
+            "cache_ttl_seconds": 3600,
+            "allowed_features": ["instant_briefing"],
+        },
+        private_key,
+    )
+
+    import json as _json
+
+    with _conn_ctx(db_path) as conn:
+        wrote = premium_runtime._cache_control_plane_policy(
+            conn,
+            policy=genuine_policy,
+            source_ref="test:real",
+            config=premium_runtime._DEFAULT_CONFIG,
+        )
+        assert wrote is True
+
+        # Tamper directly in the DB: flip allowed_features to a permissive set
+        tampered = dict(genuine_policy)
+        tampered["allowed_features"] = [
+            "instant_briefing",
+            "private_extension_runtime",
+            "client_memory_twin",
+        ]
+        conn.execute(
+            "UPDATE premium_control_plane_cache SET payload_json = ? "
+            "WHERE scope_key = 'customer:cust-tamper'",
+            (_json.dumps(tampered, ensure_ascii=False, sort_keys=True),),
+        )
+
+    monkeypatch.setenv(
+        "SQLITE_MEMORY_PREMIUM_POLICY_PUBLIC_KEY",
+        public_key_b64,
+    )
+
+    with _conn_ctx(db_path) as conn:
+        policy = premium_runtime._load_cached_control_plane_policy(
+            conn,
+            customer_id="cust-tamper",
+            config={**premium_runtime._DEFAULT_CONFIG},
+        )
+    assert policy is None, "tampered cache must not be trusted"
+
+
+def test_load_remote_json_rejects_plain_http():
+    """Plain HTTP URL must fail closed (H2)."""
+    import pytest
+
+    with pytest.raises(premium_runtime.PremiumRuntimeError, match="HTTPS"):
+        premium_runtime._load_remote_json(
+            "http://attacker.example.com/entitlement.json",
+            timeout_seconds=5,
+        )
+
+
+def test_no_redirect_handler_refuses_all_3xx_codes():
+    """Each HTTP redirect code must raise PremiumRuntimeError — no silent follow."""
+    import http.client
+    import io
+    import pytest
+    import urllib.request
+
+    handler = premium_runtime._NoRedirectHandler()
+    req = urllib.request.Request("https://pinned.example.com/policy.json")
+
+    for code, method_name in (
+        (301, "http_error_301"),
+        (302, "http_error_302"),
+        (303, "http_error_303"),
+        (307, "http_error_307"),
+        (308, "http_error_308"),
+    ):
+        method = getattr(handler, method_name)
+        headers = http.client.HTTPMessage()
+        headers["Location"] = "https://evil.example.com/pivot"
+        with pytest.raises(premium_runtime.PremiumRuntimeError, match="redirect"):
+            method(req, io.BytesIO(b""), code, "Found", headers)

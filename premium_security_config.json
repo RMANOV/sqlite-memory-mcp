@@ -20,7 +20,7 @@
   "control_plane_public_key_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_PUBLIC_KEY",
   "control_plane_timeout_seconds": 5,
   "control_plane_cache_ttl_seconds": 21600,
-  "control_plane_required": false,
+  "control_plane_required": true,
   "allow_cached_control_plane": true,
   "max_offline_grace_seconds": 604800,
   "minimum_protection_phase": 1,
