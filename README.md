@@ -92,6 +92,13 @@ The public runtime will only attempt to mount them when all of the following are
 
 Without a valid entitlement and local approval path, the premium runtime stays off and private extensions are not mounted.
 
+The host runtime can now source all three signed premium documents from a remote issuer/control service as well:
+
+- entitlement via `SQLITE_MEMORY_PREMIUM_ENTITLEMENT_URL`
+- artifact manifest via `SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_URL`
+- control policy via `SQLITE_MEMORY_PREMIUM_POLICY_URL`
+- optional runtime fetch headers via `SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_JSON`
+
 ### Premium feature packs
 
 The premium layer is not meant to be a vague "enterprise edition". It is structured as a set of **gated operational packs** that sit on top of the OSS memory core.
@@ -185,6 +192,7 @@ The commercial design still assumes that the local machine may be untrusted.
 - explicit entitlements
 - signed artifact manifests over the private runtime entrypoint
 - signed control-plane policy with cached offline fallback
+- remote issuer delivery for entitlements / manifests / policy over URL + runtime headers when desired
 - local revocation
 - owner approval for protected runtime loading
 - host/runtime compatibility checks plus minimum protection phase enforcement

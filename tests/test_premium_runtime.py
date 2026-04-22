@@ -495,6 +495,67 @@ def test_evaluate_feature_gate_uses_cached_control_policy(tmp_path, monkeypatch)
     assert verdict["control_plane_status"] == "cached"
 
 
+def test_load_entitlement_supports_remote_url_and_headers(monkeypatch):
+    config = {
+        **premium_runtime._DEFAULT_CONFIG,
+        "entitlement_url_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_URL",
+        "remote_headers_inline_env_var": "SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_JSON",
+    }
+    monkeypatch.setenv(
+        "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_URL",
+        "https://issuer.example/v1/runtime/customers/cust-1/entitlement",
+    )
+    monkeypatch.setenv(
+        "SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_JSON",
+        '{"Authorization":"Bearer runtime-token","X-Customer":"cust-1"}',
+    )
+
+    captured = {}
+
+    def _fake_remote(url, *, timeout_seconds, headers=None):
+        captured["url"] = url
+        captured["timeout_seconds"] = timeout_seconds
+        captured["headers"] = dict(headers or {})
+        return {"entitlement_id": "ent-remote"}
+
+    monkeypatch.setattr(premium_runtime, "_load_remote_json", _fake_remote)
+
+    payload, source_ref = premium_runtime._load_entitlement(config)
+
+    assert payload["entitlement_id"] == "ent-remote"
+    assert (
+        source_ref == "https://issuer.example/v1/runtime/customers/cust-1/entitlement"
+    )
+    assert captured["headers"]["Authorization"] == "Bearer runtime-token"
+    assert captured["headers"]["X-Customer"] == "cust-1"
+
+
+def test_load_artifact_manifest_supports_remote_url(monkeypatch):
+    config = {
+        **premium_runtime._DEFAULT_CONFIG,
+        "artifact_manifest_url_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_URL",
+    }
+    monkeypatch.setenv(
+        "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_URL",
+        "https://issuer.example/v1/runtime/customers/cust-1/artifact-manifest",
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_remote_json",
+        lambda url, *, timeout_seconds, headers=None: {
+            "manifest_id": "manifest-remote"
+        },
+    )
+
+    payload, source_ref = premium_runtime._load_artifact_manifest(config)
+
+    assert payload["manifest_id"] == "manifest-remote"
+    assert (
+        source_ref
+        == "https://issuer.example/v1/runtime/customers/cust-1/artifact-manifest"
+    )
+
+
 def test_maybe_mount_premium_extensions_refuses_import_when_gate_denies(
     tmp_path, monkeypatch
 ):

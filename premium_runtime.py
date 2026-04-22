@@ -48,11 +48,16 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "private_entrypoint_env_var": "SQLITE_MEMORY_PREMIUM_ENTRYPOINT",
     "entitlement_inline_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_JSON",
     "entitlement_path_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_PATH",
+    "entitlement_url_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_URL",
     "public_key_env_var": "SQLITE_MEMORY_PREMIUM_PUBLIC_KEY",
     "artifact_manifest_inline_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_JSON",
     "artifact_manifest_path_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_PATH",
+    "artifact_manifest_url_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_URL",
     "artifact_public_key_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_PUBLIC_KEY",
     "require_artifact_manifest": False,
+    "remote_headers_inline_env_var": "SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_JSON",
+    "remote_headers_path_env_var": "SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_PATH",
+    "remote_timeout_seconds": 5,
     "control_plane_inline_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_JSON",
     "control_plane_path_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_PATH",
     "control_plane_url_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_URL",
@@ -496,6 +501,7 @@ def _load_json_from_env_or_path(
     *,
     inline_key: str,
     path_key: str,
+    url_key: str | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     inline_env = str(config.get(inline_key) or "").strip()
     if inline_env:
@@ -510,6 +516,18 @@ def _load_json_from_env_or_path(
             path = Path(raw_path)
             return json.loads(path.read_text(encoding="utf-8")), str(path)
 
+    if url_key:
+        url = _load_env_var_value(config, url_key)
+        if url:
+            headers = _load_remote_headers(config)
+            timeout_seconds = int(config.get("remote_timeout_seconds") or 5)
+            return (
+                _load_remote_json(
+                    url, timeout_seconds=timeout_seconds, headers=headers
+                ),
+                url,
+            )
+
     return None, "missing"
 
 
@@ -518,6 +536,7 @@ def _load_entitlement(config: dict[str, Any]) -> tuple[dict[str, Any] | None, st
         config,
         inline_key="entitlement_inline_env_var",
         path_key="entitlement_path_env_var",
+        url_key="entitlement_url_env_var",
     )
 
 
@@ -528,13 +547,43 @@ def _load_artifact_manifest(
         config,
         inline_key="artifact_manifest_inline_env_var",
         path_key="artifact_manifest_path_env_var",
+        url_key="artifact_manifest_url_env_var",
     )
 
 
-def _load_remote_json(url: str, *, timeout_seconds: int) -> dict[str, Any]:
+def _load_remote_headers(config: dict[str, Any]) -> dict[str, str]:
+    payload, _source = _load_json_from_env_or_path(
+        config,
+        inline_key="remote_headers_inline_env_var",
+        path_key="remote_headers_path_env_var",
+    )
+    if not isinstance(payload, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        header_key = key.strip()
+        header_value = value.strip()
+        if not header_key or not header_value:
+            continue
+        headers[header_key] = header_value
+    return headers
+
+
+def _load_remote_json(
+    url: str,
+    *,
+    timeout_seconds: int,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "sqlite-memory-mcp"},
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "sqlite-memory-mcp",
+            **(headers or {}),
+        },
     )
     with urllib.request.urlopen(request, timeout=max(timeout_seconds, 1)) as response:
         body = response.read().decode("utf-8")
@@ -555,7 +604,10 @@ def _load_control_plane_document(
     url = _load_env_var_value(config, "control_plane_url_env_var")
     if url:
         timeout_seconds = int(config.get("control_plane_timeout_seconds") or 5)
-        return _load_remote_json(url, timeout_seconds=timeout_seconds), url
+        headers = _load_remote_headers(config)
+        return _load_remote_json(
+            url, timeout_seconds=timeout_seconds, headers=headers
+        ), url
     return None, "missing"
 
 
