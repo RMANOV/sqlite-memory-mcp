@@ -175,6 +175,12 @@ Narrower, sharper exposure.
 Not more answers.
 Better entrances to action.
 
+Even the launch note is framed that way. The internal note
+`sqlite-memory-mcp v3.5.0 Launch 2026-04-21` does not end with "release
+completed." Its next follow-up is Day 6-7 monitoring of stars/forks and channel
+response. That is a more honest metric of whether a premium-memory thesis has
+started to land in the world.
+
 ## Shortlist
 
 If I had to reduce the premium story to a four-item shortlist, I would choose:

@@ -189,6 +189,12 @@ The products that win this phase will not simply answer questions better.
 They will be better at deciding what should surface, when it should surface,
 and to whom.
 
+That is also how the launch is being judged internally. The open note
+`sqlite-memory-mcp v3.5.0 Launch 2026-04-21` does not stop at shipped features.
+Its next follow-up is Day 6-7 stars/forks monitoring and channel response,
+which is the more serious question: whether the premium-memory argument is
+actually gaining traction outside the repo.
+
 ## What shipped in v3.5.0
 
 This premium story is not just conceptual. The current shipped surface includes:

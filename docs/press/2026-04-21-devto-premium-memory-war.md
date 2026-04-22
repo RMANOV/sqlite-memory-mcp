@@ -274,6 +274,12 @@ software that does not merely answer, but stages attention.
 
 That is what I mean by a premium memory war room.
 
+That framing is explicit even in the repo's own launch tracking note,
+`sqlite-memory-mcp v3.5.0 Launch 2026-04-21`, where the next follow-up is not
+just another changelog entry but Day 6-7 monitoring of stars/forks and channel
+response. That is the right test: not only whether the code shipped, but
+whether the premium-memory thesis is resonating as a product shape.
+
 ## Shortlist
 
 If I had to put only four premium surfaces on the front page of the next
