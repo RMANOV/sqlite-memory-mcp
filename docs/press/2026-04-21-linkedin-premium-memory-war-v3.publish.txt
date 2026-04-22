@@ -24,6 +24,8 @@ The 4 premium surfaces that now make the strongest story:
 
 When everyone can generate, the moat is no longer generation. The moat becomes memory quality, timing, prioritization, selective exposure, and controlled unlocks.
 
+Even the launch note is named that way: `sqlite-memory-mcp v3.5.0 Launch 2026-04-21`. The next follow-up there is not vanity copy. It is stars/forks and channel response.
+
 Brief me. Warn me. Shape the room. Lock the wrong door.
 
 Shipped today in v3.5.0:

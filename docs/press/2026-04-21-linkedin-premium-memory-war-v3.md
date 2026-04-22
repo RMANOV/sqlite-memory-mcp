@@ -98,6 +98,11 @@ The moat becomes:
 - selective exposure
 - controlled unlocks
 
+Even the launch note is named that way:
+`sqlite-memory-mcp v3.5.0 Launch 2026-04-21`.
+The next follow-up there is not vanity copy.
+It is stars/forks and channel response.
+
 That is a stronger premium story than "we wrapped another model."
 
 ## Shortlist
