@@ -9,6 +9,7 @@ import copy
 import faulthandler
 import json
 import logging
+import logging.handlers
 import os
 import socket as _socket
 import sqlite3
@@ -48,11 +49,16 @@ try:
 except (OSError, RuntimeError, ValueError):
     pass
 try:
-    logging.basicConfig(
-        filename=os.path.join(_log_dir, "task_tray.log"),
-        level=logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
+    _handler = logging.handlers.RotatingFileHandler(
+        os.path.join(_log_dir, "task_tray.log"),
+        maxBytes=2 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
     )
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _root_logger = logging.getLogger()
+    _root_logger.addHandler(_handler)
+    _root_logger.setLevel(logging.WARNING)
 except OSError:
     logging.basicConfig(
         filename=os.devnull,
@@ -2037,7 +2043,7 @@ class TaskTrayApp:
         if instance_socket:
             self._instance_timer = QTimer(self.app)
             self._instance_timer.timeout.connect(self._poll_instance_socket)
-            self._instance_timer.start(500)
+            self._instance_timer.start(2000)
 
     def _update_icon(self, summary=None):
         if summary is None:

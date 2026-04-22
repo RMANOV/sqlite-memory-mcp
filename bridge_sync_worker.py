@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -91,6 +92,13 @@ _SYNC_THREAD_LOCK = threading.Lock()
 _GIT_PULL_TIMEOUT = 120
 _GIT_PUSH_TIMEOUT = 300
 _GIT_COMMIT_TIMEOUT = 60
+
+# Push failure exponential backoff (process-local): 60s → 120s → 240s → 480s → cap 600s
+_PUSH_BACKOFF_LOCK = threading.Lock()
+_push_failure_count = 0
+_push_backoff_until = 0.0  # monotonic time
+_PUSH_BACKOFF_BASE = 60
+_PUSH_BACKOFF_MAX = 600
 
 
 class _RepoSyncLock:
@@ -578,6 +586,22 @@ def main(
     machine_id = socket.gethostname()
     repo_lock = _RepoSyncLock(bridge_dir)
 
+    # Respect push-failure backoff (skip push attempts while in cooldown)
+    if not pull_only:
+        with _PUSH_BACKOFF_LOCK:
+            remaining = _push_backoff_until - time.monotonic()
+        if remaining > 0:
+            return {
+                "entities": 0,
+                "tasks": 0,
+                "pushed": False,
+                "imported_new": 0,
+                "imported_updated": 0,
+                "backoff_active": True,
+                "backoff_remaining_s": int(remaining),
+                "message": f"push backoff active ({int(remaining)}s remaining after {_push_failure_count} failures)",
+            }
+
     if not _SYNC_THREAD_LOCK.acquire(blocking=False):
         return {
             "entities": 0,
@@ -988,6 +1012,25 @@ def _main_locked(
     if not pushed and push_message:
         log.warning("git push failed: %s", push_message)
 
+    # Update push-failure backoff state (process-local)
+    global _push_failure_count, _push_backoff_until
+    with _PUSH_BACKOFF_LOCK:
+        if pushed:
+            _push_failure_count = 0
+            _push_backoff_until = 0.0
+        else:
+            _push_failure_count += 1
+            delay = min(
+                _PUSH_BACKOFF_BASE * (2 ** (_push_failure_count - 1)),
+                _PUSH_BACKOFF_MAX,
+            )
+            _push_backoff_until = time.monotonic() + delay
+            log.warning(
+                "push backoff: %d consecutive failures, skipping push for %ds",
+                _push_failure_count,
+                delay,
+            )
+
     # Record last_push_at so incremental check can skip next time
     if pushed:
         with get_conn(_db_path) as conn:
@@ -999,7 +1042,7 @@ def _main_locked(
 
     # Deploy to Cloudflare Pages (auto-update after push)
     deployed = False
-    if pushed:
+    if pushed and os.environ.get("CLOUDFLARE_API_TOKEN"):
         _progress(progress_callback, 97, "CF Pages deploy...")
         try:
             deploy_result = subprocess.run(
