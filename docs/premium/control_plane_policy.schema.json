@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RMANOV/sqlite-memory-mcp/docs/premium/control_plane_policy.schema.json",
+  "title": "sqlite-memory premium control plane policy",
+  "type": "object",
+  "required": [
+    "policy_id",
+    "signature"
+  ],
+  "properties": {
+    "policy_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "customer_id": {
+      "type": "string"
+    },
+    "minimum_host_version": {
+      "type": "string"
+    },
+    "maximum_host_version": {
+      "type": "string"
+    },
+    "minimum_protection_phase": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "require_artifact_manifest": {
+      "type": "boolean"
+    },
+    "cache_ttl_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expires_at": {
+      "type": "string"
+    },
+    "max_entitlement_ttl_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "allowed_features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "denied_features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_manifest_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_entrypoint_hashes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "denied_entrypoint_hashes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "revoked_entitlement_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "revoked_customer_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "signature": {
+      "type": "object",
+      "required": [
+        "alg",
+        "value"
+      ],
+      "properties": {
+        "alg": {
+          "const": "ed25519"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

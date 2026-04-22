@@ -52,6 +52,8 @@ def test_init_db_creates_premium_tables(tmp_path):
 
     assert "premium_gate_audit" in tables
     assert "premium_revocations" in tables
+    assert "premium_artifact_manifests" in tables
+    assert "premium_control_plane_cache" in tables
 
 
 def test_evaluate_feature_gate_denies_without_entitlement_and_audits(tmp_path):
@@ -253,6 +255,246 @@ def test_protected_operator_surface_pack_expands_password_view_dependency(
     assert "custom_design_tab" in protected["effective_features"]
 
 
+def test_evaluate_feature_gate_denies_when_manifest_required_and_missing(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-required-manifest",
+        "customer_id": "cust-required-manifest",
+        "features": ["private_extension_runtime"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "owner_approval_sha256": premium_runtime._hash_text("approve-manifest"),
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "require_artifact_manifest": True,
+        },
+    )
+    monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-manifest")
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        verdict = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="private_extension_runtime",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.premium_runtime",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert verdict["allowed"] is False
+    assert verdict["reason"] == "artifact_manifest_required"
+
+
+def test_evaluate_feature_gate_accepts_manifest_and_control_policy(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    premium_file = tmp_path / "premium_plugin_verified.py"
+    premium_file.write_text(
+        "def register_premium_extensions(mcp, *, server_name=None, mount_context=None):\n"
+        "    return {'mounted': True}\n",
+        encoding="utf-8",
+    )
+    entrypoint_info = premium_runtime._entrypoint_runtime_info(str(premium_file))
+    entitlement = {
+        "entitlement_id": "ent-artifact-ok",
+        "customer_id": "cust-artifact-ok",
+        "features": ["private_extension_runtime"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "owner_approval_sha256": premium_runtime._hash_text("approve-verified"),
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    manifest = {
+        "manifest_id": "manifest-1",
+        "customer_id": "cust-artifact-ok",
+        "extension_name": "sqlite-memory-mcp-premium",
+        "contract_version": PREMIUM_RUNTIME_CONTRACT_VERSION,
+        "entrypoint_ref": entrypoint_info["entrypoint_ref"],
+        "entrypoint_sha256": entrypoint_info["entrypoint_sha256"],
+        "protection_phase": 3,
+        "minimum_host_version": "3.5.0",
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    policy = {
+        "policy_id": "policy-1",
+        "customer_id": "cust-artifact-ok",
+        "allowed_manifest_ids": ["manifest-1"],
+        "allowed_features": ["private_extension_runtime"],
+        "allowed_entrypoint_hashes": [entrypoint_info["entrypoint_sha256"]],
+        "minimum_protection_phase": 2,
+        "require_artifact_manifest": True,
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_signed_payload",
+        lambda payload, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_artifact_manifest",
+        lambda config: (manifest, "test:artifact"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_control_plane_document",
+        lambda config: (policy, "test:policy"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "require_artifact_manifest": True,
+            "control_plane_required": True,
+        },
+    )
+    monkeypatch.setenv("SQLITE_MEMORY_OWNER_APPROVAL", "approve-verified")
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        verdict = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="private_extension_runtime",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.premium_runtime",
+            payload={"entrypoint": str(premium_file)},
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert verdict["allowed"] is True
+    assert verdict["manifest_id"] == "manifest-1"
+    assert verdict["control_plane_status"] == "live"
+    assert verdict["protection_phase"] == 3
+    assert verdict["installation_fingerprint"].startswith("sha256:")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        manifest_row = conn.execute(
+            "SELECT manifest_id, protection_phase FROM premium_artifact_manifests"
+        ).fetchone()
+        policy_row = conn.execute(
+            "SELECT policy_id FROM premium_control_plane_cache"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert manifest_row["manifest_id"] == "manifest-1"
+    assert manifest_row["protection_phase"] == 3
+    assert policy_row["policy_id"] == "policy-1"
+
+
+def test_evaluate_feature_gate_uses_cached_control_policy(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-cache-policy",
+        "customer_id": "cust-cache-policy",
+        "packs": ["briefing_suite"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    policy = {
+        "policy_id": "policy-cache",
+        "customer_id": "cust-cache-policy",
+        "allowed_features": ["instant_briefing", "private_extension_runtime"],
+        "cache_ttl_seconds": 3600,
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_control_plane_document",
+        lambda config: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "control_plane_required": True,
+            "allow_cached_control_plane": True,
+        },
+    )
+
+    with sqlite3.connect(db_path, isolation_level=None) as seed_conn:
+        seed_conn.row_factory = sqlite3.Row
+        seed_conn.execute("BEGIN")
+        premium_runtime._cache_control_plane_policy(
+            seed_conn,
+            policy=policy,
+            source_ref="test:cache",
+            config={
+                **premium_runtime._DEFAULT_CONFIG,
+                "control_plane_cache_ttl_seconds": 3600,
+            },
+        )
+        seed_conn.execute("COMMIT")
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        verdict = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="instant_briefing",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.instant_briefing",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert verdict["allowed"] is True
+    assert verdict["control_plane_status"] == "cached"
+
+
 def test_maybe_mount_premium_extensions_refuses_import_when_gate_denies(
     tmp_path, monkeypatch
 ):
@@ -309,6 +551,9 @@ def test_maybe_mount_premium_extensions_loads_private_module_when_allowed(
             "feature_id": "private_extension_runtime",
             "entitlement_id": "ent-1",
             "customer_id": "cust-1",
+            "manifest_id": "manifest-load",
+            "protection_phase": 2,
+            "installation_fingerprint": "sha256:test-load",
         },
     )
 
@@ -341,6 +586,10 @@ def test_maybe_mount_premium_extensions_passes_mount_context(tmp_path, monkeypat
         "    mcp.loaded_server_name = server_name\n"
         "    mcp.contract_version = mount_context.contract_version\n"
         "    mcp.feature_id = mount_context.feature_id\n"
+        "    mcp.host_runtime_version = mount_context.host_runtime_version\n"
+        "    mcp.installation_fingerprint = mount_context.installation_fingerprint\n"
+        "    mcp.manifest_id = mount_context.manifest_id\n"
+        "    mcp.protection_phase = mount_context.protection_phase\n"
         "    return {'mounted': True, 'contract_version': mount_context.contract_version}\n",
         encoding="utf-8",
     )
@@ -357,6 +606,9 @@ def test_maybe_mount_premium_extensions_passes_mount_context(tmp_path, monkeypat
             "feature_id": "private_extension_runtime",
             "entitlement_id": "ent-ctx",
             "customer_id": "cust-ctx",
+            "manifest_id": "manifest-ctx",
+            "protection_phase": 4,
+            "installation_fingerprint": "sha256:test-ctx",
         },
     )
 
@@ -368,3 +620,7 @@ def test_maybe_mount_premium_extensions_passes_mount_context(tmp_path, monkeypat
     assert mcp.loaded_server_name == "sqlite-unified"
     assert mcp.contract_version == PREMIUM_RUNTIME_CONTRACT_VERSION
     assert mcp.feature_id == "private_extension_runtime"
+    assert mcp.host_runtime_version == premium_runtime.HOST_RUNTIME_VERSION
+    assert mcp.installation_fingerprint == "sha256:test-ctx"
+    assert mcp.manifest_id == "manifest-ctx"
+    assert mcp.protection_phase == 4

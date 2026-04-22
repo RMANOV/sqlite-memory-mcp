@@ -47,6 +47,10 @@ def register_premium_extensions(
     return {
         "mounted": True,
         "contract_version": state.contract_version,
+        "host_runtime_version": state.host_runtime_version,
+        "installation_fingerprint": state.installation_fingerprint,
+        "manifest_id": state.manifest_id,
+        "protection_phase": state.protection_phase,
         "extension_name": "sqlite-memory-mcp-premium-template",
         "packs": list(selection.get("selected_packs", [])),
         "selection_mode": str(selection.get("selection_mode") or "none"),

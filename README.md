@@ -36,7 +36,7 @@ SQLite hits the sweet spot:
 - **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
-- **Premium runtime boundary** -- The OSS core can gate-load a separate private premium repo via signed entitlement checks, explicit owner approval, audit logging, and local revocation
+- **Premium runtime boundary** -- The OSS core can gate-load a separate private premium repo via signed entitlement checks, signed artifact manifests, signed control-plane policy, explicit owner approval, audit logging, cached revocation-aware policy fallback, and local revocation
 - **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with 47 more tools available from companion servers
 - **Zero required dependencies beyond stdlib** -- Only `fastmcp` is required for MCP protocol; `sqlite3` is Python stdlib. Optional `orjson`, `sqlite-vec`, and `sentence-transformers` add speed and semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
@@ -52,6 +52,8 @@ What is in this OSS repo:
 - premium audit + revoke tables in the shared schema
 - public contract for a separate private premium repo (`premium_contract.py`)
 - premium entitlement schema (`docs/premium/entitlement.schema.json`)
+- signed artifact manifest schema (`docs/premium/artifact_manifest.schema.json`)
+- signed control-plane policy schema (`docs/premium/control_plane_policy.schema.json`)
 - a public-safe bootstrap template for the separate private repo (`templates/private_premium_repo/`)
 
 What is **not** in this OSS repo:
@@ -83,6 +85,8 @@ The public runtime will only attempt to mount them when all of the following are
 
 - a private premium entrypoint is configured
 - a valid entitlement is provided
+- the private artifact can satisfy the signed manifest / compatibility checks when enabled
+- the signed control-plane policy allows the current manifest, entitlement, and protection phase when configured
 - local owner approval is present for protected premium features
 - the entitlement is not locally revoked
 
@@ -179,8 +183,12 @@ On top of the pack structure, the private runtime now exposes concrete premium-o
 The commercial design still assumes that the local machine may be untrusted.
 
 - explicit entitlements
+- signed artifact manifests over the private runtime entrypoint
+- signed control-plane policy with cached offline fallback
 - local revocation
 - owner approval for protected runtime loading
+- host/runtime compatibility checks plus minimum protection phase enforcement
+- installation fingerprinting for audit correlation
 - password-protected premium views for the highest-sensitivity operator surfaces
 - separate private runtime packaging
 - optional extra service boundaries for the most sensitive premium logic

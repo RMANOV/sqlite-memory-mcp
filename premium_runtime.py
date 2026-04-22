@@ -19,8 +19,14 @@ import json
 import os
 import sqlite3
 import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import tomllib
 
 from db_utils import (
     MACHINE_ID,
@@ -30,7 +36,7 @@ from db_utils import (
     record_memory_event,
     setup_logger,
 )
-from premium_contract import build_mount_context
+from premium_contract import PREMIUM_RUNTIME_CONTRACT_VERSION, build_mount_context
 
 logger = setup_logger("sqlite-premium", "premium_runtime.log")
 
@@ -43,6 +49,21 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "entitlement_inline_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_JSON",
     "entitlement_path_env_var": "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_PATH",
     "public_key_env_var": "SQLITE_MEMORY_PREMIUM_PUBLIC_KEY",
+    "artifact_manifest_inline_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_JSON",
+    "artifact_manifest_path_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_PATH",
+    "artifact_public_key_env_var": "SQLITE_MEMORY_PREMIUM_ARTIFACT_PUBLIC_KEY",
+    "require_artifact_manifest": False,
+    "control_plane_inline_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_JSON",
+    "control_plane_path_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_PATH",
+    "control_plane_url_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_URL",
+    "control_plane_public_key_env_var": "SQLITE_MEMORY_PREMIUM_POLICY_PUBLIC_KEY",
+    "control_plane_timeout_seconds": 5,
+    "control_plane_cache_ttl_seconds": 21600,
+    "control_plane_required": False,
+    "allow_cached_control_plane": True,
+    "max_offline_grace_seconds": 604800,
+    "minimum_protection_phase": 1,
+    "installation_salt_env_var": "SQLITE_MEMORY_PREMIUM_INSTALLATION_SALT",
     "owner_approval_env_var": "SQLITE_MEMORY_OWNER_APPROVAL",
     "record_allowed_events": True,
     "record_denied_events": True,
@@ -270,6 +291,22 @@ class PremiumRuntimeError(RuntimeError):
     """Raised when premium runtime loading or evaluation fails unexpectedly."""
 
 
+def _load_host_runtime_version() -> str:
+    try:
+        payload = tomllib.loads(
+            (Path(__file__).parent / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        version = payload.get("project", {}).get("version")
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    except Exception:
+        logger.warning("Unable to resolve host runtime version from pyproject.toml")
+    return "0.0.0"
+
+
+HOST_RUNTIME_VERSION = _load_host_runtime_version()
+
+
 def load_premium_config() -> dict[str, Any]:
     """Load config with safe defaults when the file is absent or invalid."""
     try:
@@ -389,6 +426,10 @@ def build_mount_runtime_config(
     *,
     base_config: dict[str, Any] | None = None,
     selection: dict[str, Any] | None = None,
+    manifest: dict[str, Any] | None = None,
+    control_policy: dict[str, Any] | None = None,
+    installation_fingerprint: str = "",
+    protection_phase: int = 1,
 ) -> dict[str, Any]:
     """Attach entitlement selection metadata to the mount context config."""
     payload = dict(base_config or load_premium_config())
@@ -396,6 +437,13 @@ def build_mount_runtime_config(
     payload["_premium_pack_catalog"] = {
         pack_id: dict(pack) for pack_id, pack in PREMIUM_PACKS.items()
     }
+    payload["_premium_host_runtime_version"] = HOST_RUNTIME_VERSION
+    payload["_premium_installation_fingerprint"] = installation_fingerprint or ""
+    payload["_premium_protection_phase"] = int(protection_phase or 1)
+    if manifest:
+        payload["_premium_artifact_manifest"] = dict(manifest)
+    if control_policy:
+        payload["_premium_control_policy"] = dict(control_policy)
     return payload
 
 
@@ -420,39 +468,94 @@ def _parse_iso(ts: str | None) -> str | None:
     return ts.strip()
 
 
-def _canonical_entitlement_payload(entitlement: dict[str, Any]) -> bytes:
-    payload = dict(entitlement)
-    payload.pop("signature", None)
+def _canonical_signed_payload(
+    payload: dict[str, Any],
+    *,
+    signature_field: str = "signature",
+) -> bytes:
+    sanitized = dict(payload)
+    sanitized.pop(signature_field, None)
     return json.dumps(
-        payload,
+        sanitized,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
 
 
-def _load_public_key_value(config: dict[str, Any]) -> str | None:
-    env_var = str(config.get("public_key_env_var") or "").strip()
+def _load_env_var_value(config: dict[str, Any], config_key: str) -> str | None:
+    env_var = str(config.get(config_key) or "").strip()
     if not env_var:
         return None
     value = os.environ.get(env_var, "").strip()
     return value or None
 
 
-def _load_entitlement(config: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    inline_env = str(config.get("entitlement_inline_env_var") or "").strip()
+def _load_json_from_env_or_path(
+    config: dict[str, Any],
+    *,
+    inline_key: str,
+    path_key: str,
+) -> tuple[dict[str, Any] | None, str]:
+    inline_env = str(config.get(inline_key) or "").strip()
     if inline_env:
         inline_value = os.environ.get(inline_env, "").strip()
         if inline_value:
             return json.loads(inline_value), "env:inline"
 
-    path_env = str(config.get("entitlement_path_env_var") or "").strip()
+    path_env = str(config.get(path_key) or "").strip()
     if path_env:
         raw_path = os.environ.get(path_env, "").strip()
         if raw_path:
             path = Path(raw_path)
             return json.loads(path.read_text(encoding="utf-8")), str(path)
 
+    return None, "missing"
+
+
+def _load_entitlement(config: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    return _load_json_from_env_or_path(
+        config,
+        inline_key="entitlement_inline_env_var",
+        path_key="entitlement_path_env_var",
+    )
+
+
+def _load_artifact_manifest(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    return _load_json_from_env_or_path(
+        config,
+        inline_key="artifact_manifest_inline_env_var",
+        path_key="artifact_manifest_path_env_var",
+    )
+
+
+def _load_remote_json(url: str, *, timeout_seconds: int) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "sqlite-memory-mcp"},
+    )
+    with urllib.request.urlopen(request, timeout=max(timeout_seconds, 1)) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body)
+
+
+def _load_control_plane_document(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    payload, source_ref = _load_json_from_env_or_path(
+        config,
+        inline_key="control_plane_inline_env_var",
+        path_key="control_plane_path_env_var",
+    )
+    if payload:
+        return payload, source_ref
+
+    url = _load_env_var_value(config, "control_plane_url_env_var")
+    if url:
+        timeout_seconds = int(config.get("control_plane_timeout_seconds") or 5)
+        return _load_remote_json(url, timeout_seconds=timeout_seconds), url
     return None, "missing"
 
 
@@ -463,11 +566,11 @@ def _decode_signature(value: str) -> bytes:
         raise PremiumRuntimeError(f"Invalid signature encoding: {exc}") from exc
 
 
-def _verify_entitlement_signature(
-    entitlement: dict[str, Any],
+def _verify_signed_payload(
+    payload: dict[str, Any],
     public_key_value: str | None,
 ) -> tuple[bool, str]:
-    signature = entitlement.get("signature")
+    signature = payload.get("signature")
     if not isinstance(signature, dict):
         return False, "signature_missing"
     if str(signature.get("alg", "")).lower() != "ed25519":
@@ -493,11 +596,139 @@ def _verify_entitlement_signature(
             )
         public_key.verify(
             _decode_signature(str(signature.get("value", ""))),
-            _canonical_entitlement_payload(entitlement),
+            _canonical_signed_payload(payload),
         )
         return True, "signature_valid"
     except Exception as exc:
         return False, f"signature_invalid:{exc.__class__.__name__}"
+
+
+def _verify_entitlement_signature(
+    entitlement: dict[str, Any],
+    public_key_value: str | None,
+) -> tuple[bool, str]:
+    return _verify_signed_payload(entitlement, public_key_value)
+
+
+def _parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _iso_to_epoch(ts: str | None) -> float | None:
+    value = _parse_iso(ts)
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _epoch_to_iso(value: float) -> str:
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+
+def _version_tuple(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return (0,)
+    parts: list[int] = []
+    for chunk in str(value).replace("-", ".").split("."):
+        if chunk.isdigit():
+            parts.append(int(chunk))
+            continue
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        if digits:
+            parts.append(int(digits))
+    return tuple(parts or [0])
+
+
+def _version_in_range(
+    current: str,
+    *,
+    minimum: str | None = None,
+    maximum: str | None = None,
+) -> bool:
+    current_tuple = _version_tuple(current)
+    if minimum and current_tuple < _version_tuple(minimum):
+        return False
+    if maximum and current_tuple > _version_tuple(maximum):
+        return False
+    return True
+
+
+def _resolve_entrypoint_file(entrypoint: str) -> Path | None:
+    path_text = entrypoint
+    if "::" in path_text:
+        path_text = path_text.rsplit("::", 1)[0]
+    if ":" in path_text and not Path(path_text).exists():
+        module_name = path_text.rsplit(":", 1)[0]
+    else:
+        module_name = path_text
+
+    path = Path(path_text)
+    if path_text.lower().endswith(".py") or path.exists():
+        if path.exists():
+            return path.resolve()
+        return None
+
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, AttributeError, ValueError):
+        return None
+    origin = getattr(spec, "origin", None)
+    if not origin or origin in {"built-in", "frozen"}:
+        return None
+    origin_path = Path(origin)
+    if origin_path.exists():
+        return origin_path.resolve()
+    return None
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _entrypoint_runtime_info(entrypoint: str) -> dict[str, Any]:
+    entrypoint_file = _resolve_entrypoint_file(entrypoint)
+    return {
+        "entrypoint": entrypoint,
+        "entrypoint_ref": _hash_text(entrypoint),
+        "entrypoint_file": str(entrypoint_file) if entrypoint_file else None,
+        "entrypoint_sha256": _hash_file(entrypoint_file) if entrypoint_file else None,
+    }
+
+
+def _installation_fingerprint(
+    *,
+    entrypoint_ref: str,
+    manifest_id: str,
+    config: dict[str, Any],
+) -> str:
+    salt = _load_env_var_value(config, "installation_salt_env_var") or ""
+    material = "|".join(
+        [
+            MACHINE_ID,
+            HOST_RUNTIME_VERSION,
+            entrypoint_ref,
+            manifest_id,
+            salt,
+        ]
+    )
+    return _hash_text(material)
 
 
 def _write_gate_audit(
@@ -624,6 +855,340 @@ def revoke_entitlement(
     return revocation_id
 
 
+def _store_artifact_manifest(
+    conn: sqlite3.Connection,
+    *,
+    manifest: dict[str, Any],
+    entrypoint_info: dict[str, Any],
+) -> None:
+    verified_at = _now()
+    conn.execute(
+        "INSERT OR REPLACE INTO premium_artifact_manifests ("
+        "manifest_id, extension_name, entrypoint_ref, entrypoint_sha256, "
+        "contract_version, build_id, customer_id, protection_phase, "
+        "minimum_host_version, maximum_host_version, issued_at, expires_at, "
+        "verified_at, payload_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            str(manifest.get("manifest_id") or _new_id("mf")),
+            str(manifest.get("extension_name") or "sqlite-memory-mcp-premium"),
+            str(
+                manifest.get("entrypoint_ref")
+                or entrypoint_info.get("entrypoint_ref")
+                or ""
+            ),
+            str(
+                manifest.get("entrypoint_sha256")
+                or entrypoint_info.get("entrypoint_sha256")
+                or ""
+            ),
+            str(manifest.get("contract_version") or PREMIUM_RUNTIME_CONTRACT_VERSION),
+            str(manifest.get("build_id") or "") or None,
+            str(manifest.get("customer_id") or "") or None,
+            max(_parse_int(manifest.get("protection_phase"), 1), 1),
+            str(manifest.get("minimum_host_version") or "") or None,
+            str(manifest.get("maximum_host_version") or "") or None,
+            _parse_iso(manifest.get("issued_at")),
+            _parse_iso(manifest.get("expires_at")),
+            verified_at,
+            _json_text(manifest),
+        ),
+    )
+
+
+def _control_scope_keys(customer_id: str | None) -> list[str]:
+    keys: list[str] = ["global"]
+    if customer_id:
+        keys.insert(0, f"customer:{customer_id}")
+    return keys
+
+
+def _cache_control_plane_policy(
+    conn: sqlite3.Connection,
+    *,
+    policy: dict[str, Any],
+    source_ref: str,
+    config: dict[str, Any],
+) -> None:
+    ttl_seconds = max(
+        _parse_int(policy.get("cache_ttl_seconds"), 0),
+        _parse_int(config.get("control_plane_cache_ttl_seconds"), 0),
+    )
+    fetched_at = _now()
+    cache_deadline = (
+        _epoch_to_iso(time.time() + ttl_seconds) if ttl_seconds > 0 else fetched_at
+    )
+    scope_key = (
+        f"customer:{policy.get('customer_id')}"
+        if str(policy.get("customer_id") or "").strip()
+        else "global"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO premium_control_plane_cache ("
+        "scope_key, policy_id, source_ref, fetched_at, expires_at, "
+        "cache_deadline, payload_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            scope_key,
+            str(policy.get("policy_id") or _new_id("cp")),
+            source_ref,
+            fetched_at,
+            _parse_iso(policy.get("expires_at")),
+            cache_deadline,
+            json.dumps(policy, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+
+
+def _load_cached_control_plane_policy(
+    conn: sqlite3.Connection,
+    *,
+    customer_id: str | None,
+) -> dict[str, Any] | None:
+    for scope_key in _control_scope_keys(customer_id):
+        row = conn.execute(
+            "SELECT scope_key, source_ref, fetched_at, expires_at, cache_deadline, payload_json "
+            "FROM premium_control_plane_cache WHERE scope_key = ? LIMIT 1",
+            (scope_key,),
+        ).fetchone()
+        if row:
+            payload = json_loads(row["payload_json"])
+            payload["_cache_scope_key"] = row["scope_key"]
+            payload["_cache_source_ref"] = row["source_ref"]
+            payload["_cache_fetched_at"] = row["fetched_at"]
+            payload["_cache_expires_at"] = row["expires_at"]
+            payload["_cache_deadline"] = row["cache_deadline"]
+            return payload
+    return None
+
+
+def _policy_cache_is_usable(
+    policy: dict[str, Any],
+    *,
+    config: dict[str, Any],
+) -> bool:
+    now_epoch = time.time()
+    deadline_epoch = _iso_to_epoch(str(policy.get("_cache_deadline") or ""))
+    expires_epoch = _iso_to_epoch(str(policy.get("_cache_expires_at") or ""))
+    grace_seconds = max(_parse_int(config.get("max_offline_grace_seconds"), 0), 0)
+    if expires_epoch and now_epoch > expires_epoch:
+        return False
+    if deadline_epoch is None:
+        return True
+    if now_epoch <= deadline_epoch:
+        return True
+    return now_epoch <= deadline_epoch + grace_seconds
+
+
+def _resolve_control_plane_policy(
+    conn: sqlite3.Connection,
+    *,
+    config: dict[str, Any],
+    customer_id: str | None,
+) -> dict[str, Any]:
+    source_ref = "missing"
+    load_reason = ""
+    try:
+        live_policy, source_ref = _load_control_plane_document(config)
+    except Exception as exc:
+        live_policy = None
+        load_reason = f"control_plane_load_failed:{exc.__class__.__name__}"
+    if live_policy:
+        public_key_value = _load_env_var_value(
+            config,
+            "control_plane_public_key_env_var",
+        )
+        sig_ok, sig_reason = _verify_signed_payload(live_policy, public_key_value)
+        if sig_ok:
+            _cache_control_plane_policy(
+                conn,
+                policy=live_policy,
+                source_ref=source_ref,
+                config=config,
+            )
+            return {
+                "status": "live",
+                "policy": live_policy,
+                "source_ref": source_ref,
+                "reason": "control_plane_live",
+            }
+        load_reason = sig_reason
+
+    if config.get("allow_cached_control_plane", True):
+        cached_policy = _load_cached_control_plane_policy(conn, customer_id=customer_id)
+        if cached_policy and _policy_cache_is_usable(cached_policy, config=config):
+            return {
+                "status": "cached",
+                "policy": cached_policy,
+                "source_ref": str(cached_policy.get("_cache_source_ref") or "cache"),
+                "reason": load_reason or "control_plane_cached",
+            }
+
+    if config.get("control_plane_required", False):
+        return {
+            "status": "denied",
+            "policy": None,
+            "source_ref": source_ref,
+            "reason": load_reason or "control_plane_missing",
+        }
+    return {
+        "status": "missing",
+        "policy": None,
+        "source_ref": source_ref,
+        "reason": load_reason or "control_plane_missing",
+    }
+
+
+def _evaluate_control_plane_rules(
+    policy: dict[str, Any] | None,
+    *,
+    feature_id: str,
+    entitlement: dict[str, Any],
+    entitlement_id: str,
+    customer_id: str | None,
+    manifest_id: str,
+    entrypoint_sha256: str | None,
+    protection_phase: int,
+) -> str | None:
+    if not policy:
+        return None
+
+    revoked_entitlements = set(
+        _normalize_string_items(policy.get("revoked_entitlement_ids"))
+    )
+    if entitlement_id in revoked_entitlements:
+        return "control_plane_revoked_entitlement"
+
+    revoked_customers = set(_normalize_string_items(policy.get("revoked_customer_ids")))
+    if customer_id and customer_id in revoked_customers:
+        return "control_plane_revoked_customer"
+
+    denied_features = set(_normalize_string_items(policy.get("denied_features")))
+    if feature_id in denied_features:
+        return "control_plane_denied_feature"
+
+    allowed_features = set(_normalize_string_items(policy.get("allowed_features")))
+    if allowed_features and feature_id not in allowed_features:
+        return "control_plane_feature_not_allowed"
+
+    denied_hashes = set(_normalize_string_items(policy.get("denied_entrypoint_hashes")))
+    if entrypoint_sha256 and entrypoint_sha256 in denied_hashes:
+        return "control_plane_denied_artifact_hash"
+
+    allowed_hashes = set(
+        _normalize_string_items(policy.get("allowed_entrypoint_hashes"))
+    )
+    if (
+        entrypoint_sha256
+        and allowed_hashes
+        and feature_id == "private_extension_runtime"
+        and entrypoint_sha256 not in allowed_hashes
+    ):
+        return "control_plane_artifact_hash_not_allowed"
+
+    allowed_manifest_ids = set(
+        _normalize_string_items(policy.get("allowed_manifest_ids"))
+    )
+    if (
+        manifest_id
+        and allowed_manifest_ids
+        and feature_id == "private_extension_runtime"
+        and manifest_id not in allowed_manifest_ids
+    ):
+        return "control_plane_manifest_not_allowed"
+
+    minimum_phase = max(_parse_int(policy.get("minimum_protection_phase"), 0), 0)
+    if minimum_phase and protection_phase < minimum_phase:
+        return "control_plane_minimum_protection_phase"
+
+    if not _version_in_range(
+        HOST_RUNTIME_VERSION,
+        minimum=str(policy.get("minimum_host_version") or "") or None,
+        maximum=str(policy.get("maximum_host_version") or "") or None,
+    ):
+        return "control_plane_host_version_mismatch"
+
+    max_ttl_seconds = _parse_int(policy.get("max_entitlement_ttl_seconds"), 0)
+    issued_epoch = _iso_to_epoch(
+        str(entitlement.get("issued_at") or entitlement.get("not_before") or "")
+    )
+    expires_epoch = _iso_to_epoch(str(entitlement.get("expires_at") or ""))
+    if (
+        max_ttl_seconds > 0
+        and issued_epoch is not None
+        and expires_epoch is not None
+        and expires_epoch - issued_epoch > max_ttl_seconds
+    ):
+        return "control_plane_entitlement_ttl_exceeded"
+    return None
+
+
+def _validate_artifact_manifest(
+    manifest: dict[str, Any] | None,
+    *,
+    config: dict[str, Any],
+    control_policy: dict[str, Any] | None,
+    entrypoint_info: dict[str, Any] | None,
+    customer_id: str | None,
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    minimum_phase = max(_parse_int(config.get("minimum_protection_phase"), 1), 1)
+    if control_policy:
+        minimum_phase = max(
+            minimum_phase,
+            max(_parse_int(control_policy.get("minimum_protection_phase"), 0), 0),
+        )
+    require_manifest = bool(
+        config.get("require_artifact_manifest", False)
+        or bool(control_policy and control_policy.get("require_artifact_manifest"))
+    )
+    if not manifest:
+        if require_manifest:
+            return None, "artifact_manifest_required", minimum_phase
+        return None, None, minimum_phase
+
+    public_key_value = _load_env_var_value(config, "artifact_public_key_env_var")
+    sig_ok, sig_reason = _verify_signed_payload(manifest, public_key_value)
+    if not sig_ok:
+        return None, sig_reason, minimum_phase
+
+    manifest_customer_id = str(manifest.get("customer_id") or "").strip() or None
+    if manifest_customer_id and customer_id and manifest_customer_id != customer_id:
+        return None, "artifact_manifest_customer_mismatch", minimum_phase
+
+    contract_version = str(manifest.get("contract_version") or "").strip()
+    if contract_version and contract_version != PREMIUM_RUNTIME_CONTRACT_VERSION:
+        return None, "artifact_manifest_contract_mismatch", minimum_phase
+
+    if not _version_in_range(
+        HOST_RUNTIME_VERSION,
+        minimum=str(manifest.get("minimum_host_version") or "") or None,
+        maximum=str(manifest.get("maximum_host_version") or "") or None,
+    ):
+        return None, "artifact_manifest_host_version_mismatch", minimum_phase
+
+    expires_at = _iso_to_epoch(str(manifest.get("expires_at") or ""))
+    if expires_at is not None and time.time() > expires_at:
+        return None, "artifact_manifest_expired", minimum_phase
+
+    if entrypoint_info:
+        manifest_entrypoint_ref = str(manifest.get("entrypoint_ref") or "").strip()
+        if manifest_entrypoint_ref and manifest_entrypoint_ref != entrypoint_info.get(
+            "entrypoint_ref"
+        ):
+            return None, "artifact_manifest_entrypoint_ref_mismatch", minimum_phase
+        manifest_sha = str(manifest.get("entrypoint_sha256") or "").strip()
+        runtime_sha = str(entrypoint_info.get("entrypoint_sha256") or "").strip()
+        if manifest_sha and runtime_sha and manifest_sha != runtime_sha:
+            return None, "artifact_manifest_hash_mismatch", minimum_phase
+        if manifest_sha and not runtime_sha:
+            return None, "artifact_manifest_hash_unverifiable", minimum_phase
+
+    protection_phase = max(_parse_int(manifest.get("protection_phase"), 1), 1)
+    if protection_phase < minimum_phase:
+        return None, "artifact_manifest_protection_phase_too_low", protection_phase
+    return manifest, None, protection_phase
+
+
 def evaluate_feature_gate(
     conn: sqlite3.Connection,
     *,
@@ -638,14 +1203,33 @@ def evaluate_feature_gate(
     Deny by default unless a valid entitlement and owner approval are present.
     """
     config = load_premium_config()
-    feature = PREMIUM_FEATURES.get(feature_id)
-    if not feature:
+    audit_payload = dict(payload or {})
+
+    def _deny(reason: str, **extra: Any) -> dict[str, Any]:
         verdict = {
             "allowed": False,
             "decision": "denied",
-            "reason": "unknown_feature",
+            "reason": reason,
             "feature_id": feature_id,
+            **extra,
         }
+        if config.get("record_denied_events", True):
+            _write_gate_audit(
+                conn,
+                feature_id=feature_id,
+                decision="denied",
+                reason=reason,
+                entitlement_id=extra.get("entitlement_id"),
+                customer_id=extra.get("customer_id"),
+                server_name=server_name,
+                tool_name=tool_name,
+                actor_id=actor_id,
+                payload=audit_payload,
+            )
+        return verdict
+
+    feature = PREMIUM_FEATURES.get(feature_id)
+    if not feature:
         _write_gate_audit(
             conn,
             feature_id=feature_id,
@@ -654,9 +1238,14 @@ def evaluate_feature_gate(
             server_name=server_name,
             tool_name=tool_name,
             actor_id=actor_id,
-            payload=payload,
+            payload=audit_payload,
         )
-        return verdict
+        return {
+            "allowed": False,
+            "decision": "denied",
+            "reason": "unknown_feature",
+            "feature_id": feature_id,
+        }
 
     if str(feature.get("tier", "premium")).lower() != "premium":
         return {
@@ -667,279 +1256,180 @@ def evaluate_feature_gate(
         }
 
     if not config.get("enabled", True):
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "premium_runtime_disabled",
-            "feature_id": feature_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload=payload,
-            )
-        return verdict
+        return _deny("premium_runtime_disabled")
 
+    source_ref = "missing"
     try:
         entitlement, source_ref = _load_entitlement(config)
     except Exception as exc:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": f"entitlement_load_failed:{exc.__class__.__name__}",
-            "feature_id": feature_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={**(payload or {}), "entitlement_source": source_ref},
-            )
-        return verdict
+        audit_payload["entitlement_source"] = source_ref
+        return _deny(f"entitlement_load_failed:{exc.__class__.__name__}")
 
     if not entitlement:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "entitlement_missing",
-            "feature_id": feature_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={**(payload or {}), "entitlement_source": source_ref},
-            )
-        return verdict
+        audit_payload["entitlement_source"] = source_ref
+        return _deny("entitlement_missing")
 
     entitlement_id = str(entitlement.get("entitlement_id") or "").strip()
     customer_id = str(entitlement.get("customer_id") or "").strip() or None
+    audit_payload["entitlement_source"] = source_ref
+    audit_payload["entitlement_id"] = entitlement_id or None
+    audit_payload["customer_id"] = customer_id
     if not entitlement_id:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "entitlement_id_missing",
-            "feature_id": feature_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={**(payload or {}), "entitlement_source": source_ref},
-            )
-        return verdict
+        return _deny("entitlement_id_missing", customer_id=customer_id)
 
     sig_ok, sig_reason = _verify_entitlement_signature(
         entitlement,
-        _load_public_key_value(config),
+        _load_env_var_value(config, "public_key_env_var"),
     )
     if not sig_ok:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": sig_reason,
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=sig_reason,
-                entitlement_id=entitlement_id,
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={**(payload or {}), "entitlement_source": source_ref},
-            )
-        return verdict
+        return _deny(
+            sig_reason,
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
 
     if _is_revoked(conn, entitlement_id=entitlement_id, feature_id=feature_id):
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "entitlement_revoked",
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                entitlement_id=entitlement_id,
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={**(payload or {}), "entitlement_source": source_ref},
-            )
-        return verdict
+        return _deny(
+            "entitlement_revoked",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
 
     selection = resolve_entitlement_selection(entitlement)
+    audit_payload["selection_mode"] = selection.get("selection_mode")
+    audit_payload["selected_packs"] = selection.get("selected_packs", [])
     if not selection.get("has_selection"):
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "entitlement_selection_missing",
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-            "selection_mode": selection.get("selection_mode"),
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                entitlement_id=entitlement_id,
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={
-                    **(payload or {}),
-                    "entitlement_source": source_ref,
-                    "selection_mode": selection.get("selection_mode"),
-                },
-            )
-        return verdict
+        return _deny(
+            "entitlement_selection_missing",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+            selection_mode=selection.get("selection_mode"),
+        )
 
     effective_features = set(selection.get("effective_features", []))
     if feature_id not in effective_features:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "feature_not_entitled",
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-            "selection_mode": selection.get("selection_mode"),
-            "selected_packs": selection.get("selected_packs", []),
-            "effective_features": selection.get("effective_features", []),
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                entitlement_id=entitlement_id,
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload={
-                    **(payload or {}),
-                    "entitlement_source": source_ref,
-                    "selection_mode": selection.get("selection_mode"),
-                    "selected_packs": selection.get("selected_packs", []),
-                },
-            )
-        return verdict
+        return _deny(
+            "feature_not_entitled",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+            selection_mode=selection.get("selection_mode"),
+            selected_packs=selection.get("selected_packs", []),
+            effective_features=selection.get("effective_features", []),
+        )
 
     now_ts = _now()
     not_before = _parse_iso(entitlement.get("not_before"))
     expires_at = _parse_iso(entitlement.get("expires_at"))
     if not_before and now_ts < not_before:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "entitlement_not_yet_valid",
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                entitlement_id=entitlement_id,
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload=payload,
-            )
-        return verdict
+        return _deny(
+            "entitlement_not_yet_valid",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
     if expires_at and now_ts > expires_at:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "entitlement_expired",
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
-                entitlement_id=entitlement_id,
-                customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload=payload,
-            )
-        return verdict
+        return _deny(
+            "entitlement_expired",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
 
     machine_ids = entitlement.get("machine_ids", [])
     if machine_ids and MACHINE_ID not in machine_ids:
-        verdict = {
-            "allowed": False,
-            "decision": "denied",
-            "reason": "machine_not_entitled",
-            "feature_id": feature_id,
-            "entitlement_id": entitlement_id,
-            "customer_id": customer_id,
-        }
-        if config.get("record_denied_events", True):
-            _write_gate_audit(
-                conn,
-                feature_id=feature_id,
-                decision="denied",
-                reason=verdict["reason"],
+        return _deny(
+            "machine_not_entitled",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
+
+    control_resolution = _resolve_control_plane_policy(
+        conn,
+        config=config,
+        customer_id=customer_id,
+    )
+    control_policy = control_resolution.get("policy")
+    audit_payload["control_plane_status"] = control_resolution.get("status")
+    audit_payload["control_plane_source"] = control_resolution.get("source_ref")
+    if control_resolution.get("status") == "denied":
+        return _deny(
+            str(control_resolution.get("reason") or "control_plane_denied"),
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
+
+    entrypoint_info: dict[str, Any] | None = None
+    if feature_id == "private_extension_runtime":
+        raw_entrypoint = str(audit_payload.get("entrypoint") or "").strip()
+        if raw_entrypoint:
+            entrypoint_info = _entrypoint_runtime_info(raw_entrypoint)
+            audit_payload.update(entrypoint_info)
+
+    manifest = None
+    manifest_source = "missing"
+    if feature_id == "private_extension_runtime":
+        try:
+            manifest, manifest_source = _load_artifact_manifest(config)
+        except Exception as exc:
+            return _deny(
+                f"artifact_manifest_load_failed:{exc.__class__.__name__}",
                 entitlement_id=entitlement_id,
                 customer_id=customer_id,
-                server_name=server_name,
-                tool_name=tool_name,
-                actor_id=actor_id,
-                payload=payload,
             )
-        return verdict
+
+    validated_manifest, manifest_reason, protection_phase = _validate_artifact_manifest(
+        manifest,
+        config=config,
+        control_policy=control_policy,
+        entrypoint_info=entrypoint_info,
+        customer_id=customer_id,
+    )
+    audit_payload["artifact_manifest_source"] = manifest_source
+    audit_payload["protection_phase"] = protection_phase
+    if manifest_reason:
+        return _deny(
+            manifest_reason,
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
+
+    manifest_id = (
+        str(validated_manifest.get("manifest_id") or "").strip()
+        if validated_manifest
+        else ""
+    )
+    installation_fingerprint = _installation_fingerprint(
+        entrypoint_ref=str(audit_payload.get("entrypoint_ref") or feature_id),
+        manifest_id=manifest_id,
+        config=config,
+    )
+    audit_payload["installation_fingerprint"] = installation_fingerprint
+
+    if validated_manifest and entrypoint_info:
+        _store_artifact_manifest(
+            conn,
+            manifest=validated_manifest,
+            entrypoint_info=entrypoint_info,
+        )
+
+    control_reason = _evaluate_control_plane_rules(
+        control_policy,
+        feature_id=feature_id,
+        entitlement=entitlement,
+        entitlement_id=entitlement_id,
+        customer_id=customer_id,
+        manifest_id=manifest_id,
+        entrypoint_sha256=(
+            str(entrypoint_info.get("entrypoint_sha256") or "")
+            if entrypoint_info
+            else None
+        ),
+        protection_phase=protection_phase,
+    )
+    if control_reason:
+        return _deny(
+            control_reason,
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
 
     if feature.get("requires_owner_approval"):
         approval_env = str(config.get("owner_approval_env_var") or "").strip()
@@ -948,51 +1438,17 @@ def evaluate_feature_gate(
         )
         approval_hash = str(entitlement.get("owner_approval_sha256") or "").strip()
         if not approval_value or not approval_hash:
-            verdict = {
-                "allowed": False,
-                "decision": "denied",
-                "reason": "owner_approval_missing",
-                "feature_id": feature_id,
-                "entitlement_id": entitlement_id,
-                "customer_id": customer_id,
-            }
-            if config.get("record_denied_events", True):
-                _write_gate_audit(
-                    conn,
-                    feature_id=feature_id,
-                    decision="denied",
-                    reason=verdict["reason"],
-                    entitlement_id=entitlement_id,
-                    customer_id=customer_id,
-                    server_name=server_name,
-                    tool_name=tool_name,
-                    actor_id=actor_id,
-                    payload=payload,
-                )
-            return verdict
+            return _deny(
+                "owner_approval_missing",
+                entitlement_id=entitlement_id,
+                customer_id=customer_id,
+            )
         if _hash_text(approval_value) != approval_hash:
-            verdict = {
-                "allowed": False,
-                "decision": "denied",
-                "reason": "owner_approval_invalid",
-                "feature_id": feature_id,
-                "entitlement_id": entitlement_id,
-                "customer_id": customer_id,
-            }
-            if config.get("record_denied_events", True):
-                _write_gate_audit(
-                    conn,
-                    feature_id=feature_id,
-                    decision="denied",
-                    reason=verdict["reason"],
-                    entitlement_id=entitlement_id,
-                    customer_id=customer_id,
-                    server_name=server_name,
-                    tool_name=tool_name,
-                    actor_id=actor_id,
-                    payload=payload,
-                )
-            return verdict
+            return _deny(
+                "owner_approval_invalid",
+                entitlement_id=entitlement_id,
+                customer_id=customer_id,
+            )
 
     verdict = {
         "allowed": True,
@@ -1004,6 +1460,11 @@ def evaluate_feature_gate(
         "selection_mode": selection.get("selection_mode"),
         "selected_packs": selection.get("selected_packs", []),
         "effective_features": selection.get("effective_features", []),
+        "control_plane_status": control_resolution.get("status"),
+        "control_plane_source": control_resolution.get("source_ref"),
+        "manifest_id": manifest_id,
+        "protection_phase": protection_phase,
+        "installation_fingerprint": installation_fingerprint,
     }
     if config.get("record_allowed_events", True):
         _write_gate_audit(
@@ -1016,17 +1477,13 @@ def evaluate_feature_gate(
             server_name=server_name,
             tool_name=tool_name,
             actor_id=actor_id,
-            payload={
-                **(payload or {}),
-                "selection_mode": selection.get("selection_mode"),
-                "selected_packs": selection.get("selected_packs", []),
-            },
+            payload=audit_payload,
         )
     return verdict
 
 
 def _entrypoint_fingerprint(entrypoint: str) -> str:
-    return _hash_text(entrypoint)
+    return str(_entrypoint_runtime_info(entrypoint).get("entrypoint_ref") or "")
 
 
 def _resolve_module_from_entrypoint(entrypoint: str):
@@ -1085,11 +1542,19 @@ def _register_loaded_module(
     attr_name: str | None,
     *,
     mount_config: dict[str, Any] | None = None,
+    host_runtime_version: str = "",
+    installation_fingerprint: str = "",
+    manifest_id: str = "",
+    protection_phase: int = 1,
 ):
     mount_context = build_mount_context(
         server_name=server_name,
         feature_id="private_extension_runtime",
         machine_id=MACHINE_ID,
+        host_runtime_version=host_runtime_version or HOST_RUNTIME_VERSION,
+        installation_fingerprint=installation_fingerprint,
+        manifest_id=manifest_id,
+        protection_phase=max(int(protection_phase or 1), 1),
         config=build_mount_runtime_config(base_config=mount_config),
     )
     if attr_name:
@@ -1147,9 +1612,10 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
     if not entrypoint:
         return {"status": "skipped", "reason": "no_private_entrypoint"}
 
+    entrypoint_info = _entrypoint_runtime_info(entrypoint)
     payload = {
         "server_name": server_name,
-        "entrypoint_ref": _entrypoint_fingerprint(entrypoint),
+        **entrypoint_info,
     }
     with _get_conn() as conn:
         verdict = evaluate_feature_gate(
@@ -1168,6 +1634,43 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
             )
             return {"status": "denied", **verdict}
 
+    manifest_payload: dict[str, Any] | None = None
+    control_policy_payload: dict[str, Any] | None = None
+    try:
+        manifest_payload, _manifest_source = _load_artifact_manifest(config)
+    except Exception:
+        manifest_payload = None
+    with _get_conn() as conn:
+        control_resolution = _resolve_control_plane_policy(
+            conn,
+            config=config,
+            customer_id=str(verdict.get("customer_id") or "") or None,
+        )
+    if isinstance(control_resolution.get("policy"), dict):
+        control_policy_payload = dict(control_resolution["policy"])
+    validated_manifest, _manifest_reason, protection_phase = (
+        _validate_artifact_manifest(
+            manifest_payload,
+            config=config,
+            control_policy=control_policy_payload,
+            entrypoint_info=entrypoint_info,
+            customer_id=str(verdict.get("customer_id") or "") or None,
+        )
+    )
+    protection_phase = max(
+        int(protection_phase or 1),
+        int(verdict.get("protection_phase") or 1),
+        1,
+    )
+    installation_fingerprint = str(verdict.get("installation_fingerprint") or "")
+    manifest_id = str(verdict.get("manifest_id") or "")
+    if not installation_fingerprint:
+        installation_fingerprint = _installation_fingerprint(
+            entrypoint_ref=str(entrypoint_info.get("entrypoint_ref") or ""),
+            manifest_id=manifest_id,
+            config=config,
+        )
+
     try:
         module, attr_name = _resolve_module_from_entrypoint(entrypoint)
         result = _register_loaded_module(
@@ -1182,7 +1685,15 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
                     for key, value in verdict.items()
                     if key in {"selection_mode", "selected_packs", "effective_features"}
                 },
+                manifest=validated_manifest,
+                control_policy=control_policy_payload,
+                installation_fingerprint=installation_fingerprint,
+                protection_phase=max(int(protection_phase or 1), 1),
             ),
+            host_runtime_version=HOST_RUNTIME_VERSION,
+            installation_fingerprint=installation_fingerprint,
+            manifest_id=manifest_id,
+            protection_phase=max(int(protection_phase or 1), 1),
         )
         logger.info("Premium runtime loaded for %s from %s", server_name, entry_env)
         with _get_conn() as conn:
@@ -1194,7 +1705,12 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
                 server_name=server_name,
                 tool_name=f"{server_name}.premium_runtime",
                 actor_id=server_name,
-                payload=payload,
+                payload={
+                    **payload,
+                    "manifest_id": manifest_id or None,
+                    "protection_phase": max(int(protection_phase or 1), 1),
+                    "installation_fingerprint": installation_fingerprint,
+                },
             )
         return {"status": "loaded", "server_name": server_name, "result": result}
     except Exception as exc:

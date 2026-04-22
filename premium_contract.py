@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
-PREMIUM_RUNTIME_CONTRACT_VERSION = "1.0"
+PREMIUM_RUNTIME_CONTRACT_VERSION = "1.1"
 
 
 @dataclass(slots=True)
@@ -20,6 +20,10 @@ class PremiumMountContext:
     server_name: str
     feature_id: str
     machine_id: str
+    host_runtime_version: str = ""
+    installation_fingerprint: str = ""
+    manifest_id: str = ""
+    protection_phase: int = 1
     config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -29,6 +33,10 @@ class PremiumRegistrationResult(TypedDict, total=False):
     mounted: bool
     contract_version: str
     extension_name: str
+    host_runtime_version: str
+    installation_fingerprint: str
+    manifest_id: str
+    protection_phase: int
     packs: list[str]
     features: list[str]
     selection_mode: str
@@ -52,6 +60,10 @@ def build_mount_context(
     server_name: str,
     feature_id: str,
     machine_id: str,
+    host_runtime_version: str = "",
+    installation_fingerprint: str = "",
+    manifest_id: str = "",
+    protection_phase: int = 1,
     config: dict[str, Any] | None = None,
 ) -> PremiumMountContext:
     """Build a standard context object for private premium extensions."""
@@ -60,5 +72,9 @@ def build_mount_context(
         server_name=server_name,
         feature_id=feature_id,
         machine_id=machine_id,
+        host_runtime_version=host_runtime_version,
+        installation_fingerprint=installation_fingerprint,
+        manifest_id=manifest_id,
+        protection_phase=protection_phase,
         config=dict(config or {}),
     )

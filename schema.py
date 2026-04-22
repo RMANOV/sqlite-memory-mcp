@@ -614,6 +614,37 @@ CREATE TABLE IF NOT EXISTS premium_revocations (
 CREATE INDEX IF NOT EXISTS idx_premium_revocations_lookup
     ON premium_revocations(entitlement_id, feature_id, active);
 
+CREATE TABLE IF NOT EXISTS premium_artifact_manifests (
+    manifest_id          TEXT PRIMARY KEY,
+    extension_name       TEXT NOT NULL,
+    entrypoint_ref       TEXT NOT NULL,
+    entrypoint_sha256    TEXT NOT NULL,
+    contract_version     TEXT NOT NULL,
+    build_id             TEXT DEFAULT NULL,
+    customer_id          TEXT DEFAULT NULL,
+    protection_phase     INTEGER NOT NULL DEFAULT 1,
+    minimum_host_version TEXT DEFAULT NULL,
+    maximum_host_version TEXT DEFAULT NULL,
+    issued_at            TEXT DEFAULT NULL,
+    expires_at           TEXT DEFAULT NULL,
+    verified_at          TEXT NOT NULL,
+    payload_json         TEXT DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_premium_artifact_manifests_entrypoint
+    ON premium_artifact_manifests(entrypoint_ref, verified_at DESC);
+
+CREATE TABLE IF NOT EXISTS premium_control_plane_cache (
+    scope_key            TEXT PRIMARY KEY,
+    policy_id            TEXT NOT NULL,
+    source_ref           TEXT DEFAULT NULL,
+    fetched_at           TEXT NOT NULL,
+    expires_at           TEXT DEFAULT NULL,
+    cache_deadline       TEXT DEFAULT NULL,
+    payload_json         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_premium_control_plane_cache_deadline
+    ON premium_control_plane_cache(cache_deadline, fetched_at DESC);
+
 -- Auto-sync triggers: keep memory_fts in lockstep with entities table
 CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON entities BEGIN
     INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
@@ -1368,6 +1399,47 @@ _MIGRATIONS = [
             ON premium_revocations(entitlement_id, feature_id, active);
         """,
         "premium_revocations table (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='premium_artifact_manifests'",
+        """
+        CREATE TABLE premium_artifact_manifests (
+            manifest_id          TEXT PRIMARY KEY,
+            extension_name       TEXT NOT NULL,
+            entrypoint_ref       TEXT NOT NULL,
+            entrypoint_sha256    TEXT NOT NULL,
+            contract_version     TEXT NOT NULL,
+            build_id             TEXT DEFAULT NULL,
+            customer_id          TEXT DEFAULT NULL,
+            protection_phase     INTEGER NOT NULL DEFAULT 1,
+            minimum_host_version TEXT DEFAULT NULL,
+            maximum_host_version TEXT DEFAULT NULL,
+            issued_at            TEXT DEFAULT NULL,
+            expires_at           TEXT DEFAULT NULL,
+            verified_at          TEXT NOT NULL,
+            payload_json         TEXT DEFAULT NULL
+        );
+        CREATE INDEX idx_premium_artifact_manifests_entrypoint
+            ON premium_artifact_manifests(entrypoint_ref, verified_at DESC);
+        """,
+        "premium_artifact_manifests table (v3.6.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='premium_control_plane_cache'",
+        """
+        CREATE TABLE premium_control_plane_cache (
+            scope_key            TEXT PRIMARY KEY,
+            policy_id            TEXT NOT NULL,
+            source_ref           TEXT DEFAULT NULL,
+            fetched_at           TEXT NOT NULL,
+            expires_at           TEXT DEFAULT NULL,
+            cache_deadline       TEXT DEFAULT NULL,
+            payload_json         TEXT NOT NULL
+        );
+        CREATE INDEX idx_premium_control_plane_cache_deadline
+            ON premium_control_plane_cache(cache_deadline, fetched_at DESC);
+        """,
+        "premium_control_plane_cache table (v3.6.0)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='memory_fts_obs_ai'",

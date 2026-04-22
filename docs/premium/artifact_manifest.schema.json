@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RMANOV/sqlite-memory-mcp/docs/premium/artifact_manifest.schema.json",
+  "title": "sqlite-memory premium artifact manifest",
+  "type": "object",
+  "required": [
+    "manifest_id",
+    "extension_name",
+    "entrypoint_ref",
+    "entrypoint_sha256",
+    "contract_version",
+    "protection_phase",
+    "signature"
+  ],
+  "properties": {
+    "manifest_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "extension_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "customer_id": {
+      "type": "string"
+    },
+    "build_id": {
+      "type": "string"
+    },
+    "entrypoint_ref": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "entrypoint_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "contract_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "minimum_host_version": {
+      "type": "string"
+    },
+    "maximum_host_version": {
+      "type": "string"
+    },
+    "protection_phase": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "issued_at": {
+      "type": "string"
+    },
+    "expires_at": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "object",
+      "required": [
+        "alg",
+        "value"
+      ],
+      "properties": {
+        "alg": {
+          "const": "ed25519"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -12,6 +12,7 @@ This template is intentionally safe to keep in the OSS repo:
 - no customer entitlements
 - no premium connector secrets
 - no proprietary ranking / governance logic
+- no signed artifact manifests or control-plane policy documents
 
 ## Purpose
 
@@ -60,6 +61,15 @@ This public-safe template tracks the current premium contract boundary for:
 
 The template still uses placeholders, but the declared features, packs, and
 optional tray-extension hook should match the public OSS contract.
+
+The current contract also carries:
+
+- `host_runtime_version`
+- `installation_fingerprint`
+- `manifest_id`
+- `protection_phase`
+- `_premium_artifact_manifest` in `mount_context.config` when present
+- `_premium_control_policy` in `mount_context.config` when present
 
 ## Minimal flow
 

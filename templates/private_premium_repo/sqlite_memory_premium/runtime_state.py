@@ -20,6 +20,10 @@ class RuntimeState:
     server_name: str = "sqlite-memory-premium-template"
     contract_version: str = ""
     machine_id: str = ""
+    host_runtime_version: str = ""
+    installation_fingerprint: str = ""
+    manifest_id: str = ""
+    protection_phase: int = 1
     config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -49,6 +53,17 @@ def configure_runtime(
     )
     _STATE.contract_version = contract_version
     _STATE.machine_id = getattr(mount_context, "machine_id", "")
+    _STATE.host_runtime_version = getattr(mount_context, "host_runtime_version", "")
+    _STATE.installation_fingerprint = getattr(
+        mount_context,
+        "installation_fingerprint",
+        "",
+    )
+    _STATE.manifest_id = getattr(mount_context, "manifest_id", "")
+    _STATE.protection_phase = max(
+        int(getattr(mount_context, "protection_phase", 1) or 1),
+        1,
+    )
     _STATE.config = dict(getattr(mount_context, "config", {}) or {})
     return _STATE
 
