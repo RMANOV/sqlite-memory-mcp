@@ -981,7 +981,11 @@ def _sqlite_has_column(
         rows = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
     except sqlite3.OperationalError:
         return False
-    return any(r["name"] == column_name for r in rows)
+    # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk).
+    # Use positional access so this works whether the caller's connection has
+    # row_factory=sqlite3.Row set or returns plain tuples (bin/task opens a
+    # raw connection without row_factory).
+    return any(r[1] == column_name for r in rows)
 
 
 def _new_event_id() -> str:
@@ -1040,7 +1044,9 @@ def _next_logical_clock(
         "SELECT last_clock FROM memory_cursors WHERE machine_id = ?",
         (mid,),
     ).fetchone()
-    current = int(row["last_clock"]) if row else 0
+    # Positional access works whether the caller's connection has
+    # row_factory=sqlite3.Row set or returns plain tuples.
+    current = int(row[0]) if row else 0
     current_ms, current_counter = _decode_logical_clock(current)
     floor_ms, floor_counter = _decode_logical_clock(floor_value)
     physical_ms = max(now_ms, current_ms, floor_ms)
@@ -1080,7 +1086,9 @@ def _observe_logical_clock(
         "SELECT last_clock FROM memory_cursors WHERE machine_id = ?",
         (mid,),
     ).fetchone()
-    current = int(row["last_clock"]) if row else 0
+    # Positional access works whether the caller's connection has
+    # row_factory=sqlite3.Row set or returns plain tuples.
+    current = int(row[0]) if row else 0
     next_clock = max(current, observed)
     conn.execute(
         "INSERT INTO memory_cursors (machine_id, last_clock, updated_at) "

@@ -48,6 +48,7 @@ import datetime, json, os, sqlite3, sys, uuid
 sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
 from db_utils import create_task_with_ledger
 c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
+c.row_factory = sqlite3.Row
 c.execute('PRAGMA busy_timeout=10000')
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 t, s, p = os.environ['TASK_TITLE'], os.environ['TASK_SECTION'], os.environ['TASK_PRIORITY']
@@ -94,6 +95,7 @@ import datetime, os, sqlite3, sys
 sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
 from db_utils import mark_tasks_done_by_title
 c = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
+c.row_factory = sqlite3.Row
 c.execute('PRAGMA busy_timeout=10000')
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 count = mark_tasks_done_by_title(
