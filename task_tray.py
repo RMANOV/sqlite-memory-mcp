@@ -1124,6 +1124,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._sync_cooldown_until: float = (
             0.0  # monotonic; suppresses watcher→sync cascade
         )
+        self._initial_auto_sync_pending = True
         self._db_refresh_debounce = QTimer(self)
         self._db_refresh_debounce.setSingleShot(True)
         self._db_refresh_debounce.setInterval(500)  # 500ms UI debounce
@@ -1385,6 +1386,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """Refresh task list then sync memory bridge to GitHub."""
         self.refresh()
         self._sync_bridge()
+
+    def _maybe_schedule_initial_auto_sync(self):
+        """Arm one startup sync after the full window is first shown."""
+        if not getattr(self, "_initial_auto_sync_pending", False):
+            return
+        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
+            return
+        self._auto_sync_timer.start()
 
     def _run_enrich(self, depth: str = "quick"):
         """Run Intelligence v2 enrich pipeline in background thread."""
@@ -1962,7 +1971,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         super().showEvent(event)
         self._refresh_timer.start(_REFRESH_INTERVAL_MS)
         self._purge_timer.start(_PURGE_INTERVAL_MS)
-        self._auto_sync_timer.start()
+        self._maybe_schedule_initial_auto_sync()
         self.refresh()
 
     def closeEvent(self, event):

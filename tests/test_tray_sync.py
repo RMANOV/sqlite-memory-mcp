@@ -46,6 +46,7 @@ class _DummyWindow(BridgeSyncMixin):
         self._excluded_filters = _empty_filters()
         self._sync_run_active = False
         self._sync_cooldown_until = 0.0
+        self._initial_auto_sync_pending = True
         self.saved_ui_state = False
         self.restored_geometry = None
 
@@ -317,6 +318,7 @@ def test_start_bridge_sync_thread_marks_sync_active_while_worker_runs(bridge_env
     assert window._start_bridge_sync_thread(_worker) is True
     assert started.wait(1.0) is True
     assert window._sync_run_active is True
+    assert window._initial_auto_sync_pending is False
 
     release.set()
     deadline = time.time() + 1.0
@@ -376,3 +378,31 @@ def test_db_dir_change_with_watch_path_delta_rearms_auto_sync_timer():
 
     assert refreshes == ["refresh"]
     assert starts == ["auto-sync"]
+
+
+def test_initial_auto_sync_only_arms_while_pending():
+    starts = []
+    dummy = SimpleNamespace(
+        _initial_auto_sync_pending=True,
+        _sync_run_active=False,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._maybe_schedule_initial_auto_sync(dummy)
+
+    assert starts == ["auto-sync"]
+
+
+def test_initial_auto_sync_does_not_rearm_after_pending_consumed():
+    starts = []
+    dummy = SimpleNamespace(
+        _initial_auto_sync_pending=False,
+        _sync_run_active=False,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._maybe_schedule_initial_auto_sync(dummy)
+
+    assert starts == []

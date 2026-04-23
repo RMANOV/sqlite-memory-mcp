@@ -71,6 +71,8 @@ class BridgeSyncMixin:
                 self.status.showMessage(busy_message, 3000)
             return False
 
+        if hasattr(self, "_initial_auto_sync_pending"):
+            self._initial_auto_sync_pending = False
         self._sync_run_active = True
         auto_sync_timer = getattr(self, "_auto_sync_timer", None)
         if auto_sync_timer is not None:
