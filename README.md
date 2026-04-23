@@ -6,6 +6,8 @@
 - **Dev.to:** [The Amnesiac That Learned to Remember — Building a Brain for Claude Code](https://dev.to/ruslan_manov/the-amnesiac-that-learned-to-remember-building-a-brain-for-claude-code-1ok6)
 - **Dev.to:** [How a SQLite WAL Fix Grew into a 54-Tool MCP Memory Stack](https://dev.to/ruslan_manov/how-a-sqlite-wal-fix-grew-into-a-54-tool-mcp-memory-stack-4nkl)
 
+[![CI](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml)
+
 A production-quality SQLite-backed MCP Memory stack with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system tray task manager.
 
 Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 47 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (56 OSS tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
