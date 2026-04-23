@@ -57,6 +57,7 @@ What is in this OSS repo:
 - signed artifact manifest schema (`docs/premium/artifact_manifest.schema.json`)
 - signed control-plane policy schema (`docs/premium/control_plane_policy.schema.json`)
 - a public-safe bootstrap template for the separate private repo (`templates/private_premium_repo/`)
+- operator wiring guide (env vars, canonical signing payload, rotation) in [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md)
 
 What is **not** in this OSS repo:
 
