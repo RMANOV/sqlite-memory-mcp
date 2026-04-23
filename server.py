@@ -718,7 +718,12 @@ def open_nodes(names: list[str]) -> str:
 # Startup
 # ═══════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+
+def main() -> None:
     _migrate_jsonl()
     maybe_mount_premium_extensions(mcp, server_name="sqlite-kb")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

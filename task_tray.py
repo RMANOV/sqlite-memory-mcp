@@ -1145,22 +1145,29 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def _on_db_dir_changed(self, path):
         """Directory changed — catch WAL create/rotate events."""
         self._db_refresh_debounce.start()
-        self._refresh_db_watch_paths()
+        watch_paths_changed = self._refresh_db_watch_paths()
         if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return
-        self._auto_sync_timer.start()
+        if watch_paths_changed:
+            self._auto_sync_timer.start()
 
     def _refresh_db_watch_paths(self):
         """Ensure DB watcher tracks the DB, WAL, and parent directory."""
-        wanted = {self._db_watch_dir}
+        wanted_dirs = {self._db_watch_dir}
+        wanted_files = set()
         db_path = Path(self.db.db_path)
         for candidate in (db_path, Path(f"{self.db.db_path}-wal")):
             if candidate.exists():
-                wanted.add(str(candidate))
-        current = set(self._db_watcher.files()) | set(self._db_watcher.directories())
-        missing = sorted(wanted - current)
+                wanted_files.add(str(candidate))
+        current_files = set(self._db_watcher.files())
+        current_dirs = set(self._db_watcher.directories())
+        stale = sorted((current_files - wanted_files) | (current_dirs - wanted_dirs))
+        if stale:
+            self._db_watcher.removePaths(stale)
+        missing = sorted((wanted_files - current_files) | (wanted_dirs - current_dirs))
         if missing:
             self._db_watcher.addPaths(missing)
+        return bool(stale or missing)
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)

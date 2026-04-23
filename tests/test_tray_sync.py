@@ -342,3 +342,37 @@ def test_db_change_during_sync_does_not_rearm_auto_sync_timer(bridge_env):
 
     assert refreshes == ["refresh", "refresh"]
     assert starts == []
+
+
+def test_db_dir_change_without_watch_path_delta_does_not_rearm_auto_sync_timer():
+    starts = []
+    refreshes = []
+    dummy = SimpleNamespace(
+        _db_refresh_debounce=SimpleNamespace(start=lambda: refreshes.append("refresh")),
+        _refresh_db_watch_paths=lambda: False,
+        _sync_run_active=False,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._on_db_dir_changed(dummy, "ignored")
+
+    assert refreshes == ["refresh"]
+    assert starts == []
+
+
+def test_db_dir_change_with_watch_path_delta_rearms_auto_sync_timer():
+    starts = []
+    refreshes = []
+    dummy = SimpleNamespace(
+        _db_refresh_debounce=SimpleNamespace(start=lambda: refreshes.append("refresh")),
+        _refresh_db_watch_paths=lambda: True,
+        _sync_run_active=False,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._on_db_dir_changed(dummy, "ignored")
+
+    assert refreshes == ["refresh"]
+    assert starts == ["auto-sync"]

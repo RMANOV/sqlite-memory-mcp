@@ -1107,7 +1107,7 @@ def _event_sort_key(
 ) -> tuple[int, Any, str]:
     if int(logical_clock or 0) >= _HLC_PACKED_MIN:
         return (1, int(logical_clock), str(machine_id or ""))
-    return (0, str(event_ts or ""), str(machine_id or ""))
+    return (0, parse_iso_datetime_for_compare(event_ts), str(machine_id or ""))
 
 
 def record_memory_event(
@@ -1712,6 +1712,12 @@ def parse_iso_datetime_for_compare(value: str | None) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_is_newer(candidate_ts: str | None, baseline_ts: str | None) -> bool:
+    return parse_iso_datetime_for_compare(
+        candidate_ts
+    ) > parse_iso_datetime_for_compare(baseline_ts)
 
 
 def parse_iso_date(s: str | None) -> date | None:
@@ -3618,7 +3624,7 @@ def _field_version_sort_key(
     """Prefer packed HLC clocks; fall back to timestamp ordering for legacy peers."""
     if int(updated_order or 0) >= _HLC_PACKED_MIN:
         return (1, int(updated_order), str(updated_by or ""))
-    return (0, str(updated_at or ""), str(updated_by or ""))
+    return (0, parse_iso_datetime_for_compare(updated_at), str(updated_by or ""))
 
 
 def merge_import_tasks(
@@ -3742,13 +3748,15 @@ def merge_import_tasks(
                     remote_status_state.get("source_event_id"),
                 )
                 remote["_field_ts"] = remote_fts
-                if remote_status_state.get("updated_at", "") > fallback_ts:
+                if _timestamp_is_newer(
+                    remote_status_state.get("updated_at", ""), fallback_ts
+                ):
                     remote["updated_at"] = remote_status_state["updated_at"]
                     fallback_ts = remote["updated_at"]
 
         # Clock skew detection + clamping: prevent future timestamps from
         # permanently winning all LWW merges (LW-02 fix)
-        if fallback_ts > now:
+        if _timestamp_is_newer(fallback_ts, now):
             try:
                 delta = (
                     datetime.fromisoformat(fallback_ts) - datetime.fromisoformat(now)
@@ -3764,11 +3772,15 @@ def merge_import_tasks(
                         _clock_skew_warned = True
                     # Clamp all future field timestamps to now
                     fallback_ts = now
-                    if remote.get("updated_at", "") > now:
+                    if _timestamp_is_newer(remote.get("updated_at", ""), now):
                         remote["updated_at"] = now
                     fts = remote.get("_field_ts", {})
                     for f_key, f_val in fts.items():
-                        if isinstance(f_val, list) and f_val and str(f_val[0]) > now:
+                        if (
+                            isinstance(f_val, list)
+                            and f_val
+                            and _timestamp_is_newer(str(f_val[0]), now)
+                        ):
                             f_val[0] = now
             except (ValueError, TypeError):
                 pass
@@ -4059,7 +4071,7 @@ def merge_import_tasks(
                             if safe_fields[merged_field] is not None
                             else None,
                         )
-            elif remote_updated_at > local_updated_at:
+            elif _timestamp_is_newer(remote_updated_at, local_updated_at):
                 conn.execute(
                     "UPDATE tasks SET updated_at = ? WHERE id = ?",
                     (remote_updated_at, local_id),

@@ -15,15 +15,15 @@ speed = ["orjson>=3.9.0"]
 vector = ["sqlite-vec>=0.1.6", "sentence-transformers>=3.0.0"]
 
 [project.scripts]
-sqlite-memory-mcp = "server:mcp.run"
-sqlite-memory-core = "server:mcp.run"
-sqlite-memory-session = "session_server:mcp.run"
-sqlite-memory-tasks = "task_server:mcp.run"
-sqlite-memory-bridge = "bridge_server:mcp.run"
-sqlite-memory-collab = "collab_server:mcp.run"
-sqlite-memory-entity = "entity_server:mcp.run"
-sqlite-memory-intel = "intel_server:mcp.run"
-sqlite-memory-unified = "unified_server:mcp.run"
+sqlite-memory-mcp = "server:main"
+sqlite-memory-core = "server:main"
+sqlite-memory-session = "session_server:main"
+sqlite-memory-tasks = "task_server:main"
+sqlite-memory-bridge = "bridge_server:main"
+sqlite-memory-collab = "collab_server:main"
+sqlite-memory-entity = "entity_server:main"
+sqlite-memory-intel = "intel_server:main"
+sqlite-memory-unified = "unified_server:main"
 task-tray = "task_tray:main"
 memory-digest = "daily_digest:main"
 

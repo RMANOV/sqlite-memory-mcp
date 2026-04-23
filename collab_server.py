@@ -107,7 +107,6 @@ def _compute_truth_score(entity_name: str, conn) -> dict[str, Any]:
     """
     # Get current content hash
     result = _entity_content_hash(conn, entity_name)
-    observations = result[1] if result else []
     c_hash = result[0] if result else _content_hash(entity_name, [])
 
     # Get ratings for current content version
@@ -1180,6 +1179,10 @@ def update_verification(
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-collab")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

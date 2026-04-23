@@ -78,6 +78,11 @@ from surface_contract import (
 
 logger = setup_logger("sqlite-bridge", "bridge_server.log")
 
+
+def _is_newer_timestamp(candidate_ts: str | None, baseline_ts: str | None) -> bool:
+    return _parse_iso_dt(candidate_ts) > _parse_iso_dt(baseline_ts)
+
+
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -1058,7 +1063,9 @@ def bridge_pull() -> str:
                     "SELECT updated_at FROM tasks WHERE id = ?", (tid,)
                 ).fetchone()
                 if existing:
-                    if task.get("updated_at", "") > existing["updated_at"]:
+                    if _is_newer_timestamp(
+                        task.get("updated_at", ""), existing["updated_at"]
+                    ):
                         # Content protection: don't overwrite non-NULL local with NULL remote
                         local_content = conn.execute(
                             "SELECT description, notes FROM tasks WHERE id=?", (tid,)
@@ -1623,9 +1630,8 @@ def review_shared_tasks(
                 ).fetchone()
                 if existing:
                     remote_ts = t.get("updated_at", "")
-                    if (
-                        _is_valid_timestamp(remote_ts)
-                        and remote_ts > existing["updated_at"]
+                    if _is_valid_timestamp(remote_ts) and _is_newer_timestamp(
+                        remote_ts, existing["updated_at"]
                     ):
                         # Content protection: don't overwrite non-NULL local with NULL remote
                         local_content = conn.execute(
@@ -1741,6 +1747,10 @@ def process_recurring_tasks(dry_run: bool = False) -> str:
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-bridge")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

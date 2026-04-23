@@ -446,6 +446,10 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-entity")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

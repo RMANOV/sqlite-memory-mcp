@@ -289,6 +289,10 @@ def resume_context(
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-session")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

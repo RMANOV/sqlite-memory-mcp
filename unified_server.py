@@ -16,9 +16,6 @@ from fastmcp import FastMCP
 from db_utils import ensure_db_initialized, setup_logger
 from premium_runtime import maybe_mount_premium_extensions
 
-# ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
-logger = setup_logger("sqlite-unified", "unified_server.log")
-
 # ── Import satellite server mcp objects ──────────────────────────────────
 # Each module creates its own FastMCP instance and registers tools via
 # @mcp.tool() at import time. We mount them all into a unified instance.
@@ -42,6 +39,9 @@ from bridge_server import mcp as bridge_mcp  # 6 tools: bridge push/pull/status/
 from collab_server import (
     mcp as collab_mcp,
 )  # 9 tools: collaboration/sharing/verification
+
+# ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
+logger = setup_logger("sqlite-unified", "unified_server.log")
 
 # ── Unified server ───────────────────────────────────────────────────────
 
@@ -74,7 +74,12 @@ logger.info(
     7,
 )
 
-if __name__ == "__main__":
+
+def main() -> None:
     ensure_db_initialized()
     maybe_mount_premium_extensions(mcp, server_name="sqlite-unified")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

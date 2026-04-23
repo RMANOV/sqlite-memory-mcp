@@ -3,6 +3,10 @@
 import logging
 import os
 import sys
+import tomllib
+from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -15,6 +19,9 @@ import server
 import session_server
 import task_server
 import unified_server
+
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_server_exposes_sqlite3_for_fallback_handlers():
@@ -40,6 +47,75 @@ def test_tool_decorators_keep_fn_alias_for_direct_invocation_regressions():
 
 def test_unified_server_imports_and_exposes_mcp_instance():
     assert hasattr(unified_server, "mcp")
+
+
+def test_project_scripts_call_main_wrappers():
+    with (_ROOT / "pyproject.toml").open("rb") as fh:
+        scripts = tomllib.load(fh)["project"]["scripts"]
+
+    assert scripts["sqlite-memory-mcp"] == "server:main"
+    assert scripts["sqlite-memory-core"] == "server:main"
+    assert scripts["sqlite-memory-session"] == "session_server:main"
+    assert scripts["sqlite-memory-tasks"] == "task_server:main"
+    assert scripts["sqlite-memory-bridge"] == "bridge_server:main"
+    assert scripts["sqlite-memory-collab"] == "collab_server:main"
+    assert scripts["sqlite-memory-entity"] == "entity_server:main"
+    assert scripts["sqlite-memory-intel"] == "intel_server:main"
+    assert scripts["sqlite-memory-unified"] == "unified_server:main"
+
+
+@pytest.mark.parametrize(
+    ("module", "server_name", "startup_hook", "hook_label"),
+    [
+        (server, "sqlite-kb", "_migrate_jsonl", "migrate"),
+        (session_server, "sqlite-session", None, None),
+        (task_server, "sqlite-tasks", None, None),
+        (bridge_server, "sqlite-bridge", None, None),
+        (collab_server, "sqlite-collab", None, None),
+        (entity_server, "sqlite-entity", None, None),
+        (intel_server, "sqlite-intel", None, None),
+        (unified_server, "sqlite-unified", "ensure_db_initialized", "ensure_db"),
+    ],
+    ids=lambda value: (
+        getattr(value, "__name__", value) if value is not None else "none"
+    ),
+)
+def test_server_main_wrappers_preserve_startup_hooks(
+    monkeypatch,
+    module,
+    server_name,
+    startup_hook,
+    hook_label,
+):
+    calls = []
+
+    if startup_hook:
+        monkeypatch.setattr(
+            module,
+            startup_hook,
+            lambda: calls.append((hook_label,)),
+        )
+    monkeypatch.setattr(
+        module,
+        "maybe_mount_premium_extensions",
+        lambda mounted_mcp, server_name=server_name: calls.append(
+            ("mount", server_name, mounted_mcp)
+        ),
+    )
+    monkeypatch.setattr(
+        module.mcp,
+        "run",
+        lambda transport="stdio": calls.append(("run", transport)),
+    )
+
+    module.main()
+
+    expected = []
+    if hook_label:
+        expected.append((hook_label,))
+    expected.append(("mount", server_name, module.mcp))
+    expected.append(("run", "stdio"))
+    assert calls == expected
 
 
 def test_task_server_instructions_make_description_the_default_body_field():

@@ -239,6 +239,70 @@ def test_bridge_pull_falls_back_to_shared_json_when_index_is_corrupt(
     assert row["title"] == "Legacy fallback task"
 
 
+def test_bridge_pull_shared_json_ignores_older_mixed_offset_remote_task(
+    bridge_env, monkeypatch
+):
+    db_path, bridge_dir = bridge_env
+    task_id = "task-legacy-offset"
+    local_ts = "2026-03-24T10:00:00Z"
+    remote_ts = "2026-03-24T11:00:00+02:00"
+
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, section, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                "Local task",
+                "Local description",
+                "not_started",
+                "medium",
+                "inbox",
+                local_ts,
+                local_ts,
+            ),
+        )
+
+    (bridge_dir / "index.json").write_text("{bad json", encoding="utf-8")
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": task_id,
+                        "title": "Remote stale task",
+                        "description": "Remote stale description",
+                        "status": "not_started",
+                        "priority": "medium",
+                        "section": "inbox",
+                        "created_at": remote_ts,
+                        "updated_at": remote_ts,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
+
+    result = json.loads(bridge_server.bridge_pull.fn())
+
+    with _db_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT title, description, updated_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+
+    assert result["updated_tasks"] == 0
+    assert row["title"] == "Local task"
+    assert row["description"] == "Local description"
+    assert row["updated_at"] == local_ts
+
+
 def test_bridge_pull_falls_back_to_shared_json_when_entities_index_is_corrupt(
     bridge_env, monkeypatch
 ):
@@ -826,4 +890,72 @@ def test_review_shared_tasks_approve_creates_ledgered_task(bridge_env):
     assert task["shared_by"] == "alice"
     assert fields > 0
     assert events > 0
+    assert pending == 0
+
+
+def test_review_shared_tasks_approve_ignores_older_mixed_offset_remote_update(
+    bridge_env,
+):
+    db_path, _ = bridge_env
+    task_id = "shared-task-offset"
+    local_ts = "2026-03-24T10:00:00Z"
+    remote_ts = "2026-03-24T11:00:00+02:00"
+
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, section, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                "Local task",
+                "Local description",
+                "not_started",
+                "medium",
+                "inbox",
+                local_ts,
+                local_ts,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO pending_shared_tasks "
+            "(id, title, description, status, priority, section, due_date, project, "
+            "parent_id, notes, recurring, type, assignee, shared_by, created_at, updated_at, received_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                "Remote stale task",
+                "Remote stale description",
+                "not_started",
+                "medium",
+                "inbox",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "task",
+                None,
+                "alice",
+                remote_ts,
+                remote_ts,
+                remote_ts,
+            ),
+        )
+
+    result = json.loads(bridge_server.review_shared_tasks.fn(action="approve"))
+
+    with _db_conn(db_path) as conn:
+        task = conn.execute(
+            "SELECT title, description, updated_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM pending_shared_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()["cnt"]
+
+    assert result["approved"] == 0
+    assert task["title"] == "Local task"
+    assert task["description"] == "Local description"
+    assert task["updated_at"] == local_ts
     assert pending == 0

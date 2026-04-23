@@ -34,6 +34,7 @@ from retrieval_contract import (
     score_lookup_surface,
 )
 from premium_runtime import maybe_mount_premium_extensions
+from task_search import TaskSearchEngine
 
 # Pre-built SQL for active-task exclusion
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
@@ -41,9 +42,6 @@ _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
 logger = setup_logger("sqlite-tasks", "task_server.log")
-
-# ── Unified search engine (shared across query_tasks calls) ──────────────
-from task_search import TaskSearchEngine
 
 _search_engine = TaskSearchEngine()
 
@@ -247,7 +245,6 @@ def update_task(
     updates["updated_at"] = _now()
 
     with _get_conn() as conn:
-        changed_keys = [k for k in updates if k != "updated_at"]
         result = _apply_task_mutation(
             conn,
             task_id,
@@ -748,6 +745,10 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-tasks")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

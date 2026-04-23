@@ -854,6 +854,85 @@ def test_legacy_updated_order_falls_back_to_timestamp_ordering():
     assert remote_key > local_key
 
 
+def test_legacy_field_version_sort_normalizes_mixed_offsets():
+    newer = _field_version_sort_key(
+        "2026-03-24T10:00:00Z",
+        "machine-A",
+        0,
+    )
+    older = _field_version_sort_key(
+        "2026-03-24T11:00:00+02:00",
+        "machine-B",
+        0,
+    )
+
+    assert newer > older
+
+
+def test_legacy_mixed_offset_remote_field_does_not_overwrite_newer_local(conn):
+    tid = "task-offset-field"
+    local_ts = "2026-03-24T10:00:00Z"
+    remote_ts = "2026-03-24T11:00:00+02:00"
+
+    _insert_task(conn, tid, title="Local title", updated_at=local_ts)
+    upsert_field_versions(
+        conn, tid, ["title"], timestamp=local_ts, machine_id="machine-A"
+    )
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Remote stale title",
+            "updated_at": remote_ts,
+            "_field_ts": {"title": [remote_ts, "machine-B"]},
+        }
+    ]
+    _, updated = merge_import_tasks(conn, remote)
+
+    assert updated == 0
+    assert _task(conn, tid)["title"] == "Local title"
+    assert _fv(conn, tid, "title") == (local_ts, "machine-A")
+
+
+def test_metadata_only_merge_preserves_newer_updated_at_across_mixed_offsets(conn):
+    tid = "task-offset-updated-at"
+    local_ts = "2026-03-24T10:00:00Z"
+    remote_ts = "2026-03-24T11:00:00+02:00"
+
+    _insert_task(conn, tid, title="Stable title", updated_at=local_ts)
+    upsert_field_versions(
+        conn,
+        tid,
+        ["title", "status", "priority", "section", "type"],
+        timestamp=local_ts,
+        machine_id="machine-A",
+    )
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Stable title",
+            "status": "not_started",
+            "priority": "medium",
+            "section": "inbox",
+            "type": "task",
+            "updated_at": remote_ts,
+            "_field_ts": {
+                "title": [local_ts, "machine-A"],
+                "status": [local_ts, "machine-A"],
+                "priority": [local_ts, "machine-A"],
+                "section": [local_ts, "machine-A"],
+                "type": [local_ts, "machine-A"],
+            },
+        }
+    ]
+
+    _, updated = merge_import_tasks(conn, remote, import_content=False)
+
+    assert updated == 0
+    assert _task(conn, tid)["updated_at"] == local_ts
+
+
 def test_packed_logical_clock_order_is_globally_comparable():
     older = _pack_logical_clock(1_743_412_800_000, 0)
     newer = _pack_logical_clock(1_743_412_801_000, 0)

@@ -504,6 +504,10 @@ def enrich_context(depth: str = "quick") -> str:
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-intel")
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
