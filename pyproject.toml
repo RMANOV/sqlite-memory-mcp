@@ -4,7 +4,7 @@ version = "3.7.0"
 description = "SQLite-backed MCP Memory Server with hybrid search (BM25 + semantic via sqlite-vec), Intelligence v2, causal event ledger, premium runtime boundary, context state machine, knowledge tiers, WAL concurrent safety, cross-machine bridge sync, and 56 OSS MCP tools"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=2.0.0"]
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "rmanov"}]
 readme = "README.md"
 
@@ -26,6 +26,57 @@ sqlite-memory-intel = "intel_server:main"
 sqlite-memory-unified = "unified_server:main"
 task-tray = "task_tray:main"
 memory-digest = "daily_digest:main"
+
+[tool.setuptools]
+py-modules = [
+    "advanced_context",
+    "auto_archive",
+    "bridge_server",
+    "bridge_sync_worker",
+    "claim_graph",
+    "collab_server",
+    "context_packer",
+    "daily_digest",
+    "db_utils",
+    "enrichment_constants",
+    "entity_server",
+    "fastmcp_compat",
+    "impact_graph",
+    "import_notion",
+    "intel_server",
+    "intelligence_v2",
+    "lazy_enrichment",
+    "memory_audit",
+    "overdue_bump",
+    "premium_contract",
+    "premium_runtime",
+    "premium_task_tray",
+    "recurring_tasks",
+    "retrieval_contract",
+    "runtime_parity",
+    "schema",
+    "server",
+    "session_server",
+    "smart_retrieval",
+    "surface_contract",
+    "task_report",
+    "task_search",
+    "task_server",
+    "task_tray",
+    "tray_dialogs",
+    "tray_filters",
+    "tray_sync",
+    "unified_server",
+    "vec_search",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hooks", "hooks.*", "templates", "templates.*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"templates.private_premium_repo" = [".gitignore", "README.md", "pyproject.toml"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
