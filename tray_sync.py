@@ -71,11 +71,17 @@ class BridgeSyncMixin:
                 self.status.showMessage(busy_message, 3000)
             return False
 
+        self._sync_run_active = True
+        auto_sync_timer = getattr(self, "_auto_sync_timer", None)
+        if auto_sync_timer is not None:
+            auto_sync_timer.stop()
+
         def _wrapped():
             try:
                 target()
             finally:
                 self._sync_cooldown_until = time.monotonic() + 5.0
+                self._sync_run_active = False
                 self._bridge_thread_lock.release()
 
         threading.Thread(target=_wrapped, daemon=True).start()

@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from bridge_sync_worker import _ui_profile_changed
 import task_tray
 from tray_sync import BridgeSyncMixin
 
@@ -42,6 +44,8 @@ class _DummyWindow(BridgeSyncMixin):
         self._sort_mode = "priority"
         self._active_filters = _empty_filters()
         self._excluded_filters = _empty_filters()
+        self._sync_run_active = False
+        self._sync_cooldown_until = 0.0
         self.saved_ui_state = False
         self.restored_geometry = None
 
@@ -218,6 +222,30 @@ def test_build_ui_profile_serializes_current_window_state(bridge_env, monkeypatc
     assert profile["geometry_b64"]
 
 
+def test_ui_profile_diff_ignores_updated_at(bridge_env):
+    profile = {
+        "theme": "blue",
+        "font_size": 14,
+        "bold": True,
+        "active_tab": 1,
+        "tab_views": {
+            "today": {"sort": "priority", "active": {}, "excluded": {}, "params": {}}
+        },
+        "updated_at": "2026-04-23T09:00:00+00:00",
+    }
+    (bridge_env / "shared.json").write_text(
+        json.dumps({"ui_profiles": {"test-host": profile}}),
+        encoding="utf-8",
+    )
+
+    current = dict(profile)
+    current["updated_at"] = "2026-04-23T09:05:00+00:00"
+
+    assert (
+        _ui_profile_changed(bridge_env / "shared.json", "test-host", current) is False
+    )
+
+
 def test_sync_bridge_skips_when_thread_already_running(bridge_env):
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
@@ -259,6 +287,8 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
 def test_start_bridge_sync_thread_releases_lock_after_worker_finishes(bridge_env):
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
+    stops = []
+    window._auto_sync_timer = SimpleNamespace(stop=lambda: stops.append(True))
     completed = []
 
     assert window._start_bridge_sync_thread(lambda: completed.append(True)) is True
@@ -267,5 +297,48 @@ def test_start_bridge_sync_thread_releases_lock_after_worker_finishes(bridge_env
         time.sleep(0.01)
 
     assert completed == [True]
+    assert stops == [True]
     assert window._bridge_thread_lock.locked() is False
+    assert window._sync_run_active is False
     assert window._sync_cooldown_until > 0
+
+
+def test_start_bridge_sync_thread_marks_sync_active_while_worker_runs(bridge_env):
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._auto_sync_timer = SimpleNamespace(stop=lambda: None)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _worker():
+        started.set()
+        release.wait(1.0)
+
+    assert window._start_bridge_sync_thread(_worker) is True
+    assert started.wait(1.0) is True
+    assert window._sync_run_active is True
+
+    release.set()
+    deadline = time.time() + 1.0
+    while time.time() < deadline and window._bridge_thread_lock.locked():
+        time.sleep(0.01)
+
+    assert window._sync_run_active is False
+
+
+def test_db_change_during_sync_does_not_rearm_auto_sync_timer(bridge_env):
+    starts = []
+    refreshes = []
+    dummy = SimpleNamespace(
+        _db_refresh_debounce=SimpleNamespace(start=lambda: refreshes.append("refresh")),
+        _refresh_db_watch_paths=lambda: None,
+        _sync_run_active=True,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._on_db_changed(dummy, "ignored")
+    task_tray.FullWindow._on_db_dir_changed(dummy, "ignored")
+
+    assert refreshes == ["refresh", "refresh"]
+    assert starts == []

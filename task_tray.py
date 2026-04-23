@@ -4,6 +4,8 @@ System tray widget with dual mode: compact popup + full window.
 Reads/writes directly to ~/.claude/memory/memory.db.
 """
 
+# ruff: noqa: E402
+
 import atexit
 import copy
 import faulthandler
@@ -86,7 +88,6 @@ from task_search import TaskSearchEngine
 
 from db_utils import (
     DB_PATH,
-    MERGEABLE_FIELDS,
     TaskDAO,
     add_task_attachment,
     apply_task_mutation,
@@ -336,7 +337,6 @@ class TaskDB:
         if not fields:
             return False
         now = now_iso()
-        changed = tuple(k for k in fields if k in MERGEABLE_FIELDS)
         with self._transact(self._conn):
             result = apply_task_mutation(
                 self._conn,
@@ -1120,6 +1120,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._periodic_pull_timer.setInterval(5 * 60_000)  # 5 minutes
         self._periodic_pull_timer.timeout.connect(self._periodic_pull)
         self._periodic_pull_timer.start()
+        self._sync_run_active = False
         self._sync_cooldown_until: float = (
             0.0  # monotonic; suppresses watcher→sync cascade
         )
@@ -1137,7 +1138,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """DB file changed — start/restart debounce timers."""
         self._db_refresh_debounce.start()  # 500ms UI refresh debounce
         self._refresh_db_watch_paths()
-        if time.monotonic() < self._sync_cooldown_until:
+        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return  # suppress sync cascade from own sync operations
         self._auto_sync_timer.start()  # 60s bridge sync debounce
 
@@ -1145,7 +1146,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """Directory changed — catch WAL create/rotate events."""
         self._db_refresh_debounce.start()
         self._refresh_db_watch_paths()
-        if time.monotonic() < self._sync_cooldown_until:
+        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return
         self._auto_sync_timer.start()
 

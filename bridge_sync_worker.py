@@ -166,6 +166,15 @@ def _ui_profile_changed(
     shared_path: Path, machine_id: str, ui_profile: dict | None
 ) -> bool:
     """Return True when a tray UI profile needs to be exported."""
+
+    def _normalize(profile: dict | None) -> dict | None:
+        if not isinstance(profile, dict):
+            return profile
+        normalized = dict(profile)
+        # Ignore volatile timestamps when deciding whether the tray profile changed.
+        normalized.pop("updated_at", None)
+        return normalized
+
     if ui_profile is None:
         return False
     if not shared_path.exists():
@@ -175,7 +184,7 @@ def _ui_profile_changed(
     except (ValueError, OSError):
         return True
     profiles = existing.get("ui_profiles", {})
-    return profiles.get(machine_id) != ui_profile
+    return _normalize(profiles.get(machine_id)) != _normalize(ui_profile)
 
 
 def _check_sync_safety(
