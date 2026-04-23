@@ -55,7 +55,7 @@ class TestTaskDB:
         assert tasks[0]["status"] == "not_started"
 
     def test_add_task_full(self, db):
-        task_id = db.add_task(
+        db.add_task(
             "Full task",
             section="today",
             priority="high",

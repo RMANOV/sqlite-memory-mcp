@@ -277,7 +277,7 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     monkeypatch.setattr(
         window,
         "_start_bridge_sync_thread",
-        lambda target, busy_message=None: (target(), True)[1],
+        lambda target, busy_message=None, **kwargs: (target(), True)[1],
     )
 
     window._periodic_pull()
@@ -406,3 +406,28 @@ def test_initial_auto_sync_does_not_rearm_after_pending_consumed():
     task_tray.FullWindow._maybe_schedule_initial_auto_sync(dummy)
 
     assert starts == []
+
+
+def test_auto_sync_triggered_uses_pending_initiator():
+    captured = []
+    dummy = SimpleNamespace(
+        _pending_auto_sync_initiator="db_file_change",
+        _sync_bridge=lambda initiator="manual": captured.append(initiator),
+    )
+
+    BridgeSyncMixin._auto_sync_triggered(dummy)
+
+    assert captured == ["db_file_change"]
+    assert dummy._pending_auto_sync_initiator is None
+
+
+def test_refresh_and_sync_delegates_to_sync_host(bridge_env):
+    captured = []
+    dummy = SimpleNamespace(
+        refresh=lambda: captured.append("refresh"),
+        _sync_host=SimpleNamespace(request_manual_sync=lambda: captured.append("sync")),
+    )
+
+    task_tray.FullWindow._refresh_and_sync(dummy)
+
+    assert captured == ["refresh", "sync"]

@@ -33,6 +33,10 @@
 
 ## C. TRULY_MANUAL / OPERATOR CHECKS (7) — това не може да се затвори само със static review
 
+Automatable subset:
+- `python bin/bridge_ops.py doctor`
+- `python bin/bridge_ops.py smoke`
+
 - [ ] Прикачи файл на машина A, sync-ни, отвори го на машина B от reader dialog-а.
 - [ ] Редактирай note с голям `description`, после го смали локално и потвърди, че bridge auto-heal-ва правилно без data loss.
 - [ ] Създай нова DB от bridge only и провери: active, archived, cancelled, attachments, `memory_events`, `memory_artifacts`.

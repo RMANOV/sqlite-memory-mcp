@@ -722,6 +722,7 @@ Enable GitHub Pages on the bridge repo (Settings > Pages > Branch: main) to get 
 - **System tray icon** with overdue badge counter
 - **Compact popup** (left-click) -- Today + Overdue tasks, checkbox toggle, quick-add
 - **Full window** (right-click > Open Full Window) -- tabbed view with Today / Inbox / Next / All
+- **Background bridge sync ownership at tray-app level** -- DB watchers, periodic pull, recurring maintenance, and purge no longer depend on opening the full window
 - **Auto-refresh** every 30 seconds when visible
 - **Window geometry** persisted via QSettings
 
@@ -731,6 +732,10 @@ pip install PyQt6
 
 # Run
 python3 task_tray.py
+
+# Bridge health / recovery smoke
+python3 bin/bridge_ops.py doctor
+python3 bin/bridge_ops.py smoke
 ```
 
 The tray app reads/writes directly to `memory.db` via `db_utils.py`, so changes are immediately visible in Claude Code sessions and vice versa.

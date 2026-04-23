@@ -14,18 +14,15 @@ import sqlite3
 import uuid
 from typing import Any
 
-logger = logging.getLogger("lazy_enrichment")
-
 from db_utils import (
     add_provenance_link,
     now_iso,
     record_memory_event,
     tokenize_for_similarity as _tokenize,
 )
-
-# ── Adaptive confidence per predicate ──────────────────────────────────────
-
 from enrichment_constants import _PREDICATE_BASE_CONFIDENCE
+
+logger = logging.getLogger("lazy_enrichment")
 
 EVIDENCE_BOOST_PER = 0.1
 EVIDENCE_BOOST_CAP = 0.3

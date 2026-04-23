@@ -705,6 +705,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QIcon, QAction, QActionGroup, QColor
 from PyQt6.QtCore import (
     QFileSystemWatcher,
+    QObject,
     QSettings,
     Qt,
     QTimer,
@@ -741,6 +742,45 @@ from tray_dialogs import (
 )
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
+
+
+def _run_recurring_maintenance(db_path):
+    """Process recurring tasks silently (idempotent)."""
+    try:
+        from recurring_tasks import process_recurring
+
+        with get_conn(db_path) as conn:
+            return process_recurring(conn, dry_run=False)
+    except _OPTIONAL_PIPELINE_ERRORS as exc:
+        logging.getLogger("task_tray").warning("recurring: %s", exc)
+        return []
+
+
+class _BridgeSignalBus(QObject):
+    progress = pyqtSignal(int, str)
+    done = pyqtSignal(str)
+
+
+class _TrayStatusProxy:
+    """Status sink for app-level sync ownership without a permanent status bar."""
+
+    def __init__(self, app):
+        self._app = app
+
+    def showMessage(self, message, timeout):
+        logger.info("tray_status message=%r timeout_ms=%s", message, timeout)
+        full_window = getattr(self._app, "full_window", None)
+        if full_window and full_window.isVisible():
+            full_window.status.showMessage(message, timeout)
+            return
+        if message.startswith(("Sync error", "Sync blocked", "Sync incomplete")):
+            self._app.tray.showMessage(
+                "SQLite Memory Tray",
+                message,
+                QSystemTrayIcon.MessageIcon.Warning,
+                timeout,
+            )
+
 
 # Per-tab sort/filter constants
 _FIXED_VIEW_TABS = frozenset({"suggested", "projects"})
@@ -780,9 +820,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         "project": "Sort: Project",
     }
 
-    def __init__(self, db, parent=None):
+    def __init__(self, db, sync_host=None, parent=None):
         super().__init__(parent)
         self.db = db
+        self._sync_host = sync_host
         self._sort_mode = "priority"
         self._search_text = ""
         self._entity_results: list[dict] = []
@@ -1084,9 +1125,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._sync_bar.hide()
         self.status.addPermanentWidget(self._sync_bar)
 
-        # Bridge sync signals (thread-safe → main thread)
-        self._bridge_progress.connect(self._on_sync_progress)
-        self._bridge_done.connect(self._on_sync_done)
+        if self._sync_host is not None:
+            self._sync_host._bridge_progress.connect(self._on_sync_progress)
+            self._sync_host._bridge_done.connect(self._on_sync_done)
+            if getattr(self._sync_host, "_last_sync_at", None):
+                self._last_sync_at = self._sync_host._last_sync_at
+                self._show_last_sync_time()
 
         # Intelligence v2 enrich signals
         self._enrich_in_progress = False
@@ -1097,41 +1141,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # Auto-refresh every 30s
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
-
-        # Purge done tasks once at startup, then hourly
-        self._last_purged = self.db.purge_old_done(days=30)
-        self._purge_timer = QTimer(self)
-        self._purge_timer.timeout.connect(self._run_purge)
-        self._purge_timer.start(_PURGE_INTERVAL_MS)
-
-        # Auto-sync: watch DB, WAL, and parent directory so WAL-only writes are seen.
-        self._db_watch_dir = str(Path(self.db.db_path).parent)
-        self._db_watcher = QFileSystemWatcher(self)
-        self._refresh_db_watch_paths()
-        self._db_watcher.fileChanged.connect(self._on_db_changed)
-        self._db_watcher.directoryChanged.connect(self._on_db_dir_changed)
-        self._auto_sync_timer = QTimer(self)
-        self._auto_sync_timer.setSingleShot(True)
-        self._auto_sync_timer.setInterval(60_000)  # 60s debounce
-        self._auto_sync_timer.timeout.connect(self._auto_sync_triggered)
-
-        # Periodic pull: import remote changes even without local edits
-        self._periodic_pull_timer = QTimer(self)
-        self._periodic_pull_timer.setInterval(5 * 60_000)  # 5 minutes
-        self._periodic_pull_timer.timeout.connect(self._periodic_pull)
-        self._periodic_pull_timer.start()
-        self._sync_run_active = False
-        self._sync_cooldown_until: float = (
-            0.0  # monotonic; suppresses watcher→sync cascade
-        )
-        self._initial_auto_sync_pending = True
-        self._db_refresh_debounce = QTimer(self)
-        self._db_refresh_debounce.setSingleShot(True)
-        self._db_refresh_debounce.setInterval(500)  # 500ms UI debounce
-        self._db_refresh_debounce.timeout.connect(self.refresh)
-
-        # Process recurring tasks at startup
-        self._process_recurring()
 
         self.refresh()
 
@@ -1174,16 +1183,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._last_purged = self.db.purge_old_done(days=30)
 
     def _process_recurring(self):
-        """Process recurring tasks silently (idempotent)."""
-        try:
-            from recurring_tasks import process_recurring
-
-            with get_conn() as conn:
-                created = process_recurring(conn, dry_run=False)
-            if created:
-                self.refresh()
-        except _OPTIONAL_PIPELINE_ERRORS as exc:
-            logging.getLogger("task_tray").warning("recurring: %s", exc)
+        created = _run_recurring_maintenance(self.db.db_path)
+        if created:
+            self.refresh()
 
     # ── Appearance ─────────────────────────────────────────────────────
 
@@ -1385,15 +1387,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def _refresh_and_sync(self):
         """Refresh task list then sync memory bridge to GitHub."""
         self.refresh()
-        self._sync_bridge()
-
-    def _maybe_schedule_initial_auto_sync(self):
-        """Arm one startup sync after the full window is first shown."""
-        if not getattr(self, "_initial_auto_sync_pending", False):
-            return
-        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
-            return
-        self._auto_sync_timer.start()
+        if self._sync_host is not None:
+            self._sync_host.request_manual_sync()
+        else:
+            self._sync_bridge(initiator="manual")
 
     def _run_enrich(self, depth: str = "quick"):
         """Run Intelligence v2 enrich pipeline in background thread."""
@@ -1970,8 +1967,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def showEvent(self, event):
         super().showEvent(event)
         self._refresh_timer.start(_REFRESH_INTERVAL_MS)
-        self._purge_timer.start(_PURGE_INTERVAL_MS)
-        self._maybe_schedule_initial_auto_sync()
+        if getattr(self, "_last_sync_at", None):
+            self._show_last_sync_time()
         self.refresh()
 
     def closeEvent(self, event):
@@ -1979,9 +1976,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._save_ui_state()
         self._search_engine.save()
         self._refresh_timer.stop()
-        self._purge_timer.stop()
-        self._auto_sync_timer.stop()
-        self._db_refresh_debounce.stop()
         self._search_timer.stop()
         event.ignore()
         self.hide()
@@ -1990,7 +1984,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 # ── App Controller ──────────────────────────────────────────────────
 
 
-class TaskTrayApp:
+class TaskTrayApp(BridgeSyncMixin):
     """Main application controller."""
 
     def __init__(self, instance_socket=None):
@@ -1999,6 +1993,13 @@ class TaskTrayApp:
         self.db = TaskDB()
         self.db.on_change = self._refresh_all
         self.app.aboutToQuit.connect(self._on_quit)
+        self.full_window = None
+        self._last_sync_at = None
+
+        self._bridge_signal_bus = _BridgeSignalBus(self.app)
+        self._bridge_progress = self._bridge_signal_bus.progress
+        self._bridge_done = self._bridge_signal_bus.done
+        self._bridge_done.connect(self._on_app_sync_done)
 
         # Periodic entity enrichment cache refresh (60s safety net for external writes)
         self._enrich_timer = QTimer(self.app)
@@ -2028,6 +2029,7 @@ class TaskTrayApp:
         self._update_icon()
         self.tray.setToolTip(self._tooltip())
         self.tray.activated.connect(self._on_tray_activated)
+        self.status = _TrayStatusProxy(self)
 
         # Context menu
         menu = QMenu()
@@ -2045,7 +2047,6 @@ class TaskTrayApp:
 
         self.tray.show()
         self.popup = None
-        self.full_window = None
 
         # Reminder timer — check every 60s for due reminders
         self._reminder_timer = QTimer(self.app)
@@ -2061,6 +2062,37 @@ class TaskTrayApp:
             self._instance_timer = QTimer(self.app)
             self._instance_timer.timeout.connect(self._poll_instance_socket)
             self._instance_timer.start(2000)
+
+        self._last_purged = self.db.purge_old_done(days=30)
+        self._purge_timer = QTimer(self.app)
+        self._purge_timer.timeout.connect(self._run_purge)
+        self._purge_timer.start(_PURGE_INTERVAL_MS)
+
+        self._db_watch_dir = str(Path(self.db.db_path).parent)
+        self._db_path = self.db.db_path
+        self._db_watcher = QFileSystemWatcher(self.app)
+        self._db_watcher.fileChanged.connect(self._on_db_changed)
+        self._db_watcher.directoryChanged.connect(self._on_db_dir_changed)
+        self._refresh_db_watch_paths()
+        self._auto_sync_timer = QTimer(self.app)
+        self._auto_sync_timer.setSingleShot(True)
+        self._auto_sync_timer.setInterval(60_000)
+        self._auto_sync_timer.timeout.connect(self._auto_sync_triggered)
+        self._periodic_pull_timer = QTimer(self.app)
+        self._periodic_pull_timer.setInterval(5 * 60_000)
+        self._periodic_pull_timer.timeout.connect(self._periodic_pull)
+        self._periodic_pull_timer.start()
+        self._db_refresh_debounce = QTimer(self.app)
+        self._db_refresh_debounce.setSingleShot(True)
+        self._db_refresh_debounce.setInterval(500)
+        self._db_refresh_debounce.timeout.connect(self._refresh_all)
+        self._sync_run_active = False
+        self._sync_cooldown_until = 0.0
+        self._initial_auto_sync_pending = True
+        self._pending_auto_sync_initiator = None
+
+        self._process_recurring()
+        self._maybe_schedule_initial_auto_sync()
 
     def _update_icon(self, summary=None):
         if summary is None:
@@ -2090,6 +2122,28 @@ class TaskTrayApp:
                 )
         except Exception as exc:
             logger.warning("background memory audit failed: %s", exc)
+
+    def _run_purge(self):
+        self._last_purged = self.db.purge_old_done(days=30)
+
+    def _process_recurring(self):
+        created = _run_recurring_maintenance(self.db.db_path)
+        if created:
+            self._refresh_all()
+
+    def _build_ui_profile(self):
+        if self.full_window is None:
+            return None
+        return self.full_window._build_ui_profile()
+
+    def _on_app_sync_done(self, msg):
+        is_success = msg.startswith(("Synced:", "Pulled ", "Already in sync"))
+        if is_success:
+            self._last_sync_at = datetime.now()
+            if self.full_window is not None:
+                self.full_window._last_sync_at = self._last_sync_at
+            self._process_recurring()
+        self._refresh_all()
 
     def _tooltip(self, summary=None):
         if summary is None:
@@ -2128,7 +2182,7 @@ class TaskTrayApp:
         if self.popup:
             self.popup.hide()
         if not self.full_window:
-            self.full_window = FullWindow(self.db)
+            self.full_window = FullWindow(self.db, sync_host=self)
         self.full_window.show()
         self.full_window.raise_()
         self.full_window.activateWindow()
@@ -2239,6 +2293,10 @@ class TaskTrayApp:
         self._enrich_timer.stop()
         self._audit_timer.stop()
         self._reminder_timer.stop()
+        self._purge_timer.stop()
+        self._periodic_pull_timer.stop()
+        self._auto_sync_timer.stop()
+        self._db_refresh_debounce.stop()
         if self._instance_socket:
             self._instance_socket.close()
         self.db.close()

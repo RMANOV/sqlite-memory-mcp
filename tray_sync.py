@@ -1,28 +1,30 @@
-"""Bridge/sync mixin for FullWindow.
+"""Bridge/sync helpers shared by the tray app and full window.
 
 All methods here operate on the memory bridge (pull, push, shared.json profiles).
-This is a mixin — it requires the following from the host class (FullWindow):
+This is a mixin — long-lived sync ownership should live on the tray app host,
+while the full window can reuse the UI/profile helpers.
 
-Qt signals (defined on FullWindow):
-    _bridge_progress: pyqtSignal(int, str)
-    _bridge_done:     pyqtSignal(str)
+Expected host capabilities for active sync ownership:
+    self._bridge_progress.emit(int, str)
+    self._bridge_done.emit(str)
+    self.status.showMessage(str, int)
+    self._db_watcher / self._auto_sync_timer / self._periodic_pull_timer
+    self._db_refresh_debounce / self._db_watch_dir / self._sync_run_active
+    self._sync_cooldown_until / self._initial_auto_sync_pending
+    self._build_ui_profile()
 
-Qt widgets (set up in FullWindow.__init__):
+Expected host capabilities for window UI integration:
     self._sync_bar:   QProgressBar
     self._sync_label: QLabel
     self.status:      QStatusBar
 
-Methods called on self (must exist on FullWindow):
-    self.refresh()
-    self._process_recurring()
-
 Module-level globals from task_tray (accessed via import):
     _theme_name, _font_size, _bold, _THEMES, _update_theme_colors
 
-FullWindow instance attributes read by _restore_profile_from_bridge:
+Window instance attributes read by _restore_profile_from_bridge:
     self._tab_views, self._tab_keys, self._SORT_MODES,
     self._sort_mode, self._active_filters, self._excluded_filters,
-    self._saved_active_tab, self._settings, self._db_refresh_debounce
+    self._saved_active_tab, self._settings
 """
 
 import base64
@@ -51,7 +53,7 @@ def _normalize_filter_payload(filter_payload):
 
 
 class BridgeSyncMixin:
-    """Bridge sync methods for FullWindow. Mixin — requires Qt signals and _BRIDGE_DIR."""
+    """Bridge sync methods shared by long-lived tray hosts and UI clients."""
 
     # Class-level constants — belong here since only sync code uses them
     _BRIDGE_DIR = os.path.expanduser("~/.claude/memory/bridge")
@@ -62,13 +64,98 @@ class BridgeSyncMixin:
 
     def _auto_sync_triggered(self):
         """Debounce elapsed — run bridge sync."""
-        self._sync_bridge()
+        initiator = getattr(self, "_pending_auto_sync_initiator", "auto")
+        self._pending_auto_sync_initiator = None
+        self._sync_bridge(initiator=initiator)
 
-    def _start_bridge_sync_thread(self, target, busy_message=None):
+    def _arm_auto_sync(self, initiator: str):
+        """Restart the debounce timer and remember the most recent initiator."""
+        self._pending_auto_sync_initiator = initiator
+        self._auto_sync_timer.start()
+
+    def _log_sync_event(self, phase: str, *, initiator: str, mode: str, **fields):
+        extras = " ".join(f"{key}={value!r}" for key, value in sorted(fields.items()))
+        if extras:
+            logger.info(
+                "tray_sync phase=%s initiator=%s mode=%s %s",
+                phase,
+                initiator,
+                mode,
+                extras,
+            )
+        else:
+            logger.info(
+                "tray_sync phase=%s initiator=%s mode=%s",
+                phase,
+                initiator,
+                mode,
+            )
+
+    def _on_db_changed(self, path):
+        """DB file changed — start/restart debounce timers."""
+        self._db_refresh_debounce.start()
+        self._refresh_db_watch_paths()
+        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
+            return
+        self._arm_auto_sync("db_file_change")
+
+    def _on_db_dir_changed(self, path):
+        """Directory changed — catch WAL create/rotate events."""
+        self._db_refresh_debounce.start()
+        watch_paths_changed = self._refresh_db_watch_paths()
+        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
+            return
+        if watch_paths_changed:
+            self._arm_auto_sync("db_dir_watch_update")
+
+    def _refresh_db_watch_paths(self):
+        """Ensure DB watcher tracks the DB, WAL, and parent directory."""
+        wanted_dirs = {self._db_watch_dir}
+        wanted_files = set()
+        db_path = Path(self.db.db_path if hasattr(self, "db") else self._db_path)
+        for candidate in (db_path, Path(f"{db_path}-wal")):
+            if candidate.exists():
+                wanted_files.add(str(candidate))
+        current_files = set(self._db_watcher.files())
+        current_dirs = set(self._db_watcher.directories())
+        stale = sorted((current_files - wanted_files) | (current_dirs - wanted_dirs))
+        if stale:
+            self._db_watcher.removePaths(stale)
+        missing = sorted((wanted_files - current_files) | (wanted_dirs - current_dirs))
+        if missing:
+            self._db_watcher.addPaths(missing)
+        return bool(stale or missing)
+
+    def _maybe_schedule_initial_auto_sync(self):
+        """Arm one startup sync after the tray app has initialized."""
+        if not getattr(self, "_initial_auto_sync_pending", False):
+            return
+        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
+            return
+        arm = getattr(self, "_arm_auto_sync", None)
+        if callable(arm):
+            arm("bootstrap")
+        else:
+            self._auto_sync_timer.start()
+
+    def _start_bridge_sync_thread(
+        self,
+        target,
+        busy_message=None,
+        *,
+        initiator: str = "manual",
+        mode: str = "sync",
+    ):
         """Run at most one bridge sync thread at a time."""
         if not self._bridge_thread_lock.acquire(blocking=False):
             if busy_message:
                 self.status.showMessage(busy_message, 3000)
+            self._log_sync_event(
+                "busy",
+                initiator=initiator,
+                mode=mode,
+                message=busy_message or "busy",
+            )
             return False
 
         if hasattr(self, "_initial_auto_sync_pending"):
@@ -77,6 +164,7 @@ class BridgeSyncMixin:
         auto_sync_timer = getattr(self, "_auto_sync_timer", None)
         if auto_sync_timer is not None:
             auto_sync_timer.stop()
+        self._log_sync_event("started", initiator=initiator, mode=mode)
 
         def _wrapped():
             try:
@@ -84,12 +172,13 @@ class BridgeSyncMixin:
             finally:
                 self._sync_cooldown_until = time.monotonic() + 5.0
                 self._sync_run_active = False
+                self._log_sync_event("finished", initiator=initiator, mode=mode)
                 self._bridge_thread_lock.release()
 
         threading.Thread(target=_wrapped, daemon=True).start()
         return True
 
-    def _periodic_pull(self):
+    def _periodic_pull(self, initiator: str = "periodic_pull"):
         """Periodic pull from remote — catches changes from other machines."""
         if not os.path.isdir(self._BRIDGE_DIR):
             return
@@ -107,22 +196,55 @@ class BridgeSyncMixin:
                 imported = stats.get("imported_new", 0) + stats.get(
                     "imported_updated", 0
                 )
+                self._log_sync_event(
+                    "result",
+                    initiator=initiator,
+                    mode="pull_only",
+                    imported=imported,
+                    pushed=stats.get("pushed", False),
+                    already_running=stats.get("already_running", False),
+                )
                 if imported:
                     self._bridge_done.emit(f"Pulled {imported} updates from remote")
-                    # Refresh UI after importing remote changes
                     self._db_refresh_debounce.start()
             except Exception as exc:
+                self._log_sync_event(
+                    "error",
+                    initiator=initiator,
+                    mode="pull_only",
+                    error=str(exc),
+                )
                 logger.warning("Periodic pull failed: %s", exc)
 
-        self._start_bridge_sync_thread(_run)
+        self._start_bridge_sync_thread(
+            _run,
+            initiator=initiator,
+            mode="pull_only",
+        )
 
-    def _sync_bridge(self):
+    def request_manual_sync(self):
+        """Explicit user-triggered sync request."""
+        self._sync_bridge(initiator="manual")
+
+    def _sync_bridge(self, initiator: str = "manual"):
         """Sync memory bridge (pull + push + shared.json)."""
         if not os.path.isdir(self._BRIDGE_DIR):
             self.status.showMessage("Bridge dir not found", 3000)
+            self._log_sync_event(
+                "blocked",
+                initiator=initiator,
+                mode="sync",
+                reason="bridge_dir_missing",
+            )
             return
         if self._bridge_thread_lock.locked():
             self.status.showMessage("Sync already running", 3000)
+            self._log_sync_event(
+                "busy",
+                initiator=initiator,
+                mode="sync",
+                reason="thread_lock",
+            )
             return
 
         ui_profile = self._build_ui_profile()
@@ -136,6 +258,19 @@ class BridgeSyncMixin:
                     progress_callback=lambda pct, label: self._bridge_progress.emit(
                         pct, label
                     ),
+                )
+                self._log_sync_event(
+                    "result",
+                    initiator=initiator,
+                    mode="sync",
+                    pushed=stats.get("pushed", False),
+                    skipped=stats.get("skipped", False),
+                    entities=stats.get("entities", 0),
+                    tasks=stats.get("tasks", 0),
+                    imported_new=stats.get("imported_new", 0),
+                    imported_updated=stats.get("imported_updated", 0),
+                    blocked_by_repo_state=stats.get("blocked_by_repo_state", False),
+                    blocked_by_safety=stats.get("blocked_by_safety", False),
                 )
 
                 if stats.get("blocked_by_repo_state"):
@@ -168,9 +303,20 @@ class BridgeSyncMixin:
                     n_tasks = stats.get("tasks", 0)
                     self._bridge_done.emit(f"Synced: {n_ent} entities, {n_tasks} tasks")
             except Exception as exc:
+                self._log_sync_event(
+                    "error",
+                    initiator=initiator,
+                    mode="sync",
+                    error=str(exc),
+                )
                 self._bridge_done.emit(f"Sync error: {exc}")
 
-        self._start_bridge_sync_thread(_run, busy_message="Sync already running")
+        self._start_bridge_sync_thread(
+            _run,
+            busy_message="Sync already running",
+            initiator=initiator,
+            mode="sync",
+        )
 
     # ── Signal handlers (must run on Qt main thread via signal/slot) ────
 
@@ -191,8 +337,6 @@ class BridgeSyncMixin:
         self.status.showMessage(msg, hide_ms)
         if not is_error:
             self._last_sync_at = datetime.now()
-            self._process_recurring()
-            self.refresh()
 
     def _show_last_sync_time(self):
         self._sync_bar.hide()

@@ -297,7 +297,7 @@ class TaskSearchEngine:
                 "ORDER BY rank LIMIT ?",
                 (fts_q, limit),
             ).fetchall()
-        except Exception as e:
+        except Exception:
             log.debug("FTS5 search failed for %r, falling back", query, exc_info=True)
             return None
         if not rows:

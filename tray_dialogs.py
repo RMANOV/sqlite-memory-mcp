@@ -1154,7 +1154,7 @@ class TrayPopup(QWidget):
         if due:
             kwargs["due_date"] = due
         task_type = self._add_type.currentText().lower()
-        task_id = self.db.add_task(
+        self.db.add_task(
             title,
             type=task_type,
             description=desc or None,

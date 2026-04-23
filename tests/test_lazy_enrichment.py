@@ -305,12 +305,12 @@ class TestContradictions:
 class TestStaleEntities:
     def test_detect_stale(self, conn):
         # Entity updated 120 days ago
-        eid = _add_entity(conn, "OldEntity", updated_at="2025-11-01T00:00:00+00:00")
+        _add_entity(conn, "OldEntity", updated_at="2025-11-01T00:00:00+00:00")
         stale = detect_stale_entities(conn, staleness_days=90)
         assert any(s["name"] == "OldEntity" for s in stale)
 
     def test_fresh_entity_not_stale(self, conn):
-        eid = _add_entity(conn, "FreshEntity", updated_at="2026-03-10T00:00:00+00:00")
+        _add_entity(conn, "FreshEntity", updated_at="2026-03-10T00:00:00+00:00")
         stale = detect_stale_entities(conn, staleness_days=90)
         assert not any(s["name"] == "FreshEntity" for s in stale)
 
