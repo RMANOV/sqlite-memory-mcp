@@ -68,6 +68,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "allow_cached_control_plane": True,
     "max_offline_grace_seconds": 604800,
     "minimum_protection_phase": 1,
+    "require_machine_binding": True,
     "installation_salt_env_var": "SQLITE_MEMORY_PREMIUM_INSTALLATION_SALT",
     "owner_approval_env_var": "SQLITE_MEMORY_OWNER_APPROVAL",
     "record_allowed_events": True,
@@ -1270,6 +1271,7 @@ def _validate_artifact_manifest(
     control_policy: dict[str, Any] | None,
     entrypoint_info: dict[str, Any] | None,
     customer_id: str | None,
+    require_private_runtime_manifest: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None, int]:
     minimum_phase = max(_parse_int(config.get("minimum_protection_phase"), 1), 1)
     if control_policy:
@@ -1278,7 +1280,8 @@ def _validate_artifact_manifest(
             max(_parse_int(control_policy.get("minimum_protection_phase"), 0), 0),
         )
     require_manifest = bool(
-        config.get("require_artifact_manifest", False)
+        require_private_runtime_manifest
+        or config.get("require_artifact_manifest", False)
         or bool(control_policy and control_policy.get("require_artifact_manifest"))
     )
     if not manifest:
@@ -1474,6 +1477,12 @@ def evaluate_feature_gate(
         )
 
     machine_ids = entitlement.get("machine_ids", [])
+    if config.get("require_machine_binding", True) and not machine_ids:
+        return _deny(
+            "machine_binding_missing",
+            entitlement_id=entitlement_id,
+            customer_id=customer_id,
+        )
     if machine_ids and MACHINE_ID not in machine_ids:
         return _deny(
             "machine_not_entitled",
@@ -1521,6 +1530,7 @@ def evaluate_feature_gate(
         control_policy=control_policy,
         entrypoint_info=entrypoint_info,
         customer_id=customer_id,
+        require_private_runtime_manifest=feature_id == "private_extension_runtime",
     )
     audit_payload["artifact_manifest_source"] = manifest_source
     audit_payload["protection_phase"] = protection_phase

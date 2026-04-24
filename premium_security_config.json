@@ -24,6 +24,7 @@
   "allow_cached_control_plane": true,
   "max_offline_grace_seconds": 604800,
   "minimum_protection_phase": 1,
+  "require_machine_binding": true,
   "installation_salt_env_var": "SQLITE_MEMORY_PREMIUM_INSTALLATION_SALT",
   "owner_approval_env_var": "SQLITE_MEMORY_OWNER_APPROVAL",
   "record_allowed_events": true,

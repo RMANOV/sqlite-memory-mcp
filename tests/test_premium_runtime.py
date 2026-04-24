@@ -143,6 +143,51 @@ def test_evaluate_feature_gate_honors_local_revocation(tmp_path, monkeypatch):
     assert verdict["reason"] == "entitlement_revoked"
 
 
+def test_evaluate_feature_gate_requires_machine_binding_by_default(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-no-machine",
+        "customer_id": "cust-no-machine",
+        "features": ["acl_rbac"],
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {**premium_runtime._DEFAULT_CONFIG, "control_plane_required": False},
+    )
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        verdict = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="acl_rbac",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.acl_rbac",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert verdict["allowed"] is False
+    assert verdict["reason"] == "machine_binding_missing"
+
+
 def test_evaluate_feature_gate_expands_packs_and_dependencies(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)
@@ -202,8 +247,8 @@ def test_evaluate_feature_gate_expands_packs_and_dependencies(tmp_path, monkeypa
     assert briefing["selected_packs"] == ["briefing_suite"]
     assert "partner_digest" in briefing["effective_features"]
     assert "advanced_ranking" in briefing["effective_features"]
-    assert runtime["allowed"] is True
-    assert "private_extension_runtime" in runtime["effective_features"]
+    assert runtime["allowed"] is False
+    assert runtime["reason"] == "artifact_manifest_required"
     assert denied["allowed"] is False
     assert denied["reason"] == "feature_not_entitled"
 
