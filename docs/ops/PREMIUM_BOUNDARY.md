@@ -23,7 +23,11 @@ The public host runtime enforces, in `premium_runtime.evaluate_feature_gate`:
    `requires_owner_approval=True` (e.g. `private_extension_runtime`).
 6. Entitlement `not_before` / `expires_at` compared in epoch seconds (no
    string-sort bug for `Z`-suffixed timestamps).
-7. All decisions audit-logged in `premium_gate_audit`.
+7. Entitlements must carry an explicit `machine_ids` binding by default; a
+   copied signed entitlement without the current `MACHINE_ID` is denied.
+8. `private_extension_runtime` always requires a signed artifact manifest even
+   when non-runtime premium feature checks are allowed to proceed without one.
+9. All decisions audit-logged in `premium_gate_audit`.
 
 `premium_security_config.json` turns these checks on. `control_plane_required=true`
 means: no valid signed policy → deny. Do not flip this to `false` in production.
@@ -92,8 +96,9 @@ something is wrong with the env-var wiring or the public-key material.
 
 ## What this wiring is *not*
 
-This is Phase A of the anti-fork strategy: local-authoritative, single-machine,
-path-based. The next phase (Phase B / C) pushes authority to a remote signing
+This is Phase A / B1 of the anti-fork strategy: local-authoritative,
+single-machine, signed-artifact, and machine-bound. The next phase (Phase B / C)
+pushes authority to a remote signing
 service, short-lived entitlements, and remote-assisted execution for the highest
 value features (advanced ranking, partner digest, chief-of-staff queries). See
 the internal strategy note "Corporate fork defense research and echeloned

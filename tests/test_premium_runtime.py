@@ -3,11 +3,40 @@ import sqlite3
 import sys
 from contextlib import contextmanager
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import premium_runtime
 from premium_contract import PREMIUM_RUNTIME_CONTRACT_VERSION
 from schema import init_db
+
+
+_PREMIUM_ENV_VARS = (
+    "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_JSON",
+    "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_PATH",
+    "SQLITE_MEMORY_PREMIUM_ENTITLEMENT_URL",
+    "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_JSON",
+    "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_PATH",
+    "SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_URL",
+    "SQLITE_MEMORY_PREMIUM_POLICY_JSON",
+    "SQLITE_MEMORY_PREMIUM_POLICY_PATH",
+    "SQLITE_MEMORY_PREMIUM_POLICY_URL",
+    "SQLITE_MEMORY_PREMIUM_PUBLIC_KEY",
+    "SQLITE_MEMORY_PREMIUM_ARTIFACT_PUBLIC_KEY",
+    "SQLITE_MEMORY_PREMIUM_POLICY_PUBLIC_KEY",
+    "SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_JSON",
+    "SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_PATH",
+    "SQLITE_MEMORY_PREMIUM_ENTRYPOINT",
+    "SQLITE_MEMORY_PREMIUM_INSTALLATION_SALT",
+    "SQLITE_MEMORY_OWNER_APPROVAL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_premium_env(monkeypatch):
+    for name in _PREMIUM_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 @contextmanager
