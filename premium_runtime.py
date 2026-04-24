@@ -1230,12 +1230,7 @@ def _evaluate_control_plane_rules(
     allowed_manifest_ids = set(
         _normalize_string_items(policy.get("allowed_manifest_ids"))
     )
-    if (
-        manifest_id
-        and allowed_manifest_ids
-        and feature_id == "private_extension_runtime"
-        and manifest_id not in allowed_manifest_ids
-    ):
+    if manifest_id and allowed_manifest_ids and manifest_id not in allowed_manifest_ids:
         return "control_plane_manifest_not_allowed"
 
     minimum_phase = max(_parse_int(policy.get("minimum_protection_phase"), 0), 0)
@@ -1512,9 +1507,13 @@ def evaluate_feature_gate(
             entrypoint_info = _entrypoint_runtime_info(raw_entrypoint)
             audit_payload.update(entrypoint_info)
 
+    manifest_required_for_feature = feature_id == "private_extension_runtime" or bool(
+        config.get("require_artifact_manifest", False)
+        or bool(control_policy and control_policy.get("require_artifact_manifest"))
+    )
     manifest = None
     manifest_source = "missing"
-    if feature_id == "private_extension_runtime":
+    if manifest_required_for_feature:
         try:
             manifest, manifest_source = _load_artifact_manifest(config)
         except Exception as exc:

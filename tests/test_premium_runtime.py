@@ -506,6 +506,90 @@ def test_evaluate_feature_gate_accepts_manifest_and_control_policy(
     assert policy_row["policy_id"] == "policy-1"
 
 
+def test_manifest_required_policy_loads_manifest_for_non_runtime_feature(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-acl-manifest",
+        "customer_id": "cust-acl-manifest",
+        "features": ["acl_rbac"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    manifest = {
+        "manifest_id": "manifest-acl",
+        "customer_id": "cust-acl-manifest",
+        "extension_name": "sqlite-memory-mcp-premium",
+        "contract_version": PREMIUM_RUNTIME_CONTRACT_VERSION,
+        "protection_phase": 2,
+        "minimum_host_version": "3.5.0",
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    policy = {
+        "policy_id": "policy-acl",
+        "customer_id": "cust-acl-manifest",
+        "allowed_manifest_ids": ["manifest-acl"],
+        "allowed_features": ["acl_rbac"],
+        "minimum_protection_phase": 2,
+        "require_artifact_manifest": True,
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_signed_payload",
+        lambda payload, public_key_value: (True, "signature_valid"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_artifact_manifest",
+        lambda config: (manifest, "test:artifact"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_control_plane_document",
+        lambda config: (policy, "test:policy"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "control_plane_required": True,
+        },
+    )
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    try:
+        verdict = premium_runtime.evaluate_feature_gate(
+            conn,
+            feature_id="acl_rbac",
+            server_name="sqlite-kb",
+            tool_name="sqlite-kb.acl_rbac",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert verdict["allowed"] is True
+    assert verdict["manifest_id"] == "manifest-acl"
+    assert verdict["control_plane_status"] == "live"
+    assert verdict["protection_phase"] == 2
+
+
 def test_evaluate_feature_gate_uses_cached_control_policy(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)
