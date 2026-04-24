@@ -94,14 +94,33 @@ A negative-path smoke test (tamper one field of the entitlement JSON without
 re-signing) must return `signature_invalid:InvalidSignature`. If it does not,
 something is wrong with the env-var wiring or the public-key material.
 
+## URL-based remote fetch (Phase B)
+
+Every `_PATH` env var above has a parallel `_URL` variant
+(`*_ENTITLEMENT_URL`, `*_ARTIFACT_MANIFEST_URL`, `*_POLICY_URL`) consumed by
+the same gate. Runtime precedence is inline JSON → path → URL, but operators
+can leave `_PATH` unset and point the client at an HTTPS issuer service.
+
+The fetcher enforces:
+- HTTPS only (plain `http://` refused at `premium_runtime.py:603`)
+- No redirects (`_NoRedirectHandler` — 3xx raises, never follows to another host)
+- Signatures verified *before* the doc enters any cache or gate decision
+- Rollback guard: a fresh fetch whose `issued_at` is older than the cached
+  copy is rejected (`premium_runtime._cache_control_plane_policy`)
+
+The standalone HTTPS issuer service lives outside this OSS repo (see the
+private tree under `~/.sqlite-memory-mcp-control-plane/` on operator machines).
+Its role: hold signing keys, serve signed documents with monotonic
+`doc_version` counters, and mint short-lived per-installation entitlements.
+None of its state is required here.
+
 ## What this wiring is *not*
 
-This is Phase A / B1 of the anti-fork strategy: local-authoritative,
-single-machine, signed-artifact, and machine-bound. The next phase (Phase B / C)
-pushes authority to a remote signing
-service, short-lived entitlements, and remote-assisted execution for the highest
-value features (advanced ranking, partner digest, chief-of-staff queries). See
-the internal strategy note "Corporate fork defense research and echeloned
+This is Phase A + Phase B of the anti-fork strategy: signed artifacts with
+an optional remote issuer service. Phase C (remote-authoritative execution
+for advanced_ranking / partner_digest / chief_of_staff_queries) and Phase D
+(managed release channels, customer rings, kill switches) are future work.
+See the internal strategy note "Corporate fork defense research and echeloned
 strategy" (2026-04-22) for the full roadmap.
 
 The OSS boundary in this repo is sufficient to prove that a copy of the code
