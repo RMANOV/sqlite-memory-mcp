@@ -118,6 +118,10 @@ control-plane policy, revocation authority, or operator approval chain.
 See [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md) for the
 operator wiring and verification procedure.
 
+For the release-confidence posture around `v3.7.2`, including the limits of
+MCP boundary claims, external badges, harness checks, and context-pack quality
+gates, see [`docs/ops/OPERATOR_CONFIDENCE_HARDENING.md`](docs/ops/OPERATOR_CONFIDENCE_HARDENING.md).
+
 **Premium-only capabilities** are for paid, explicitly entitled users only. They are expected to live in a separate private repo and be loaded through the gated runtime only. Typical premium-only modules include:
 
 - password-protected premium views and protected operator scopes for especially sensitive memory surfaces
