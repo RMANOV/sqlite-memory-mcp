@@ -1227,7 +1227,9 @@ class EditTaskDialog(QDialog):
     def __init__(self, task, parent=None, db=None):
         super().__init__(parent)
         self._db = db
+        self._task = dict(task)
         self._task_id = task.get("id")
+        self._recurring_config = task.get("recurring") or None
         self._attachment_items: list[dict] = []
         self._removed_attachment_ids: set[str] = set()
         self.setWindowTitle("Edit Task")
@@ -1294,6 +1296,54 @@ class EditTaskDialog(QDialog):
         self.due_clear_btn.clicked.connect(self._clear_due)
         due_row.addWidget(self.due_clear_btn)
         layout.addRow("Due Date:", due_row)
+
+        self.reminder_enabled = QCheckBox("Enable")
+        self.reminder_enabled.toggled.connect(self._set_reminder_controls_enabled)
+        self.reminder_edit = QDateTimeEdit()
+        self.reminder_edit.setCalendarPopup(True)
+        self.reminder_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
+        self.reminder_edit.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+        existing_reminder = task.get("reminder_at") or ""
+        if existing_reminder:
+            parsed_reminder = self._parse_reminder_datetime(existing_reminder)
+            if parsed_reminder.isValid():
+                self.reminder_edit.setDateTime(parsed_reminder)
+            self.reminder_enabled.setChecked(True)
+        reminder_row = QVBoxLayout()
+        reminder_top = QHBoxLayout()
+        reminder_top.addWidget(self.reminder_enabled)
+        reminder_top.addWidget(self.reminder_edit, 1)
+        reminder_clear_btn = QPushButton("Clear")
+        reminder_clear_btn.clicked.connect(self._clear_reminder)
+        reminder_top.addWidget(reminder_clear_btn)
+        reminder_row.addLayout(reminder_top)
+        reminder_shortcuts = QHBoxLayout()
+        self._reminder_shortcut_buttons = []
+        for label, minutes in [
+            ("1h", 60),
+            ("3h", 180),
+            ("Tomorrow 9:00", -1),
+            ("Next Monday 9:00", -2),
+        ]:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda checked, m=minutes: self._apply_reminder(m))
+            reminder_shortcuts.addWidget(btn)
+            self._reminder_shortcut_buttons.append(btn)
+        reminder_row.addLayout(reminder_shortcuts)
+        layout.addRow("Reminder:", reminder_row)
+        self._set_reminder_controls_enabled(self.reminder_enabled.isChecked())
+
+        recurring_row = QHBoxLayout()
+        self.recurring_label = QLabel()
+        recurring_row.addWidget(self.recurring_label, 1)
+        recurring_set_btn = QPushButton("Set/Edit...")
+        recurring_set_btn.clicked.connect(self._show_recurring_dialog)
+        recurring_row.addWidget(recurring_set_btn)
+        recurring_clear_btn = QPushButton("Clear")
+        recurring_clear_btn.clicked.connect(self._clear_recurring)
+        recurring_row.addWidget(recurring_clear_btn)
+        layout.addRow("Recurring:", recurring_row)
+        self._update_recurring_label()
 
         # Calendar: open at today, block past dates, dropdown month/year nav
         cal = self.due_edit.calendarWidget()
@@ -1417,6 +1467,65 @@ class EditTaskDialog(QDialog):
         self.due_edit.setDate(self.due_edit.minimumDate())
         self._due_cleared = True
 
+    def _parse_reminder_datetime(self, raw: str) -> QDateTime:
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return QDateTime()
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return QDateTime(
+            QDate(parsed.year, parsed.month, parsed.day),
+            QTime(parsed.hour, parsed.minute),
+        )
+
+    def _set_reminder_controls_enabled(self, enabled: bool):
+        self.reminder_edit.setEnabled(enabled)
+        for btn in getattr(self, "_reminder_shortcut_buttons", []):
+            btn.setEnabled(enabled)
+
+    def _apply_reminder(self, minutes: int):
+        now = QDateTime.currentDateTime()
+        self.reminder_enabled.setChecked(True)
+        if minutes == -1:
+            self.reminder_edit.setDateTime(QDateTime(now.date().addDays(1), QTime(9, 0)))
+        elif minutes == -2:
+            days_until_monday = (8 - now.date().dayOfWeek()) % 7
+            if days_until_monday == 0:
+                days_until_monday = 7
+            monday = now.date().addDays(days_until_monday)
+            self.reminder_edit.setDateTime(QDateTime(monday, QTime(9, 0)))
+        else:
+            self.reminder_edit.setDateTime(now.addSecs(minutes * 60))
+
+    def _clear_reminder(self):
+        self.reminder_enabled.setChecked(False)
+
+    def _reminder_iso(self) -> str:
+        qdt = self.reminder_edit.dateTime().toUTC()
+        return datetime(
+            qdt.date().year(),
+            qdt.date().month(),
+            qdt.date().day(),
+            qdt.time().hour(),
+            qdt.time().minute(),
+            tzinfo=timezone.utc,
+        ).isoformat()
+
+    def _show_recurring_dialog(self):
+        task = {**self._task, "recurring": self._recurring_config}
+        dlg = RecurringDialog(task, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._recurring_config = dlg.get_config()
+            self._update_recurring_label()
+
+    def _clear_recurring(self):
+        self._recurring_config = None
+        self._update_recurring_label()
+
+    def _update_recurring_label(self):
+        self.recurring_label.setText(_recurring_label(self._recurring_config) or "None")
+
     def _refresh_attachment_list(self):
         self.attachments_list.clear()
         for attachment in self._attachment_items:
@@ -1519,6 +1628,10 @@ class EditTaskDialog(QDialog):
             vals["due_date"] = None
         else:
             vals["due_date"] = self.due_edit.date().toString("yyyy-MM-dd")
+        vals["reminder_at"] = (
+            self._reminder_iso() if self.reminder_enabled.isChecked() else None
+        )
+        vals["recurring"] = self._recurring_config
         project = self.project_combo.currentText().strip()
         vals["project"] = project if project else None
         vals["type"] = self.type_combo.currentText().lower()

@@ -135,6 +135,55 @@ def test_edit_task_dialog_roundtrips_notes(qapp):
     dlg.close()
 
 
+def test_edit_task_dialog_roundtrips_reminder_and_recurring(qapp):
+    recurring = '{"every":"week","day":"monday"}'
+    dlg = tray_dialogs.EditTaskDialog(
+        {
+            "title": "Task",
+            "description": "Main body",
+            "notes": "Internal details",
+            "type": "task",
+            "status": "not_started",
+            "section": "inbox",
+            "priority": "medium",
+            "project": "general",
+            "reminder_at": "2026-04-25T15:30:00+00:00",
+            "recurring": recurring,
+        },
+        db=_FakeTaskDb(),
+    )
+
+    vals = dlg.get_values()
+
+    assert vals["reminder_at"] == "2026-04-25T15:30:00+00:00"
+    assert vals["recurring"] == recurring
+    dlg.close()
+
+
+def test_edit_task_dialog_can_clear_reminder_and_recurring(qapp):
+    dlg = tray_dialogs.EditTaskDialog(
+        {
+            "title": "Task",
+            "type": "task",
+            "status": "not_started",
+            "section": "inbox",
+            "priority": "medium",
+            "project": "general",
+            "reminder_at": "2026-04-25T15:30:00+00:00",
+            "recurring": '{"every":"day"}',
+        },
+        db=_FakeTaskDb(),
+    )
+
+    dlg._clear_reminder()
+    dlg._clear_recurring()
+    vals = dlg.get_values()
+
+    assert vals["reminder_at"] is None
+    assert vals["recurring"] is None
+    dlg.close()
+
+
 def test_task_reader_dialog_renders_notes_section(qapp, monkeypatch):
     monkeypatch.setattr(
         tray_dialogs,
