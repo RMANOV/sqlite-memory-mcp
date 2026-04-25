@@ -214,7 +214,7 @@ class TaskDB:
         return TaskDAO.get_suggested(self._conn, limit)
 
     def get_all_notes(self):
-        """All notes (never-deleted). Excludes archived/cancelled."""
+        """Visible open notes. Excludes done/archived/cancelled."""
         return TaskDAO.get_notes(self._conn)
 
     def get_project_names(self):

@@ -2249,12 +2249,14 @@ class TaskDAO:
 
     @staticmethod
     def get_notes(conn: sqlite3.Connection) -> list[dict]:
-        """All notes (type='note'), excluding archived/cancelled."""
+        """Visible open notes (type='note'), excluding closed statuses."""
         pri_sql = build_priority_order_sql()
+        exclusions = ",".join("?" * len(TASK_ACTIVE_EXCLUSIONS))
         rows = conn.execute(
             f"SELECT {TaskDAO.ALL_COLS} FROM tasks WHERE type = 'note' "
-            "AND status NOT IN ('archived', 'cancelled') "
-            f"ORDER BY {pri_sql}, updated_at DESC"
+            f"AND status NOT IN ({exclusions}) "
+            f"ORDER BY {pri_sql}, updated_at DESC",
+            list(TASK_ACTIVE_EXCLUSIONS),
         ).fetchall()
         return [dict(r) for r in rows]
 

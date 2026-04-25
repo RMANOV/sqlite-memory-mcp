@@ -340,6 +340,23 @@ def test_get_active_empty_db(conn):
     assert TaskDAO.get_active(conn) == []
 
 
+# ── get_notes ────────────────────────────────────────────────────────────
+
+
+def test_get_notes_excludes_closed_statuses(conn):
+    _make_task(conn, "open", "Open note", type="note", status="not_started")
+    _make_task(conn, "inprog", "In-progress note", type="note", status="in_progress")
+    _make_task(conn, "done", "Done note", type="note", status="done")
+    _make_task(conn, "arch", "Archived note", type="note", status="archived")
+    _make_task(conn, "cancel", "Cancelled note", type="note", status="cancelled")
+    _make_task(conn, "task", "Open task", type="task", status="not_started")
+
+    notes = TaskDAO.get_notes(conn)
+    ids = {r["id"] for r in notes}
+
+    assert ids == {"open", "inprog"}
+
+
 # ── search (FTS5) ─────────────────────────────────────────────────────────
 
 
