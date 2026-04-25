@@ -67,6 +67,57 @@ What is **not** in this OSS repo:
 - signing keys
 - proprietary ranking / governance rules
 
+### Anti-corporate-fork protection model
+
+This project is open source, so the OSS core can be forked. That is intentional.
+The protection model is not "hide the code" or pretend a permissive public repo
+cannot be copied.
+
+The protected asset is the **premium operating boundary**:
+
+- the private runtime lives outside this repo
+- premium features require signed, revocable entitlements
+- entitlements are machine-bound by default via `machine_ids`
+- private runtime loading requires a signed artifact manifest over the entrypoint
+- a signed control-plane policy can allow or deny manifests, features,
+  protection phases, and entitlement versions
+- protected runtime loading requires explicit owner approval
+- every premium gate decision is written to `premium_gate_audit`
+- local revocations are honored before a premium feature runs
+- remote issuer/control documents must be fetched over HTTPS with redirects
+  refused, then signature-verified before use
+
+Why this exists:
+
+- a customer should be able to run the OSS memory core without trusting opaque
+  premium code
+- a legitimate premium deployment should have a clear audit trail for why a
+  feature was allowed or denied
+- a copied public repo should not be enough to execute paid private modules
+- stale or leaked premium documents should be revocable and bounded to machines,
+  manifests, owners, and policy versions
+- commercial value should sit in signed authority, operational policy, private
+  runtime distribution, and customer-specific governance rather than in fragile
+  code obfuscation
+
+What this does **not** claim:
+
+- it does not stop anyone from forking the OSS core
+- it does not make Python code impossible to modify
+- it does not replace legal licensing, private-key custody, customer contracts,
+  or deployment discipline
+- it does not defend against a company building its own unrelated private fork
+  and its own signing infrastructure
+
+The practical goal is narrower and more useful: a corporate fork of the public
+tree alone cannot honestly claim to be running the premium runtime through the
+same audited, signed, machine-bound control surface. They can copy the airlock;
+they do not get the signed keys, customer entitlements, private runtime,
+control-plane policy, revocation authority, or operator approval chain.
+
+See [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md) for the
+operator wiring and verification procedure.
+
 **Premium-only capabilities** are for paid, explicitly entitled users only. They are expected to live in a separate private repo and be loaded through the gated runtime only. Typical premium-only modules include:
 
 - password-protected premium views and protected operator scopes for especially sensitive memory surfaces
