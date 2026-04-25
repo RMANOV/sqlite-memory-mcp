@@ -1,6 +1,6 @@
 [project]
 name = "sqlite-memory-mcp"
-version = "3.7.1"
+version = "3.7.2"
 description = "SQLite-backed MCP Memory Server with hybrid search (BM25 + semantic via sqlite-vec), Intelligence v2, causal event ledger, premium runtime boundary, context state machine, knowledge tiers, WAL concurrent safety, cross-machine bridge sync, and 56 OSS MCP tools"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=2.0.0"]
@@ -24,6 +24,8 @@ sqlite-memory-collab = "collab_server:main"
 sqlite-memory-entity = "entity_server:main"
 sqlite-memory-intel = "intel_server:main"
 sqlite-memory-unified = "unified_server:main"
+sqlite-memory-doctor = "install_doctor:main"
+sqlite-memory-demo = "demo_flow:main"
 task-tray = "task_tray:main"
 memory-digest = "daily_digest:main"
 
@@ -43,6 +45,7 @@ py-modules = [
     "fastmcp_compat",
     "impact_graph",
     "import_notion",
+    "install_doctor",
     "intel_server",
     "intelligence_v2",
     "lazy_enrichment",
@@ -55,6 +58,7 @@ py-modules = [
     "retrieval_contract",
     "runtime_parity",
     "schema",
+    "demo_flow",
     "server",
     "session_server",
     "smart_retrieval",

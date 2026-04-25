@@ -322,7 +322,32 @@ See:
 
 ## Installation
 
-### Quick Start
+### Two-minute install + demo
+
+Use this path when you want to verify the install before wiring Claude Code:
+
+```bash
+git clone https://github.com/RMANOV/sqlite-memory-mcp.git
+cd sqlite-memory-mcp
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[gui,dev]"
+
+# Verify Python, FastMCP, SQLite schema, and DB write access.
+sqlite-memory-doctor --db /tmp/sqlite-memory-mcp-demo.db --check-gui
+
+# Seed a safe demo DB with one entity, one task, one note, a reminder,
+# and a recurring schedule. This does not touch your real memory.db.
+sqlite-memory-demo --db /tmp/sqlite-memory-mcp-demo.db --reset
+
+# Optional desktop demo against the demo DB.
+SQLITE_MEMORY_DB=/tmp/sqlite-memory-mcp-demo.db task-tray
+```
+
+If `sqlite-memory-doctor` is clean and the tray opens the demo DB, the local
+install is healthy enough to connect to Claude Code.
+
+### Claude Code quick start
 
 ```bash
 # Clone
@@ -776,6 +801,7 @@ Enable GitHub Pages on the bridge repo (Settings > Pages > Branch: main) to get 
 - **System tray icon** with overdue badge counter
 - **Compact popup** (left-click) -- Today + Overdue tasks, checkbox toggle, quick-add
 - **Full window** (right-click > Open Full Window) -- tabbed view with Today / Inbox / Next / All
+- **Create/edit dialog** -- task/note type, status, section, priority, due date, reminder, recurring schedule, project, notes, and attachments in one pass
 - **Background bridge sync ownership at tray-app level** -- DB watchers, periodic pull, recurring maintenance, and purge no longer depend on opening the full window
 - **Auto-refresh** every 30 seconds when visible
 - **Window geometry** persisted via QSettings
@@ -785,10 +811,11 @@ Enable GitHub Pages on the bridge repo (Settings > Pages > Branch: main) to get 
 pip install PyQt6
 
 # Run
-python3 task_tray.py
+task-tray
 
 # Bridge health / recovery smoke
 python3 bin/bridge_ops.py doctor
+python3 bin/bridge_ops.py refresh-hooks
 python3 bin/bridge_ops.py smoke
 ```
 
