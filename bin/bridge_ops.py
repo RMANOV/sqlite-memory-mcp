@@ -34,6 +34,15 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refresh_hooks(args: argparse.Namespace) -> int:
+    sys.path.insert(0, str(ROOT))
+    from runtime_parity import sync_runtime_hooks
+
+    payload = sync_runtime_hooks(dry_run=args.dry_run)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 1 if payload.get("missing_repo") else 0
+
+
 def cmd_smoke(args: argparse.Namespace) -> int:
     cmd = [sys.executable, "-m", "pytest", *SMOKE_TESTS]
     if not args.verbose:
@@ -49,6 +58,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="Print bridge_doctor JSON snapshot.")
     doctor.set_defaults(func=cmd_doctor)
+
+    refresh = sub.add_parser(
+        "refresh-hooks",
+        help="Copy tracked repo bridge hooks into the live Claude runtime hook dir.",
+    )
+    refresh.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show hook copies that would be refreshed without writing files.",
+    )
+    refresh.set_defaults(func=cmd_refresh_hooks)
 
     smoke = sub.add_parser(
         "smoke",

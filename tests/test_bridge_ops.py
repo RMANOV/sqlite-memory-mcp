@@ -1,5 +1,7 @@
+import json
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -56,3 +58,34 @@ def test_bridge_ops_smoke_verbose_omits_quiet_flag(monkeypatch):
         "pytest",
         *bridge_ops.SMOKE_TESTS,
     ]
+
+
+def test_bridge_ops_refresh_hooks_prints_sync_payload(monkeypatch, capsys):
+    bridge_ops = _load_bridge_ops()
+
+    def fake_sync_runtime_hooks(*, dry_run):
+        return {
+            "dry_run": dry_run,
+            "updated": [{"name": "bridge_auto_sync.py"}],
+            "skipped": [],
+            "missing_repo": [],
+            "before": {"all_synced": False},
+            "after": {"all_synced": True},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "runtime_parity",
+        type(
+            "RuntimeParityStub",
+            (),
+            {"sync_runtime_hooks": staticmethod(fake_sync_runtime_hooks)},
+        ),
+    )
+
+    rc = bridge_ops.main(["refresh-hooks", "--dry-run"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["dry_run"] is True
+    assert payload["updated"][0]["name"] == "bridge_auto_sync.py"

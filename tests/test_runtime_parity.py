@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from runtime_parity import (
     collect_runtime_parity,
     runtime_warning_summary,
+    sync_runtime_hooks,
     write_runtime_parity_manifest,
 )
 
@@ -71,3 +72,47 @@ def test_write_runtime_parity_manifest_persists_report(tmp_path):
     assert saved["manifest_path"] == str(manifest_path)
     assert len(saved["files"]) == 2
     assert {entry["status"] for entry in saved["files"]} == {"mismatch"}
+
+
+def test_sync_runtime_hooks_copies_drifted_files_and_writes_manifest(tmp_path):
+    repo_root = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    manifest_path = tmp_path / "parity.json"
+    _seed_runtime_tree(repo_root, runtime_root, same_worker=False)
+
+    result = sync_runtime_hooks(
+        repo_root=repo_root,
+        runtime_dir=runtime_root,
+        manifest_path=manifest_path,
+    )
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert result["dry_run"] is False
+    assert {entry["name"] for entry in result["updated"]} == {
+        "bridge_auto_sync.py",
+        "bridge_sync_worker.py",
+    }
+    assert result["after"]["all_synced"] is True
+    assert saved["all_synced"] is True
+    assert (runtime_root / "bridge_auto_sync.py").read_text(encoding="utf-8") == (
+        repo_root / "hooks" / "bridge_auto_sync.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_sync_runtime_hooks_dry_run_does_not_write(tmp_path):
+    repo_root = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    manifest_path = tmp_path / "parity.json"
+    _seed_runtime_tree(repo_root, runtime_root, same_worker=False)
+
+    result = sync_runtime_hooks(
+        repo_root=repo_root,
+        runtime_dir=runtime_root,
+        manifest_path=manifest_path,
+        dry_run=True,
+    )
+
+    assert result["dry_run"] is True
+    assert {entry["action"] for entry in result["updated"]} == {"would_copy"}
+    assert result["after"]["all_synced"] is False
+    assert not manifest_path.exists()

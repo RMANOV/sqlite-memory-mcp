@@ -8,10 +8,14 @@ Keep bridge health, tray-side sync behavior, and recovery confidence visible wit
 
 ```bash
 python bin/bridge_ops.py doctor
+python bin/bridge_ops.py refresh-hooks
 python bin/bridge_ops.py smoke
 ```
 
 `doctor` prints the current `bridge_doctor` JSON snapshot from the local repo/runtime.
+
+`refresh-hooks` copies the tracked repo bridge hooks into the live Claude runtime
+hook directory and rewrites the runtime parity manifest.
 
 `smoke` runs the highest-signal automated checks for:
 - bridge export/import
@@ -24,6 +28,8 @@ python bin/bridge_ops.py smoke
   - run `python bin/bridge_ops.py smoke`
 - Before or after a machine-to-machine rollout:
   - run `python bin/bridge_ops.py doctor`
+- When `doctor` reports runtime hook drift:
+  - run `python bin/bridge_ops.py refresh-hooks`
 - Weekly or before high-risk travel / machine changes:
   - run one manual fresh-machine recovery drill from bridge only
 

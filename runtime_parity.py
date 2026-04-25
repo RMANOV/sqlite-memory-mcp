@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,6 +139,68 @@ def write_runtime_parity_manifest(
     tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, target)
     return report
+
+
+def sync_runtime_hooks(
+    *,
+    repo_root: str | os.PathLike[str] | None = None,
+    runtime_dir: str | os.PathLike[str] | None = None,
+    manifest_path: str | os.PathLike[str] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy tracked repo hook files into the live Claude runtime hook dir."""
+    before = collect_runtime_parity(
+        repo_root=repo_root,
+        runtime_dir=runtime_dir,
+        manifest_path=manifest_path,
+    )
+    runtime_dir_path = Path(runtime_dir) if runtime_dir is not None else RUNTIME_HOOK_DIR
+    updates: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    missing_repo: list[str] = []
+
+    if not dry_run:
+        runtime_dir_path.mkdir(parents=True, exist_ok=True)
+
+    for entry in before["files"]:
+        name = str(entry["name"])
+        if not entry["repo_exists"]:
+            missing_repo.append(name)
+            continue
+        if entry["status"] == "in_sync":
+            skipped.append(name)
+            continue
+        update = {
+            "name": name,
+            "from": entry["repo_path"],
+            "to": entry["runtime_path"],
+            "previous_status": entry["status"],
+            "action": "would_copy" if dry_run else "copied",
+        }
+        updates.append(update)
+        if dry_run:
+            continue
+        runtime_path = Path(entry["runtime_path"])
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(entry["repo_path"], runtime_path)
+
+    after = (
+        before
+        if dry_run
+        else write_runtime_parity_manifest(
+            repo_root=repo_root,
+            runtime_dir=runtime_dir,
+            manifest_path=manifest_path,
+        )
+    )
+    return {
+        "dry_run": dry_run,
+        "updated": updates,
+        "skipped": skipped,
+        "missing_repo": missing_repo,
+        "before": before,
+        "after": after,
+    }
 
 
 def runtime_warning_summary(report: dict[str, Any]) -> str | None:
