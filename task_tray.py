@@ -742,6 +742,57 @@ from tray_dialogs import (
 )
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
+_REMINDER_MAX_DELIVERIES = 3
+_REMINDER_REPEAT_DELAYS_SECONDS = (5 * 60, 15 * 60)
+
+
+def _reminder_delivery_key(
+    task_id: str, reminder_at: str | None
+) -> tuple[str, str]:
+    return (task_id, reminder_at or "")
+
+
+def _should_deliver_reminder(
+    delivery_state: dict[tuple[str, str], dict[str, float | int]],
+    task_id: str,
+    reminder_at: str | None,
+    now_monotonic: float,
+) -> bool:
+    """Return True when a due reminder may be shown under the backoff policy."""
+    key = _reminder_delivery_key(task_id, reminder_at)
+    state = delivery_state.get(key)
+    if state is None:
+        delivery_state[key] = {
+            "count": 1,
+            "last_at": now_monotonic,
+            "next_at": now_monotonic + _REMINDER_REPEAT_DELAYS_SECONDS[0],
+        }
+        return True
+
+    count = int(state.get("count", 0))
+    if count >= _REMINDER_MAX_DELIVERIES:
+        return False
+
+    next_at = float(state.get("next_at", now_monotonic))
+    if now_monotonic < next_at:
+        return False
+
+    count += 1
+    state["count"] = count
+    state["last_at"] = now_monotonic
+    if count >= _REMINDER_MAX_DELIVERIES:
+        state["next_at"] = float("inf")
+    else:
+        state["next_at"] = now_monotonic + _REMINDER_REPEAT_DELAYS_SECONDS[count - 1]
+    return True
+
+
+def _clear_reminder_delivery_state(
+    delivery_state: dict[tuple[str, str], dict[str, float | int]],
+    task_id: str,
+) -> None:
+    for key in [key for key in delivery_state if key[0] == task_id]:
+        delivery_state.pop(key, None)
 
 
 def _run_recurring_maintenance(db_path):
@@ -2052,7 +2103,10 @@ class TaskTrayApp(BridgeSyncMixin):
         self._reminder_timer = QTimer(self.app)
         self._reminder_timer.timeout.connect(self._check_reminders)
         self._reminder_timer.start(60_000)
-        self._shown_reminder_ids: dict[str, float] = {}  # task_id → monotonic ts
+        self._reminder_delivery_state: dict[
+            tuple[str, str], dict[str, float | int]
+        ] = {}
+        self._active_reminder_keys: set[tuple[str, str]] = set()
         self._active_reminder_dlgs: list = []  # keep dialogs alive until closed
         QTimer.singleShot(5000, self._check_reminders)  # initial check after startup
 
@@ -2215,12 +2269,6 @@ class TaskTrayApp(BridgeSyncMixin):
 
     def _check_reminders(self):
         """Check for tasks with due reminders and show notifications."""
-        # Auto-cleanup: evict entries older than 5 min so reminders can re-fire
-        cutoff = time.monotonic() - 300
-        self._shown_reminder_ids = {
-            k: v for k, v in self._shown_reminder_ids.items() if v > cutoff
-        }
-
         try:
             now_str = now_iso()
             with get_conn(self.db.db_path) as conn:
@@ -2236,9 +2284,16 @@ class TaskTrayApp(BridgeSyncMixin):
 
         for row in rows:
             tid = row["id"]
-            if tid in self._shown_reminder_ids:
+            reminder_key = _reminder_delivery_key(tid, row["reminder_at"])
+            if reminder_key in self._active_reminder_keys:
                 continue
-            self._shown_reminder_ids[tid] = time.monotonic()
+            if not _should_deliver_reminder(
+                self._reminder_delivery_state,
+                tid,
+                row["reminder_at"],
+                time.monotonic(),
+            ):
+                continue
 
             # Critical priority or >1h overdue → popup dialog
             is_critical = row["priority"] == "critical"
@@ -2260,6 +2315,7 @@ class TaskTrayApp(BridgeSyncMixin):
                 )
                 dlg.snoozed.connect(self._snooze_reminder)
                 dlg.dismissed.connect(self._dismiss_reminder)
+                self._active_reminder_keys.add(reminder_key)
                 self._active_reminder_dlgs.append(dlg)
                 dlg.finished.connect(
                     lambda _, d=dlg: (
@@ -2268,6 +2324,9 @@ class TaskTrayApp(BridgeSyncMixin):
                         and d in self._active_reminder_dlgs
                         else None
                     )
+                )
+                dlg.finished.connect(
+                    lambda _, k=reminder_key: self._active_reminder_keys.discard(k)
                 )
                 dlg.show()
             else:
@@ -2282,12 +2341,12 @@ class TaskTrayApp(BridgeSyncMixin):
         """Reschedule reminder to NOW + minutes."""
         new_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
         self.db.update_task(task_id, reminder_at=new_time.isoformat())
-        self._shown_reminder_ids.pop(task_id, None)
+        _clear_reminder_delivery_state(self._reminder_delivery_state, task_id)
 
     def _dismiss_reminder(self, task_id: str):
         """Clear the reminder."""
         self.db.update_task(task_id, reminder_at=None)
-        self._shown_reminder_ids.pop(task_id, None)
+        _clear_reminder_delivery_state(self._reminder_delivery_state, task_id)
 
     def _on_quit(self):
         self._enrich_timer.stop()
