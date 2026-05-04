@@ -10,7 +10,7 @@
 
 A production-quality SQLite-backed MCP Memory stack with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system tray task manager.
 
-Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 47 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (56 OSS tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
+Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 48 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (57 OSS tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
 
 ## Why SQLite?
 
@@ -336,8 +336,9 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[gui,dev]"
 
-# Verify Python, FastMCP, SQLite schema, and DB write access.
-sqlite-memory-doctor --db /tmp/sqlite-memory-mcp-demo.db --check-gui
+# Verify Python, FastMCP, SQLite schema, DB write access, and optionally
+# whether Claude Code and Codex list the local sqlite MCP servers.
+sqlite-memory-doctor --db /tmp/sqlite-memory-mcp-demo.db --check-gui --check-claude-mcp --check-codex-mcp
 
 # Seed a safe demo DB with one entity, one task, one note, a reminder,
 # and a recurring schedule. This does not touch your real memory.db.
@@ -364,38 +365,61 @@ pip install -e .
 # pip install -e ".[gui,vector,speed]"
 
 # Add the core drop-in server
-claude mcp add sqlite_memory python /path/to/server.py
+claude mcp add --scope user sqlite_memory -- python /path/to/server.py
 
-# Add companion servers for the full 56-tool OSS stack
-claude mcp add sqlite_tasks python /path/to/task_server.py
-claude mcp add sqlite_session python /path/to/session_server.py
-claude mcp add sqlite_bridge python /path/to/bridge_server.py
-claude mcp add sqlite_collab python /path/to/collab_server.py
-claude mcp add sqlite_entity python /path/to/entity_server.py
-claude mcp add sqlite_intel python /path/to/intel_server.py
+# Add companion servers for the full 57-tool OSS stack
+claude mcp add --scope user sqlite_tasks -- python /path/to/task_server.py
+claude mcp add --scope user sqlite_session -- python /path/to/session_server.py
+claude mcp add --scope user sqlite_bridge -- python /path/to/bridge_server.py
+claude mcp add --scope user sqlite_collab -- python /path/to/collab_server.py
+claude mcp add --scope user sqlite_entity -- python /path/to/entity_server.py
+claude mcp add --scope user sqlite_intel -- python /path/to/intel_server.py
 
 # Optional: run the full stack as one all-in-one server instead
-claude mcp add sqlite_unified python /path/to/unified_server.py
+claude mcp add --scope user sqlite_unified -- python /path/to/unified_server.py
 ```
 
 If you install the package instead of running from a checkout, the same servers are available as console scripts:
 
 ```bash
-claude mcp add sqlite_memory sqlite-memory-core
-claude mcp add sqlite_tasks sqlite-memory-tasks
-claude mcp add sqlite_session sqlite-memory-session
-claude mcp add sqlite_bridge sqlite-memory-bridge
-claude mcp add sqlite_collab sqlite-memory-collab
-claude mcp add sqlite_entity sqlite-memory-entity
-claude mcp add sqlite_intel sqlite-memory-intel
+claude mcp add --scope user sqlite_memory -- sqlite-memory-core
+claude mcp add --scope user sqlite_tasks -- sqlite-memory-tasks
+claude mcp add --scope user sqlite_session -- sqlite-memory-session
+claude mcp add --scope user sqlite_bridge -- sqlite-memory-bridge
+claude mcp add --scope user sqlite_collab -- sqlite-memory-collab
+claude mcp add --scope user sqlite_entity -- sqlite-memory-entity
+claude mcp add --scope user sqlite_intel -- sqlite-memory-intel
 
 # Optional all-in-one server
-claude mcp add sqlite_unified sqlite-memory-unified
+claude mcp add --scope user sqlite_unified -- sqlite-memory-unified
+```
+
+Codex can use the same console-script servers:
+
+```bash
+codex mcp add sqlite_memory -- sqlite-memory-core
+codex mcp add sqlite_tasks -- sqlite-memory-tasks
+codex mcp add sqlite_session -- sqlite-memory-session
+codex mcp add sqlite_bridge -- sqlite-memory-bridge
+codex mcp add sqlite_collab -- sqlite-memory-collab
+codex mcp add sqlite_entity -- sqlite-memory-entity
+codex mcp add sqlite_intel -- sqlite-memory-intel
+
+# Optional all-in-one server
+codex mcp add sqlite_unified -- sqlite-memory-unified
 ```
 
 ### Manual Configuration
 
-Add these server/file pairs to your `~/.claude/settings.json` under `mcpServers`:
+Prefer `claude mcp add --scope user ...` above and verify with
+`claude mcp list`; prefer `codex mcp add ...` and verify with
+`codex mcp list` for Codex. Some Claude Code builds no longer surface legacy
+`~/.claude/settings.json` `mcpServers` entries in `claude mcp list`, and Codex
+uses its own `~/.codex/config.toml`, so one client's manual block does not
+prove the other client can load the servers.
+
+If you need a manual fallback, add these server/file pairs to your
+`~/.claude/settings.json` under `mcpServers`:
 
 | MCP server name | Python entry file | Purpose |
 |---|---|---|
@@ -406,7 +430,7 @@ Add these server/file pairs to your `~/.claude/settings.json` under `mcpServers`
 | `sqlite_collab` | `collab_server.py` | Collaborator and public-knowledge workflows |
 | `sqlite_entity` | `entity_server.py` | Task-entity linking and merge helpers |
 | `sqlite_intel` | `intel_server.py` | Context assessment and enrichment tools |
-| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full 56-tool OSS stack |
+| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full 57-tool OSS stack |
 
 Each server should share the same environment values:
 
@@ -513,13 +537,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 
 ## Tool Reference
 
-The 56 OSS tools are grouped by MCP server:
+The 57 OSS tools are grouped by MCP server:
 
 | MCP server | Tool count | Tools |
 |---|---:|---|
 | `sqlite_memory` | 9 | `create_entities`, `add_observations`, `create_relations`, `delete_entities`, `delete_observations`, `delete_relations`, `read_graph`, `search_nodes`, `open_nodes` |
 | `sqlite_session` | 5 | `session_save`, `session_recall`, `search_by_project`, `knowledge_health`, `resume_context` |
-| `sqlite_tasks` | 7 | `create_task_or_note`, `update_task`, `query_tasks`, `find_by_title`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority` |
+| `sqlite_tasks` | 8 | `create_task_or_note`, `upsert_note_by_title_project`, `update_task`, `query_tasks`, `find_by_title`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority` |
 | `sqlite_bridge` | 7 | `bridge_push`, `bridge_pull`, `bridge_status`, `bridge_doctor`, `assign_task`, `review_shared_tasks`, `process_recurring_tasks` |
 | `sqlite_collab` | 9 | `manage_collaborators`, `share_knowledge`, `review_shared_knowledge`, `request_publish`, `cancel_publish`, `search_public_knowledge`, `rate_public_knowledge`, `get_knowledge_ratings`, `update_verification` |
 | `sqlite_entity` | 7 | `link_task_entity`, `unlink_task_entity`, `get_task_links`, `get_entity_tasks`, `suggest_task_links`, `find_entity_overlaps`, `merge_entities` |
@@ -718,6 +742,13 @@ create_task_or_note(
 
 # Query pending tasks for today
 query_tasks(section="today", status="not_started")
+
+# Idempotently save or update a research/decision note by title + project
+upsert_note_by_title_project(
+    title="2026-05-04 | sqlite-memory-mcp | MCP research triangulation",
+    project="sqlite-memory-mcp",
+    description="Main long-form note body..."
+)
 
 # Mark a task in progress
 update_task(task_id="<uuid>", status="in_progress")

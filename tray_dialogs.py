@@ -854,6 +854,31 @@ class TrayPopup(QWidget):
         self._add_due = QLineEdit()
         self._add_due.setPlaceholderText("Due date (YYYY-MM-DD)")
         form_layout.addWidget(self._add_due)
+        add_reminder_top = QHBoxLayout()
+        self._add_reminder_enabled = QCheckBox("Reminder")
+        self._add_reminder_enabled.toggled.connect(
+            self._set_add_reminder_controls_enabled
+        )
+        add_reminder_top.addWidget(self._add_reminder_enabled)
+        self._add_reminder = QDateTimeEdit()
+        self._add_reminder.setCalendarPopup(True)
+        self._add_reminder.setDisplayFormat("dd.MM.yyyy HH:mm")
+        self._add_reminder.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+        add_reminder_top.addWidget(self._add_reminder, 1)
+        form_layout.addLayout(add_reminder_top)
+        add_reminder_shortcuts = QHBoxLayout()
+        self._add_reminder_shortcut_buttons = []
+        for label, minutes in [
+            ("1h", 60),
+            ("3h", 180),
+            ("Tomorrow 9:00", -1),
+        ]:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda checked, m=minutes: self._apply_add_reminder(m))
+            add_reminder_shortcuts.addWidget(btn)
+            self._add_reminder_shortcut_buttons.append(btn)
+        form_layout.addLayout(add_reminder_shortcuts)
+        self._set_add_reminder_controls_enabled(False)
         self._add_priority = QComboBox()
         self._add_priority.addItems(PRIORITIES)
         self._add_priority.setCurrentText("medium")
@@ -1143,6 +1168,32 @@ class TrayPopup(QWidget):
             self._add_title.setFocus()
         self.adjustSize()
 
+    def _set_add_reminder_controls_enabled(self, enabled: bool):
+        self._add_reminder.setEnabled(enabled)
+        for btn in getattr(self, "_add_reminder_shortcut_buttons", []):
+            btn.setEnabled(enabled)
+
+    def _apply_add_reminder(self, minutes: int):
+        now = QDateTime.currentDateTime()
+        self._add_reminder_enabled.setChecked(True)
+        if minutes == -1:
+            self._add_reminder.setDateTime(
+                QDateTime(now.date().addDays(1), QTime(9, 0))
+            )
+        else:
+            self._add_reminder.setDateTime(now.addSecs(minutes * 60))
+
+    def _add_reminder_iso(self) -> str:
+        qdt = self._add_reminder.dateTime().toUTC()
+        return datetime(
+            qdt.date().year(),
+            qdt.date().month(),
+            qdt.date().day(),
+            qdt.time().hour(),
+            qdt.time().minute(),
+            tzinfo=timezone.utc,
+        ).isoformat()
+
     def _submit_task(self):
         title = self._add_title.text().strip()
         if not title:
@@ -1153,6 +1204,8 @@ class TrayPopup(QWidget):
         due = self._add_due.text().strip()
         if due:
             kwargs["due_date"] = due
+        if self._add_reminder_enabled.isChecked():
+            kwargs["reminder_at"] = self._add_reminder_iso()
         task_type = self._add_type.currentText().lower()
         self.db.add_task(
             title,
@@ -1165,6 +1218,8 @@ class TrayPopup(QWidget):
         self._add_desc.clear()
         self._add_notes.clear()
         self._add_due.clear()
+        self._add_reminder_enabled.setChecked(False)
+        self._add_reminder.setDateTime(QDateTime.currentDateTime().addSecs(3600))
         self._add_priority.setCurrentText("medium")
         self._add_type.setCurrentText("Task")
         self._add_form.setVisible(False)

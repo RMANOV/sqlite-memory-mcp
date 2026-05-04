@@ -56,6 +56,35 @@ def _vec_sync_task_safe(conn, task_id: str) -> None:
         logger.debug("vec_sync_task(%s) skipped: %s", task_id, e)
 
 
+def _normalize_title_key(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _find_note_by_title_project(
+    conn, *, title: str, project: str | None
+) -> dict[str, Any] | None:
+    title_key = _normalize_title_key(title)
+    if not title_key:
+        return None
+    if project is None:
+        rows = conn.execute(
+            "SELECT id, title, description, notes, status, section, priority, "
+            "project, updated_at, created_at "
+            "FROM tasks WHERE type = 'note' AND project IS NULL"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, title, description, notes, status, section, priority, "
+            "project, updated_at, created_at "
+            "FROM tasks WHERE type = 'note' AND project = ?",
+            (project,),
+        ).fetchall()
+    for row in rows:
+        if _normalize_title_key(row["title"]) == title_key:
+            return dict(row)
+    return None
+
+
 # ── FastMCP app ──────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -67,6 +96,9 @@ mcp = FastMCP(
         "and entities across title/name, description, notes, observations, and project "
         "regardless of status, section, or project filters, using retrieval contract "
         f"{RETRIEVAL_CONTRACT_VERSION} with confidence gating. "
+        "Use upsert_note_by_title_project for idempotent research/decision notes "
+        "when a repeated agent run must update an existing title/project instead of "
+        "creating duplicates. "
         "Use description as the default primary body for task/note content; "
         "use notes only for auxiliary/internal metadata. Shares DB with sqlite-kb."
     ),
@@ -157,6 +189,149 @@ def create_task_or_note(
     logger.info("create_task_or_note: %s (%s)", title, task_id)
     return json.dumps(
         {"task_id": task_id, "title": title, "type": type, "status": "not_started"}
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 1b: upsert_note_by_title_project
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def upsert_note_by_title_project(
+    title: str,
+    project: str = "",
+    description: str = "",
+    notes: str = "",
+    section: str = "",
+    priority: str = "",
+    update_if_found: bool = True,
+) -> str:
+    """Create or update a note by exact normalized title + project.
+
+    This is the idempotent write surface for durable research/decision notes.
+    It prevents repeated agent retries from creating near-duplicate note rows.
+
+    Matching rule:
+    - exact normalized title + project;
+    - no fuzzy overwrite;
+    - updates go through the task mutation ledger.
+
+    Args:
+        title: Note title (required).
+        project: Project tag for matching and grouping.
+        description: Primary long-form note body.
+        notes: Optional auxiliary/internal metadata.
+        section: Section for new notes; updates only when explicitly set.
+        priority: Priority for new notes; updates only when explicitly set.
+        update_if_found: When false, return the existing row without mutation.
+    """
+    title = (title or "").strip()
+    if not title:
+        return json.dumps({"error": "title is required"})
+
+    project_value = project.strip() if project else None
+    create_section = section or "next"
+    create_priority = priority or "medium"
+    if err := _validate_task_fields(
+        section=create_section,
+        priority=create_priority,
+        type="note",
+    ):
+        return json.dumps({"error": err})
+    update_validation = {
+        key: value
+        for key, value in {"section": section, "priority": priority}.items()
+        if value
+    }
+    if update_validation and (err := _validate_task_fields(**update_validation)):
+        return json.dumps({"error": err})
+
+    now = _now()
+    with _get_conn() as conn:
+        existing = _find_note_by_title_project(
+            conn, title=title, project=project_value
+        )
+        if existing:
+            if not update_if_found:
+                return json.dumps(
+                    {
+                        "task_id": existing["id"],
+                        "title": existing["title"],
+                        "type": "note",
+                        "action": "existing",
+                        "matched_on": "normalized_title_project",
+                    }
+                )
+
+            updates: dict[str, Any] = {}
+            if description:
+                updates["description"] = description
+            if notes:
+                updates["notes"] = notes
+            if section:
+                updates["section"] = section
+            if priority:
+                updates["priority"] = priority
+
+            if not updates:
+                return json.dumps(
+                    {
+                        "task_id": existing["id"],
+                        "title": existing["title"],
+                        "type": "note",
+                        "action": "existing",
+                        "matched_on": "normalized_title_project",
+                    }
+                )
+
+            result = _apply_task_mutation(
+                conn,
+                existing["id"],
+                updates,
+                timestamp=now,
+                tool_name="sqlite-tasks.upsert_note_by_title_project",
+            )
+            if {"title", "description", "notes"} & set(
+                result.get("changed_fields", ())
+            ):
+                _vec_sync_task_safe(conn, existing["id"])
+            return json.dumps(
+                {
+                    "task_id": existing["id"],
+                    "title": title,
+                    "type": "note",
+                    "action": "updated",
+                    "fields": result.get("changed_fields", []),
+                    "matched_on": "normalized_title_project",
+                }
+            )
+
+        task_id = str(uuid.uuid4())
+        _create_task_with_ledger(
+            conn,
+            task_id,
+            title,
+            now,
+            description=description or None,
+            status="not_started",
+            priority=create_priority,
+            section=create_section,
+            project=project_value,
+            notes=notes or None,
+            type="note",
+            tool_name="sqlite-tasks.upsert_note_by_title_project",
+        )
+        _vec_sync_task_safe(conn, task_id)
+
+    logger.info("upsert_note_by_title_project: %s (%s)", title, task_id)
+    return json.dumps(
+        {
+            "task_id": task_id,
+            "title": title,
+            "type": "note",
+            "status": "not_started",
+            "action": "created",
+            "matched_on": "normalized_title_project",
+        }
     )
 
 

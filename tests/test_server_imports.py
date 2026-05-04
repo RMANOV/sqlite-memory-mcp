@@ -32,6 +32,10 @@ def test_tool_decorators_keep_fn_alias_for_direct_invocation_regressions():
     assert server.create_entities.fn is server.create_entities
     assert server.create_entities([]) == server.create_entities.__wrapped__([])
     assert task_server.create_task_or_note.fn is task_server.create_task_or_note
+    assert (
+        task_server.upsert_note_by_title_project.fn
+        is task_server.upsert_note_by_title_project
+    )
     assert task_server.find_by_title.fn is task_server.find_by_title
     assert callable(task_server.create_task_or_note.fn)
     assert session_server.session_save.fn is session_server.session_save
@@ -121,6 +125,9 @@ def test_server_main_wrappers_preserve_startup_hooks(
 def test_task_server_instructions_make_description_the_default_body_field():
     assert "description as the default primary body" in task_server.mcp.instructions
     assert "Use find_by_title when only a remembered phrase is known" in (
+        task_server.mcp.instructions
+    )
+    assert "Use upsert_note_by_title_project for idempotent research/decision notes" in (
         task_server.mcp.instructions
     )
     assert "confidence gating" in task_server.mcp.instructions

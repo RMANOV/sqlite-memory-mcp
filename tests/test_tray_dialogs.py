@@ -39,6 +39,39 @@ class _FakeTaskDb:
         return None
 
 
+class _FakeTraySearchEngine:
+    def rebuild_index(self, tasks):
+        pass
+
+    def search(self, query, tasks, limit=20, conn=None, use_vector=False):
+        return []
+
+
+class _FakeTrayPopupDb(_FakeTaskDb):
+    def __init__(self):
+        self.search_engine = _FakeTraySearchEngine()
+        self.created = []
+
+    def promote_due_today(self):
+        return []
+
+    def get_suggested_tasks(self, limit=8):
+        return []
+
+    def get_all_active(self):
+        return []
+
+    def get_done_tasks(self):
+        return []
+
+    def search_entities_fast(self, query, limit=5):
+        return []
+
+    def add_task(self, title, **kwargs):
+        self.created.append((title, kwargs))
+        return "task-created"
+
+
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance()
@@ -182,6 +215,24 @@ def test_edit_task_dialog_can_clear_reminder_and_recurring(qapp):
     assert vals["reminder_at"] is None
     assert vals["recurring"] is None
     dlg.close()
+
+
+def test_tray_popup_add_form_can_create_note_with_reminder(qapp):
+    db = _FakeTrayPopupDb()
+    popup = tray_dialogs.TrayPopup(db, lambda: None)
+
+    popup._add_title.setText("Reminder note")
+    popup._add_type.setCurrentText("Note")
+    popup._apply_add_reminder(60)
+    popup._submit_task()
+
+    assert len(db.created) == 1
+    title, kwargs = db.created[0]
+    assert title == "Reminder note"
+    assert kwargs["type"] == "note"
+    assert kwargs["reminder_at"].endswith("+00:00")
+    assert popup._add_reminder_enabled.isChecked() is False
+    popup.close()
 
 
 def test_task_reader_dialog_renders_notes_section(qapp, monkeypatch):

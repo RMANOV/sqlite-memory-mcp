@@ -134,6 +134,67 @@ def test_find_by_title_matches_description_notes_and_project(task_env):
     )
 
 
+def test_upsert_note_by_title_project_updates_existing_note_in_place(task_env):
+    created = json.loads(
+        task_server.upsert_note_by_title_project.fn(
+            title="Daily research note",
+            project="sqlite-memory-mcp",
+            description="first body",
+        )
+    )
+    updated = json.loads(
+        task_server.upsert_note_by_title_project.fn(
+            title="  daily   research NOTE ",
+            project="sqlite-memory-mcp",
+            description="updated body",
+            notes="source=retry",
+        )
+    )
+
+    assert created["action"] == "created"
+    assert updated["action"] == "updated"
+    assert updated["task_id"] == created["task_id"]
+
+    with task_server._get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, description, notes FROM tasks "
+            "WHERE type = 'note' AND project = ?",
+            ("sqlite-memory-mcp",),
+        ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["description"] == "updated body"
+    assert rows[0]["notes"] == "source=retry"
+
+
+def test_upsert_note_by_title_project_can_return_existing_without_mutation(task_env):
+    created = json.loads(
+        task_server.upsert_note_by_title_project.fn(
+            title="Stable note",
+            project="sqlite-memory-mcp",
+            description="first body",
+        )
+    )
+    existing = json.loads(
+        task_server.upsert_note_by_title_project.fn(
+            title="Stable note",
+            project="sqlite-memory-mcp",
+            description="should not replace",
+            update_if_found=False,
+        )
+    )
+
+    assert existing["action"] == "existing"
+    assert existing["task_id"] == created["task_id"]
+
+    with task_server._get_conn() as conn:
+        body = conn.execute(
+            "SELECT description FROM tasks WHERE id = ?", (created["task_id"],)
+        ).fetchone()["description"]
+
+    assert body == "first body"
+
+
 def test_find_by_title_matches_entity_observations(task_env):
     _seed_lookup_corpus()
 
