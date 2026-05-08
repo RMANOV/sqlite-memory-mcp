@@ -503,6 +503,59 @@ def enrich_context(depth: str = "quick") -> str:
         return json.dumps({"error": str(exc)})
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 13: reflect_audit (Phase 0.5 — read-only consolidation candidate audit)
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def reflect_audit(
+    project: str = "",
+    stale_days: int = 60,
+    abandoned_inbox_days: int = 30,
+    limit_per_category: int = 20,
+    format: str = "json",
+) -> str:
+    """Find consolidation candidates without mutating. Read-only, no LLM, no API.
+
+    Detects six categories: exact duplicate task titles, stale overdue
+    not_started tasks, notes with empty descriptions, orphan parent_ids,
+    abandoned inbox items, and entities without observations. Each candidate
+    carries a suggested action so a downstream reviewer can decide
+    merge/archive/supersede without re-querying.
+
+    Phase 0.5 of the Reviewable Memory Consolidation pipeline (Ingest →
+    Extract → Reconcile → Review → Apply). Subsequent phases will add
+    session-source ingestion plus review/apply tooling. MVP excludes
+    hard-delete; archive/supersede preserves provenance.
+
+    Args:
+        project: filter to a single project (empty = all)
+        stale_days: due_date older than this many days counts as stale (default 60)
+        abandoned_inbox_days: inbox items untouched this long are flagged (default 30)
+        limit_per_category: cap candidates per category (default 20)
+        format: "json" (default) or "markdown" (adds rendered report)
+    """
+    try:
+        with _get_conn() as conn:
+            report = _audit_reflection_candidates(
+                conn,
+                project=project or None,
+                stale_days=stale_days,
+                abandoned_inbox_days=abandoned_inbox_days,
+                limit_per_category=limit_per_category,
+            )
+            logger.info(
+                "reflect_audit: total=%d project=%s",
+                report["summary"]["total_candidates"],
+                project or "*",
+            )
+            if format == "markdown":
+                report["markdown"] = _format_audit_markdown(report)
+            return json.dumps(report)
+    except Exception as exc:
+        logger.error("reflect_audit failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc)})
+
+
 # ── Entry point ──────────────────────────────────────────────────────────
 def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-intel")
