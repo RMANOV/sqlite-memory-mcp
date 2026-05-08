@@ -742,6 +742,9 @@ from tray_dialogs import (
 )
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
+_PERIODIC_PULL_INTERVAL_MS = 15 * 60_000
+_BACKGROUND_AUDIT_INTERVAL_MS = 60 * 60_000
+_BACKGROUND_AUDIT_STARTUP_DELAY_MS = 10 * 60_000
 _REMINDER_MAX_DELIVERIES = 3
 _REMINDER_REPEAT_DELAYS_SECONDS = (5 * 60, 15 * 60)
 
@@ -810,6 +813,7 @@ def _run_recurring_maintenance(db_path):
 class _BridgeSignalBus(QObject):
     progress = pyqtSignal(int, str)
     done = pyqtSignal(str)
+    refresh_requested = pyqtSignal()
 
 
 class _TrayStatusProxy:
@@ -1199,6 +1203,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """DB file changed — start/restart debounce timers."""
         self._db_refresh_debounce.start()  # 500ms UI refresh debounce
         self._refresh_db_watch_paths()
+        if not getattr(self, "_auto_sync_enabled", True):
+            return
         if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return  # suppress sync cascade from own sync operations
         self._auto_sync_timer.start()  # 60s bridge sync debounce
@@ -1207,6 +1213,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """Directory changed — catch WAL create/rotate events."""
         self._db_refresh_debounce.start()
         watch_paths_changed = self._refresh_db_watch_paths()
+        if not getattr(self, "_auto_sync_enabled", True):
+            return
         if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return
         if watch_paths_changed:
@@ -2050,7 +2058,10 @@ class TaskTrayApp(BridgeSyncMixin):
         self._bridge_signal_bus = _BridgeSignalBus(self.app)
         self._bridge_progress = self._bridge_signal_bus.progress
         self._bridge_done = self._bridge_signal_bus.done
+        self._bridge_refresh_requested = self._bridge_signal_bus.refresh_requested
         self._bridge_done.connect(self._on_app_sync_done)
+        self._background_db_write_lock = threading.Lock()
+        self._auto_sync_enabled = os.environ.get("SQLITE_MEMORY_TRAY_AUTO_SYNC", "1") != "0"
 
         # Periodic entity enrichment cache refresh (60s safety net for external writes)
         self._enrich_timer = QTimer(self.app)
@@ -2061,19 +2072,15 @@ class TaskTrayApp(BridgeSyncMixin):
         )
         self._enrich_timer.start(60_000)
 
-        self._audit_timer = QTimer(self.app)
-        self._audit_timer.timeout.connect(
-            lambda: threading.Thread(
-                target=self._run_background_memory_audit, daemon=True
-            ).start()
-        )
-        self._audit_timer.start(10 * 60_000)
-        QTimer.singleShot(
-            15_000,
-            lambda: threading.Thread(
-                target=self._run_background_memory_audit, daemon=True
-            ).start(),
-        )
+        self._audit_timer = None
+        if os.environ.get("SQLITE_MEMORY_TRAY_BACKGROUND_AUDIT") == "1":
+            self._audit_timer = QTimer(self.app)
+            self._audit_timer.timeout.connect(self._start_background_memory_audit)
+            self._audit_timer.start(_BACKGROUND_AUDIT_INTERVAL_MS)
+            QTimer.singleShot(
+                _BACKGROUND_AUDIT_STARTUP_DELAY_MS,
+                self._start_background_memory_audit,
+            )
 
         # Tray icon
         self.tray = QSystemTrayIcon()
@@ -2133,16 +2140,18 @@ class TaskTrayApp(BridgeSyncMixin):
         self._auto_sync_timer.setInterval(60_000)
         self._auto_sync_timer.timeout.connect(self._auto_sync_triggered)
         self._periodic_pull_timer = QTimer(self.app)
-        self._periodic_pull_timer.setInterval(5 * 60_000)
+        self._periodic_pull_timer.setInterval(_PERIODIC_PULL_INTERVAL_MS)
         self._periodic_pull_timer.timeout.connect(self._periodic_pull)
-        self._periodic_pull_timer.start()
+        if self._auto_sync_enabled:
+            self._periodic_pull_timer.start()
         self._db_refresh_debounce = QTimer(self.app)
         self._db_refresh_debounce.setSingleShot(True)
         self._db_refresh_debounce.setInterval(500)
         self._db_refresh_debounce.timeout.connect(self._refresh_all)
+        self._bridge_refresh_requested.connect(self._db_refresh_debounce.start)
         self._sync_run_active = False
         self._sync_cooldown_until = 0.0
-        self._initial_auto_sync_pending = True
+        self._initial_auto_sync_pending = self._auto_sync_enabled
         self._pending_auto_sync_initiator = None
 
         self._process_recurring()
@@ -2154,7 +2163,17 @@ class TaskTrayApp(BridgeSyncMixin):
         pm = create_tray_icon_pixmap(summary["overdue"])
         self.tray.setIcon(QIcon(pm))
 
+    def _start_background_memory_audit(self):
+        threading.Thread(target=self._run_background_memory_audit, daemon=True).start()
+
     def _run_background_memory_audit(self):
+        audit_lock = getattr(self, "_background_db_write_lock", None)
+        audit_lock_acquired = False
+        if audit_lock is not None:
+            audit_lock_acquired = audit_lock.acquire(blocking=False)
+            if not audit_lock_acquired:
+                logger.info("background memory audit skipped: DB writer active")
+                return
         try:
             from memory_audit import maybe_run_memory_audit
 
@@ -2176,6 +2195,9 @@ class TaskTrayApp(BridgeSyncMixin):
                 )
         except Exception as exc:
             logger.warning("background memory audit failed: %s", exc)
+        finally:
+            if audit_lock is not None and audit_lock_acquired:
+                audit_lock.release()
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
@@ -2350,7 +2372,8 @@ class TaskTrayApp(BridgeSyncMixin):
 
     def _on_quit(self):
         self._enrich_timer.stop()
-        self._audit_timer.stop()
+        if self._audit_timer is not None:
+            self._audit_timer.stop()
         self._reminder_timer.stop()
         self._purge_timer.stop()
         self._periodic_pull_timer.stop()

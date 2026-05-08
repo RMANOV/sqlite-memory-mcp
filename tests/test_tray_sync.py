@@ -262,16 +262,22 @@ def test_sync_bridge_skips_when_thread_already_running(bridge_env):
 
 def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     captured = {}
+    refreshes = []
     bridge_sync_worker = SimpleNamespace(
         main=lambda **kwargs: (
-            captured.update(kwargs) or {"imported_new": 0, "imported_updated": 0}
+            captured.update(kwargs) or {"imported_new": 1, "imported_updated": 0}
         )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
 
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
-    window._db_refresh_debounce = SimpleNamespace(start=lambda: None)
+    window._db_refresh_debounce = SimpleNamespace(
+        start=lambda: refreshes.append("timer")
+    )
+    window._bridge_refresh_requested = SimpleNamespace(
+        emit=lambda: refreshes.append("signal")
+    )
     window._bridge_progress = SimpleNamespace(emit=lambda *args: None)
     window._bridge_done = SimpleNamespace(emit=lambda *args: None)
     monkeypatch.setattr(
@@ -283,6 +289,42 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     window._periodic_pull()
 
     assert captured["pull_only"] is True
+    assert refreshes == ["signal"]
+
+
+def test_request_db_refresh_from_worker_falls_back_to_timer(bridge_env):
+    refreshes = []
+    window = _DummyWindow(bridge_env)
+    window._db_refresh_debounce = SimpleNamespace(
+        start=lambda: refreshes.append("timer")
+    )
+
+    window._request_db_refresh_from_worker()
+
+    assert refreshes == ["timer"]
+
+
+def test_start_bridge_sync_thread_serializes_background_db_writers(bridge_env):
+    order = []
+    window = _DummyWindow(bridge_env)
+    window._auto_sync_timer = SimpleNamespace(stop=lambda: None)
+    window._background_db_write_lock = threading.Lock()
+    window._background_db_write_lock.acquire()
+
+    assert window._start_bridge_sync_thread(
+        lambda: order.append("target"),
+        initiator="test",
+        mode="sync",
+    )
+    time.sleep(0.05)
+    assert order == []
+
+    window._background_db_write_lock.release()
+    deadline = time.monotonic() + 1
+    while not order and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert order == ["target"]
 
 
 def test_start_bridge_sync_thread_releases_lock_after_worker_finishes(bridge_env):
@@ -346,6 +388,24 @@ def test_db_change_during_sync_does_not_rearm_auto_sync_timer(bridge_env):
     assert starts == []
 
 
+def test_db_change_does_not_arm_auto_sync_when_disabled():
+    starts = []
+    refreshes = []
+    dummy = SimpleNamespace(
+        _db_refresh_debounce=SimpleNamespace(start=lambda: refreshes.append("refresh")),
+        _refresh_db_watch_paths=lambda: None,
+        _auto_sync_enabled=False,
+        _sync_run_active=False,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._on_db_changed(dummy, "ignored")
+
+    assert refreshes == ["refresh"]
+    assert starts == []
+
+
 def test_db_dir_change_without_watch_path_delta_does_not_rearm_auto_sync_timer():
     starts = []
     refreshes = []
@@ -392,6 +452,21 @@ def test_initial_auto_sync_only_arms_while_pending():
     task_tray.FullWindow._maybe_schedule_initial_auto_sync(dummy)
 
     assert starts == ["auto-sync"]
+
+
+def test_initial_auto_sync_does_not_arm_when_disabled():
+    starts = []
+    dummy = SimpleNamespace(
+        _auto_sync_enabled=False,
+        _initial_auto_sync_pending=True,
+        _sync_run_active=False,
+        _sync_cooldown_until=0.0,
+        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+    )
+
+    task_tray.FullWindow._maybe_schedule_initial_auto_sync(dummy)
+
+    assert starts == []
 
 
 def test_initial_auto_sync_does_not_rearm_after_pending_consumed():

@@ -7,10 +7,12 @@ while the full window can reuse the UI/profile helpers.
 Expected host capabilities for active sync ownership:
     self._bridge_progress.emit(int, str)
     self._bridge_done.emit(str)
+    self._bridge_refresh_requested.emit()
     self.status.showMessage(str, int)
     self._db_watcher / self._auto_sync_timer / self._periodic_pull_timer
     self._db_refresh_debounce / self._db_watch_dir / self._sync_run_active
     self._sync_cooldown_until / self._initial_auto_sync_pending
+    optional self._background_db_write_lock for serializing background DB writers
     self._build_ui_profile()
 
 Expected host capabilities for window UI integration:
@@ -91,10 +93,20 @@ class BridgeSyncMixin:
                 mode,
             )
 
+    def _request_db_refresh_from_worker(self):
+        """Request a debounced UI refresh from a worker-safe path."""
+        signal = getattr(self, "_bridge_refresh_requested", None)
+        if signal is not None:
+            signal.emit()
+            return
+        self._db_refresh_debounce.start()
+
     def _on_db_changed(self, path):
         """DB file changed — start/restart debounce timers."""
         self._db_refresh_debounce.start()
         self._refresh_db_watch_paths()
+        if not getattr(self, "_auto_sync_enabled", True):
+            return
         if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return
         self._arm_auto_sync("db_file_change")
@@ -103,6 +115,8 @@ class BridgeSyncMixin:
         """Directory changed — catch WAL create/rotate events."""
         self._db_refresh_debounce.start()
         watch_paths_changed = self._refresh_db_watch_paths()
+        if not getattr(self, "_auto_sync_enabled", True):
+            return
         if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
             return
         if watch_paths_changed:
@@ -128,6 +142,8 @@ class BridgeSyncMixin:
 
     def _maybe_schedule_initial_auto_sync(self):
         """Arm one startup sync after the tray app has initialized."""
+        if not getattr(self, "_auto_sync_enabled", True):
+            return
         if not getattr(self, "_initial_auto_sync_pending", False):
             return
         if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
@@ -168,7 +184,12 @@ class BridgeSyncMixin:
 
         def _wrapped():
             try:
-                target()
+                background_lock = getattr(self, "_background_db_write_lock", None)
+                if background_lock is None:
+                    target()
+                else:
+                    with background_lock:
+                        target()
             finally:
                 self._sync_cooldown_until = time.monotonic() + 5.0
                 self._sync_run_active = False
@@ -180,6 +201,8 @@ class BridgeSyncMixin:
 
     def _periodic_pull(self, initiator: str = "periodic_pull"):
         """Periodic pull from remote — catches changes from other machines."""
+        if not getattr(self, "_auto_sync_enabled", True):
+            return
         if not os.path.isdir(self._BRIDGE_DIR):
             return
 
@@ -206,7 +229,7 @@ class BridgeSyncMixin:
                 )
                 if imported:
                     self._bridge_done.emit(f"Pulled {imported} updates from remote")
-                    self._db_refresh_debounce.start()
+                    self._request_db_refresh_from_worker()
             except Exception as exc:
                 self._log_sync_event(
                     "error",
