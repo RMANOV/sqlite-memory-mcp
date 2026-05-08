@@ -499,12 +499,25 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             remote_payload,
             logger,
         )
+        merge_failed = False
         if remote_tasks:
             try:
                 _merge_import_tasks(conn, remote_tasks, import_content=True)
                 _sync_task_attachments_from_remote(conn, remote_tasks, BRIDGE_REPO)
             except (sqlite3.Error, ValueError) as exc:
                 logger.warning("bridge_push: task merge failed: %s", exc)
+                merge_failed = True
+
+        if merge_failed:
+            logger.error(
+                "bridge_push aborted: task merge failed — local DB has not "
+                "absorbed remote tombstones; pushing stale state would "
+                "resurrect deletions made on other peers"
+            )
+            return _error(
+                "bridge_push aborted: task merge failed; remote tombstones "
+                "not absorbed. Resolve DB lock contention and retry."
+            )
 
         # Incremental check: skip if no changes since last push
         if not force:

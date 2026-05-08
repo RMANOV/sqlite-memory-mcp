@@ -773,6 +773,7 @@ def _main_locked(
             remote_payload,
             log,
         )
+        merge_failed = False
         if remote_tasks:
             try:
                 new_t, upd_t = merge_import_tasks(
@@ -789,7 +790,29 @@ def _main_locked(
                 ValueError,
             ) as exc:
                 log.warning("Task merge failed: %s", exc)
+                merge_failed = True
     # Task import transaction closed — DB lock released
+
+    if merge_failed and not pull_only:
+        log.error(
+            "sync aborted: task merge failed — local DB has not absorbed "
+            "remote tombstones; pushing stale state would resurrect "
+            "deletions made on other peers"
+        )
+        _progress(
+            progress_callback,
+            -1,
+            "BLOCKED: task merge failed (DB lock contention). "
+            "Tombstones from other peers not absorbed; push aborted.",
+        )
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+            "blocked_by_merge_failure": True,
+        }
 
     if pull_only:
         _progress(progress_callback, 100, "Pull complete")

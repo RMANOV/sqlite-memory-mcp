@@ -727,3 +727,64 @@ def test_bridge_sync_worker_records_last_push_at_from_payload_timestamp(
 
     assert result["pushed"] is True
     assert stored == payload["pushed_at"]
+
+
+def test_bridge_sync_worker_aborts_push_when_task_merge_raises_db_lock(
+    tmp_path, monkeypatch
+):
+    """Regression: 2026-05-08 19:36 incident — fedora silently caught
+    sqlite3.OperationalError("database is locked") from merge_import_tasks
+    and continued to export, pushing stale local state that overwrote
+    RManov's tombstones (12 archived tasks resurrected). The fix must
+    abort export+push when the task merge fails, since the local DB
+    has not absorbed the remote tombstones."""
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    git_calls: list[tuple] = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    def raise_db_locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "load_remote_tasks_for_merge",
+        lambda *a, **k: ([{"id": "task-tomb", "_tombstone": True}], True),
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "import_remote_bridge_data",
+        lambda *a, **k: {"entities": 0, "relations": 0, "ratings": 0},
+    )
+    monkeypatch.setattr(bridge_sync_worker, "merge_import_tasks", raise_db_locked)
+    monkeypatch.setattr(
+        bridge_sync_worker, "sync_task_attachments_from_remote", lambda *a, **k: (0, 0)
+    )
+
+    result = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+
+    assert result["pushed"] is False, "must NOT push when merge fails"
+    assert result.get("blocked_by_merge_failure") is True
+    assert not any(
+        args[:1] == ("push",) for args in git_calls
+    ), "no git push must occur when merge failed"
+    assert not (bridge_dir / "shared.json").exists(), (
+        "shared.json must not be exported with stale data"
+    )
