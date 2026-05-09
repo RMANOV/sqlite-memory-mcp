@@ -387,3 +387,41 @@ def test_reader_double_check_while_pending_is_noop(qapp, monkeypatch):
     assert dlg._pending_done is True
     assert db.mark_done_calls == []
     dlg.close()
+
+
+def test_reader_edit_while_pending_commits_before_dialog_opens(qapp, monkeypatch):
+    """When user clicks Edit while a 5s mark-done is pending, the
+    pending action MUST commit to DB BEFORE EditTaskDialog opens.
+
+    Avoids ambiguity between the auto-mark-done timer and the explicit
+    edit intent — the user pressing Edit is treated as 'I'm done with
+    this dialog state' (matches close-while-pending behavior).
+    """
+    dlg, db = _make_reader(qapp, monkeypatch)
+    dlg._done_checkbox.setChecked(True)
+    assert dlg._pending_done is True
+    assert dlg._undo_timer.isActive()
+
+    edit_open_state = {}
+
+    class _FakeEditDialog:
+        def __init__(self, *args, **kwargs):
+            # Capture mark_done call state at the exact moment Edit opens.
+            edit_open_state["mark_done_calls_at_open"] = list(db.mark_done_calls)
+
+        def exec(self):
+            from PyQt6.QtWidgets import QDialog
+
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(tray_dialogs, "EditTaskDialog", _FakeEditDialog)
+
+    dlg._on_edit()
+
+    # The single mark_done call must have landed BEFORE the edit dialog
+    # constructor ran — i.e., commit-then-open ordering, not vice versa.
+    assert edit_open_state["mark_done_calls_at_open"] == ["task-mark-1"]
+    assert db.mark_done_calls == ["task-mark-1"]  # exactly one, no duplicate
+    assert dlg._pending_done is False
+    assert dlg._undo_timer.isActive() is False
+    dlg.close()
