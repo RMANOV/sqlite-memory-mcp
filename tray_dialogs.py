@@ -424,6 +424,15 @@ def _build_reader_style():
         QLabel#reader-body {{ color: {t["text"]}; font-size: {fs}px; padding: 16px;
                              background: {t["bg"]}; }}
         QFrame#reader-header {{ background: {t["bg2"]}; border-bottom: 1px solid {t["bg3"]}; }}
+        QCheckBox#reader-done {{ color: {t["text2"]}; padding: 12px 0 4px 16px; spacing: 0; }}
+        QCheckBox#reader-done::indicator {{ width: 22px; height: 22px; }}
+        QFrame#reader-undo-banner {{ background: {t["bg3"]}; border-top: 1px solid {t["border"]}; }}
+        QLabel#reader-undo-text {{ color: {t["text"]}; font-size: {fs}px; padding: 0 12px; }}
+        QPushButton#reader-undo-btn {{ background: {t["accent"]}; color: #ffffff;
+                                       border: 1px solid {t["accent"]}; border-radius: 4px;
+                                       padding: 6px 16px; font-weight: bold; font-size: {fs - 1}px; }}
+        QPushButton#reader-undo-btn:hover {{ background: {t["bg2"]}; color: {t["accent"]};
+                                             border: 1px solid {t["accent"]}; }}
         QPushButton {{ background: {t["bg3"]}; color: {t["text"]}; border: 1px solid {t["border"]};
                       border-radius: 4px; padding: 8px 20px; font-weight: bold;
                       font-size: {fs}px; }}
@@ -2122,10 +2131,25 @@ class TaskReaderDialog(QDialog):
         header_layout.setContentsMargins(0, 0, 0, 8)
         header_layout.setSpacing(4)
 
+        # v3.9.1: Mark-Done checkbox inline with title (per user msg:e83f24c1
+        # resolution + ADVOCATE turn-5 COMPACTION msg:0cdb6738 — actual
+        # missing surface is reader-header, not list row).
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 16, 0)
+        title_row.setSpacing(0)
+
+        self._done_checkbox = QCheckBox()
+        self._done_checkbox.setObjectName("reader-done")
+        self._done_checkbox.setToolTip("Mark task done (5s undo)")
+        self._done_checkbox.toggled.connect(self._on_done_toggled)
+        title_row.addWidget(self._done_checkbox, 0, Qt.AlignmentFlag.AlignTop)
+
         self._title_label = QLabel()
         self._title_label.setObjectName("reader-title")
         self._title_label.setWordWrap(True)
-        header_layout.addWidget(self._title_label)
+        title_row.addWidget(self._title_label, 1)
+
+        header_layout.addLayout(title_row)
 
         self._meta_layout = QHBoxLayout()
         self._meta_layout.setContentsMargins(16, 0, 16, 0)
@@ -2175,6 +2199,32 @@ class TaskReaderDialog(QDialog):
         attachments_layout.addLayout(attachments_btns)
         layout.addWidget(self._attachments_frame)
 
+        # v3.9.1: Undo banner — optimistic UI, hidden until checkbox toggled.
+        # Click-to-mark fires QTimer(5s); banner offers Undo. Per user-selected
+        # design (msg:e83f24c1): single DB write at timer-fire OR zero writes
+        # on undo. App crash within 5s window loses the action — accepted
+        # trade-off for lighter DB load + cleaner audit trail.
+        self._undo_banner = QFrame()
+        self._undo_banner.setObjectName("reader-undo-banner")
+        undo_layout = QHBoxLayout(self._undo_banner)
+        undo_layout.setContentsMargins(16, 8, 16, 8)
+        self._undo_text = QLabel("Marking done in 5s")
+        self._undo_text.setObjectName("reader-undo-text")
+        undo_layout.addWidget(self._undo_text)
+        undo_layout.addStretch()
+        self._undo_btn = QPushButton("Undo")
+        self._undo_btn.setObjectName("reader-undo-btn")
+        self._undo_btn.clicked.connect(self._on_undo_clicked)
+        undo_layout.addWidget(self._undo_btn)
+        self._undo_banner.hide()
+        layout.addWidget(self._undo_banner)
+
+        self._undo_timer = QTimer(self)
+        self._undo_timer.setSingleShot(True)
+        self._undo_timer.setInterval(5000)
+        self._undo_timer.timeout.connect(self._commit_mark_done)
+        self._pending_done = False
+
         # Button bar
         btn_bar = QHBoxLayout()
         btn_bar.setContentsMargins(16, 8, 16, 8)
@@ -2196,6 +2246,14 @@ class TaskReaderDialog(QDialog):
 
     def _refresh_display(self):
         self._title_label.setText(self.task.get("title") or "Untitled")
+
+        # v3.9.1: sync checkbox to current persisted status. Block signals
+        # during programmatic toggle so _on_done_toggled doesn't trigger
+        # the undo timer when we're just reflecting DB state.
+        already_done = (self.task.get("status") or "").lower() == "done"
+        self._done_checkbox.blockSignals(True)
+        self._done_checkbox.setChecked(already_done)
+        self._done_checkbox.blockSignals(False)
 
         # Clear old meta labels
         while self._meta_layout.count():
@@ -2389,6 +2447,11 @@ class TaskReaderDialog(QDialog):
             QMessageBox.warning(self, "Open Failed", path)
 
     def _on_edit(self):
+        # If a mark-done is pending, commit it before transitioning to edit
+        # (avoids ambiguity between auto-mark-done and explicit edit intent).
+        if self._pending_done:
+            self._undo_timer.stop()
+            self._commit_mark_done()
         dlg = EditTaskDialog(self.task, self, db=self.db)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
@@ -2403,6 +2466,69 @@ class TaskReaderDialog(QDialog):
                 )
             self.task.update(vals)
             self._refresh_display()
+
+    # ── v3.9.1: Mark-Done flow ────────────────────────────────────────
+    def _on_done_toggled(self, checked: bool) -> None:
+        """User clicked the header checkbox. Optimistic UI: arm 5s timer;
+        actual DB write happens in _commit_mark_done. Re-toggle while
+        already pending is a no-op (banner stays open with original timer)."""
+        if checked:
+            if self._pending_done:
+                return
+            self._pending_done = True
+            self._undo_text.setText("Marking done in 5s")
+            self._undo_banner.show()
+            self._undo_timer.start()
+        else:
+            # Programmatic uncheck (from undo or initial sync) — handled
+            # by _on_undo_clicked or blockSignals respectively. User-driven
+            # uncheck while not pending means task was already done and
+            # they want to revert: write the revert immediately.
+            if self._pending_done:
+                return
+            already_done = (self.task.get("status") or "").lower() == "done"
+            if already_done:
+                try:
+                    self.db.update_task(self.task["id"], status="not_started")
+                    self.task["status"] = "not_started"
+                except Exception:
+                    self._done_checkbox.blockSignals(True)
+                    self._done_checkbox.setChecked(True)
+                    self._done_checkbox.blockSignals(False)
+
+    def _commit_mark_done(self) -> None:
+        """Timer fired (no undo within 5s). Write to DB; on_change()
+        propagates refresh to FullWindow.refresh()."""
+        self._undo_banner.hide()
+        if not self._pending_done:
+            return
+        self._pending_done = False
+        try:
+            self.db.mark_done(self.task["id"])
+            self.task["status"] = "done"
+        except Exception:
+            # Revert UI on DB failure.
+            self._done_checkbox.blockSignals(True)
+            self._done_checkbox.setChecked(False)
+            self._done_checkbox.blockSignals(False)
+
+    def _on_undo_clicked(self) -> None:
+        """User clicked Undo within the 5s window. Cancel timer, revert
+        checkbox to unchecked. Zero DB writes occurred."""
+        self._undo_timer.stop()
+        self._pending_done = False
+        self._undo_banner.hide()
+        self._done_checkbox.blockSignals(True)
+        self._done_checkbox.setChecked(False)
+        self._done_checkbox.blockSignals(False)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        """Commit pending done before close so user-explicit close
+        finalizes the action (matches Edit-button behaviour)."""
+        if self._pending_done:
+            self._undo_timer.stop()
+            self._commit_mark_done()
+        super().closeEvent(event)
 
 
 class PremiumRecordDialog(QDialog):

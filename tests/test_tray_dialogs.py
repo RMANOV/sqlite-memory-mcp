@@ -258,3 +258,132 @@ def test_task_reader_dialog_renders_notes_section(qapp, monkeypatch):
     assert "Notes" in body_html
     assert "Internal details" in body_html
     dlg.close()
+
+
+# ── v3.9.1: Mark-Done checkbox + 5s optimistic undo ────────────────────
+
+
+class _FakeTaskDbWithStatus(_FakeTaskDb):
+    """FakeTaskDb extension that records mark_done/update_task calls."""
+
+    def __init__(self):
+        self.mark_done_calls = []
+        self.update_calls = []
+
+    def mark_done(self, task_id):
+        self.mark_done_calls.append(task_id)
+        return True
+
+    def update_task(self, task_id, **fields):
+        self.update_calls.append((task_id, fields))
+        return True
+
+
+def _make_reader(qapp, monkeypatch, status="not_started"):
+    monkeypatch.setattr(
+        tray_dialogs,
+        "get_conn",
+        lambda db_path=None: _BrokenTruthScoreConnCtx(),
+    )
+    db = _FakeTaskDbWithStatus()
+    dlg = tray_dialogs.TaskReaderDialog(
+        {
+            "id": "task-mark-1",
+            "title": "Reader test",
+            "description": "body",
+            "priority": "medium",
+            "section": "inbox",
+            "status": status,
+        },
+        db,
+    )
+    return dlg, db
+
+
+def test_reader_checkbox_initially_unchecked_for_not_started(qapp, monkeypatch):
+    dlg, _db = _make_reader(qapp, monkeypatch, status="not_started")
+    assert dlg._done_checkbox.isChecked() is False
+    assert dlg._undo_banner.isHidden()
+    assert dlg._pending_done is False
+    dlg.close()
+
+
+def test_reader_checkbox_initially_checked_for_done_status(qapp, monkeypatch):
+    dlg, _db = _make_reader(qapp, monkeypatch, status="done")
+    assert dlg._done_checkbox.isChecked() is True
+    assert dlg._undo_banner.isHidden()  # no pending action; just reflects state
+    assert dlg._pending_done is False
+    dlg.close()
+
+
+def test_reader_check_arms_timer_and_shows_banner_no_db_yet(qapp, monkeypatch):
+    dlg, db = _make_reader(qapp, monkeypatch)
+    dlg._done_checkbox.setChecked(True)
+    assert dlg._pending_done is True
+    # isVisible() needs full window chain shown; isHidden() reads the
+    # explicit-hidden flag and is correct for headless tests.
+    assert dlg._undo_banner.isHidden() is False
+    assert dlg._undo_timer.isActive()
+    # No DB write yet — that's the optimistic-UI contract.
+    assert db.mark_done_calls == []
+    dlg.close()
+
+
+def test_reader_undo_within_window_cancels_timer_zero_writes(qapp, monkeypatch):
+    dlg, db = _make_reader(qapp, monkeypatch)
+    dlg._done_checkbox.setChecked(True)
+    assert dlg._undo_timer.isActive()
+    dlg._on_undo_clicked()
+    assert dlg._pending_done is False
+    assert dlg._undo_timer.isActive() is False
+    assert dlg._done_checkbox.isChecked() is False
+    assert dlg._undo_banner.isHidden()
+    assert db.mark_done_calls == []  # zero DB writes on undo
+    dlg.close()
+
+
+def test_reader_timer_fire_writes_mark_done_once(qapp, monkeypatch):
+    dlg, db = _make_reader(qapp, monkeypatch)
+    dlg._done_checkbox.setChecked(True)
+    # Simulate timer fire without waiting 5s — call the slot directly.
+    dlg._commit_mark_done()
+    assert dlg._pending_done is False
+    assert dlg._undo_banner.isHidden()
+    assert dlg._done_checkbox.isChecked() is True  # commit keeps checked
+    assert db.mark_done_calls == ["task-mark-1"]
+    assert dlg.task["status"] == "done"
+    dlg.close()
+
+
+def test_reader_close_while_pending_commits_immediately(qapp, monkeypatch):
+    dlg, db = _make_reader(qapp, monkeypatch)
+    dlg._done_checkbox.setChecked(True)
+    assert dlg._pending_done is True
+    dlg.close()
+    # closeEvent path should commit the pending mark-done.
+    assert db.mark_done_calls == ["task-mark-1"]
+
+
+def test_reader_uncheck_already_done_writes_revert_immediately(qapp, monkeypatch):
+    dlg, db = _make_reader(qapp, monkeypatch, status="done")
+    assert dlg._done_checkbox.isChecked() is True
+    dlg._done_checkbox.setChecked(False)
+    # Reverting an already-done task is NOT undoable — writes immediately.
+    assert db.update_calls == [("task-mark-1", {"status": "not_started"})]
+    assert dlg._pending_done is False
+    dlg.close()
+
+
+def test_reader_double_check_while_pending_is_noop(qapp, monkeypatch):
+    """Defensive: re-toggling the checkbox while a timer is pending must
+    not stack timers or restart the window."""
+    dlg, db = _make_reader(qapp, monkeypatch)
+    dlg._done_checkbox.setChecked(True)
+    first_active = dlg._undo_timer.isActive()
+    # Force-set checked=True again via the slot (real Qt would suppress
+    # the duplicate signal, but defensive code path still must be safe).
+    dlg._on_done_toggled(True)
+    assert dlg._undo_timer.isActive() == first_active
+    assert dlg._pending_done is True
+    assert db.mark_done_calls == []
+    dlg.close()
