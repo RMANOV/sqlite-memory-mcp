@@ -682,6 +682,68 @@ CREATE TRIGGER IF NOT EXISTS memory_fts_obs_ad AFTER DELETE ON observations BEGI
     WHERE e.id = old.entity_id GROUP BY e.id;
 END;
 
+-- ── Debate Protocol v2 (Tier S #0, conductor 2026-05-09T16:35 EEST) ─────
+-- Productized inter-session coordination. Replaces ad-hoc observations on
+-- a single KG entity with a structured channel: (debates) topic record,
+-- (debate_messages) append-only log with role + priority + kind enums,
+-- (debate_watermarks) per-role read cursors. Lifecycle state machine
+-- INIT→ACTIVE→RESOLVED→ARCHIVED enforced in DAO + STATE messages.
+-- COMPACTION kind added per conductor 16:55 EEST (recursive bloat fix —
+-- readers bootstrap from latest compaction snapshot + incremental tail).
+-- topic_id regex validation lives in pure Python (debate.py) since
+-- SQLite lacks native REGEXP; CHECK constraint omitted intentionally.
+
+CREATE TABLE IF NOT EXISTS debates (
+    topic_id          TEXT PRIMARY KEY,
+    title             TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'INIT'
+        CHECK (state IN ('INIT', 'ACTIVE', 'RESOLVED', 'ARCHIVED')),
+    created_at        TEXT NOT NULL,
+    created_by_role   TEXT NOT NULL,
+    resolve_by        TEXT,
+    archived_at       TEXT,
+    roles_json        TEXT NOT NULL,
+    metadata_json     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_debates_state
+    ON debates(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_debates_resolve_by
+    ON debates(resolve_by) WHERE resolve_by IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS debate_messages (
+    msg_id     TEXT PRIMARY KEY,
+    topic_id   TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    priority   TEXT NOT NULL
+        CHECK (priority IN ('H', 'M', 'L', 'INFO')),
+    kind       TEXT NOT NULL
+        CHECK (kind IN ('Q', 'A', 'STATUS', 'DECISION', 'PING',
+                        'WATERMARK', 'STATE', 'COMPACTION')),
+    reply_to   TEXT REFERENCES debate_messages(msg_id) ON DELETE SET NULL,
+    body       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_debmsg_topic_ts
+    ON debate_messages(topic_id, ts);
+CREATE INDEX IF NOT EXISTS idx_debmsg_topic_kind
+    ON debate_messages(topic_id, kind);
+CREATE INDEX IF NOT EXISTS idx_debmsg_topic_priority
+    ON debate_messages(topic_id, priority);
+CREATE INDEX IF NOT EXISTS idx_debmsg_topic_role_ts
+    ON debate_messages(topic_id, role, ts);
+CREATE INDEX IF NOT EXISTS idx_debmsg_reply_to
+    ON debate_messages(reply_to) WHERE reply_to IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS debate_watermarks (
+    topic_id              TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role                  TEXT NOT NULL,
+    last_processed_msg_id TEXT REFERENCES debate_messages(msg_id) ON DELETE SET NULL,
+    last_processed_ts     TEXT,
+    updated_at            TEXT NOT NULL,
+    PRIMARY KEY (topic_id, role)
+);
+
 -- ── Memory Reflection (Phase 1) ─────────────────────────────────────────
 -- Reviewable memory consolidation runs. Async job model with state machine
 -- pending → running → completed/failed/canceled (C1). Lifecycle ops cancel +
