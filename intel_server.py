@@ -38,6 +38,10 @@ from memory_audit import (
     replay_memory_events as _replay_memory_events,
     run_memory_audit as _run_memory_audit,
 )
+from reflection import (
+    audit_reflection_candidates as _audit_reflection_candidates,
+    format_audit_markdown as _format_audit_markdown,
+)
 from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
