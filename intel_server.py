@@ -64,7 +64,10 @@ from reflection_dao import (
     VALID_DECISIONS as _VALID_DECISIONS,
 )
 from reflection_apply import apply_run as _apply_run
-from gbrain_export import export_to_gbrain_brain_repo as _export_to_gbrain
+from tools.gbrain_bridge import (
+    export_to_gbrain_brain_repo as _export_to_gbrain,
+    import_from_gbrain_brain_repo as _import_from_gbrain,
+)
 from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
@@ -1075,6 +1078,63 @@ def export_to_gbrain(output_dir: str, project: str = "") -> str:
         return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
     except Exception as exc:
         logger.error("export_to_gbrain failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 24: import_from_gbrain — reverse adapter (Tier A #4 second half)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def import_from_gbrain(
+    input_dir: str,
+    project_default: str = "",
+    skip_if_exists: bool = True,
+) -> str:
+    """Import a GBrain-compatible Markdown brain repo into the local KG.
+
+    Walks input_dir/{people,companies,topics}/, parses YAML frontmatter +
+    observation bullets + relations as wikilinks, and inserts via the
+    canonical entities / observations / relations tables. FTS index is
+    refreshed for each touched entity.
+
+    Idempotent: existing entities (matched by UNIQUE name) are skipped by
+    default. Pass skip_if_exists=False to re-attempt observations/relations
+    insertion against existing rows (entity row itself is never duplicated).
+
+    Args:
+        input_dir: folder produced by export_to_gbrain_brain_repo or any
+            GBrain-compatible layout. Returns zero counters if missing.
+        project_default: project value applied when frontmatter has no
+            `project` field. Empty string leaves project NULL.
+        skip_if_exists: skip already-known entities (default True).
+
+    Returns counters: entities_created, entities_skipped,
+    observations_inserted, relations_inserted, relations_skipped,
+    files_parsed, files_skipped.
+    """
+    try:
+        with _get_conn() as conn:
+            counts = _import_from_gbrain(
+                conn,
+                input_dir,
+                project_default=project_default or None,
+                skip_if_exists=skip_if_exists,
+            )
+            logger.info(
+                "import_from_gbrain: dir=%s entities_created=%d "
+                "files_parsed=%d",
+                input_dir,
+                counts["entities_created"],
+                counts["files_parsed"],
+            )
+            return json.dumps({"input_dir": input_dir, **counts})
+    except OSError as exc:
+        logger.error("import_from_gbrain filesystem error: %s", exc)
+        return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
+    except Exception as exc:
+        logger.error("import_from_gbrain failed: %s", exc, exc_info=True)
         return _reflect_error_response(exc)
 
 

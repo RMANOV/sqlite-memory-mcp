@@ -1561,6 +1561,36 @@ _MIGRATIONS = [
         """,
         "FTS observation triggers + entity trigger update (FT-01/FT-02 fix)",
     ),
+    (
+        # Tier-A #5 typed predicates vocabulary seed (canonical_facts as
+        # data-not-code per coordinator advice 2026-05-09). Seven predicates
+        # cover the structural relations the export/import bridge produces
+        # (mentions / references / depends_on / related_to / supersedes /
+        # implements / contradicts) plus the GBrain-style typed edges
+        # (works_at / attended / invested_in / founded / advises). Future
+        # code reads vocabulary from DB, not from source.
+        "SELECT 1 FROM canonical_facts WHERE fact_scope = 'predicate_vocabulary' LIMIT 1",
+        """
+        INSERT OR IGNORE INTO canonical_facts (
+            fact_id, subject, predicate, object_text, object_type,
+            fact_scope, provenance_summary, confidence, validation_mode,
+            valid_from, created_at, updated_at
+        ) VALUES
+        ('pred-mentions',    'predicate', 'name', 'mentions',    'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-references',  'predicate', 'name', 'references',  'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-depends-on',  'predicate', 'name', 'depends_on',  'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-related-to',  'predicate', 'name', 'related_to',  'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-supersedes',  'predicate', 'name', 'supersedes',  'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-implements',  'predicate', 'name', 'implements',  'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-contradicts', 'predicate', 'name', 'contradicts', 'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-works-at',    'predicate', 'name', 'works_at',    'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-attended',    'predicate', 'name', 'attended',    'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-invested-in', 'predicate', 'name', 'invested_in', 'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-founded',     'predicate', 'name', 'founded',     'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00'),
+        ('pred-advises',     'predicate', 'name', 'advises',     'text', 'predicate_vocabulary', 'seed-2026-05-09', 1.0, 'multi_evidence', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00', '2026-05-09T00:00:00+00:00')
+        """,
+        "Tier-A #5 typed predicate vocabulary seed (12 predicates)",
+    ),
 ]
 
 
