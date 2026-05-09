@@ -50,8 +50,11 @@ from reflection_dao import (
     candidate_decision_counts as _dao_candidate_decision_counts,
     create_run as _dao_create_run,
     decide_candidate as _dao_decide_candidate,
+    discard_run as _dao_discard_run,
     finish_run as _dao_finish_run,
     get_run as _dao_get_run,
+    list_apply_snapshots as _dao_list_apply_snapshots,
+    list_candidates as _dao_list_candidates,
     list_inputs as _dao_list_inputs,
     list_runs as _dao_list_runs,
     start_run as _dao_start_run,
@@ -60,6 +63,7 @@ from reflection_dao import (
     ReflectionStateError as _ReflectionStateError,
     VALID_DECISIONS as _VALID_DECISIONS,
 )
+from reflection_apply import apply_run as _apply_run
 from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
@@ -894,6 +898,137 @@ def reflect_decide(
             )
     except Exception as exc:
         logger.error("reflect_decide failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tools 20-22: Phase 1 Reflection apply / review / discard
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# Tool 20: reflect_apply
+@mcp.tool()
+def reflect_apply(
+    run_id: str,
+    candidate_ids_csv: str = "",
+    applied_by: str = "user",
+) -> str:
+    """Apply accepted candidates from a completed run.
+
+    Routes mutations through the canonical apply_task_mutation path so
+    memory_events and task_field_versions are written consistently.
+    Idempotent — candidates that already have a snapshot for this run
+    are skipped with reason='already_applied'. Entities are skipped in
+    MVP (no entity archive primitive yet).
+
+    Args:
+        run_id: id of a run in `completed` status. Other statuses error.
+        candidate_ids_csv: optional comma-separated subset of candidate
+            ids to apply. Empty string = apply all accepted.
+        applied_by: actor recorded on each snapshot row.
+    """
+    try:
+        ids: list[str] | None = None
+        if candidate_ids_csv:
+            ids = [s.strip() for s in candidate_ids_csv.split(",") if s.strip()]
+        with _get_conn() as conn:
+            summary = _apply_run(
+                conn, run_id, candidate_ids=ids, applied_by=applied_by
+            )
+            logger.info(
+                "reflect_apply: run=%s applied=%d skipped=%d failed=%d",
+                run_id,
+                summary["applied"],
+                len(summary["skipped"]),
+                len(summary["failed"]),
+            )
+            return json.dumps(summary)
+    except _ReflectionStateError as exc:
+        msg = str(exc)
+        et = "not_found" if msg.startswith("run_not_found") else "invalid_state_transition"
+        return json.dumps({"error": msg, "error_type": et})
+    except Exception as exc:
+        logger.error("reflect_apply failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# Tool 21: reflect_review
+@mcp.tool()
+def reflect_review(
+    run_id: str,
+    decision_filter: str = "",
+    candidate_type_filter: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> str:
+    """Paginated, filterable list of candidates for human review.
+
+    Args:
+        run_id: parent run id.
+        decision_filter: empty | pending | accept | reject | defer.
+        candidate_type_filter: optional category narrowing
+            (e.g. 'stale_overdue_tasks').
+        limit: max rows (clamped to 1000).
+        offset: pagination cursor.
+    """
+    try:
+        with _get_conn() as conn:
+            rows, total = _dao_list_candidates(
+                conn,
+                run_id,
+                decision_filter=decision_filter or None,
+                candidate_type_filter=candidate_type_filter or None,
+                limit=limit,
+                offset=offset,
+            )
+            apply_snaps, _ = _dao_list_apply_snapshots(
+                conn, run_id=run_id, limit=1000
+            )
+            applied_ids = {s["candidate_id"] for s in apply_snaps}
+            for r in rows:
+                r["already_applied"] = r["candidate_id"] in applied_ids
+            return json.dumps(
+                {
+                    "candidates": rows,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "decision_filter": decision_filter or None,
+                    "candidate_type_filter": candidate_type_filter or None,
+                }
+            )
+    except _ReflectionStateError as exc:
+        return json.dumps({"error": str(exc), "error_type": "invalid_argument"})
+    except Exception as exc:
+        logger.error("reflect_review failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# Tool 22: reflect_discard
+@mcp.tool()
+def reflect_discard(run_id: str) -> str:
+    """Hard-delete a terminal run; cascades to inputs/candidates/snapshots.
+
+    Rejects pending/running with invalid_state_transition (cancel first).
+    Returns rows_deleted (0 if not found, 1 on success). FK CASCADE
+    handles cleanup of dependent rows in a single transaction.
+    """
+    try:
+        with _get_conn() as conn:
+            # FK CASCADE only fires if PRAGMA foreign_keys=ON, which
+            # production paths set in db_utils._PRAGMAS. Defensive
+            # fallback: enforce per-connection in case caller bypassed.
+            conn.execute("PRAGMA foreign_keys = ON")
+            rows_deleted = _dao_discard_run(conn, run_id)
+            return json.dumps(
+                {"run_id": run_id, "rows_deleted": rows_deleted}
+            )
+    except _ReflectionStateError as exc:
+        msg = str(exc)
+        et = "not_found" if msg.startswith("run_not_found") else "invalid_state_transition"
+        return json.dumps({"error": msg, "error_type": et})
+    except Exception as exc:
+        logger.error("reflect_discard failed: %s", exc, exc_info=True)
         return _reflect_error_response(exc)
 
 

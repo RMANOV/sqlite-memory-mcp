@@ -415,3 +415,123 @@ def enforce_candidate_limit(conn: sqlite3.Connection, run_id: str) -> int:
         (run_id,),
     ).fetchone()
     return int(row["c"]) if row else 0
+
+
+# ── reflection_apply_snapshots ─────────────────────────────────────────
+
+
+def add_apply_snapshot(
+    conn: sqlite3.Connection,
+    run_id: str,
+    candidate_id: str,
+    *,
+    target_kind: str,
+    target_ref: str,
+    before_state: dict[str, Any],
+    after_state: dict[str, Any],
+    applied_by: str = "user",
+) -> str:
+    """Persist a before/after snapshot for an applied candidate.
+
+    Snapshots are append-only; the same (run_id, candidate_id) pair can
+    have multiple rows if the candidate is re-applied (rare, but allowed
+    so audit trail captures every attempt).
+    """
+    if target_kind not in VALID_TARGET_KINDS:
+        raise ReflectionStateError(f"unknown_target_kind: {target_kind}")
+    sid = _new_id("snap")
+    conn.execute(
+        "INSERT INTO reflection_apply_snapshots "
+        "(snapshot_id, run_id, candidate_id, target_kind, target_ref, "
+        "before_state_json, after_state_json, applied_by, applied_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            sid,
+            run_id,
+            candidate_id,
+            target_kind,
+            target_ref,
+            json_dumps(before_state),
+            json_dumps(after_state),
+            applied_by,
+            now_iso(),
+        ),
+    )
+    return sid
+
+
+def list_apply_snapshots(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str | None = None,
+    candidate_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Paginated newest-first snapshots filtered by run_id and/or candidate_id."""
+    limit = max(1, min(limit, 1000))
+    offset = max(0, offset)
+    where: list[str] = []
+    params: list[Any] = []
+    if run_id is not None:
+        where.append("run_id = ?")
+        params.append(run_id)
+    if candidate_id is not None:
+        where.append("candidate_id = ?")
+        params.append(candidate_id)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    total_row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM reflection_apply_snapshots {where_sql}", params
+    ).fetchone()
+    total = int(total_row["c"]) if total_row else 0
+    rows = conn.execute(
+        f"SELECT * FROM reflection_apply_snapshots {where_sql} "
+        f"ORDER BY applied_at DESC LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["before_state"] = json_loads(d.pop("before_state_json") or "{}")
+        except (ValueError, TypeError):
+            d["before_state"] = {}
+        try:
+            d["after_state"] = json_loads(d.pop("after_state_json") or "{}")
+        except (ValueError, TypeError):
+            d["after_state"] = {}
+        out.append(d)
+    return out, total
+
+
+def has_apply_snapshot(
+    conn: sqlite3.Connection, run_id: str, candidate_id: str
+) -> bool:
+    """Idempotency probe — True iff this run+candidate already has a snapshot."""
+    row = conn.execute(
+        "SELECT 1 FROM reflection_apply_snapshots "
+        "WHERE run_id = ? AND candidate_id = ? LIMIT 1",
+        (run_id, candidate_id),
+    ).fetchone()
+    return row is not None
+
+
+# ── Run discard (hard delete with cascade) ─────────────────────────────
+
+
+def discard_run(conn: sqlite3.Connection, run_id: str) -> int:
+    """Hard-delete a run; ON DELETE CASCADE removes inputs/candidates/snapshots.
+
+    Requires the run to be in a terminal state (or already archived). Use
+    cancel_run first if the run is pending/running. Returns the number of
+    rows deleted from reflection_runs (0 or 1).
+    """
+    row = get_run(conn, run_id)
+    if row is None:
+        raise ReflectionStateError(f"run_not_found: {run_id}")
+    if row["status"] not in TERMINAL_STATUSES:
+        raise ReflectionStateError(
+            f"cannot_discard_active_run: status={row['status']}"
+        )
+    cur = conn.execute("DELETE FROM reflection_runs WHERE run_id = ?", (run_id,))
+    return cur.rowcount
