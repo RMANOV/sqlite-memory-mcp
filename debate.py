@@ -32,6 +32,26 @@ ROLE_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
 MSG_ID_RE = re.compile(r"^[a-f0-9]{8}$")
 ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$")
 
+# OODA structure required for kind=COMPACTION bodies (per CONDUCTOR
+# 2026-05-09T16:35 EEST EXECUTOR INSTRUCTION + ADVOCATE turn 2
+# acknowledgement msg:bf45a126). All four section labels must appear in
+# order. Case-insensitive, multiline match across the body.
+_OODA_RE = re.compile(
+    r"\bOBSERVE\b.*\bORIENT\b.*\bDECIDE\b.*\bACT\b",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Deferred-answer prefix recognized when computing RESOLVED gate. An
+# A message with a body starting with "[DEFERRED:" counts as a matched
+# answer for its parent Q (per CONDUCTOR msg:d29b7e58 ADVOCATE turn 2
+# strict gate decision).
+_DEFERRED_PREFIX = "[DEFERRED:"
+
+# Pagination defaults for read_messages — compound (ts, msg_id) cursor
+# fix per CONDUCTOR msg:7e3c8f10. Caller may override limit up to MAX.
+DEFAULT_READ_LIMIT = 200
+MAX_READ_LIMIT = 1000
+
 
 VALID_PRIORITIES = ("H", "M", "L", "INFO")
 VALID_KINDS = (
@@ -239,9 +259,11 @@ def post_message(
     reply_to: str | None = None,
 ) -> dict[str, Any]:
     """Append a message to a debate. Validates topic state, role membership,
-    enums, and reply_to existence.
+    enums, and all kind-specific semantics BEFORE the INSERT (atomicity
+    fix per CONDUCTOR msg:bf45a126). On any DebateError no row is
+    persisted.
 
-    Side-effects:
+    Side-effects (post-INSERT, only when validations pass):
       kind=STATE: triggers transition via VALID_TRANSITIONS + UPDATE debates.
       kind=WATERMARK: updates debate_watermarks for (topic_id, role).
     """
@@ -269,10 +291,11 @@ def post_message(
             f"topic_resolved_read_only: {topic_id} (only STATE -> ARCHIVED allowed)"
         )
 
+    parent_kind: str | None = None
     if reply_to is not None:
         validate_msg_id(reply_to)
         parent = conn.execute(
-            "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+            "SELECT topic_id, kind FROM debate_messages WHERE msg_id = ?",
             (reply_to,),
         ).fetchone()
         if parent is None:
@@ -281,6 +304,48 @@ def post_message(
             raise DebateError(
                 f"reply_to_cross_topic: {reply_to} not in {topic_id}"
             )
+        parent_kind = parent["kind"]
+
+    # ── Kind-specific PRE-INSERT validation (atomicity fix bf45a126) ──
+    new_state_target: str | None = None
+    watermark_resolved: tuple[str | None, str] | None = None
+
+    if kind == "STATE":
+        target = body.strip()
+        validate_transition(debate["state"], target)
+        new_state_target = target
+
+    if kind == "WATERMARK":
+        watermark_target = body.strip()
+        if MSG_ID_RE.fullmatch(watermark_target):
+            ref_msg = conn.execute(
+                "SELECT msg_id, ts FROM debate_messages "
+                "WHERE msg_id = ? AND topic_id = ?",
+                (watermark_target, topic_id),
+            ).fetchone()
+            if ref_msg is None:
+                raise DebateError(
+                    f"watermark_msg_not_in_topic: {watermark_target}"
+                )
+            watermark_resolved = (ref_msg["msg_id"], ref_msg["ts"])
+        elif ISO_UTC_RE.fullmatch(watermark_target):
+            watermark_resolved = (None, watermark_target)
+        else:
+            raise DebateError(
+                f"invalid_watermark_body: {watermark_target!r} "
+                "(expect msg_id or ISO UTC)"
+            )
+
+    if kind == "DECISION" and reply_to is not None and parent_kind != "Q":
+        raise DebateError(
+            f"decision_reply_to_must_be_Q: parent kind={parent_kind!r}"
+        )
+
+    if kind == "COMPACTION" and not _OODA_RE.search(body):
+        raise DebateError(
+            "compaction_body_missing_OODA_sections: body must contain "
+            "OBSERVE / ORIENT / DECIDE / ACT in that order"
+        )
 
     msg_id = new_msg_id()
     while conn.execute(
@@ -299,9 +364,8 @@ def post_message(
     )
 
     new_state = debate["state"]
-    if kind == "STATE":
-        new_state = body.strip()
-        validate_transition(debate["state"], new_state)
+    if kind == "STATE" and new_state_target is not None:
+        new_state = new_state_target
         archived_at = ts if new_state == "ARCHIVED" else None
         conn.execute(
             "UPDATE debates SET state = ?, "
@@ -309,28 +373,8 @@ def post_message(
             (new_state, archived_at, topic_id),
         )
 
-    if kind == "WATERMARK":
-        watermark_target = body.strip()
-        if MSG_ID_RE.fullmatch(watermark_target):
-            ref_msg = conn.execute(
-                "SELECT msg_id, ts FROM debate_messages "
-                "WHERE msg_id = ? AND topic_id = ?",
-                (watermark_target, topic_id),
-            ).fetchone()
-            if ref_msg is None:
-                raise DebateError(
-                    f"watermark_msg_not_in_topic: {watermark_target}"
-                )
-            wm_ts = ref_msg["ts"]
-            wm_id: str | None = ref_msg["msg_id"]
-        elif ISO_UTC_RE.fullmatch(watermark_target):
-            wm_ts = watermark_target
-            wm_id = None
-        else:
-            raise DebateError(
-                f"invalid_watermark_body: {watermark_target!r} "
-                "(expect msg_id or ISO UTC)"
-            )
+    if kind == "WATERMARK" and watermark_resolved is not None:
+        wm_id, wm_ts = watermark_resolved
         conn.execute(
             "INSERT INTO debate_watermarks (topic_id, role, "
             "last_processed_msg_id, last_processed_ts, updated_at) "
@@ -368,11 +412,20 @@ def read_messages(
     priority_filter: list[str] | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Read messages from a topic with cursor resolution + filters.
+    """Read messages from a topic with compound (ts, msg_id) cursor.
 
     Cursor priority: explicit since_msg_id > explicit since_ts >
     debate_watermarks[(topic_id, role)] > beginning of topic.
-    Does NOT auto-advance the watermark — caller writes WATERMARK message.
+
+    WHERE clause is `(ts > :wm_ts) OR (ts = :wm_ts AND msg_id > :wm_msg_id)`
+    so messages with the same ts but different msg_ids never get skipped
+    (per CONDUCTOR msg:7e3c8f10 ADVOCATE turn 2 fix). Legacy watermarks
+    with only ts (no msg_id) treat msg_id as '' (lex-smallest) so the
+    first compound-cursor read returns ALL messages at that ts.
+
+    Pagination: limit defaults to DEFAULT_READ_LIMIT (200), capped at
+    MAX_READ_LIMIT (1000). Returns truncated=True + next_*_cursor when
+    more messages remain. Does NOT auto-advance the watermark.
     """
     validate_topic_id(topic_id)
     validate_role(role)
@@ -381,30 +434,39 @@ def read_messages(
         raise DebateError(f"unknown_topic: {topic_id}")
 
     cursor_ts: str | None = None
+    cursor_msg_id: str = ""
     if since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
-            "SELECT ts FROM debate_messages "
+            "SELECT ts, msg_id FROM debate_messages "
             "WHERE msg_id = ? AND topic_id = ?",
             (since_msg_id, topic_id),
         ).fetchone()
         if ref is not None:
             cursor_ts = ref["ts"]
-        else:
-            cursor_ts = None
+            cursor_msg_id = ref["msg_id"]
     elif since_ts is not None:
         validate_iso_utc(since_ts)
         cursor_ts = since_ts
+        cursor_msg_id = ""
     else:
         wm = get_watermark(conn, topic_id, role)
         if wm and wm.get("last_processed_ts"):
             cursor_ts = wm["last_processed_ts"]
+            cursor_msg_id = wm.get("last_processed_msg_id") or ""
+
+    if limit is None:
+        effective_limit = DEFAULT_READ_LIMIT
+    else:
+        if not isinstance(limit, int) or limit < 1:
+            raise DebateError("invalid_limit: must be positive int or None")
+        effective_limit = min(limit, MAX_READ_LIMIT)
 
     where: list[str] = ["topic_id = ?"]
     params: list[Any] = [topic_id]
     if cursor_ts is not None:
-        where.append("ts > ?")
-        params.append(cursor_ts)
+        where.append("(ts > ? OR (ts = ? AND msg_id > ?))")
+        params.extend([cursor_ts, cursor_ts, cursor_msg_id])
     if kind_filter:
         for k in kind_filter:
             validate_kind(k)
@@ -418,25 +480,32 @@ def read_messages(
         where.append(f"priority IN ({ph})")
         params.extend(priority_filter)
     where_sql = "WHERE " + " AND ".join(where)
-    limit_sql = ""
-    if limit is not None:
-        if not isinstance(limit, int) or limit < 1:
-            raise DebateError("invalid_limit: must be positive int or None")
-        limit_sql = "LIMIT ?"
-        params.append(limit)
+
+    fetch_limit = effective_limit + 1  # one extra row to detect truncation
     rows = conn.execute(
         f"SELECT msg_id, topic_id, role, ts, priority, kind, reply_to, "
         f"body, created_at FROM debate_messages {where_sql} "
-        f"ORDER BY ts ASC, msg_id ASC {limit_sql}",
-        params,
+        f"ORDER BY ts ASC, msg_id ASC LIMIT ?",
+        [*params, fetch_limit],
     ).fetchall()
+
+    truncated = len(rows) > effective_limit
+    if truncated:
+        rows = rows[:effective_limit]
     messages = [dict(r) for r in rows]
     last_msg_id = messages[-1]["msg_id"] if messages else None
+    last_ts = messages[-1]["ts"] if messages else None
+
     return {
         "messages": messages,
         "topic_state": debate["state"],
         "last_msg_id_returned": last_msg_id,
+        "last_ts_returned": last_ts,
         "count": len(messages),
+        "truncated": truncated,
+        "next_msg_id_cursor": last_msg_id if truncated else None,
+        "next_ts_cursor": last_ts if truncated else None,
+        "limit": effective_limit,
     }
 
 
@@ -471,7 +540,7 @@ def transition_state(
         )
 
     if new_state == "RESOLVED":
-        blocking = _open_high_questions(conn, topic_id)
+        blocking = _open_blocking_questions(conn, topic_id)
         if blocking:
             return {
                 "old_state": old_state,
@@ -508,14 +577,20 @@ def transition_state(
     }
 
 
-def _open_high_questions(
+def _open_blocking_questions(
     conn: sqlite3.Connection, topic_id: str
 ) -> list[dict[str, Any]]:
-    """Return high-priority Q messages without a matching A reply."""
+    """Return Q messages of any priority without a matching A reply.
+
+    Per CONDUCTOR msg:d29b7e58 ADVOCATE turn 2 strict gate decision: ALL
+    open Qs block RESOLVED, not just H-priority. An A whose body starts
+    with the DEFERRED prefix counts as a matched answer (resolution-
+    equivalent — the question is intentionally deferred for follow-up).
+    """
     rows = conn.execute(
-        "SELECT q.msg_id, q.role, q.ts, q.body "
+        "SELECT q.msg_id, q.role, q.priority, q.ts, q.body "
         "FROM debate_messages q "
-        "WHERE q.topic_id = ? AND q.kind = 'Q' AND q.priority = 'H' "
+        "WHERE q.topic_id = ? AND q.kind = 'Q' "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM debate_messages a "
         "  WHERE a.topic_id = q.topic_id "
