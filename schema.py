@@ -1591,6 +1591,33 @@ _MIGRATIONS = [
         """,
         "Tier-A #5 typed predicate vocabulary seed (12 predicates)",
     ),
+    (
+        # Companion provenance_links for the vocabulary seed. memory_audit
+        # backfill flags any canonical_fact lacking a provenance_links row,
+        # so each vocabulary fact gets a self-referential 'seed' link.
+        # Idempotent — keyed off the existence of pred-mentions provenance.
+        "SELECT 1 FROM provenance_links WHERE subject_kind = 'fact' "
+        "AND subject_ref = 'pred-mentions' LIMIT 1",
+        """
+        INSERT OR IGNORE INTO provenance_links (
+            provenance_id, subject_kind, subject_ref, source_kind, source_ref,
+            confidence, created_at
+        ) VALUES
+        ('prov-pred-mentions',    'fact', 'pred-mentions',    'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-references',  'fact', 'pred-references',  'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-depends-on',  'fact', 'pred-depends-on',  'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-related-to',  'fact', 'pred-related-to',  'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-supersedes',  'fact', 'pred-supersedes',  'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-implements',  'fact', 'pred-implements',  'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-contradicts', 'fact', 'pred-contradicts', 'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-works-at',    'fact', 'pred-works-at',    'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-attended',    'fact', 'pred-attended',    'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-invested-in', 'fact', 'pred-invested-in', 'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-founded',     'fact', 'pred-founded',     'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00'),
+        ('prov-pred-advises',     'fact', 'pred-advises',     'seed', 'predicate_vocabulary', 1.0, '2026-05-09T00:00:00+00:00')
+        """,
+        "Tier-A #5 typed predicate vocabulary provenance backfill",
+    ),
 ]
 
 
