@@ -10,3 +10,4 @@ memory.db
 memory.db-*
 memory.db.bak-pre-optimization
 *.log
+docs/strategic/

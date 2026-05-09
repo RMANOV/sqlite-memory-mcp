@@ -323,6 +323,33 @@ See:
 | Setup effort | pip install | npx | API key + pip | pip | npx | Docker + pip | Docker + pip | pip | Docker + Neo4j |
 | Dependencies | sqlite3 (stdlib) | Node.js | Cloud API | sqlite3 | Node.js | ChromaDB | Qdrant | sqlite3 | Neo4j |
 
+## Convergent evolution: sqlite-memory-mcp vs GBrain
+
+[GBrain](https://github.com/garrytan/gbrain) — Garry Tan's structured knowledge layer for AI agents — launched **2026-04-10**. It and sqlite-memory-mcp arrived independently at the same architectural conclusions: local-first storage, hybrid lexical + vector search fused via Reciprocal Rank Fusion, rule-based zero-LLM entity extraction, and a memory-consolidation cycle (GBrain calls it *dream*, sqlite-memory-mcp calls it *reflect*). When two solo founders converge on the same architecture, the design space is real.
+
+The two projects ship **different bets** for different deployments. Public git history establishes that sqlite-memory-mcp's hybrid search shipped on **2026-03-18** (commit [`feat(search): add hybrid semantic search via sqlite-vec + RRF fusion`](https://github.com/RMANOV/sqlite-memory-mcp/commits/main/vec_search.py)) — twenty-three days before GBrain's first public release.
+
+| Axis | GBrain | sqlite-memory-mcp |
+|---|---|---|
+| Initial public release | 2026-04-10 | **2026-03-01** (v0.1.0, 40-day lead) |
+| Hybrid search (BM25 + vector + RRF) | shipped 2026-04-10 | **shipped 2026-03-18** (23-day lead) |
+| Storage primitive | Markdown files in git + PGLite (embedded Postgres) + pgvector | Single SQLite file (FTS5 + sqlite-vec) + bridge git repo |
+| Infrastructure footprint | Postgres runtime + git remote + LLM API | Single binary, single file, optional local embeddings |
+| Embeddings | OpenAI API (network call per page write) | sentence-transformers, fully local |
+| Memory consolidation | "dream cycle" (uses LLM) | `reflect_audit` Phase 0.5 — **deterministic SQL, no LLM cost** |
+| Per-candidate review | atomic store-level output | per-row accept / reject / defer with apply snapshots |
+| Cross-machine sync | git remote of the brain repo | bridge JSON + per-field LWW-Register CRDT (proven 2000+ tasks across 3 machines) |
+| Source of truth | Markdown (human-readable) | SQLite + JSON bridge exports (machine-portable) |
+| Air-gapped / regulated deployment | blocked by OpenAI embedding requirement | **fully supported** (no external network in hot path) |
+| Companion stack | GStack (Garry's Claude Code setup) | MCP-native, works with any MCP client (Claude Code, Codex, Cursor) |
+
+Where each one wins:
+
+- **GBrain** is right for teams that want a markdown-first knowledge base, are happy paying for OpenAI embeddings on every page write, and benefit from Garry Tan's distribution. The forthcoming hosted [`gbrain.io`](https://gbrain.io) targets teams that don't want to run their own runtime.
+- **sqlite-memory-mcp** is right for solo developers, privacy-first / offline / embedded deployments, regulated environments where data cannot reach OpenAI (DoD, healthcare, finance), and anyone who needs the consolidation pipeline to run on a Raspberry Pi or inside an air-gapped network. The deterministic Phase 0.5 audit produces real candidate counts with **zero LLM cost per run**.
+
+This is convergent validation, not derivative work. The architecture is decided; the markets diverge.
+
 ## Installation
 
 ### Two-minute install + demo
