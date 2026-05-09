@@ -64,6 +64,7 @@ from reflection_dao import (
     VALID_DECISIONS as _VALID_DECISIONS,
 )
 from reflection_apply import apply_run as _apply_run
+from gbrain_export import export_to_gbrain_brain_repo as _export_to_gbrain
 from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
