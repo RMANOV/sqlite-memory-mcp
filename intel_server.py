@@ -1032,6 +1032,51 @@ def reflect_discard(run_id: str) -> str:
         return _reflect_error_response(exc)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 23: export_to_gbrain — sqlite-memory-mcp ↔ GBrain bridge (Tier A #4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def export_to_gbrain(output_dir: str, project: str = "") -> str:
+    """Export entities/observations/relations to GBrain-compatible Markdown.
+
+    Writes one .md file per entity under output_dir/{people,companies,topics}/
+    with YAML frontmatter, observations as bullets, and relations as
+    relative-path wikilinks. Compatible with the brain-repo layout used by
+    Garry Tan's GBrain (github.com/garrytan/gbrain).
+
+    Args:
+        output_dir: target folder. Created if missing.
+        project: optional project filter; export only entities in that project.
+            Empty string exports all entities.
+
+    Returns counters: entities_written, relations_written, observations_written,
+    files_written. Deterministic; idempotent overwrite of any existing files.
+    """
+    try:
+        with _get_conn() as conn:
+            counts = _export_to_gbrain(
+                conn,
+                output_dir,
+                project_filter=project or None,
+            )
+            logger.info(
+                "export_to_gbrain: dir=%s entities=%d files=%d project=%s",
+                output_dir,
+                counts["entities_written"],
+                counts["files_written"],
+                project or "*",
+            )
+            return json.dumps({"output_dir": output_dir, **counts})
+    except OSError as exc:
+        logger.error("export_to_gbrain filesystem error: %s", exc)
+        return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
+    except Exception as exc:
+        logger.error("export_to_gbrain failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
 # ── Entry point ──────────────────────────────────────────────────────────
 def main() -> None:
     maybe_mount_premium_extensions(mcp, server_name="sqlite-intel")
