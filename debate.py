@@ -331,6 +331,9 @@ def post_message(
     if kind == "WATERMARK":
         watermark_target = body.strip()
         if MSG_ID_RE.fullmatch(watermark_target):
+            # Canonical form (turn-4 per CONDUCTOR msg:c39e7d18): raw
+            # msg_id only. DAO derives ts from the message row so the
+            # body cannot tamper with the timestamp.
             ref_msg = conn.execute(
                 "SELECT msg_id, ts FROM debate_messages "
                 "WHERE msg_id = ? AND topic_id = ?",
@@ -342,26 +345,28 @@ def post_message(
                 )
             watermark_resolved = (ref_msg["msg_id"], ref_msg["ts"])
         else:
-            # Per CONDUCTOR msg:4c8a91be turn-3: WATERMARK body must
-            # carry both ts AND msg_id so the compound (ts, msg_id)
-            # cursor never falls back to ts-only. Parse canonical form
-            # via _WATERMARK_RE; reject ISO-only or any other shape.
+            # Deprecated keyword form. Parsed for back-compat, but DAO
+            # authoritatively derives ts from the message row and
+            # raises watermark_ts_mismatch if the body's ts disagrees
+            # — closes a tampering vector during the deprecation
+            # window. New callers MUST use msg_id-only form.
             m = _WATERMARK_RE.search(watermark_target)
             if m is None:
                 raise DebateError(
                     f"invalid_watermark_body: {watermark_target!r} "
-                    "(expect raw msg_id, or 'processed_up_to=<ts>:<msg_id>',"
-                    " or 'processed_up_to_ts=<ts> processed_up_to_msg_id="
-                    "<msg_id>')"
+                    "(expect raw msg_id; deprecated keyword form is "
+                    "also accepted only if its ts matches the looked-up "
+                    "row)"
                 )
-            wm_ts = m.group("ts")
+            wm_ts_claimed = m.group("ts")
             wm_msg_id = m.group("msg_id")
-            if not ISO_UTC_RE.fullmatch(wm_ts):
+            if not ISO_UTC_RE.fullmatch(wm_ts_claimed):
                 raise DebateError(
-                    f"invalid_watermark_ts: {wm_ts!r} (expect ISO 8601 UTC)"
+                    f"invalid_watermark_ts: {wm_ts_claimed!r} "
+                    "(expect ISO 8601 UTC)"
                 )
             ref_msg = conn.execute(
-                "SELECT msg_id FROM debate_messages "
+                "SELECT msg_id, ts FROM debate_messages "
                 "WHERE msg_id = ? AND topic_id = ?",
                 (wm_msg_id, topic_id),
             ).fetchone()
@@ -369,7 +374,13 @@ def post_message(
                 raise DebateError(
                     f"watermark_msg_not_in_topic: {wm_msg_id}"
                 )
-            watermark_resolved = (wm_msg_id, wm_ts)
+            if ref_msg["ts"] != wm_ts_claimed:
+                raise DebateError(
+                    f"watermark_ts_mismatch: body claimed ts="
+                    f"{wm_ts_claimed!r} but msg_id {wm_msg_id} actual "
+                    f"ts={ref_msg['ts']!r}"
+                )
+            watermark_resolved = (wm_msg_id, ref_msg["ts"])
 
     if kind == "DECISION" and reply_to is not None and parent_kind != "Q":
         raise DebateError(
@@ -484,19 +495,12 @@ def read_messages(
     cursor_msg_id: str = ""
     bootstrap_compaction_msg_id: str | None = None
 
-    if since_latest_compaction:
-        comp = conn.execute(
-            "SELECT msg_id, ts FROM debate_messages "
-            "WHERE topic_id = ? AND kind = 'COMPACTION' "
-            "ORDER BY ts DESC, msg_id DESC LIMIT 1",
-            (topic_id,),
-        ).fetchone()
-        if comp is not None:
-            cursor_ts = comp["ts"]
-            cursor_msg_id = comp["msg_id"]
-            bootstrap_compaction_msg_id = comp["msg_id"]
-
-    if cursor_ts is None and since_msg_id is not None:
+    # Cursor precedence (turn-4 per CONDUCTOR msg:5a2f8c47):
+    #   since_msg_id > since_ts > since_latest_compaction > watermark > start
+    # Explicit caller intent (msg_id, ts) takes precedence over the
+    # COMPACTION bootstrap shortcut so a caller asking for "from X"
+    # never gets silently shifted to the latest compaction.
+    if since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
             "SELECT ts, msg_id FROM debate_messages "
@@ -515,6 +519,18 @@ def read_messages(
         validate_iso_utc(since_ts)
         cursor_ts = since_ts
         cursor_msg_id = ""
+
+    if cursor_ts is None and since_latest_compaction:
+        comp = conn.execute(
+            "SELECT msg_id, ts FROM debate_messages "
+            "WHERE topic_id = ? AND kind = 'COMPACTION' "
+            "ORDER BY ts DESC, msg_id DESC LIMIT 1",
+            (topic_id,),
+        ).fetchone()
+        if comp is not None:
+            cursor_ts = comp["ts"]
+            cursor_msg_id = comp["msg_id"]
+            bootstrap_compaction_msg_id = comp["msg_id"]
 
     if cursor_ts is None:
         wm = get_watermark(conn, topic_id, role)
@@ -587,19 +603,16 @@ def advance_watermark(
     """Convenience helper: write a canonical WATERMARK message that
     advances the (topic_id, role) cursor to a specific msg_id.
 
-    Looks up the msg_id's ts in debate_messages and writes:
-        body = f'processed_up_to_ts={ts} processed_up_to_msg_id={msg_id}'
-
-    Atomically updates debate_watermarks via post_message side-effect.
-    Per CONDUCTOR msg:4c8a91be turn-3 — reduces caller error surface
-    from raw WATERMARK body construction.
+    Canonical body (turn-4 per CONDUCTOR msg:c39e7d18): raw msg_id only.
+    DAO derives ts from the message row, so callers can never insert a
+    stale or tampered ts. Atomically updates debate_watermarks via
+    post_message side-effect.
     """
     validate_topic_id(topic_id)
     validate_role(role)
     validate_msg_id(processed_up_to_msg_id)
     ref = conn.execute(
-        "SELECT msg_id, ts FROM debate_messages "
-        "WHERE msg_id = ? AND topic_id = ?",
+        "SELECT 1 FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
         (processed_up_to_msg_id, topic_id),
     ).fetchone()
     if ref is None:
@@ -607,17 +620,13 @@ def advance_watermark(
             f"unknown_msg_id_for_watermark: {processed_up_to_msg_id} "
             f"not in topic {topic_id}"
         )
-    body = (
-        f"processed_up_to_ts={ref['ts']} "
-        f"processed_up_to_msg_id={ref['msg_id']}"
-    )
     return post_message(
         conn,
         topic_id=topic_id,
         role=role,
         priority="INFO",
         kind="WATERMARK",
-        body=body,
+        body=processed_up_to_msg_id,
     )
 
 

@@ -6,9 +6,9 @@
 > compaction.
 >
 > Lives in `sqlite-memory-mcp` as part of the `sqlite-intel` MCP server.
-> Six tools: `debate_init`, `debate_post`, `debate_read`, `debate_state`,
-> `debate_escalate`, `debate_compact`. Three tables: `debates`,
-> `debate_messages`, `debate_watermarks`.
+> Seven tools: `debate_init`, `debate_post`, `debate_read`, `debate_state`,
+> `debate_escalate`, `debate_compact`, `debate_advance_watermark`. Three
+> tables: `debates`, `debate_messages`, `debate_watermarks`.
 
 ## Mental model
 
@@ -149,23 +149,59 @@ session_id}` dicts, every role matches the role regex.
 
 Append-only message insert. **Pre-INSERT validation** of kind-specific
 semantics: STATE body must be a legal transition target, WATERMARK body
-must resolve to a `msg_id` in the same topic or a valid ISO 8601 UTC ts,
-DECISION with `reply_to` must point at a `kind=Q` parent, COMPACTION
-body must contain OBSERVE / ORIENT / DECIDE / ACT sections (regex,
-case-insensitive). Failed validation raises `DebateError` and leaves
-no row in `debate_messages`.
+must be a raw `msg_id` in the same topic (canonical) or a deprecated
+keyword form whose ts agrees with the looked-up row (back-compat
+grace), DECISION with `reply_to` must point at a `kind=Q` parent,
+COMPACTION body must contain OBSERVE / ORIENT / DECIDE / ACT sections
+(regex, case-insensitive). Failed validation raises `DebateError` and
+leaves no row in `debate_messages`.
 
 State side-effects (`debates.state`, `debate_watermarks` upsert) only
 run after the INSERT lands.
 
-### `debate_read(topic_id, role, since_msg_id="", since_ts="", kind_filter_csv="", priority_filter_csv="", limit=200)`
+### `debate_read(topic_id, role, since_msg_id="", since_ts="", since_latest_compaction=False, kind_filter_csv="", priority_filter_csv="", limit=200)`
 
-Compound `(ts, msg_id)` cursor read. Cursor resolution priority:
-explicit `since_msg_id` > explicit `since_ts` > role watermark > start
-of topic. Default `limit=200`, capped at `1000`. Returns
-`truncated=true` plus `next_msg_id_cursor` and `next_ts_cursor` when
-more remain. Does **not** auto-advance the watermark — caller writes a
-`WATERMARK` message via `debate_post` when ready.
+Compound `(ts, msg_id)` cursor read. **Cursor precedence**
+(turn-4 fix per `msg:5a2f8c47`):
+
+1. `since_msg_id` (highest — explicit caller intent; raises
+   `unknown_since_msg_id` if not in topic).
+2. `since_ts`.
+3. `since_latest_compaction=True` → DAO selects the latest
+   `kind=COMPACTION` row (`MAX(ts) DESC, msg_id DESC` tiebreak) and
+   uses it as the cursor. Returns `bootstrap_compaction_msg_id` in the
+   response. Falls through to the next rule when no COMPACTION exists.
+4. Role watermark (`debate_watermarks[(topic_id, role)]`).
+5. Start of topic.
+
+Default `limit=200`, capped at `1000`. Returns `truncated=true` plus
+`next_msg_id_cursor` and `next_ts_cursor` when more remain. Does
+**not** auto-advance the watermark — caller writes a `WATERMARK`
+message via `debate_post` (or `debate_advance_watermark`) when ready.
+
+#### Watermark contract
+
+`debate_post` with `kind="WATERMARK"` accepts:
+
+- **Canonical**: body is a raw `msg_id` (8-hex). DAO derives `ts` from
+  the message row, so the body cannot tamper with the timestamp.
+- **Deprecated keyword form**: `processed_up_to=<ts>:<msg_id>` or
+  `processed_up_to_ts=<ts> processed_up_to_msg_id=<msg_id>`. Parsed
+  for back-compat; **rejected with `watermark_ts_mismatch` if the
+  body's ts disagrees with the looked-up row**. New callers MUST use
+  the canonical form.
+
+The `debate_watermarks` row is updated atomically with both
+`last_processed_msg_id` AND `last_processed_ts` columns so the
+compound `(ts, msg_id)` cursor never falls back to ts-only.
+
+### `debate_advance_watermark(topic_id, role, processed_up_to_msg_id)`
+
+Convenience wrapper around `debate_post(kind="WATERMARK")`. Takes only
+a `msg_id`, looks up its `ts` from the message row, and writes a
+canonical msg_id-only WATERMARK message. Reduces caller error surface
+vs constructing the body by hand. Raises
+`unknown_msg_id_for_watermark` if the `msg_id` is not in the topic.
 
 ### `debate_state(topic_id, role, new_state, reason="")`
 
@@ -282,6 +318,10 @@ compaction + incremental tail instead of replaying the full log.
   topic).
 - Schema: `schema.py` `_SCHEMA_SQL` block (search for "Debate Protocol v2").
 - DAO: `debate.py`.
-- MCP tool wrappers: `intel_server.py` Tools 25-30.
-- Test battery: `tests/test_debate_*.py` (138 tests, including the
-  socket-blocked LLM-free proof at `test_debate_paranoid.py`).
+- MCP tool wrappers: `intel_server.py` Tools 25-31.
+- Test battery: `tests/test_debate_*.py` (155 tests including
+  `test_debate_turn3.py` (COMPACTION bootstrap + watermark msg_id
+  enforcement + unknown-cursor raise) and `test_debate_turn4.py`
+  (cursor precedence + watermark security against ts tampering); the
+  socket-blocked LLM-free proof at `test_debate_paranoid.py` is also
+  in this battery).
