@@ -681,6 +681,96 @@ CREATE TRIGGER IF NOT EXISTS memory_fts_obs_ad AFTER DELETE ON observations BEGI
     FROM entities e LEFT JOIN observations o ON o.entity_id = e.id
     WHERE e.id = old.entity_id GROUP BY e.id;
 END;
+
+-- ── Memory Reflection (Phase 1) ─────────────────────────────────────────
+-- Reviewable memory consolidation runs. Async job model with state machine
+-- pending → running → completed/failed/canceled (C1). Lifecycle ops cancel +
+-- archive (C2 enforced in MCP tool layer). Resource-based inputs (C3) via
+-- reflection_inputs.input_type. Free-form instructions (C4). Structured
+-- error taxonomy (C5). Per-run usage tracking (C6). Per-candidate granularity
+-- preserved (C8 default); atomic-apply mode opt-in via reflection_candidates
+-- batch decisions. Apply snapshots never mutate in-place (C9). Pagination
+-- via archived_at index (C10). Per-run version pin for API evolution (C11).
+-- Per-run model selection with BYOK/Ollama support (C13).
+-- Source: notes 0ea75f2a + 5a4be019; corrections C1-C14 in entity
+-- MemoryReflection_DreamsAlignmentCorrections (approved subset 2026-05-09).
+
+CREATE TABLE IF NOT EXISTS reflection_runs (
+    run_id              TEXT PRIMARY KEY,
+    version             TEXT NOT NULL DEFAULT 'reflect_v1.0',
+    status              TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','completed','failed','canceled')),
+    model               TEXT NULL,
+    instructions        TEXT NULL,
+    error_type          TEXT NULL
+        CHECK (error_type IS NULL OR error_type IN (
+            'timeout','internal_error',
+            'input_session_unavailable','input_too_large',
+            'instructions_too_long','candidate_limit_exceeded'
+        )),
+    error_message       TEXT NULL,
+    usage_json          TEXT NULL,
+    created_by          TEXT NOT NULL DEFAULT 'system',
+    created_at          TEXT NOT NULL,
+    started_at          TEXT NULL,
+    ended_at            TEXT NULL,
+    archived_at         TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_runs_status_created
+    ON reflection_runs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reflection_runs_archived
+    ON reflection_runs(archived_at, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS reflection_inputs (
+    input_id            TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES reflection_runs(run_id) ON DELETE CASCADE,
+    input_type          TEXT NOT NULL
+        CHECK (input_type IN ('tasks','sessions','entities','notes')),
+    input_ref_json      TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_inputs_run
+    ON reflection_inputs(run_id, input_type);
+
+CREATE TABLE IF NOT EXISTS reflection_candidates (
+    candidate_id        TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES reflection_runs(run_id) ON DELETE CASCADE,
+    candidate_type      TEXT NOT NULL,
+    suggested_action    TEXT NOT NULL,
+    target_kind         TEXT NOT NULL
+        CHECK (target_kind IN ('task','entity','note','observation')),
+    target_ref          TEXT NOT NULL,
+    evidence_json       TEXT NOT NULL,
+    proposed_state_json TEXT NULL,
+    confidence          REAL NULL,
+    human_decision      TEXT NULL
+        CHECK (human_decision IS NULL OR human_decision IN ('accept','reject','defer')),
+    decided_by          TEXT NULL,
+    decided_at          TEXT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_candidates_run
+    ON reflection_candidates(run_id, candidate_type);
+CREATE INDEX IF NOT EXISTS idx_reflection_candidates_decision
+    ON reflection_candidates(run_id, human_decision);
+CREATE INDEX IF NOT EXISTS idx_reflection_candidates_target
+    ON reflection_candidates(target_kind, target_ref);
+
+CREATE TABLE IF NOT EXISTS reflection_apply_snapshots (
+    snapshot_id         TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES reflection_runs(run_id) ON DELETE CASCADE,
+    candidate_id        TEXT NOT NULL REFERENCES reflection_candidates(candidate_id) ON DELETE CASCADE,
+    target_kind         TEXT NOT NULL,
+    target_ref          TEXT NOT NULL,
+    before_state_json   TEXT NOT NULL,
+    after_state_json    TEXT NOT NULL,
+    applied_by          TEXT NOT NULL,
+    applied_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_apply_run
+    ON reflection_apply_snapshots(run_id, applied_at);
+CREATE INDEX IF NOT EXISTS idx_reflection_apply_target
+    ON reflection_apply_snapshots(target_kind, target_ref, applied_at DESC);
 """
 
 
