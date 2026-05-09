@@ -68,6 +68,15 @@ from tools.gbrain_bridge import (
     export_to_gbrain_brain_repo as _export_to_gbrain,
     import_from_gbrain_brain_repo as _import_from_gbrain,
 )
+from debate import (
+    DebateError as _DebateError,
+    compact as _debate_compact,
+    escalate as _debate_escalate_dao,
+    init_debate as _debate_init_dao,
+    post_message as _debate_post_dao,
+    read_messages as _debate_read_dao,
+    transition_state as _debate_transition_dao,
+)
 from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
@@ -1136,6 +1145,227 @@ def import_from_gbrain(
     except Exception as exc:
         logger.error("import_from_gbrain failed: %s", exc, exc_info=True)
         return _reflect_error_response(exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tools 25-30: Debate Protocol v2 — single-channel inter-session coordination
+# ═══════════════════════════════════════════════════════════════════════════
+# Productized inter-session coordination per CONDUCTOR Tier S #0
+# (msg:0a91f237 + 16:35 EEST EXECUTOR INSTRUCTION). Replaces ad-hoc
+# observations on a KG entity with a structured channel: 3 tables
+# (debates, debate_messages, debate_watermarks), 8-kind enum incl.
+# COMPACTION, lifecycle state machine INIT→ACTIVE→RESOLVED→ARCHIVED.
+
+
+def _debate_error_response(exc: Exception) -> str:
+    if isinstance(exc, _DebateError):
+        return json.dumps({"error": str(exc), "error_type": "debate_validation"})
+    return json.dumps({"error": str(exc), "error_type": "internal_error"})
+
+
+# Tool 25: debate_init
+@mcp.tool()
+def debate_init(
+    topic_id: str,
+    title: str,
+    roles_json: str,
+    created_by_role: str,
+    resolve_by: str = "",
+    metadata_json: str = "",
+) -> str:
+    """Bootstrap a new debate. Idempotent on (topic_id, roles).
+
+    Args:
+        topic_id: matches ^[A-Z][A-Z0-9_]+$.
+        title: non-empty.
+        roles_json: JSON array of {role, session_id} dicts.
+        created_by_role: role posting the init.
+        resolve_by: optional ISO 8601 UTC deadline.
+        metadata_json: optional JSON object, free-form.
+    """
+    try:
+        roles = json.loads(roles_json) if roles_json else []
+        metadata = json.loads(metadata_json) if metadata_json else None
+        with _get_conn() as conn:
+            out = _debate_init_dao(
+                conn,
+                topic_id=topic_id,
+                title=title,
+                roles=roles,
+                created_by_role=created_by_role,
+                resolve_by=resolve_by or None,
+                metadata=metadata,
+            )
+            logger.info(
+                "debate_init: topic=%s state=%s roles=%d",
+                out["topic_id"], out["state"], len(out["roles"]),
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        logger.info("debate_init rejected: %s", exc)
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_init failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 26: debate_post
+@mcp.tool()
+def debate_post(
+    topic_id: str,
+    role: str,
+    priority: str,
+    kind: str,
+    body: str,
+    reply_to: str = "",
+) -> str:
+    """Append a message to a debate. Validates kind-specific semantics
+    BEFORE the INSERT (atomic — failed validation leaves no row).
+
+    Args:
+        topic_id: existing debate topic.
+        role: must appear in declared roles.
+        priority: H | M | L | INFO.
+        kind: Q | A | STATUS | DECISION | PING | WATERMARK | STATE | COMPACTION.
+        body: non-empty.
+        reply_to: optional msg_id in same topic.
+    """
+    try:
+        with _get_conn() as conn:
+            out = _debate_post_dao(
+                conn,
+                topic_id=topic_id, role=role, priority=priority,
+                kind=kind, body=body, reply_to=reply_to or None,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        logger.info("debate_post rejected: %s", exc)
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_post failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 27: debate_read
+@mcp.tool()
+def debate_read(
+    topic_id: str,
+    role: str,
+    since_msg_id: str = "",
+    since_ts: str = "",
+    kind_filter_csv: str = "",
+    priority_filter_csv: str = "",
+    limit: int = 200,
+) -> str:
+    """Read messages with compound (ts, msg_id) cursor. Cursor priority:
+    since_msg_id > since_ts > role watermark > start. Default limit=200,
+    cap=1000. Returns truncated + next cursors when more messages remain.
+    """
+    try:
+        kind_filter = (
+            [k.strip() for k in kind_filter_csv.split(",") if k.strip()]
+            if kind_filter_csv else None
+        )
+        priority_filter = (
+            [p.strip() for p in priority_filter_csv.split(",") if p.strip()]
+            if priority_filter_csv else None
+        )
+        with _get_conn() as conn:
+            out = _debate_read_dao(
+                conn,
+                topic_id=topic_id, role=role,
+                since_msg_id=since_msg_id or None,
+                since_ts=since_ts or None,
+                kind_filter=kind_filter,
+                priority_filter=priority_filter,
+                limit=limit,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_read failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 28: debate_state
+@mcp.tool()
+def debate_state(
+    topic_id: str,
+    role: str,
+    new_state: str,
+    reason: str = "",
+) -> str:
+    """Transition debate to a new state. Validates VALID_TRANSITIONS.
+    RESOLVED requires all open Qs to have a matching A reply (or A body
+    starting `[DEFERRED:` to count as resolution-equivalent).
+    """
+    try:
+        with _get_conn() as conn:
+            out = _debate_transition_dao(
+                conn,
+                topic_id=topic_id, role=role,
+                new_state=new_state, reason=reason or "",
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_state failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 29: debate_escalate
+@mcp.tool()
+def debate_escalate(
+    topic_id: str,
+    role: str,
+    reason: str,
+    target_role: str = "HUMAN",
+) -> str:
+    """Force-write an H-priority PING tagged for target_role (default HUMAN)."""
+    try:
+        with _get_conn() as conn:
+            out = _debate_escalate_dao(
+                conn,
+                topic_id=topic_id, role=role,
+                reason=reason, target_role=target_role,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_escalate failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 30: debate_compact
+@mcp.tool()
+def debate_compact(
+    topic_id: str,
+    role: str,
+    body: str,
+    since_ts: str = "",
+    until_ts: str = "",
+) -> str:
+    """Write a COMPACTION snapshot. Body must contain OBSERVE / ORIENT /
+    DECIDE / ACT sections (regex-validated pre-INSERT). since_ts and
+    until_ts are optional ISO 8601 UTC bounds for the snapshotted range.
+    """
+    try:
+        with _get_conn() as conn:
+            out = _debate_compact(
+                conn,
+                topic_id=topic_id, role=role, body=body,
+                since_ts=since_ts or None,
+                until_ts=until_ts or None,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_compact failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
