@@ -42,6 +42,24 @@ from reflection import (
     audit_reflection_candidates as _audit_reflection_candidates,
     format_audit_markdown as _format_audit_markdown,
 )
+from reflection_dao import (
+    add_candidate as _dao_add_candidate,
+    add_input as _dao_add_input,
+    archive_run as _dao_archive_run,
+    cancel_run as _dao_cancel_run,
+    candidate_decision_counts as _dao_candidate_decision_counts,
+    create_run as _dao_create_run,
+    decide_candidate as _dao_decide_candidate,
+    finish_run as _dao_finish_run,
+    get_run as _dao_get_run,
+    list_inputs as _dao_list_inputs,
+    list_runs as _dao_list_runs,
+    start_run as _dao_start_run,
+    MAX_CANDIDATES_PER_RUN as _MAX_CANDIDATES,
+    MAX_INSTRUCTIONS_CHARS as _MAX_INSTRUCTIONS,
+    ReflectionStateError as _ReflectionStateError,
+    VALID_DECISIONS as _VALID_DECISIONS,
+)
 from premium_runtime import maybe_mount_premium_extensions
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
@@ -558,6 +576,325 @@ def reflect_audit(
     except Exception as exc:
         logger.error("reflect_audit failed: %s", exc, exc_info=True)
         return json.dumps({"error": str(exc)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tools 14–19: Phase 1 Reflection lifecycle (reflect_v1.0 — async runs)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These tools implement the approved Phase 1 subset of corrections from
+# entity MemoryReflection_DreamsAlignmentCorrections (C1, C2, C5, C6, C9,
+# C10, C11, C13). reflect_audit (Phase 0.5) remains the read-only audit
+# entrypoint; Phase 1 tools wrap it with persistent run state + per-
+# candidate human decisions for review/decide workflows.
+#
+# Note: reflect_start currently runs the Extract stage synchronously
+# (mirrors Phase 0.5 audit). Phase 2 will add async background workers
+# for LLM-based extraction.
+
+
+def _reflect_error_response(exc: Exception, *, error_type: str | None = None) -> str:
+    """Map exceptions to Dreams-style error envelopes."""
+    if isinstance(exc, _ReflectionStateError):
+        return json.dumps(
+            {"error": str(exc), "error_type": error_type or "internal_error"}
+        )
+    return json.dumps({"error": str(exc), "error_type": "internal_error"})
+
+
+# Tool 14: reflect_start
+@mcp.tool()
+def reflect_start(
+    project: str = "",
+    stale_days: int = 60,
+    abandoned_inbox_days: int = 30,
+    limit_per_category: int = 20,
+    instructions: str = "",
+    model: str = "",
+    version: str = "reflect_v1.0",
+    created_by: str = "user",
+) -> str:
+    """Create a Phase 1 run and execute the Extract stage synchronously.
+
+    Reuses Phase 0.5 audit logic (deterministic SQL, no LLM) and persists
+    each surfaced candidate to reflection_candidates so it can be reviewed
+    via reflect_decide and applied via future reflect_apply.
+
+    Args:
+        project: optional project filter for the audit pass.
+        stale_days, abandoned_inbox_days, limit_per_category: tuning for the
+            Extract stage; same semantics as reflect_audit.
+        instructions: free-form guidance text (max 4096 chars per C14/Dreams).
+        model: optional model id for future LLM-based runs (Phase 2 uses).
+        version: run schema version for forward-compat (default reflect_v1.0).
+        created_by: actor recorded in reflection_runs.created_by.
+    """
+    if instructions and len(instructions) > _MAX_INSTRUCTIONS:
+        return json.dumps(
+            {
+                "error": (
+                    f"instructions too long: {len(instructions)} > {_MAX_INSTRUCTIONS}"
+                ),
+                "error_type": "instructions_too_long",
+            }
+        )
+
+    run_id: str | None = None
+    try:
+        with _get_conn() as conn:
+            run_id = _dao_create_run(
+                conn,
+                version=version,
+                model=model or None,
+                instructions=instructions or None,
+                created_by=created_by,
+            )
+            input_ref = {
+                "project": project or None,
+                "stale_days": stale_days,
+                "abandoned_inbox_days": abandoned_inbox_days,
+                "limit_per_category": limit_per_category,
+            }
+            _dao_add_input(conn, run_id, "tasks", input_ref)
+            _dao_start_run(conn, run_id)
+
+            report = _audit_reflection_candidates(
+                conn,
+                project=project or None,
+                stale_days=stale_days,
+                abandoned_inbox_days=abandoned_inbox_days,
+                limit_per_category=limit_per_category,
+            )
+
+            persisted = 0
+            for cat_name, items in report["candidates"].items():
+                for item in items:
+                    target_kind = (
+                        "entity" if cat_name == "entities_no_observations" else "task"
+                    )
+                    target_ref = (
+                        item.get("id")
+                        or item.get("task_ids", ["?"])[0]
+                        or item.get("title_key")
+                        or "?"
+                    )
+                    _dao_add_candidate(
+                        conn,
+                        run_id,
+                        candidate_type=cat_name,
+                        suggested_action=item.get("suggested_action", "review"),
+                        target_kind=target_kind,
+                        target_ref=str(target_ref),
+                        evidence=item,
+                    )
+                    persisted += 1
+                    if persisted >= _MAX_CANDIDATES:
+                        _dao_finish_run(
+                            conn,
+                            run_id,
+                            "failed",
+                            error_type="candidate_limit_exceeded",
+                            error_message=(
+                                f"persisted {persisted} candidates; cap is "
+                                f"{_MAX_CANDIDATES}"
+                            ),
+                            usage={"candidate_count": persisted},
+                        )
+                        logger.warning(
+                            "reflect_start hit candidate cap: run=%s persisted=%d",
+                            run_id,
+                            persisted,
+                        )
+                        return json.dumps(
+                            {
+                                "run_id": run_id,
+                                "status": "failed",
+                                "error_type": "candidate_limit_exceeded",
+                                "candidates_persisted": persisted,
+                            }
+                        )
+
+            _dao_finish_run(
+                conn,
+                run_id,
+                "completed",
+                usage={
+                    "candidate_count": persisted,
+                    "categories": report["summary"]["by_category"],
+                },
+            )
+            logger.info(
+                "reflect_start: run=%s candidates=%d project=%s",
+                run_id,
+                persisted,
+                project or "*",
+            )
+            return json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "candidates_persisted": persisted,
+                    "summary": report["summary"],
+                }
+            )
+    except _ReflectionStateError as exc:
+        logger.warning("reflect_start state error: %s", exc)
+        return _reflect_error_response(exc)
+    except Exception as exc:
+        logger.error("reflect_start failed: %s", exc, exc_info=True)
+        if run_id is not None:
+            try:
+                with _get_conn() as conn:
+                    _dao_finish_run(
+                        conn,
+                        run_id,
+                        "failed",
+                        error_type="internal_error",
+                        error_message=str(exc)[:500],
+                    )
+            except Exception:
+                pass
+        return _reflect_error_response(exc)
+
+
+# Tool 15: reflect_status
+@mcp.tool()
+def reflect_status(run_id: str) -> str:
+    """Return run state, inputs, and decision counts for a given run_id."""
+    try:
+        with _get_conn() as conn:
+            row = _dao_get_run(conn, run_id)
+            if row is None:
+                return json.dumps(
+                    {"error": f"run_not_found: {run_id}", "error_type": "not_found"}
+                )
+            inputs = _dao_list_inputs(conn, run_id)
+            counts = _dao_candidate_decision_counts(conn, run_id)
+            return json.dumps(
+                {"run": row, "inputs": inputs, "candidate_counts": counts}
+            )
+    except Exception as exc:
+        logger.error("reflect_status failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# Tool 16: reflect_history
+@mcp.tool()
+def reflect_history(
+    limit: int = 20,
+    offset: int = 0,
+    include_archived: bool = False,
+    status_filter: str = "",
+) -> str:
+    """Paginated newest-first list of reflection runs (Dreams list parity)."""
+    try:
+        with _get_conn() as conn:
+            rows, total = _dao_list_runs(
+                conn,
+                limit=limit,
+                offset=offset,
+                include_archived=include_archived,
+                status_filter=status_filter or None,
+            )
+            return json.dumps(
+                {
+                    "runs": rows,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "include_archived": include_archived,
+                    "status_filter": status_filter or None,
+                }
+            )
+    except _ReflectionStateError as exc:
+        return _reflect_error_response(exc)
+    except Exception as exc:
+        logger.error("reflect_history failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# Tool 17: reflect_cancel
+@mcp.tool()
+def reflect_cancel(run_id: str) -> str:
+    """Cancel a pending or running run. Rejects terminal states."""
+    try:
+        with _get_conn() as conn:
+            _dao_cancel_run(conn, run_id)
+            row = _dao_get_run(conn, run_id)
+            return json.dumps({"run_id": run_id, "status": row["status"] if row else None})
+    except _ReflectionStateError as exc:
+        logger.info("reflect_cancel rejected: %s", exc)
+        return json.dumps(
+            {"error": str(exc), "error_type": "invalid_state_transition"}
+        )
+    except Exception as exc:
+        logger.error("reflect_cancel failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# Tool 18: reflect_archive
+@mcp.tool()
+def reflect_archive(run_id: str) -> str:
+    """Archive a terminal run. Rejects pending/running. Idempotent."""
+    try:
+        with _get_conn() as conn:
+            changed = _dao_archive_run(conn, run_id)
+            row = _dao_get_run(conn, run_id)
+            return json.dumps(
+                {
+                    "run_id": run_id,
+                    "archived_at": row["archived_at"] if row else None,
+                    "newly_archived": changed,
+                }
+            )
+    except _ReflectionStateError as exc:
+        logger.info("reflect_archive rejected: %s", exc)
+        return json.dumps(
+            {"error": str(exc), "error_type": "invalid_state_transition"}
+        )
+    except Exception as exc:
+        logger.error("reflect_archive failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
+
+
+# Tool 19: reflect_decide
+@mcp.tool()
+def reflect_decide(
+    candidate_id: str,
+    decision: str,
+    decided_by: str = "user",
+) -> str:
+    """Record human accept/reject/defer decision on a candidate."""
+    if decision not in _VALID_DECISIONS:
+        return json.dumps(
+            {
+                "error": (
+                    f"unknown decision: {decision}; expected one of "
+                    f"{','.join(_VALID_DECISIONS)}"
+                ),
+                "error_type": "invalid_argument",
+            }
+        )
+    try:
+        with _get_conn() as conn:
+            ok = _dao_decide_candidate(conn, candidate_id, decision, decided_by)
+            if not ok:
+                return json.dumps(
+                    {
+                        "error": f"candidate_not_found: {candidate_id}",
+                        "error_type": "not_found",
+                    }
+                )
+            return json.dumps(
+                {
+                    "candidate_id": candidate_id,
+                    "decision": decision,
+                    "decided_by": decided_by,
+                }
+            )
+    except Exception as exc:
+        logger.error("reflect_decide failed: %s", exc, exc_info=True)
+        return _reflect_error_response(exc)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
