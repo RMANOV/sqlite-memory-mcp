@@ -70,6 +70,7 @@ from tools.gbrain_bridge import (
 )
 from debate import (
     DebateError as _DebateError,
+    advance_watermark as _debate_advance_watermark_dao,
     compact as _debate_compact,
     escalate as _debate_escalate_dao,
     init_debate as _debate_init_dao,
@@ -1253,13 +1254,24 @@ def debate_read(
     role: str,
     since_msg_id: str = "",
     since_ts: str = "",
+    since_latest_compaction: bool = False,
     kind_filter_csv: str = "",
     priority_filter_csv: str = "",
     limit: int = 200,
 ) -> str:
-    """Read messages with compound (ts, msg_id) cursor. Cursor priority:
-    since_msg_id > since_ts > role watermark > start. Default limit=200,
-    cap=1000. Returns truncated + next cursors when more messages remain.
+    """Read messages with compound (ts, msg_id) cursor.
+
+    Cursor priority (turn-3 fix):
+      1. since_latest_compaction=True → use latest COMPACTION's
+         (ts, msg_id) as cursor; bootstrap_compaction_msg_id field set.
+         Falls through to existing precedence if no COMPACTION exists.
+      2. since_msg_id (raises unknown_since_msg_id if not in topic).
+      3. since_ts.
+      4. role watermark.
+      5. start of topic.
+
+    Default limit=200, cap=1000. Returns truncated + next cursors when
+    more messages remain.
     """
     try:
         kind_filter = (
@@ -1276,6 +1288,7 @@ def debate_read(
                 topic_id=topic_id, role=role,
                 since_msg_id=since_msg_id or None,
                 since_ts=since_ts or None,
+                since_latest_compaction=since_latest_compaction,
                 kind_filter=kind_filter,
                 priority_filter=priority_filter,
                 limit=limit,
@@ -1365,6 +1378,37 @@ def debate_compact(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_compact failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 31: debate_advance_watermark (turn-3 helper, msg:4c8a91be)
+@mcp.tool()
+def debate_advance_watermark(
+    topic_id: str,
+    role: str,
+    processed_up_to_msg_id: str,
+) -> str:
+    """Advance (topic_id, role) cursor to a specific msg_id.
+
+    Convenience wrapper that looks up the msg_id's ts and writes a
+    canonical WATERMARK message of the form:
+      'processed_up_to_ts=<ts> processed_up_to_msg_id=<msg_id>'
+
+    Atomically updates debate_watermarks. Reduces caller error surface
+    vs constructing the WATERMARK body by hand.
+    """
+    try:
+        with _get_conn() as conn:
+            out = _debate_advance_watermark_dao(
+                conn,
+                topic_id=topic_id, role=role,
+                processed_up_to_msg_id=processed_up_to_msg_id,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_advance_watermark failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

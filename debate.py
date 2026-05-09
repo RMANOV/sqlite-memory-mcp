@@ -52,6 +52,19 @@ _DEFERRED_PREFIX = "[DEFERRED:"
 DEFAULT_READ_LIMIT = 200
 MAX_READ_LIMIT = 1000
 
+# Canonical WATERMARK body parser — turn-3 correction msg:4c8a91be.
+# Supports two forms:
+#   'processed_up_to=2026-05-09T17:45:00Z:a8f3c192'
+#   'processed_up_to_ts=2026-05-09T17:45:00Z processed_up_to_msg_id=a8f3c192'
+# Both yield ts + msg_id together so debate_watermarks rows always
+# carry both columns non-null; legacy ISO-only bodies are rejected on
+# POST so callers are forced to enrich.
+_WATERMARK_RE = re.compile(
+    r"processed_up_to(?:_ts)?=(?P<ts>\S+?)"
+    r"(?::|\s+processed_up_to_msg_id=)"
+    r"(?P<msg_id>[a-f0-9]{8})"
+)
+
 
 VALID_PRIORITIES = ("H", "M", "L", "INFO")
 VALID_KINDS = (
@@ -328,13 +341,35 @@ def post_message(
                     f"watermark_msg_not_in_topic: {watermark_target}"
                 )
             watermark_resolved = (ref_msg["msg_id"], ref_msg["ts"])
-        elif ISO_UTC_RE.fullmatch(watermark_target):
-            watermark_resolved = (None, watermark_target)
         else:
-            raise DebateError(
-                f"invalid_watermark_body: {watermark_target!r} "
-                "(expect msg_id or ISO UTC)"
-            )
+            # Per CONDUCTOR msg:4c8a91be turn-3: WATERMARK body must
+            # carry both ts AND msg_id so the compound (ts, msg_id)
+            # cursor never falls back to ts-only. Parse canonical form
+            # via _WATERMARK_RE; reject ISO-only or any other shape.
+            m = _WATERMARK_RE.search(watermark_target)
+            if m is None:
+                raise DebateError(
+                    f"invalid_watermark_body: {watermark_target!r} "
+                    "(expect raw msg_id, or 'processed_up_to=<ts>:<msg_id>',"
+                    " or 'processed_up_to_ts=<ts> processed_up_to_msg_id="
+                    "<msg_id>')"
+                )
+            wm_ts = m.group("ts")
+            wm_msg_id = m.group("msg_id")
+            if not ISO_UTC_RE.fullmatch(wm_ts):
+                raise DebateError(
+                    f"invalid_watermark_ts: {wm_ts!r} (expect ISO 8601 UTC)"
+                )
+            ref_msg = conn.execute(
+                "SELECT msg_id FROM debate_messages "
+                "WHERE msg_id = ? AND topic_id = ?",
+                (wm_msg_id, topic_id),
+            ).fetchone()
+            if ref_msg is None:
+                raise DebateError(
+                    f"watermark_msg_not_in_topic: {wm_msg_id}"
+                )
+            watermark_resolved = (wm_msg_id, wm_ts)
 
     if kind == "DECISION" and reply_to is not None and parent_kind != "Q":
         raise DebateError(
@@ -408,24 +443,36 @@ def read_messages(
     role: str,
     since_msg_id: str | None = None,
     since_ts: str | None = None,
+    since_latest_compaction: bool = False,
     kind_filter: list[str] | None = None,
     priority_filter: list[str] | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Read messages from a topic with compound (ts, msg_id) cursor.
 
-    Cursor priority: explicit since_msg_id > explicit since_ts >
-    debate_watermarks[(topic_id, role)] > beginning of topic.
+    Cursor priority:
+      1. since_latest_compaction=True (per CONDUCTOR msg:9b7c3d28 turn-3):
+         use latest COMPACTION's (ts, msg_id) as cursor. Returns
+         bootstrap_compaction_msg_id field. If no COMPACTION exists,
+         falls through to the rest of the precedence.
+      2. explicit since_msg_id (validated; raises if not found in topic).
+      3. explicit since_ts (no exact-match requirement; pre-existing
+         timestamps are allowed and return all messages after).
+      4. debate_watermarks[(topic_id, role)].
+      5. beginning of topic.
 
     WHERE clause is `(ts > :wm_ts) OR (ts = :wm_ts AND msg_id > :wm_msg_id)`
     so messages with the same ts but different msg_ids never get skipped
-    (per CONDUCTOR msg:7e3c8f10 ADVOCATE turn 2 fix). Legacy watermarks
-    with only ts (no msg_id) treat msg_id as '' (lex-smallest) so the
-    first compound-cursor read returns ALL messages at that ts.
+    (per CONDUCTOR msg:7e3c8f10 turn-2 fix). Legacy watermarks with only
+    ts (no msg_id) treat msg_id as '' (lex-smallest) so the first
+    compound-cursor read returns ALL messages at that ts.
 
     Pagination: limit defaults to DEFAULT_READ_LIMIT (200), capped at
     MAX_READ_LIMIT (1000). Returns truncated=True + next_*_cursor when
     more messages remain. Does NOT auto-advance the watermark.
+
+    Unknown since_msg_id raises (turn-3 fix per CONDUCTOR msg:7da13e9f);
+    silent fall-through to start of topic was a masked-bug pattern.
     """
     validate_topic_id(topic_id)
     validate_role(role)
@@ -435,21 +482,41 @@ def read_messages(
 
     cursor_ts: str | None = None
     cursor_msg_id: str = ""
-    if since_msg_id is not None:
+    bootstrap_compaction_msg_id: str | None = None
+
+    if since_latest_compaction:
+        comp = conn.execute(
+            "SELECT msg_id, ts FROM debate_messages "
+            "WHERE topic_id = ? AND kind = 'COMPACTION' "
+            "ORDER BY ts DESC, msg_id DESC LIMIT 1",
+            (topic_id,),
+        ).fetchone()
+        if comp is not None:
+            cursor_ts = comp["ts"]
+            cursor_msg_id = comp["msg_id"]
+            bootstrap_compaction_msg_id = comp["msg_id"]
+
+    if cursor_ts is None and since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
             "SELECT ts, msg_id FROM debate_messages "
             "WHERE msg_id = ? AND topic_id = ?",
             (since_msg_id, topic_id),
         ).fetchone()
-        if ref is not None:
-            cursor_ts = ref["ts"]
-            cursor_msg_id = ref["msg_id"]
-    elif since_ts is not None:
+        if ref is None:
+            raise DebateError(
+                f"unknown_since_msg_id: {since_msg_id} not found in "
+                f"topic {topic_id}"
+            )
+        cursor_ts = ref["ts"]
+        cursor_msg_id = ref["msg_id"]
+
+    if cursor_ts is None and since_ts is not None:
         validate_iso_utc(since_ts)
         cursor_ts = since_ts
         cursor_msg_id = ""
-    else:
+
+    if cursor_ts is None:
         wm = get_watermark(conn, topic_id, role)
         if wm and wm.get("last_processed_ts"):
             cursor_ts = wm["last_processed_ts"]
@@ -506,7 +573,52 @@ def read_messages(
         "next_msg_id_cursor": last_msg_id if truncated else None,
         "next_ts_cursor": last_ts if truncated else None,
         "limit": effective_limit,
+        "bootstrap_compaction_msg_id": bootstrap_compaction_msg_id,
     }
+
+
+def advance_watermark(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    processed_up_to_msg_id: str,
+) -> dict[str, Any]:
+    """Convenience helper: write a canonical WATERMARK message that
+    advances the (topic_id, role) cursor to a specific msg_id.
+
+    Looks up the msg_id's ts in debate_messages and writes:
+        body = f'processed_up_to_ts={ts} processed_up_to_msg_id={msg_id}'
+
+    Atomically updates debate_watermarks via post_message side-effect.
+    Per CONDUCTOR msg:4c8a91be turn-3 — reduces caller error surface
+    from raw WATERMARK body construction.
+    """
+    validate_topic_id(topic_id)
+    validate_role(role)
+    validate_msg_id(processed_up_to_msg_id)
+    ref = conn.execute(
+        "SELECT msg_id, ts FROM debate_messages "
+        "WHERE msg_id = ? AND topic_id = ?",
+        (processed_up_to_msg_id, topic_id),
+    ).fetchone()
+    if ref is None:
+        raise DebateError(
+            f"unknown_msg_id_for_watermark: {processed_up_to_msg_id} "
+            f"not in topic {topic_id}"
+        )
+    body = (
+        f"processed_up_to_ts={ref['ts']} "
+        f"processed_up_to_msg_id={ref['msg_id']}"
+    )
+    return post_message(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        priority="INFO",
+        kind="WATERMARK",
+        body=body,
+    )
 
 
 # ── State transitions outside of post_message ──────────────────────────

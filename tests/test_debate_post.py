@@ -177,17 +177,18 @@ def test_debate_post_kind_WATERMARK_updates_table_with_msg_id_target(topic):
     assert wm["last_processed_msg_id"] == target["msg_id"]
 
 
-def test_debate_post_kind_WATERMARK_updates_with_iso_only(topic):
+def test_debate_post_kind_WATERMARK_iso_only_now_rejected(topic):
+    """Per CONDUCTOR msg:4c8a91be turn-3 fix: WATERMARK body must carry
+    BOTH ts AND msg_id so the compound (ts, msg_id) cursor never falls
+    back to ts-only. ISO-only bodies are now rejected on POST.
+    """
     conn, t = topic
-    post_message(
-        conn, topic_id=t, role="EXECUTOR",
-        priority="INFO", kind="WATERMARK",
-        body="2026-05-09T18:00:00Z",
-    )
-    wm = get_watermark(conn, t, "EXECUTOR")
-    assert wm is not None
-    assert wm["last_processed_msg_id"] is None
-    assert wm["last_processed_ts"] == "2026-05-09T18:00:00Z"
+    with pytest.raises(DebateError, match="invalid_watermark_body"):
+        post_message(
+            conn, topic_id=t, role="EXECUTOR",
+            priority="INFO", kind="WATERMARK",
+            body="2026-05-09T18:00:00Z",
+        )
 
 
 def test_debate_post_blocked_when_state_ARCHIVED(topic):
