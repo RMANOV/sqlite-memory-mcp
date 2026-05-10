@@ -744,6 +744,40 @@ CREATE TABLE IF NOT EXISTS debate_watermarks (
     PRIMARY KEY (topic_id, role)
 );
 
+-- ── v3.9.2: prompt-time inbox signaling ─────────────────────────────────
+-- Two-table model per CONDUCTOR canonical msg:b3a87f15 (replaces
+-- deprecated msg:f3a72c84). debate_message_recipients carries WHO is
+-- addressed (intent, normalized — replaces rejected CSV addressed_to
+-- column anti-pattern from turn 7). debate_signal_state carries WHERE
+-- each per-session read cursor sits (compound (ts, msg_id) per turn 2).
+-- ARCHIVED retention preserved: ON DELETE CASCADE only fires on actual
+-- DELETE FROM debates / debate_messages, NOT on state transitions.
+-- last_processed_msg_id has NO FK so cursor history survives potential
+-- message hard-deletes; advance is gated by recipient match in DAO
+-- (msg:5e2d1c89 turn-12 fix).
+
+CREATE TABLE IF NOT EXISTS debate_message_recipients (
+    msg_id    TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    recipient TEXT NOT NULL,
+    PRIMARY KEY (msg_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_dmr_recipient
+    ON debate_message_recipients(recipient);
+
+CREATE TABLE IF NOT EXISTS debate_signal_state (
+    session_id            TEXT NOT NULL,
+    role                  TEXT NOT NULL,
+    topic_id              TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    last_processed_msg_id TEXT,
+    last_processed_ts     TEXT,
+    last_check_at         TEXT NOT NULL,
+    PRIMARY KEY (session_id, role, topic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dss_role_topic
+    ON debate_signal_state(role, topic_id);
+CREATE INDEX IF NOT EXISTS idx_dss_last_check
+    ON debate_signal_state(last_check_at);
+
 -- ── Memory Reflection (Phase 1) ─────────────────────────────────────────
 -- Reviewable memory consolidation runs. Async job model with state machine
 -- pending → running → completed/failed/canceled (C1). Lifecycle ops cancel +

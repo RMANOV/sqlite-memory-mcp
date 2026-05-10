@@ -72,6 +72,9 @@ from debate import (
     DebateError as _DebateError,
     advance_watermark as _debate_advance_watermark_dao,
     compact as _debate_compact,
+    debate_post_with_recipients as _debate_post_with_recipients_dao,
+    debate_signal_advance as _debate_signal_advance_dao,
+    debate_signal_check as _debate_signal_check_dao,
     escalate as _debate_escalate_dao,
     init_debate as _debate_init_dao,
     post_message as _debate_post_dao,
@@ -1159,8 +1162,17 @@ def import_from_gbrain(
 
 
 def _debate_error_response(exc: Exception) -> str:
+    """Map a DAO exception to a stable MCP error JSON string.
+
+    Per v3.9.2 amendment 7 (msg:e0f47b29):
+      - DebateError → emit its ``.error_type`` attribute (specific
+        taxonomy or the legacy default ``'debate_validation'``).
+      - Any other exception → ``'internal_error'`` (unexpected, NOT a
+        validation error). Preserves the v3.9.0+v3.9.1 wire contract:
+        return type stays ``str`` via ``json.dumps``.
+    """
     if isinstance(exc, _DebateError):
-        return json.dumps({"error": str(exc), "error_type": "debate_validation"})
+        return json.dumps({"error": str(exc), "error_type": exc.error_type})
     return json.dumps({"error": str(exc), "error_type": "internal_error"})
 
 
@@ -1409,6 +1421,120 @@ def debate_advance_watermark(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_advance_watermark failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 32: debate_post_with_recipients (v3.9.2 prompt-time inbox signaling)
+@mcp.tool()
+def debate_post_with_recipients(
+    topic_id: str,
+    role: str,
+    priority: str,
+    kind: str,
+    body: str,
+    addressed_to_csv: str,
+    reply_to: str = "",
+) -> str:
+    """Post an addressed message: debate_messages + debate_message_recipients
+    in a single atomic transaction.
+
+    addressed_to_csv: comma-separated list of recipients. Each entry must
+    be either a declared role of the topic OR a session_id with an
+    approved runtime prefix (cc-, codex-, mcp-, tray-, human-) and a
+    [a-zA-Z0-9_]{4,64} suffix. Empty list rejected (broadcast not
+    supported in v3.9.x). Duplicates silently de-duplicated preserving
+    order. ARCHIVED topics block all kinds (including STATE);
+    RESOLVED topics block all non-STATE kinds.
+    """
+    try:
+        addressed_to = [
+            r.strip() for r in addressed_to_csv.split(",") if r.strip()
+        ]
+        with _get_conn() as conn:
+            out = _debate_post_with_recipients_dao(
+                conn,
+                topic_id=topic_id, role=role,
+                priority=priority, kind=kind, body=body,
+                addressed_to=addressed_to,
+                reply_to=reply_to or None,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error(
+            "debate_post_with_recipients failed: %s", exc, exc_info=True
+        )
+        return _debate_error_response(exc)
+
+
+# Tool 33: debate_signal_check (v3.9.2 prompt-time inbox poll)
+@mcp.tool()
+def debate_signal_check(
+    session_id: str,
+    role: str,
+    topic_id: str,
+    since_msg_id: str = "",
+    since_ts: str = "",
+    limit: int = 200,
+) -> str:
+    """Return messages addressed to (role OR session_id) past the
+    caller's compound (ts, msg_id) cursor.
+
+    session_id must match ^(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64}$.
+    Cursor precedence: since_msg_id > since_ts > debate_signal_state row
+    > start of topic. limit defaults to 200, capped at 1000; out-of-range
+    or non-int raises with a specific error_type. Returns pending list,
+    truncated bool + next_cursor for pagination, max_priority for
+    short-circuit logic, plus topic_state.
+    """
+    try:
+        with _get_conn() as conn:
+            out = _debate_signal_check_dao(
+                conn,
+                session_id=session_id, role=role, topic_id=topic_id,
+                since_msg_id=since_msg_id or None,
+                since_ts=since_ts or None,
+                limit=limit,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_signal_check failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 34: debate_signal_advance (v3.9.2 cursor advance with recipient guard)
+@mcp.tool()
+def debate_signal_advance(
+    session_id: str,
+    role: str,
+    topic_id: str,
+    last_processed_msg_id: str,
+) -> str:
+    """Advance the (session_id, role, topic_id) compound cursor to a
+    specific msg_id.
+
+    The target msg_id MUST be addressed to the caller (role OR
+    session_id) — turn-12 fix: prevents a buggy adapter from advancing
+    past unprocessed addressed work and permanently hiding pending
+    messages. ts is derived from the message row (not caller-supplied).
+    Atomic upsert into debate_signal_state writes BOTH cursor columns
+    plus last_check_at.
+    """
+    try:
+        with _get_conn() as conn:
+            out = _debate_signal_advance_dao(
+                conn,
+                session_id=session_id, role=role, topic_id=topic_id,
+                last_processed_msg_id=last_processed_msg_id,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_signal_advance failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

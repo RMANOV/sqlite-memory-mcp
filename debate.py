@@ -52,6 +52,16 @@ _DEFERRED_PREFIX = "[DEFERRED:"
 DEFAULT_READ_LIMIT = 200
 MAX_READ_LIMIT = 1000
 
+# v3.9.2 prompt-time inbox signaling (per CONDUCTOR canonical
+# msg:b3a87f15 + msg:c5e91d24). Session ids are namespaced by runtime
+# so adapters can route messages back to the right session without
+# colliding with role names. Pagination contract mirrors read_messages.
+APPROVED_RUNTIME_PREFIXES = ("cc-", "codex-", "mcp-", "tray-", "human-")
+SESSION_ID_RE = re.compile(r"^(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64}$")
+DEFAULT_SIGNAL_LIMIT = 200
+MAX_SIGNAL_LIMIT = 1000
+VALID_PRIORITY_ORDER = {"H": 3, "M": 2, "L": 1, "INFO": 0}
+
 # Canonical WATERMARK body parser — turn-3 correction msg:4c8a91be.
 # Supports two forms:
 #   'processed_up_to=2026-05-09T17:45:00Z:a8f3c192'
@@ -88,7 +98,24 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 
 
 class DebateError(ValueError):
-    """Validation or state-machine rejection."""
+    """Validation or state-machine rejection.
+
+    Backward-compatible per v3.9.2 amendment 7 (msg:e0f47b29):
+      - Legacy v3.9.0/v3.9.1 callers: ``raise DebateError("msg")`` still
+        works; .error_type defaults to ``'debate_validation'``.
+      - v3.9.2+ callers: ``raise DebateError("msg", error_type="...")``
+        with a specific taxonomy string from DEBATE_ERROR_TYPES.
+
+    ``error_type`` is keyword-only (the leading ``*`` enforces this) so a
+    future positional arg (e.g. ``cause``) cannot silently shift
+    semantics for existing callers.
+    """
+
+    def __init__(
+        self, message: str, *, error_type: str = "debate_validation"
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 def validate_topic_id(topic_id: str) -> None:
@@ -780,3 +807,421 @@ def compact(
         kind="COMPACTION",
         body=full_body,
     )
+
+
+# ── v3.9.2: Inbox signaling DAO ────────────────────────────────────────
+# Two-table model per CONDUCTOR canonical msg:b3a87f15 + msg:c5e91d24
+# (with amendments msg:5e2d1c89 + msg:7831af04 + msg:a08c61b3 + msg:1d8e7c20
+# + msg:e0f47b29 — last-amendment-wins for the error-contract layer).
+# debate_message_recipients carries WHO is addressed (intent), normalized.
+# debate_signal_state carries WHERE each per-session read cursor sits
+# (compound (ts, msg_id), race-safe per turn-2 fix). Adapters poll via
+# debate_signal_check at prompt time; the watcher daemon is deferred to
+# v3.10.0 pending empirical proof of resource budget.
+
+
+def _validate_recipient(
+    recipient: str, topic_id: str, conn: sqlite3.Connection
+) -> None:
+    """Recipient must be a declared role OR a SESSION_ID_RE-shaped session
+    id with an approved runtime prefix. Forward-compat: a well-formed
+    session_id is accepted even if not yet registered in
+    debate_signal_state — registration is implicit on first signal_check.
+
+    Raises DebateError with a specific error_type taxonomy:
+      - 'recipient_unknown_role' for role-shaped names that don't match
+        the topic's declared roles
+      - 'recipient_invalid_session_id' for ids that don't match
+        SESSION_ID_RE
+    """
+    if not isinstance(recipient, str) or not recipient:
+        raise DebateError(
+            f"invalid_recipient: {recipient!r} must be a non-empty string",
+            error_type="recipient_invalid_session_id",
+        )
+    debates_row = conn.execute(
+        "SELECT roles_json FROM debates WHERE topic_id = ?", (topic_id,)
+    ).fetchone()
+    if debates_row is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    declared_roles = {
+        r["role"]
+        for r in json_loads(debates_row["roles_json"])
+        if isinstance(r, dict) and "role" in r
+    }
+    if recipient in declared_roles:
+        return
+    if SESSION_ID_RE.fullmatch(recipient):
+        return
+    # Classify: role-shaped (uppercase, no dash, no prefix) → unknown role;
+    # otherwise → malformed session id. Both yield a clear caller-fixable
+    # error_type so MCP wrappers don't lump validation under
+    # 'internal_error'.
+    looks_like_role = recipient.isupper() and "-" not in recipient
+    if looks_like_role:
+        raise DebateError(
+            f"recipient {recipient!r} is not a declared role of topic "
+            f"{topic_id} (declared: {sorted(declared_roles)})",
+            error_type="recipient_unknown_role",
+        )
+    raise DebateError(
+        f"recipient {recipient!r} is not a valid session_id "
+        f"(approved prefixes: {APPROVED_RUNTIME_PREFIXES}; suffix must "
+        f"match [a-zA-Z0-9_]{{4,64}})",
+        error_type="recipient_invalid_session_id",
+    )
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    """First-occurrence-wins dedupe. Per amendment msg:a08c61b3: caller
+    intent is 'send to these recipients' — duplicates are typo, not
+    malice. DAO silently dedupes before INSERT to avoid PK violations
+    that would force a full transaction rollback."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def debate_post_with_recipients(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    priority: str,
+    kind: str,
+    body: str,
+    addressed_to: list[str],
+    reply_to: str | None = None,
+) -> dict[str, Any]:
+    """Atomic insert: debate_messages row + per-recipient
+    debate_message_recipients rows.
+
+    Per CONDUCTOR canonical msg:c5e91d24 with amendments msg:a08c61b3
+    (dedupe + ARCHIVED terminal) and msg:1d8e7c20 / msg:e0f47b29
+    (DebateError taxonomy).
+
+    Validation order (fail fast, before any DB write):
+      1. addressed_to non-empty (else 'recipient_empty')
+      2. topic exists, lifecycle gate (ARCHIVED blocks ALL kinds incl.
+         STATE; RESOLVED blocks all non-STATE)
+      3. dedupe addressed_to preserving order
+      4. validate each recipient via _validate_recipient
+
+    Atomicity: BEGIN → post_message (which itself INSERTs into
+    debate_messages and may UPDATE debates / debate_watermarks) →
+    INSERT INTO debate_message_recipients per dedupd recipient → COMMIT.
+    On any exception during the transaction, ROLLBACK leaves no row in
+    debate_messages or debate_message_recipients.
+
+    Returns: ``{msg_id, ts, recipient_count, topic_state}``.
+    """
+    if not isinstance(addressed_to, list) or not addressed_to:
+        raise DebateError(
+            "addressed_to required and non-empty (broadcast not "
+            "supported in v3.9.x)",
+            error_type="recipient_empty",
+        )
+
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    if debate["state"] == "ARCHIVED":
+        raise DebateError(
+            f"topic_archived_terminal: {topic_id} blocks all message "
+            f"kinds including STATE",
+            error_type="lifecycle_archived",
+        )
+    if debate["state"] == "RESOLVED" and kind != "STATE":
+        raise DebateError(
+            f"topic_resolved_blocks_non_STATE: {topic_id} accepts only "
+            f"kind=STATE for ARCHIVED transition",
+            error_type="lifecycle_resolved_non_state",
+        )
+
+    deduped = _dedupe_preserve_order(addressed_to)
+    for recipient in deduped:
+        _validate_recipient(recipient, topic_id, conn)
+
+    # BEGIN IMMEDIATE acquires a RESERVED lock up front, so concurrent
+    # writers serialize cleanly against each other instead of racing
+    # SHARED→EXCLUSIVE upgrades and dead-locking. Readers (signal_check,
+    # read_messages) keep using DEFERRED via implicit reads — they are
+    # not blocked.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        post_result = post_message(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            priority=priority,
+            kind=kind,
+            body=body,
+            reply_to=reply_to,
+        )
+        msg_id = post_result["msg_id"]
+        for recipient in deduped:
+            conn.execute(
+                "INSERT INTO debate_message_recipients (msg_id, recipient) "
+                "VALUES (?, ?)",
+                (msg_id, recipient),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return {
+        "msg_id": msg_id,
+        "ts": post_result["ts"],
+        "recipient_count": len(deduped),
+        "topic_state": post_result["topic_state"],
+    }
+
+
+def _validate_signal_caller(
+    session_id: str, role: str, topic_id: str, conn: sqlite3.Connection
+) -> dict[str, Any]:
+    """Shared input validation for signal_check + signal_advance.
+
+    Verifies session_id matches SESSION_ID_RE and role is declared in the
+    topic's roles_json. Returns the debate row dict for downstream use.
+    """
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        raise DebateError(
+            f"session_id {session_id!r} must match {SESSION_ID_RE.pattern}",
+            error_type="recipient_invalid_session_id",
+        )
+    validate_role(role)
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    if not role_in_debate(debate["roles"], role):
+        raise DebateError(
+            f"role {role!r} not declared in topic {topic_id}",
+            error_type="recipient_unknown_role",
+        )
+    return debate
+
+
+def _validate_signal_limit(limit: int) -> int:
+    """Strict limit validation per amendment msg:7831af04. Bools are
+    rejected explicitly because ``isinstance(True, int) is True`` would
+    otherwise allow them to silently coerce to 1/0."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise DebateError(
+            f"limit must be int (not {type(limit).__name__})",
+            error_type="limit_invalid_type",
+        )
+    if limit < 1:
+        raise DebateError(
+            f"limit must be >= 1 (got {limit})",
+            error_type="limit_out_of_range",
+        )
+    if limit > MAX_SIGNAL_LIMIT:
+        raise DebateError(
+            f"limit {limit} exceeds MAX_SIGNAL_LIMIT {MAX_SIGNAL_LIMIT}",
+            error_type="limit_out_of_range",
+        )
+    return limit
+
+
+def debate_signal_check(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    role: str,
+    topic_id: str,
+    since_msg_id: str | None = None,
+    since_ts: str | None = None,
+    limit: int = DEFAULT_SIGNAL_LIMIT,
+) -> dict[str, Any]:
+    """Return pending messages addressed to (role OR session_id) past
+    the caller's compound cursor.
+
+    Per CONDUCTOR canonical msg:c5e91d24 with amendments msg:7831af04
+    (limit validation matrix), msg:c798c786 (EXISTS de-dupe so a single
+    msg addressed to BOTH role and session_id counts once), and
+    msg:e0f47b29 (DebateError taxonomy).
+
+    Cursor precedence (matches read_messages from v3.9.0):
+      1. since_msg_id explicit (pagination walk)
+      2. since_ts explicit
+      3. debate_signal_state row for (session_id, role, topic_id)
+      4. start of topic (no filter)
+
+    Pagination contract: fetch limit+1 rows; ``truncated=True`` when
+    more remain; ``next_cursor`` carries (ts, msg_id) for the next page.
+    Returns ``max_priority`` so adapters can short-circuit on H without
+    enumerating every row.
+    """
+    effective_limit = _validate_signal_limit(limit)
+    debate = _validate_signal_caller(session_id, role, topic_id, conn)
+
+    cursor_ts: str | None = None
+    cursor_msg_id: str = ""
+
+    if since_msg_id is not None:
+        validate_msg_id(since_msg_id)
+        ref = conn.execute(
+            "SELECT ts, msg_id FROM debate_messages "
+            "WHERE msg_id = ? AND topic_id = ?",
+            (since_msg_id, topic_id),
+        ).fetchone()
+        if ref is None:
+            raise DebateError(
+                f"unknown_since_msg_id: {since_msg_id} not in topic {topic_id}",
+                error_type="watermark_msg_id_unknown",
+            )
+        cursor_ts = ref["ts"]
+        cursor_msg_id = ref["msg_id"]
+    elif since_ts is not None:
+        validate_iso_utc(since_ts)
+        cursor_ts = since_ts
+        cursor_msg_id = ""
+    else:
+        state_row = conn.execute(
+            "SELECT last_processed_msg_id, last_processed_ts "
+            "FROM debate_signal_state "
+            "WHERE session_id = ? AND role = ? AND topic_id = ?",
+            (session_id, role, topic_id),
+        ).fetchone()
+        if state_row and state_row["last_processed_ts"]:
+            cursor_ts = state_row["last_processed_ts"]
+            cursor_msg_id = state_row["last_processed_msg_id"] or ""
+
+    where = ["m.topic_id = ?"]
+    params: list[Any] = [topic_id]
+    where.append(
+        "EXISTS (SELECT 1 FROM debate_message_recipients r "
+        "WHERE r.msg_id = m.msg_id AND r.recipient IN (?, ?))"
+    )
+    params.extend([role, session_id])
+    if cursor_ts is not None:
+        where.append("(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))")
+        params.extend([cursor_ts, cursor_ts, cursor_msg_id])
+
+    fetch_limit = effective_limit + 1  # +1 to detect truncation
+    rows = conn.execute(
+        "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
+        "m.reply_to, m.body, m.created_at "
+        "FROM debate_messages m "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
+        [*params, fetch_limit],
+    ).fetchall()
+
+    truncated = len(rows) > effective_limit
+    if truncated:
+        rows = rows[:effective_limit]
+    pending = [dict(r) for r in rows]
+
+    next_cursor: dict[str, str] | None = None
+    if truncated and pending:
+        last = pending[-1]
+        next_cursor = {"ts": last["ts"], "msg_id": last["msg_id"]}
+
+    max_priority: str | None = None
+    if pending:
+        max_priority = max(
+            (m["priority"] for m in pending),
+            key=lambda p: VALID_PRIORITY_ORDER.get(p, -1),
+        )
+
+    return {
+        "pending": pending,
+        "count": len(pending),
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "max_priority": max_priority,
+        "topic_state": debate["state"],
+        "limit": effective_limit,
+    }
+
+
+def debate_signal_advance(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    role: str,
+    topic_id: str,
+    last_processed_msg_id: str,
+) -> dict[str, Any]:
+    """Advance the (session_id, role, topic_id) compound cursor.
+
+    Per CONDUCTOR canonical msg:c5e91d24 with critical amendment 3a
+    (msg:5e2d1c89 turn-12 fix): the target msg_id MUST be addressed to
+    this caller (role OR session_id). Otherwise a buggy adapter could
+    advance its cursor past unprocessed addressed work, making
+    high-priority pending messages permanently invisible.
+
+    Atomic upsert: derives ts from the message row (DAO authority over
+    timestamp; body cannot tamper) and writes BOTH last_processed_msg_id
+    and last_processed_ts so the compound (ts, msg_id) cursor never
+    falls back to ts-only on a subsequent read. last_check_at also
+    updated to the advance time.
+    """
+    _validate_signal_caller(session_id, role, topic_id, conn)
+    validate_msg_id(last_processed_msg_id)
+
+    ref = conn.execute(
+        "SELECT msg_id, ts FROM debate_messages "
+        "WHERE msg_id = ? AND topic_id = ?",
+        (last_processed_msg_id, topic_id),
+    ).fetchone()
+    if ref is None:
+        raise DebateError(
+            f"unknown_msg_id_for_advance: {last_processed_msg_id} not in "
+            f"topic {topic_id}",
+            error_type="watermark_msg_id_unknown",
+        )
+
+    addressed = conn.execute(
+        "SELECT 1 FROM debate_message_recipients "
+        "WHERE msg_id = ? AND recipient IN (?, ?) LIMIT 1",
+        (last_processed_msg_id, role, session_id),
+    ).fetchone()
+    if addressed is None:
+        raise DebateError(
+            f"watermark_advance_unaddressed: msg_id "
+            f"{last_processed_msg_id} is not addressed to role={role!r} "
+            f"or session_id={session_id!r}; advancing past it would "
+            f"hide unprocessed addressed work",
+            error_type="watermark_advance_unaddressed",
+        )
+
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO debate_signal_state "
+        "(session_id, role, topic_id, last_processed_msg_id, "
+        " last_processed_ts, last_check_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(session_id, role, topic_id) DO UPDATE SET "
+        "last_processed_msg_id = excluded.last_processed_msg_id, "
+        "last_processed_ts = excluded.last_processed_ts, "
+        "last_check_at = excluded.last_check_at",
+        (session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
+    )
+
+    return {
+        "session_id": session_id,
+        "role": role,
+        "topic_id": topic_id,
+        "last_processed_msg_id": ref["msg_id"],
+        "last_processed_ts": ref["ts"],
+        "last_check_at": now,
+    }
