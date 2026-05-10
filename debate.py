@@ -953,33 +953,28 @@ def debate_post_with_recipients(
     for recipient in deduped:
         _validate_recipient(recipient, topic_id, conn)
 
-    # BEGIN IMMEDIATE acquires a RESERVED lock up front, so concurrent
-    # writers serialize cleanly against each other instead of racing
-    # SHARED→EXCLUSIVE upgrades and dead-locking. Readers (signal_check,
-    # read_messages) keep using DEFERRED via implicit reads — they are
-    # not blocked.
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        post_result = post_message(
-            conn,
-            topic_id=topic_id,
-            role=role,
-            priority=priority,
-            kind=kind,
-            body=body,
-            reply_to=reply_to,
+    # Atomicity is provided by the caller's context manager
+    # (db_utils.get_conn() wraps every block in BEGIN/COMMIT). Issuing
+    # an inner BEGIN here would nest transactions and SQLite would raise
+    # "cannot start a transaction within a transaction" under real MCP
+    # usage. Matches the existing post_message DAO contract: the DAO
+    # never owns its own outer transaction.
+    post_result = post_message(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        priority=priority,
+        kind=kind,
+        body=body,
+        reply_to=reply_to,
+    )
+    msg_id = post_result["msg_id"]
+    for recipient in deduped:
+        conn.execute(
+            "INSERT INTO debate_message_recipients (msg_id, recipient) "
+            "VALUES (?, ?)",
+            (msg_id, recipient),
         )
-        msg_id = post_result["msg_id"]
-        for recipient in deduped:
-            conn.execute(
-                "INSERT INTO debate_message_recipients (msg_id, recipient) "
-                "VALUES (?, ?)",
-                (msg_id, recipient),
-            )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
 
     return {
         "msg_id": msg_id,
@@ -1203,6 +1198,31 @@ def debate_signal_advance(
             f"hide unprocessed addressed work",
             error_type="watermark_advance_unaddressed",
         )
+
+    # Monotonic compound (ts, msg_id) guard per ADVOCATE turn-18
+    # msg:ca22ee19. Plain ON CONFLICT DO UPDATE would let two threads
+    # racing different msg_ids overwrite a newer cursor with an older
+    # one. Reject regressions; equal cursor is idempotent (no-op
+    # rewrite is safe).
+    current = conn.execute(
+        "SELECT last_processed_msg_id, last_processed_ts "
+        "FROM debate_signal_state "
+        "WHERE session_id = ? AND role = ? AND topic_id = ?",
+        (session_id, role, topic_id),
+    ).fetchone()
+    if current and current["last_processed_ts"]:
+        cur_ts = current["last_processed_ts"]
+        cur_msg_id = current["last_processed_msg_id"] or ""
+        proposed = (ref["ts"], ref["msg_id"])
+        existing = (cur_ts, cur_msg_id)
+        if proposed < existing:
+            raise DebateError(
+                f"watermark_regression: proposed cursor "
+                f"({ref['ts']}, {ref['msg_id']}) is older than "
+                f"existing ({cur_ts}, {cur_msg_id}); advancing "
+                f"backwards would re-deliver already-processed work",
+                error_type="watermark_regression",
+            )
 
     now = now_iso()
     conn.execute(
