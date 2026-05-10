@@ -411,3 +411,165 @@ def test_post_message_accepts_body_with_internal_whitespace(topic):
         priority="M", kind="STATUS", body="  ok  ",
     )
     assert "msg_id" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ADVOCATE turn-5 blocker (msg:b246664b): WATERMARK keyword fullmatch
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Pre-fix the deprecated keyword form was parsed via _WATERMARK_RE.search,
+# which matches ANYWHERE in the body. A body like
+# ``processed_up_to=<ts>:<valid12>ffff`` would silently accept the valid
+# 12-char msg_id and drop the trailing junk — a tampering hole.
+# Post-fix uses _WATERMARK_RE.fullmatch so the entire body must conform.
+
+
+def _seed_target_msg(conn, topic_id):
+    """Helper: post a STATUS the WATERMARK can reference, return its row."""
+    out = post_message(
+        conn, topic_id=topic_id, role="EXECUTOR",
+        priority="M", kind="STATUS", body="anchor",
+    )
+    return out
+
+
+def test_watermark_keyword_form_exact_8_char_accepted(topic):
+    """Legacy-shaped body with an exact 8-char msg_id MUST still
+    parse via the deprecated keyword form (back-compat through the
+    8|12 transition)."""
+    conn, t = topic
+    # Insert an 8-char-msg_id message directly so we can build a
+    # legacy-shaped body that exercises the 8-char branch of the
+    # widened MSG_ID_RE.
+    legacy_id = "abcd1234"
+    legacy_ts = "2026-01-15T12:00:00Z"
+    conn.execute(
+        "INSERT INTO debate_messages "
+        "(msg_id, topic_id, role, ts, priority, kind, body, created_at) "
+        "VALUES (?, ?, 'EXECUTOR', ?, 'INFO', 'STATUS', ?, ?)",
+        (legacy_id, t, legacy_ts, "legacy", legacy_ts),
+    )
+    body = f"processed_up_to_ts={legacy_ts} processed_up_to_msg_id={legacy_id}"
+    out = post_message(
+        conn, topic_id=t, role="EXECUTOR",
+        priority="INFO", kind="WATERMARK", body=body,
+    )
+    assert "msg_id" in out
+
+
+def test_watermark_keyword_form_exact_12_char_accepted(topic):
+    """Current-generation 12-char msg_id keyword form parses cleanly."""
+    conn, t = topic
+    target = _seed_target_msg(conn, t)
+    assert len(target["msg_id"]) == 12
+    body = (
+        f"processed_up_to_ts={target['ts']} "
+        f"processed_up_to_msg_id={target['msg_id']}"
+    )
+    out = post_message(
+        conn, topic_id=t, role="EXECUTOR",
+        priority="INFO", kind="WATERMARK", body=body,
+    )
+    assert "msg_id" in out
+
+
+def test_watermark_keyword_form_8_char_with_5_hex_suffix_rejected(topic):
+    """8-char + exactly 4-char suffix = 12 chars total — that's
+    structurally a valid 12-char ID under the widened MSG_ID_RE, so
+    fullmatch can't tell it from a fresh 12-char generation; rejection
+    happens at the message-lookup step downstream. To prove the
+    fullmatch fix specifically, we need a length that doesn't fit
+    either 8 or 12. 13 hex chars (8+5) is the cleanest such case."""
+    conn, t = topic
+    legacy_id = "abcd1234"
+    legacy_ts = "2026-01-15T12:00:00Z"
+    conn.execute(
+        "INSERT INTO debate_messages "
+        "(msg_id, topic_id, role, ts, priority, kind, body, created_at) "
+        "VALUES (?, ?, 'EXECUTOR', ?, 'INFO', 'STATUS', ?, ?)",
+        (legacy_id, t, legacy_ts, "legacy", legacy_ts),
+    )
+    body = (
+        f"processed_up_to_ts={legacy_ts} "
+        f"processed_up_to_msg_id={legacy_id}fffff"
+    )
+    with pytest.raises(DebateError, match="invalid_watermark_body"):
+        post_message(
+            conn, topic_id=t, role="EXECUTOR",
+            priority="INFO", kind="WATERMARK", body=body,
+        )
+
+
+def test_watermark_keyword_form_8_char_with_4_hex_suffix_rejected_at_lookup(topic):
+    """The 8+4 = 12 case ALSO must be rejected end-to-end (just by a
+    different error_type). Pre-fix this would have advanced to the
+    8-char prefix; post-fix the regex sees 12 chars and treats them
+    as a single fresh ID, then the lookup detects the unknown msg_id
+    and raises watermark_msg_not_in_topic. Either rejection is
+    acceptable because the watermark fails closed."""
+    conn, t = topic
+    legacy_id = "abcd1234"
+    legacy_ts = "2026-01-15T12:00:00Z"
+    conn.execute(
+        "INSERT INTO debate_messages "
+        "(msg_id, topic_id, role, ts, priority, kind, body, created_at) "
+        "VALUES (?, ?, 'EXECUTOR', ?, 'INFO', 'STATUS', ?, ?)",
+        (legacy_id, t, legacy_ts, "legacy", legacy_ts),
+    )
+    body = (
+        f"processed_up_to_ts={legacy_ts} "
+        f"processed_up_to_msg_id={legacy_id}ffff"
+    )
+    with pytest.raises(
+        DebateError,
+        match="invalid_watermark_body|watermark_msg_not_in_topic",
+    ):
+        post_message(
+            conn, topic_id=t, role="EXECUTOR",
+            priority="INFO", kind="WATERMARK", body=body,
+        )
+
+
+def test_watermark_keyword_form_12_char_with_trailing_suffix_rejected(topic):
+    """The exact reproduction ADVOCATE filed in msg:b246664b: a valid
+    12-char msg_id followed by ``ffff``. fullmatch must reject."""
+    conn, t = topic
+    target = _seed_target_msg(conn, t)
+    body = (
+        f"processed_up_to_ts={target['ts']} "
+        f"processed_up_to_msg_id={target['msg_id']}ffff"
+    )
+    with pytest.raises(DebateError, match="invalid_watermark_body"):
+        post_message(
+            conn, topic_id=t, role="EXECUTOR",
+            priority="INFO", kind="WATERMARK", body=body,
+        )
+
+
+def test_watermark_keyword_form_colon_variant_with_suffix_rejected(topic):
+    """Same suffix attack via the ``processed_up_to=<ts>:<msg_id>``
+    colon form must also be rejected by fullmatch."""
+    conn, t = topic
+    target = _seed_target_msg(conn, t)
+    body = f"processed_up_to={target['ts']}:{target['msg_id']}ffff"
+    with pytest.raises(DebateError, match="invalid_watermark_body"):
+        post_message(
+            conn, topic_id=t, role="EXECUTOR",
+            priority="INFO", kind="WATERMARK", body=body,
+        )
+
+
+def test_watermark_keyword_form_with_leading_junk_rejected(topic):
+    """fullmatch also closes the leading-junk variant: extra text
+    BEFORE the keyword pattern must not be silently dropped."""
+    conn, t = topic
+    target = _seed_target_msg(conn, t)
+    body = (
+        f"XXX processed_up_to_ts={target['ts']} "
+        f"processed_up_to_msg_id={target['msg_id']}"
+    )
+    with pytest.raises(DebateError, match="invalid_watermark_body"):
+        post_message(
+            conn, topic_id=t, role="EXECUTOR",
+            priority="INFO", kind="WATERMARK", body=body,
+        )

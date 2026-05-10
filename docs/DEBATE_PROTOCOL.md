@@ -183,13 +183,20 @@ message via `debate_post` (or `debate_advance_watermark`) when ready.
 
 `debate_post` with `kind="WATERMARK"` accepts:
 
-- **Canonical**: body is a raw `msg_id` (8-hex). DAO derives `ts` from
-  the message row, so the body cannot tamper with the timestamp.
+- **Canonical**: body is a raw `msg_id` matching `MSG_ID_RE`
+  (`^[a-f0-9]{8}(?:[a-f0-9]{4})?$` — 8-char rows from v3.9.0–v3.9.2 or
+  12-char rows from v3.9.3+). DAO derives `ts` from the message row,
+  so the body cannot tamper with the timestamp.
 - **Deprecated keyword form**: `processed_up_to=<ts>:<msg_id>` or
   `processed_up_to_ts=<ts> processed_up_to_msg_id=<msg_id>`. Parsed
-  for back-compat; **rejected with `watermark_ts_mismatch` if the
-  body's ts disagrees with the looked-up row**. New callers MUST use
-  the canonical form.
+  for back-compat via `re.fullmatch` (v3.9.3 ADVOCATE turn-5 fix
+  msg:b246664b — the prior `re.search` was unanchored and silently
+  dropped trailing/leading junk, accepting `processed_up_to=<ts>:<valid>ffff`
+  by truncating to the valid prefix). The full body must conform; any
+  extra characters before or after raise `invalid_watermark_body`.
+  Additionally **rejected with `watermark_ts_mismatch` if the body's
+  ts disagrees with the looked-up row**. New callers MUST use the
+  canonical form.
 
 The `debate_watermarks` row is updated atomically with both
 `last_processed_msg_id` AND `last_processed_ts` columns so the

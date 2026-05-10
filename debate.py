@@ -394,7 +394,15 @@ def post_message(
             # raises watermark_ts_mismatch if the body's ts disagrees
             # — closes a tampering vector during the deprecation
             # window. New callers MUST use msg_id-only form.
-            m = _WATERMARK_RE.search(watermark_target)
+            #
+            # Per ADVOCATE turn-5 blocker (msg:b246664b): use fullmatch
+            # not search. ``re.search`` matches anywhere in the input,
+            # so a body like ``processed_up_to=<ts>:<valid12>ffff``
+            # would accept the valid 12-char msg_id and silently drop
+            # the trailing junk. ``fullmatch`` requires the entire
+            # body to conform, rejecting any trailing or leading
+            # extra characters. Body is already ``.strip()``-ed above.
+            m = _WATERMARK_RE.fullmatch(watermark_target)
             if m is None:
                 raise DebateError(
                     f"invalid_watermark_body: {watermark_target!r} "
