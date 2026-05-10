@@ -17,6 +17,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from db_utils import get_conn_immediate
 from debate import (
     DebateError,
     debate_post_with_recipients,
@@ -215,34 +216,41 @@ def test_concurrent_signal_advance_no_lost_updates(tmp_path):
     regression_swallowed: list[str] = []
 
     def race(target_msg_id: str):
-        c = sqlite3.connect(db_path, isolation_level=None)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA foreign_keys = ON")
-        c.execute("PRAGMA busy_timeout = 30000")
-        try:
-            for _ in range(20):
-                try:
+        # v3.9.3 amendment 2B (msg:3d3442cb): the DAO's race-safety
+        # contract is wrapper-scoped. Each iteration must open its own
+        # ``get_conn_immediate`` block so the SELECT-then-UPSERT in
+        # debate_signal_advance is serialized against the other racer
+        # via BEGIN IMMEDIATE. Raw ``sqlite3.connect(isolation_level=
+        # None)`` would auto-commit each statement and let two racers
+        # race the SELECT and overwrite each other — which is exactly
+        # the failure mode the wrapper closes.
+        for _ in range(20):
+            try:
+                with get_conn_immediate(db_path=db_path) as conn:
                     debate_signal_advance(
-                        c, session_id="cc-exec1", role="EXECUTOR",
+                        conn, session_id="cc-exec1", role="EXECUTOR",
                         topic_id="X1",
                         last_processed_msg_id=target_msg_id,
                     )
-                except DebateError as exc:
-                    if exc.error_type == "watermark_regression":
-                        # Expected: the OTHER racer already advanced to
-                        # the newer cursor; this stale racer's older
-                        # target is now correctly rejected.
-                        regression_swallowed.append(target_msg_id)
-                        # Future iterations of this worker would all
-                        # hit the same regression — stop polling.
-                        break
+            except DebateError as exc:
+                if exc.error_type == "watermark_regression":
+                    # Expected: the OTHER racer already advanced to
+                    # the newer cursor; this stale racer's older
+                    # target is now correctly rejected. Future
+                    # iterations would all regress identically.
+                    regression_swallowed.append(target_msg_id)
+                    break
+                errors.append(f"{target_msg_id}: {exc!r}")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
                     errors.append(f"{target_msg_id}: {exc!r}")
                     break
-                except Exception as exc:  # pragma: no cover
-                    errors.append(f"{target_msg_id}: {exc!r}")
-                    break
-        finally:
-            c.close()
+                # Lock contention is acceptable under the wrapper's
+                # serialization; retry the next iteration.
+            except Exception as exc:  # pragma: no cover
+                errors.append(f"{target_msg_id}: {exc!r}")
+                break
 
     t1 = threading.Thread(target=race, args=(msg_ids[0],))
     t2 = threading.Thread(target=race, args=(msg_ids[1],))
