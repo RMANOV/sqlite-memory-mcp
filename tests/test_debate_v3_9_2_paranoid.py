@@ -18,6 +18,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from debate import (
+    DebateError,
     debate_post_with_recipients,
     debate_signal_advance,
     debate_signal_check,
@@ -171,8 +172,19 @@ def test_concurrent_post_with_recipients_4_threads_x_50_messages(tmp_path):
 
 def test_concurrent_signal_advance_no_lost_updates(tmp_path):
     """Two threads racing signal_advance for the same (session_id, role,
-    topic_id) row must converge to one of the candidate values; no
-    SQLite OperationalError, no orphaned ON CONFLICT state."""
+    topic_id) compound cursor must converge to the strictly-newer
+    candidate (per ts, msg_id), with the monotonic guard surfacing
+    stale racers as DebateError(error_type='watermark_regression').
+
+    Worker contract per ADVOCATE turn-19 mandate (msg:b8182b8b):
+      - swallow watermark_regression (expected for the stale racer
+        after the newer cursor lands)
+      - fail loud on any other DebateError or unexpected exception
+
+    Final assertion queries the topic for the strictly-latest message
+    by compound (ts DESC, msg_id DESC) and asserts the persisted cursor
+    matches it — precise winner, not "any of the candidates".
+    """
     db_path = str(tmp_path / "v3_9_2_advance_race.db")
     init_db(db_path)
     setup = sqlite3.connect(db_path, isolation_level=None)
@@ -200,24 +212,37 @@ def test_concurrent_signal_advance_no_lost_updates(tmp_path):
     setup.close()
 
     errors: list[str] = []
+    regression_swallowed: list[str] = []
 
     def race(target_msg_id: str):
+        c = sqlite3.connect(db_path, isolation_level=None)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys = ON")
+        c.execute("PRAGMA busy_timeout = 30000")
         try:
-            c = sqlite3.connect(db_path, isolation_level=None)
-            c.row_factory = sqlite3.Row
-            c.execute("PRAGMA foreign_keys = ON")
-            c.execute("PRAGMA busy_timeout = 30000")
-            try:
-                for _ in range(20):
+            for _ in range(20):
+                try:
                     debate_signal_advance(
                         c, session_id="cc-exec1", role="EXECUTOR",
                         topic_id="X1",
                         last_processed_msg_id=target_msg_id,
                     )
-            finally:
-                c.close()
-        except Exception as exc:  # pragma: no cover
-            errors.append(f"{target_msg_id}: {exc!r}")
+                except DebateError as exc:
+                    if exc.error_type == "watermark_regression":
+                        # Expected: the OTHER racer already advanced to
+                        # the newer cursor; this stale racer's older
+                        # target is now correctly rejected.
+                        regression_swallowed.append(target_msg_id)
+                        # Future iterations of this worker would all
+                        # hit the same regression — stop polling.
+                        break
+                    errors.append(f"{target_msg_id}: {exc!r}")
+                    break
+                except Exception as exc:  # pragma: no cover
+                    errors.append(f"{target_msg_id}: {exc!r}")
+                    break
+        finally:
+            c.close()
 
     t1 = threading.Thread(target=race, args=(msg_ids[0],))
     t2 = threading.Thread(target=race, args=(msg_ids[1],))
@@ -226,16 +251,33 @@ def test_concurrent_signal_advance_no_lost_updates(tmp_path):
     t1.join()
     t2.join()
 
+    # Only NON-regression errors fail the test. Regressions are the
+    # designed-by-spec outcome for the stale racer.
     assert errors == [], errors
 
-    # Final cursor must equal one of the two candidates — last-write
-    # wins, no torn state.
+    # Compute the expected winner authoritatively from the topic — the
+    # strictly-latest message by compound (ts DESC, msg_id DESC) order
+    # — instead of relying on insertion order which would couple the
+    # test to a property of the fixture rather than the cursor contract.
     verify = sqlite3.connect(db_path)
     verify.row_factory = sqlite3.Row
+    expected_winner = verify.execute(
+        "SELECT msg_id FROM debate_messages "
+        "WHERE topic_id = ? AND kind = 'STATUS' "
+        "ORDER BY ts DESC, msg_id DESC LIMIT 1",
+        ("X1",),
+    ).fetchone()
     final = verify.execute(
         "SELECT last_processed_msg_id FROM debate_signal_state "
         "WHERE session_id = ? AND role = ? AND topic_id = ?",
         ("cc-exec1", "EXECUTOR", "X1"),
     ).fetchone()
     verify.close()
-    assert final["last_processed_msg_id"] in msg_ids
+
+    assert expected_winner is not None
+    assert final is not None
+    assert final["last_processed_msg_id"] == expected_winner["msg_id"], (
+        f"final cursor {final['last_processed_msg_id']!r} does not "
+        f"match strictly-latest message {expected_winner['msg_id']!r}; "
+        f"monotonic guard failed to enforce winner"
+    )

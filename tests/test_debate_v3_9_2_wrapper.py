@@ -378,13 +378,25 @@ def test_signal_advance_interleaved_racers_converge_to_newer_cursor(
         # case explicitly.
         assert exc.error_type != "watermark_regression"
 
+    # Authoritatively compute the expected winner from the topic per
+    # ADVOCATE turn-19 mandate (msg:b8182b8b): query the strictly-
+    # latest message by compound (ts DESC, msg_id DESC) instead of
+    # hard-coding an index into the post-order list. Couples the
+    # assertion to the cursor contract, not to fixture sequencing.
     with get_conn(db_path=db) as conn:
+        expected = conn.execute(
+            "SELECT msg_id FROM debate_messages "
+            "WHERE topic_id = ? AND kind = 'STATUS' "
+            "ORDER BY ts DESC, msg_id DESC LIMIT 1",
+            ("X1",),
+        ).fetchone()
         row = conn.execute(
             "SELECT last_processed_msg_id FROM debate_signal_state "
             "WHERE session_id = ? AND role = ? AND topic_id = ?",
             ("cc-exec1", "EXECUTOR", "X1"),
         ).fetchone()
-    assert row["last_processed_msg_id"] == msg_ids[1]
+    assert expected is not None
+    assert row["last_processed_msg_id"] == expected["msg_id"]
 
 
 def test_signal_advance_initial_no_state_row_no_regression_check(
