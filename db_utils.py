@@ -605,6 +605,62 @@ def get_conn(db_path: str | None = None):
 
 
 @contextmanager
+def get_conn_immediate(db_path: str | None = None):
+    """Like ``get_conn()`` but starts the transaction in IMMEDIATE mode.
+
+    Plain ``BEGIN`` is DEFERRED — SQLite waits until the first write to
+    take a RESERVED lock. Two writers that each open a connection,
+    issue some reads, and then try to upgrade to RESERVED can collide
+    on the SHARED→RESERVED race instead of serializing cleanly. For
+    DAO functions whose race-safety contract requires reads + writes
+    to be linearised against other writers (debate_signal_advance and
+    debate_post_with_recipients in v3.9.3), open the txn with
+    ``BEGIN IMMEDIATE`` so the RESERVED lock is held from the very
+    first statement.
+
+    Per ADVOCATE turn-2 amendment 1A (msg:34adcb3e): wrapper-scoped
+    contract — direct DAO callers using regular ``get_conn()`` retain
+    the old race risk; the production MCP path always uses this
+    wrapper for write tools.
+    """
+    import time as _time
+
+    target = db_path or DB_PATH
+    if db_path is None:
+        ensure_db_initialized(target)
+
+    conn = None
+    for attempt in range(_BUSY_RETRIES):
+        conn = sqlite3.connect(target, isolation_level=None, timeout=10)
+        conn.row_factory = sqlite3.Row
+        for pragma in _PRAGMAS:
+            conn.execute(pragma)
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            break
+        except sqlite3.OperationalError as e:
+            conn.close()
+            conn = None
+            if "locked" in str(e).lower() and attempt < _BUSY_RETRIES - 1:
+                _time.sleep(_BUSY_BASE_DELAY * (2**attempt))
+                continue
+            raise
+
+    try:
+        yield conn
+        conn.execute("COMMIT;")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@contextmanager
 def bulk_conn(db_path: str | None = None):
     """Connection optimized for bulk inserts: single transaction, relaxed sync.
 

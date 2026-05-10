@@ -17,8 +17,8 @@ validators + state machine.
 from __future__ import annotations
 
 import re
+import secrets
 import sqlite3
-import uuid
 from typing import Any
 
 from db_utils import json_dumps, json_loads, now_iso
@@ -29,7 +29,11 @@ from db_utils import json_dumps, json_loads, now_iso
 
 TOPIC_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
 ROLE_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
-MSG_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+# v3.9.3 widening (msg:34adcb3e amendment 1B): accept both 8-char
+# (legacy v3.9.0–v3.9.2 rows) and 12-char (new writes) hex msg_ids.
+# secrets.token_hex(6) → 48-bit entropy ≈ 16 M generations before 50 %
+# birthday collision; ample headroom over the 8-char regime.
+MSG_ID_RE = re.compile(r"^[a-f0-9]{8}(?:[a-f0-9]{4})?$")
 ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$")
 
 # OODA structure required for kind=COMPACTION bodies (per CONDUCTOR
@@ -72,7 +76,7 @@ VALID_PRIORITY_ORDER = {"H": 3, "M": 2, "L": 1, "INFO": 0}
 _WATERMARK_RE = re.compile(
     r"processed_up_to(?:_ts)?=(?P<ts>\S+?)"
     r"(?::|\s+processed_up_to_msg_id=)"
-    r"(?P<msg_id>[a-f0-9]{8})"
+    r"(?P<msg_id>[a-f0-9]{8}(?:[a-f0-9]{4})?)"
 )
 
 
@@ -178,8 +182,17 @@ def validate_transition(old_state: str, new_state: str) -> None:
 
 
 def new_msg_id() -> str:
-    """Generate a unique 8-char hex message id (uuid4 prefix)."""
-    return uuid.uuid4().hex[:8]
+    """Generate a unique 12-char hex message id (v3.9.3+).
+
+    Uses ``secrets.token_hex(6)`` for 48-bit entropy (~16 M generations
+    before 50 % birthday collision; ~80 K before any practical
+    collision). Existing 8-char rows from v3.9.0–v3.9.2 remain valid;
+    ``MSG_ID_RE`` accepts both widths during the transition window
+    (msg:34adcb3e amendment 1B). ``uuid`` import dropped — the only
+    prior use was ``uuid.uuid4().hex[:8]`` here, and ``secrets`` is a
+    cleaner crypto-RNG primitive for this purpose anyway.
+    """
+    return secrets.token_hex(6)
 
 
 # ── DAO: debates ──────────────────────────────────────────────────────
@@ -311,7 +324,11 @@ def post_message(
     validate_role(role)
     validate_priority(priority)
     validate_kind(kind)
-    if not isinstance(body, str) or not body:
+    if not isinstance(body, str) or not body.strip():
+        # v3.9.3 (msg:76e96a96 P2.5): reject whitespace-only bodies in
+        # addition to fully empty ones. A body that strips to empty
+        # carries no semantic content and would silently bypass any
+        # downstream OODA / kind-specific regex checks.
         raise DebateError("invalid_body: must be non-empty string")
 
     debate = get_debate(conn, topic_id)
@@ -545,7 +562,11 @@ def read_messages(
     if cursor_ts is None and since_ts is not None:
         validate_iso_utc(since_ts)
         cursor_ts = since_ts
-        cursor_msg_id = ""
+        # v3.9.3 since_ts strict-exclusive (msg:946bcff6 amendment 3):
+        # cursor_msg_id=None signals the WHERE-clause branch to emit
+        # bare ``ts > ?`` instead of the compound form. Returns
+        # messages strictly AFTER since_ts (no boundary inclusion).
+        cursor_msg_id = None
 
     if cursor_ts is None and since_latest_compaction:
         comp = conn.execute(
@@ -575,8 +596,19 @@ def read_messages(
     where: list[str] = ["topic_id = ?"]
     params: list[Any] = [topic_id]
     if cursor_ts is not None:
-        where.append("(ts > ? OR (ts = ? AND msg_id > ?))")
-        params.extend([cursor_ts, cursor_ts, cursor_msg_id])
+        # Dual-branch cursor (v3.9.3 msg:946bcff6 amendment 3,
+        # read_messages naked-column form). cursor_msg_id is None ONLY
+        # when the caller passed since_ts without since_msg_id — emit
+        # strict-exclusive ts comparison so a message at ts ==
+        # since_ts is NOT re-emitted. Compound form runs only when an
+        # explicit msg_id cursor exists (since_msg_id, watermark,
+        # compaction).
+        if cursor_msg_id is None:
+            where.append("ts > ?")
+            params.extend([cursor_ts])
+        else:
+            where.append("(ts > ? OR (ts = ? AND msg_id > ?))")
+            params.extend([cursor_ts, cursor_ts, cursor_msg_id])
     if kind_filter:
         for k in kind_filter:
             validate_kind(k)
@@ -821,7 +853,10 @@ def compact(
 
 
 def _validate_recipient(
-    recipient: str, topic_id: str, conn: sqlite3.Connection
+    recipient: str,
+    topic_id: str,
+    conn: sqlite3.Connection,
+    debate: dict[str, Any] | None = None,
 ) -> None:
     """Recipient must be a declared role OR a SESSION_ID_RE-shaped session
     id with an approved runtime prefix. Forward-compat: a well-formed
@@ -833,23 +868,40 @@ def _validate_recipient(
         the topic's declared roles
       - 'recipient_invalid_session_id' for ids that don't match
         SESSION_ID_RE
+
+    Per v3.9.3 P1.2 (msg:76e96a96 + amendment 1A): the optional
+    ``debate`` dict (as returned by ``get_debate(conn, topic_id)``)
+    short-circuits the per-recipient ``SELECT roles_json`` round-trip
+    and eliminates a TOCTOU between repeated lookups when validating
+    many recipients in one call. When ``None``, falls back to fetch
+    (legacy path; backward-compatible signature).
+
+    Recipient strings are truncated to ``[:64]`` in error messages
+    (msg:76e96a96 P3.7) to bound DoS / log-flood from caller-supplied
+    arbitrary-length input.
     """
+    safe_repr = repr(recipient[:64]) if isinstance(recipient, str) else repr(recipient)
     if not isinstance(recipient, str) or not recipient:
         raise DebateError(
-            f"invalid_recipient: {recipient!r} must be a non-empty string",
+            f"invalid_recipient: {safe_repr} must be a non-empty string",
             error_type="recipient_invalid_session_id",
         )
-    debates_row = conn.execute(
-        "SELECT roles_json FROM debates WHERE topic_id = ?", (topic_id,)
-    ).fetchone()
-    if debates_row is None:
-        raise DebateError(
-            f"unknown_topic: {topic_id}",
-            error_type="topic_not_found",
-        )
+    if debate is not None:
+        # Pass-through path: caller already loaded the debate row.
+        roles_iter = debate.get("roles") or []
+    else:
+        debates_row = conn.execute(
+            "SELECT roles_json FROM debates WHERE topic_id = ?", (topic_id,)
+        ).fetchone()
+        if debates_row is None:
+            raise DebateError(
+                f"unknown_topic: {topic_id}",
+                error_type="topic_not_found",
+            )
+        roles_iter = json_loads(debates_row["roles_json"])
     declared_roles = {
         r["role"]
-        for r in json_loads(debates_row["roles_json"])
+        for r in roles_iter
         if isinstance(r, dict) and "role" in r
     }
     if recipient in declared_roles:
@@ -863,12 +915,12 @@ def _validate_recipient(
     looks_like_role = recipient.isupper() and "-" not in recipient
     if looks_like_role:
         raise DebateError(
-            f"recipient {recipient!r} is not a declared role of topic "
+            f"recipient {safe_repr} is not a declared role of topic "
             f"{topic_id} (declared: {sorted(declared_roles)})",
             error_type="recipient_unknown_role",
         )
     raise DebateError(
-        f"recipient {recipient!r} is not a valid session_id "
+        f"recipient {safe_repr} is not a valid session_id "
         f"(approved prefixes: {APPROVED_RUNTIME_PREFIXES}; suffix must "
         f"match [a-zA-Z0-9_]{{4,64}})",
         error_type="recipient_invalid_session_id",
@@ -921,6 +973,19 @@ def debate_post_with_recipients(
     debate_messages or debate_message_recipients.
 
     Returns: ``{msg_id, ts, recipient_count, topic_state}``.
+
+    RACE-SAFETY CONTRACT (v3.9.3, msg:34adcb3e amendment 1A +
+    msg:3d3442cb amendment 2B): this DAO requires the caller to provide
+    a connection in BEGIN IMMEDIATE mode (or stronger). Use
+    ``db_utils.get_conn_immediate()`` — the regular ``get_conn()``
+    starts in DEFERRED mode and does NOT serialize the lifecycle/
+    recipient-validation reads against concurrent writers, exposing a
+    snapshot race during high-contention bursts. The MCP wrapper at
+    ``intel_server.debate_post_with_recipients`` always uses the
+    immediate-mode wrapper. Direct DAO callers bypassing it accept the
+    race risk; the contract is wrapper-scoped, not DAO-enforced (no
+    runtime check — SQLite does not expose the txn mode through the
+    Python sqlite3 module).
     """
     if not isinstance(addressed_to, list) or not addressed_to:
         raise DebateError(
@@ -951,7 +1016,10 @@ def debate_post_with_recipients(
 
     deduped = _dedupe_preserve_order(addressed_to)
     for recipient in deduped:
-        _validate_recipient(recipient, topic_id, conn)
+        # Pass the already-loaded debate dict to skip the per-recipient
+        # SELECT roles_json round-trip and close the TOCTOU window
+        # (v3.9.3 P1.2).
+        _validate_recipient(recipient, topic_id, conn, debate=debate)
 
     # Atomicity is provided by the caller's context manager
     # (db_utils.get_conn() wraps every block in BEGIN/COMMIT). Issuing
@@ -1063,6 +1131,15 @@ def debate_signal_check(
     more remain; ``next_cursor`` carries (ts, msg_id) for the next page.
     Returns ``max_priority`` so adapters can short-circuit on H without
     enumerating every row.
+
+    NOTE on session_id ownership (v3.9.3): ``session_id`` is caller-
+    asserted at the DAO layer; no cryptographic binding between the
+    live process and the asserted id. MCP-layer enforcement deferred
+    to v3.9.4. ``since_ts`` (when supplied without ``since_msg_id``) is
+    strictly-exclusive — messages with ``ts == since_ts`` are NOT
+    re-emitted (msg:946bcff6 amendment 3 fix). Use ``since_msg_id``
+    for resume-where-cursor-left-off semantics that include intra-ts
+    ordering.
     """
     effective_limit = _validate_signal_limit(limit)
     debate = _validate_signal_caller(session_id, role, topic_id, conn)
@@ -1087,7 +1164,10 @@ def debate_signal_check(
     elif since_ts is not None:
         validate_iso_utc(since_ts)
         cursor_ts = since_ts
-        cursor_msg_id = ""
+        # v3.9.3 since_ts strict-exclusive (msg:946bcff6 amendment 3):
+        # see read_messages note above. Same semantics here so
+        # signal_check's contract matches read_messages's.
+        cursor_msg_id = None
     else:
         state_row = conn.execute(
             "SELECT last_processed_msg_id, last_processed_ts "
@@ -1107,8 +1187,16 @@ def debate_signal_check(
     )
     params.extend([role, session_id])
     if cursor_ts is not None:
-        where.append("(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))")
-        params.extend([cursor_ts, cursor_ts, cursor_msg_id])
+        # Dual-branch cursor (v3.9.3 msg:946bcff6 amendment 3,
+        # signal_check m.-aliased form). Same strict-exclusive
+        # semantics as read_messages above; the ``m.`` prefix matches
+        # the existing aliased FROM clause for this query.
+        if cursor_msg_id is None:
+            where.append("m.ts > ?")
+            params.extend([cursor_ts])
+        else:
+            where.append("(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))")
+            params.extend([cursor_ts, cursor_ts, cursor_msg_id])
 
     fetch_limit = effective_limit + 1  # +1 to detect truncation
     rows = conn.execute(
@@ -1169,6 +1257,23 @@ def debate_signal_advance(
     and last_processed_ts so the compound (ts, msg_id) cursor never
     falls back to ts-only on a subsequent read. last_check_at also
     updated to the advance time.
+
+    RACE-SAFETY CONTRACT (v3.9.3, msg:34adcb3e amendment 1A +
+    msg:3d3442cb amendment 2B): this DAO requires the caller to provide
+    a connection in BEGIN IMMEDIATE mode (or stronger). The cursor-
+    monotonicity check (current vs proposed compound (ts, msg_id))
+    reads ``debate_signal_state`` BEFORE the upsert; under regular
+    DEFERRED ``get_conn()`` that read can race with another writer's
+    upsert and let an older proposed cursor pass the guard. Use
+    ``db_utils.get_conn_immediate()``. The MCP wrapper at
+    ``intel_server.debate_signal_advance`` always uses immediate mode.
+    Direct DAO callers bypassing it accept the race risk; contract is
+    wrapper-scoped, not DAO-enforced.
+
+    NOTE on session_id ownership: ``session_id`` is caller-asserted at
+    the DAO layer; there is no cryptographic binding between the live
+    process and the asserted session_id. MCP-layer enforcement (e.g.
+    requiring a per-session capability token) is deferred to v3.9.4.
     """
     _validate_signal_caller(session_id, role, topic_id, conn)
     validate_msg_id(last_processed_msg_id)

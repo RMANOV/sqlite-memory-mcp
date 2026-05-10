@@ -14,6 +14,7 @@ from fastmcp_compat import FastMCP
 
 from db_utils import (
     get_conn as _get_conn,
+    get_conn_immediate as _get_conn_immediate,
     setup_logger,
 )
 from intelligence_v2 import (
@@ -1450,7 +1451,10 @@ def debate_post_with_recipients(
         addressed_to = [
             r.strip() for r in addressed_to_csv.split(",") if r.strip()
         ]
-        with _get_conn() as conn:
+        # v3.9.3: BEGIN IMMEDIATE wrapper — write path requires
+        # serialized reads + writes against other writers (msg:34adcb3e
+        # amendment 1A). Race-safety contract is wrapper-scoped.
+        with _get_conn_immediate() as conn:
             out = _debate_post_with_recipients_dao(
                 conn,
                 topic_id=topic_id, role=role,
@@ -1460,6 +1464,7 @@ def debate_post_with_recipients(
             )
             return json.dumps(out)
     except _DebateError as exc:
+        logger.info("debate_post_with_recipients rejected: %s", exc)
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error(
@@ -1489,6 +1494,8 @@ def debate_signal_check(
     short-circuit logic, plus topic_state.
     """
     try:
+        # v3.9.3: signal_check stays on regular get_conn (read path —
+        # deferred snapshot is correct semantically per amendment 1A).
         with _get_conn() as conn:
             out = _debate_signal_check_dao(
                 conn,
@@ -1499,6 +1506,7 @@ def debate_signal_check(
             )
             return json.dumps(out)
     except _DebateError as exc:
+        logger.info("debate_signal_check rejected: %s", exc)
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_signal_check failed: %s", exc, exc_info=True)
@@ -1524,7 +1532,10 @@ def debate_signal_advance(
     plus last_check_at.
     """
     try:
-        with _get_conn() as conn:
+        # v3.9.3: BEGIN IMMEDIATE wrapper — advance has the same
+        # read-then-write race as post_with_recipients
+        # (msg:34adcb3e amendment 1A).
+        with _get_conn_immediate() as conn:
             out = _debate_signal_advance_dao(
                 conn,
                 session_id=session_id, role=role, topic_id=topic_id,
@@ -1532,6 +1543,7 @@ def debate_signal_advance(
             )
             return json.dumps(out)
     except _DebateError as exc:
+        logger.info("debate_signal_advance rejected: %s", exc)
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_signal_advance failed: %s", exc, exc_info=True)
