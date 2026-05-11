@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.egg-info/
 server.py.v1.bak
 test_runtime.py
 press-releases/

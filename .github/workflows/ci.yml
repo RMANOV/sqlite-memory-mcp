@@ -33,6 +33,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install ".[dev,gui]" ruff
 
+      - name: Editable install + manifest-completeness gate
+        # Per v3.9.4 (msg:f21d82cc): exercise the same editable
+        # MAPPING that production MCP entrypoints use, then run the
+        # manifest-completeness probe BEFORE the full suite so
+        # missing-module bugs surface as an explicit early-stage
+        # failure rather than getting diluted across the 760-test run.
+        run: |
+          pip install -e .
+          pytest tests/test_pyproject_manifest_completeness.py -v
+
       - name: Ruff
         run: ruff check .
 
