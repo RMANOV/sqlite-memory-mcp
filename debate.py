@@ -79,6 +79,19 @@ _WATERMARK_RE = re.compile(
     r"(?P<msg_id>[a-f0-9]{8}(?:[a-f0-9]{4})?)"
 )
 
+# v3.9.5 canonical STATE body shape (CONDUCTOR msg:c5e2e575 +
+# resolution msg:2c22988a). Two accepted forms only:
+#   '<STATE>'                 — bare state transition (legacy form)
+#   '<STATE> [reason: <text>]' — enriched transition with reason
+# fullmatch-anchored to defend against the same prefix-acceptance bug
+# class the v3.9.3 WATERMARK parser fixup taught (msg:b246664b →
+# msg:932b9bab). Reason text accepts any single-line content (the
+# `.+` excludes newlines by default); multi-line bodies are rejected
+# intentionally so structured logs stay one row per transition.
+_STATE_BODY_RE = re.compile(
+    r"^(INIT|ACTIVE|RESOLVED|ARCHIVED)(\s+\[reason: .+\])?$"
+)
+
 
 VALID_PRIORITIES = ("H", "M", "L", "INFO")
 VALID_KINDS = (
@@ -368,7 +381,19 @@ def post_message(
     watermark_resolved: tuple[str | None, str] | None = None
 
     if kind == "STATE":
-        target = body.strip()
+        # v3.9.5 strict-regex validation (msg:2c22988a). Accepts EITHER
+        # '<STATE>' OR '<STATE> [reason: ...]' fullmatch-anchored. The
+        # bare `body.strip()` form used pre-v3.9.5 would reject an
+        # enriched body wholesale; a naive leading-token parse would
+        # silently swallow trailing junk — exactly the prefix-
+        # acceptance class the v3.9.3 WATERMARK fixup ruled out.
+        m = _STATE_BODY_RE.fullmatch(body.strip())
+        if m is None:
+            raise DebateError(
+                f"invalid_state_body: {body!r}",
+                error_type="invalid_state",
+            )
+        target = m.group(1)
         validate_transition(debate["state"], target)
         new_state_target = target
 
@@ -737,31 +762,33 @@ def transition_state(
                 "blocking_questions": blocking,
             }
 
-    body = new_state if not reason else f"{new_state} [reason: {reason}]"
+    # v3.9.5 fix (msg:c5e2e575 + ADVOCATE msg:2ccadbff): fold the
+    # transition reason INTO the persisted STATE body instead of
+    # writing a separate STATUS row. The deprecated dual-record
+    # pattern failed catastrophically on RESOLVED→ARCHIVED transitions
+    # because once the state flip lands, the topic enters read-only
+    # mode and the follow-up STATUS write hits topic_resolved_read_only.
+    # Reason text now lives where it semantically belongs — alongside
+    # the state it explains — and the return value's `body` field
+    # accurately reflects what's in debate_messages.
+    state_body = (
+        new_state if not reason else f"{new_state} [reason: {reason}]"
+    )
     msg = post_message(
         conn,
         topic_id=topic_id,
         role=role,
         priority="H",
         kind="STATE",
-        body=new_state,
+        body=state_body,
     )
-    if reason:
-        post_message(
-            conn,
-            topic_id=topic_id,
-            role=role,
-            priority="INFO",
-            kind="STATUS",
-            body=f"state transition reason: {reason}",
-        )
     return {
         "old_state": old_state,
         "new_state": new_state,
         "ts": msg["ts"],
         "blocking_questions": [],
         "transition_msg_id": msg["msg_id"],
-        "body": body,
+        "body": state_body,
     }
 
 
