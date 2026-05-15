@@ -41,6 +41,7 @@ STATE_PATH = Path(
 POST_SCHEMA_VERSION = "debate_post_with_recipients.v1"
 
 STOP = False
+CHILDREN: set[int] = set()
 
 
 def _now() -> str:
@@ -83,8 +84,22 @@ def _topic_clause(topics: list[str]) -> tuple[str, list[str]]:
     return f"AND m.topic_id IN ({placeholders})", topics
 
 
-def _fetch_new(last_ts: str, last_msg_id: str, topics: list[str], limit: int) -> list[sqlite3.Row]:
+def _kind_clause(kinds: list[str]) -> tuple[str, list[str]]:
+    if not kinds:
+        return "", []
+    placeholders = ",".join("?" for _ in kinds)
+    return f"AND m.kind IN ({placeholders})", kinds
+
+
+def _fetch_new(
+    last_ts: str,
+    last_msg_id: str,
+    topics: list[str],
+    kinds: list[str],
+    limit: int,
+) -> list[sqlite3.Row]:
     topic_sql, topic_params = _topic_clause(topics)
+    kind_sql, kind_params = _kind_clause(kinds)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
@@ -94,8 +109,9 @@ def _fetch_new(last_ts: str, last_msg_id: str, topics: list[str], limit: int) ->
             "JOIN debate_message_recipients r ON r.msg_id = m.msg_id "
             "WHERE (m.ts > ? OR (m.ts = ? AND m.msg_id > ?)) "
             f"{topic_sql} "
+            f"{kind_sql} "
             "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
-            [last_ts, last_ts, last_msg_id, *topic_params, limit],
+            [last_ts, last_ts, last_msg_id, *topic_params, *kind_params, limit],
         ).fetchall()
     finally:
         con.close()
@@ -134,7 +150,36 @@ def _dispatch_row(row: sqlite3.Row, suppressed_roles: set[str]) -> None:
     }
     out = debate_wake._handle_tool_response(tool_response)
     if isinstance(out, dict):
+        before = set(CHILDREN)
         debate_wake._maybe_dispatch(tool_response, _filter_targets(out, suppressed_roles))
+        _track_launched_children(before)
+
+
+def _track_launched_children(before: set[int]) -> None:
+    """Track direct child PIDs so the resident pump does not leave zombies."""
+    try:
+        after = {
+            int(pid)
+            for pid in os.listdir("/proc")
+            if pid.isdigit()
+            and Path("/proc") .joinpath(pid, "stat").read_text().split()[3] == str(os.getpid())
+        }
+    except Exception:
+        return
+    CHILDREN.update(after - before)
+
+
+def _reap_children() -> None:
+    for pid in list(CHILDREN):
+        try:
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            CHILDREN.discard(pid)
+            continue
+        except OSError:
+            continue
+        if waited:
+            CHILDREN.discard(pid)
 
 
 def _handle_signal(_signum: int, _frame: Any) -> None:
@@ -145,6 +190,12 @@ def _handle_signal(_signum: int, _frame: Any) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--topic", action="append", default=[])
+    parser.add_argument(
+        "--action-kind",
+        action="append",
+        default=os.environ.get("DEBATE_PUMP_ACTION_KINDS", "Q,DECISION,STATE").split(","),
+        help="message kinds that should wake agents; default excludes STATUS",
+    )
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--once", action="store_true")
@@ -157,6 +208,7 @@ def main() -> int:
     args = parser.parse_args()
 
     topics = [t for t in args.topic if t]
+    action_kinds = [k.strip().upper() for k in args.action_kind if k and k.strip()]
     suppressed_roles = {r.strip().upper() for r in args.suppress_role if r and r.strip()}
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -171,12 +223,14 @@ def main() -> int:
         interval=args.interval,
         last_ts=last_ts,
         last_msg_id=last_msg_id,
+        action_kinds=action_kinds,
         suppressed_roles=sorted(suppressed_roles),
     )
 
     while not STOP:
+        _reap_children()
         try:
-            rows = _fetch_new(last_ts, last_msg_id, topics, args.limit)
+            rows = _fetch_new(last_ts, last_msg_id, topics, action_kinds, args.limit)
             for row in rows:
                 try:
                     _dispatch_row(row, suppressed_roles)
@@ -193,6 +247,7 @@ def main() -> int:
             break
         time.sleep(max(0.2, args.interval))
 
+    _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)
     return 0
 
