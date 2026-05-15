@@ -104,7 +104,13 @@ VALID_KINDS = (
     "STATE",
     "COMPACTION",
 )
+STANDING_SIGNAL_KINDS = ("DECISION", "STATE")
 VALID_STATES = ("INIT", "ACTIVE", "RESOLVED", "ARCHIVED")
+VALID_BINDING_STATES = ("active", "retired", "diagnostic")
+VALID_CURSOR_MODES = ("head", "copy", "replay")
+DEBATE_POST_RESPONSE_SCHEMA_VERSION = "debate_post_with_recipients.v1"
+DEBATE_WAKE_SCHEMA_VERSION = "debate_wake.v1"
+WAKE_SUPPRESSION_SECONDS = 60
 
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "INIT": {"ACTIVE"},
@@ -309,6 +315,107 @@ def _row_to_debate_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 def role_in_debate(roles: list[dict[str, Any]], role: str) -> bool:
     return any(isinstance(r, dict) and r.get("role") == role for r in roles)
+
+
+def validate_session_id(session_id: str) -> None:
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        raise DebateError(
+            f"session_id {session_id!r} must match {SESSION_ID_RE.pattern}",
+            error_type="recipient_invalid_session_id",
+        )
+
+
+def validate_binding_state(state: str) -> None:
+    if state not in VALID_BINDING_STATES:
+        raise DebateError(
+            f"invalid_binding_state: {state!r} not in {VALID_BINDING_STATES}",
+            error_type="binding_state_invalid",
+        )
+
+
+def validate_cursor_mode(cursor_mode: str) -> None:
+    if cursor_mode not in VALID_CURSOR_MODES:
+        raise DebateError(
+            f"invalid_cursor_mode: {cursor_mode!r} not in {VALID_CURSOR_MODES}",
+            error_type="cursor_mode_invalid",
+        )
+
+
+def _validate_role_for_debate(debate: dict[str, Any], topic_id: str, role: str) -> None:
+    validate_role(role)
+    if not role_in_debate(debate["roles"], role):
+        raise DebateError(
+            f"role {role!r} not declared in topic {topic_id}",
+            error_type="recipient_unknown_role",
+        )
+
+
+def _validate_conductor_override(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    override_msg_id: str | None,
+) -> None:
+    if not override_msg_id:
+        raise DebateError(
+            "conductor_override_required",
+            error_type="conductor_override_required",
+        )
+    validate_msg_id(override_msg_id)
+    row = conn.execute(
+        "SELECT role, kind FROM debate_messages "
+        "WHERE msg_id = ? AND topic_id = ?",
+        (override_msg_id, topic_id),
+    ).fetchone()
+    if row is None or row["role"] != "CONDUCTOR" or row["kind"] != "DECISION":
+        raise DebateError(
+            f"invalid_conductor_override: {override_msg_id}",
+            error_type="conductor_override_invalid",
+        )
+
+
+def _active_binding(
+    conn: sqlite3.Connection, topic_id: str, role: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM debate_role_bindings "
+        "WHERE topic_id = ? AND role = ? AND state = 'active' "
+        "ORDER BY generation DESC LIMIT 1",
+        (topic_id, role),
+    ).fetchone()
+
+
+def _binding_for_session(
+    conn: sqlite3.Connection, topic_id: str, role: str, session_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM debate_role_bindings "
+        "WHERE topic_id = ? AND role = ? AND session_id = ?",
+        (topic_id, role, session_id),
+    ).fetchone()
+
+
+def _binding_count(conn: sqlite3.Connection, topic_id: str, role: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM debate_role_bindings "
+        "WHERE topic_id = ? AND role = ?",
+        (topic_id, role),
+    ).fetchone()["c"]
+
+
+def _next_binding_generation(
+    conn: sqlite3.Connection, topic_id: str, role: str
+) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(generation), 0) + 1 AS generation "
+        "FROM debate_role_bindings WHERE topic_id = ? AND role = ?",
+        (topic_id, role),
+    ).fetchone()
+    return int(row["generation"])
+
+
+def _runtime_from_session(session_id: str) -> str:
+    return session_id.split("-", 1)[0]
 
 
 # ── DAO: messages ─────────────────────────────────────────────────────
@@ -722,6 +829,333 @@ def advance_watermark(
     )
 
 
+# ── v3.10: role/session lifecycle authority ───────────────────────────
+
+
+def list_role_bindings(
+    conn: sqlite3.Connection, *, topic_id: str
+) -> dict[str, Any]:
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    rows = conn.execute(
+        "SELECT b.topic_id, b.role, b.session_id, b.runtime, b.state, "
+        "b.generation, b.created_at, b.updated_at, b.retired_at, "
+        "b.reason, b.bound_by_role, b.bound_by_msg_id, "
+        "s.last_processed_msg_id, s.last_processed_ts, s.last_check_at "
+        "FROM debate_role_bindings b "
+        "LEFT JOIN debate_signal_state s "
+        "ON s.topic_id = b.topic_id AND s.role = b.role "
+        "AND s.session_id = b.session_id "
+        "WHERE b.topic_id = ? "
+        "ORDER BY b.role ASC, b.generation ASC, b.session_id ASC",
+        (topic_id,),
+    ).fetchall()
+    return {
+        "topic_id": topic_id,
+        "topic_state": debate["state"],
+        "bindings": [dict(r) for r in rows],
+    }
+
+
+def bind_role_session(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    session_id: str,
+    runtime: str = "",
+    state: str = "active",
+    reason: str,
+    bound_by_role: str | None = None,
+    bound_by_msg_id: str | None = None,
+    replace_active: bool = False,
+    conductor_override_msg_id: str | None = None,
+) -> dict[str, Any]:
+    validate_topic_id(topic_id)
+    validate_session_id(session_id)
+    validate_binding_state(state)
+    if not isinstance(reason, str) or not reason.strip():
+        raise DebateError("invalid_reason: must be non-empty string")
+    if bound_by_role:
+        validate_role(bound_by_role)
+    if bound_by_msg_id:
+        validate_msg_id(bound_by_msg_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    _validate_role_for_debate(debate, topic_id, role)
+
+    now = now_iso()
+    runtime = runtime.strip() if isinstance(runtime, str) else ""
+    if not runtime:
+        runtime = _runtime_from_session(session_id)
+
+    existing_active = _active_binding(conn, topic_id, role)
+    retired_sessions: list[str] = []
+
+    if state == "active":
+        if (
+            existing_active is not None
+            and existing_active["session_id"] != session_id
+        ):
+            if not replace_active:
+                raise DebateError(
+                    f"duplicate_active_binding: role {role} already "
+                    f"owned by {existing_active['session_id']}",
+                    error_type="binding_duplicate_active",
+                )
+            conn.execute(
+                "UPDATE debate_role_bindings SET state = 'retired', "
+                "retired_at = ?, updated_at = ?, reason = ? "
+                "WHERE topic_id = ? AND role = ? AND state = 'active'",
+                (
+                    now,
+                    now,
+                    f"replaced_by={session_id}: {reason.strip()}",
+                    topic_id,
+                    role,
+                ),
+            )
+            retired_sessions.append(existing_active["session_id"])
+        generation = _next_binding_generation(conn, topic_id, role)
+        conn.execute(
+            "INSERT INTO debate_role_bindings "
+            "(topic_id, role, session_id, runtime, state, generation, "
+            " created_at, updated_at, retired_at, reason, bound_by_role, "
+            " bound_by_msg_id) "
+            "VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL, ?, ?, ?) "
+            "ON CONFLICT(topic_id, role, session_id) DO UPDATE SET "
+            "runtime = excluded.runtime, state = 'active', "
+            "generation = excluded.generation, updated_at = excluded.updated_at, "
+            "retired_at = NULL, reason = excluded.reason, "
+            "bound_by_role = excluded.bound_by_role, "
+            "bound_by_msg_id = excluded.bound_by_msg_id",
+            (
+                topic_id,
+                role,
+                session_id,
+                runtime,
+                generation,
+                now,
+                now,
+                reason.strip(),
+                bound_by_role,
+                bound_by_msg_id,
+            ),
+        )
+        return {
+            "topic_id": topic_id,
+            "role": role,
+            "session_id": session_id,
+            "runtime": runtime,
+            "state": "active",
+            "generation": generation,
+            "retired_sessions": retired_sessions,
+        }
+
+    if state == "diagnostic":
+        generation = _next_binding_generation(conn, topic_id, role)
+        conn.execute(
+            "INSERT INTO debate_role_bindings "
+            "(topic_id, role, session_id, runtime, state, generation, "
+            " created_at, updated_at, retired_at, reason, bound_by_role, "
+            " bound_by_msg_id) "
+            "VALUES (?, ?, ?, ?, 'diagnostic', ?, ?, ?, NULL, ?, ?, ?) "
+            "ON CONFLICT(topic_id, role, session_id) DO UPDATE SET "
+            "runtime = excluded.runtime, state = 'diagnostic', "
+            "generation = excluded.generation, updated_at = excluded.updated_at, "
+            "retired_at = NULL, reason = excluded.reason, "
+            "bound_by_role = excluded.bound_by_role, "
+            "bound_by_msg_id = excluded.bound_by_msg_id",
+            (
+                topic_id,
+                role,
+                session_id,
+                runtime,
+                generation,
+                now,
+                now,
+                reason.strip(),
+                bound_by_role,
+                bound_by_msg_id,
+            ),
+        )
+        return {
+            "topic_id": topic_id,
+            "role": role,
+            "session_id": session_id,
+            "runtime": runtime,
+            "state": "diagnostic",
+            "generation": generation,
+        }
+
+    # Retiring a role owner without replacement is an explicit override path.
+    target = _binding_for_session(conn, topic_id, role, session_id)
+    if target is None:
+        raise DebateError(
+            f"unknown_binding: {topic_id}/{role}/{session_id}",
+            error_type="binding_not_found",
+        )
+    would_uncover = target["state"] == "active"
+    if would_uncover:
+        _validate_conductor_override(
+            conn, topic_id=topic_id, override_msg_id=conductor_override_msg_id
+        )
+    conn.execute(
+        "UPDATE debate_role_bindings SET state = 'retired', retired_at = ?, "
+        "updated_at = ?, reason = ? "
+        "WHERE topic_id = ? AND role = ? AND session_id = ?",
+        (now, now, reason.strip(), topic_id, role, session_id),
+    )
+    return {
+        "topic_id": topic_id,
+        "role": role,
+        "session_id": session_id,
+        "state": "retired",
+        "ownership_gap_override": would_uncover,
+    }
+
+
+def rotate_role_binding(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    old_session_id: str,
+    new_session_id: str,
+    runtime: str = "",
+    cursor_mode: str,
+    reason: str,
+    bound_by_role: str | None = None,
+    bound_by_msg_id: str | None = None,
+) -> dict[str, Any]:
+    validate_cursor_mode(cursor_mode)
+    validate_session_id(old_session_id)
+    validate_session_id(new_session_id)
+    old = _binding_for_session(conn, topic_id, role, old_session_id)
+    if old is None or old["state"] != "active":
+        raise DebateError(
+            f"rotate_predecessor_not_active: {old_session_id}",
+            error_type="binding_predecessor_not_active",
+        )
+    result = bind_role_session(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=new_session_id,
+        runtime=runtime,
+        state="active",
+        reason=reason,
+        bound_by_role=bound_by_role,
+        bound_by_msg_id=bound_by_msg_id,
+        replace_active=True,
+    )
+
+    warning: str | None = None
+    now = now_iso()
+    if cursor_mode == "head":
+        head = conn.execute(
+            "SELECT msg_id, ts FROM debate_messages "
+            "WHERE topic_id = ? ORDER BY ts DESC, msg_id DESC LIMIT 1",
+            (topic_id,),
+        ).fetchone()
+        if head is not None:
+            conn.execute(
+                "INSERT INTO debate_signal_state "
+                "(session_id, role, topic_id, last_processed_msg_id, "
+                " last_processed_ts, last_check_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, role, topic_id) DO UPDATE SET "
+                "last_processed_msg_id = excluded.last_processed_msg_id, "
+                "last_processed_ts = excluded.last_processed_ts, "
+                "last_check_at = excluded.last_check_at",
+                (new_session_id, role, topic_id, head["msg_id"], head["ts"], now),
+            )
+    elif cursor_mode == "copy":
+        source = conn.execute(
+            "SELECT last_processed_msg_id, last_processed_ts "
+            "FROM debate_signal_state "
+            "WHERE session_id = ? AND role = ? AND topic_id = ?",
+            (old_session_id, role, topic_id),
+        ).fetchone()
+        if source is None:
+            warning = "copy_source_cursor_missing"
+            conn.execute(
+                "DELETE FROM debate_signal_state "
+                "WHERE session_id = ? AND role = ? AND topic_id = ?",
+                (new_session_id, role, topic_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO debate_signal_state "
+                "(session_id, role, topic_id, last_processed_msg_id, "
+                " last_processed_ts, last_check_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, role, topic_id) DO UPDATE SET "
+                "last_processed_msg_id = excluded.last_processed_msg_id, "
+                "last_processed_ts = excluded.last_processed_ts, "
+                "last_check_at = excluded.last_check_at",
+                (
+                    new_session_id,
+                    role,
+                    topic_id,
+                    source["last_processed_msg_id"],
+                    source["last_processed_ts"],
+                    now,
+                ),
+            )
+    else:  # replay
+        conn.execute(
+            "DELETE FROM debate_signal_state "
+            "WHERE session_id = ? AND role = ? AND topic_id = ?",
+            (new_session_id, role, topic_id),
+        )
+
+    result.update(
+        {
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id,
+            "cursor_mode": cursor_mode,
+            "warning": warning,
+        }
+    )
+    return result
+
+
+def _retire_bindings_for_transition(
+    conn: sqlite3.Connection, *, topic_id: str, new_state: str, reason: str
+) -> int:
+    now = now_iso()
+    if new_state == "RESOLVED":
+        states = ("active",)
+    elif new_state == "ARCHIVED":
+        states = ("active", "diagnostic")
+    else:
+        return 0
+    placeholders = ",".join("?" for _ in states)
+    cur = conn.execute(
+        "UPDATE debate_role_bindings SET state = 'retired', "
+        "retired_at = COALESCE(retired_at, ?), updated_at = ?, reason = ? "
+        f"WHERE topic_id = ? AND state IN ({placeholders})",
+        (
+            now,
+            now,
+            f"topic_{new_state.lower()}:{reason}" if reason else f"topic_{new_state.lower()}",
+            topic_id,
+            *states,
+        ),
+    )
+    return int(cur.rowcount or 0)
+
+
 # ── State transitions outside of post_message ──────────────────────────
 
 
@@ -782,6 +1216,9 @@ def transition_state(
         kind="STATE",
         body=state_body,
     )
+    retired_bindings = _retire_bindings_for_transition(
+        conn, topic_id=topic_id, new_state=new_state, reason=reason
+    )
     return {
         "old_state": old_state,
         "new_state": new_state,
@@ -789,6 +1226,7 @@ def transition_state(
         "blocking_questions": [],
         "transition_msg_id": msg["msg_id"],
         "body": state_body,
+        "retired_bindings": retired_bindings,
     }
 
 
@@ -893,10 +1331,10 @@ def _validate_recipient(
     conn: sqlite3.Connection,
     debate: dict[str, Any] | None = None,
 ) -> None:
-    """Recipient must be a declared role OR a SESSION_ID_RE-shaped session
-    id with an approved runtime prefix. Forward-compat: a well-formed
-    session_id is accepted even if not yet registered in
-    debate_signal_state — registration is implicit on first signal_check.
+    """Normal recipients must be declared roles.
+
+    Direct session_id recipients moved behind the explicit diagnostic path
+    in v3.10 so stale runtime bindings cannot silently consume role work.
 
     Raises DebateError with a specific error_type taxonomy:
       - 'recipient_unknown_role' for role-shaped names that don't match
@@ -942,7 +1380,10 @@ def _validate_recipient(
     if recipient in declared_roles:
         return
     if SESSION_ID_RE.fullmatch(recipient):
-        return
+        raise DebateError(
+            f"direct_session_recipient_requires_diagnostic: {safe_repr}",
+            error_type="recipient_direct_session_requires_diagnostic",
+        )
     # Classify: role-shaped (uppercase, no dash, no prefix) → unknown role;
     # otherwise → malformed session id. Both yield a clear caller-fixable
     # error_type so MCP wrappers don't lump validation under
@@ -959,6 +1400,38 @@ def _validate_recipient(
         f"(approved prefixes: {APPROVED_RUNTIME_PREFIXES}; suffix must "
         f"match [a-zA-Z0-9_]{{4,64}})",
         error_type="recipient_invalid_session_id",
+    )
+
+
+def _validate_diagnostic_recipient(
+    recipient: str,
+    topic_id: str,
+    conn: sqlite3.Connection,
+    *,
+    conductor_override_msg_id: str | None = None,
+) -> None:
+    safe_repr = repr(recipient[:64]) if isinstance(recipient, str) else repr(recipient)
+    if not isinstance(recipient, str) or not SESSION_ID_RE.fullmatch(recipient):
+        raise DebateError(
+            f"diagnostic_recipient {safe_repr} must be a valid session_id",
+            error_type="recipient_invalid_session_id",
+        )
+    binding = conn.execute(
+        "SELECT 1 FROM debate_role_bindings "
+        "WHERE topic_id = ? AND session_id = ? AND state = 'diagnostic' "
+        "LIMIT 1",
+        (topic_id, recipient),
+    ).fetchone()
+    if binding is not None:
+        return
+    if conductor_override_msg_id:
+        _validate_conductor_override(
+            conn, topic_id=topic_id, override_msg_id=conductor_override_msg_id
+        )
+        return
+    raise DebateError(
+        f"diagnostic_binding_required: {recipient}",
+        error_type="recipient_diagnostic_binding_required",
     )
 
 
@@ -985,6 +1458,8 @@ def debate_post_with_recipients(
     kind: str,
     body: str,
     addressed_to: list[str],
+    diagnostic_to: list[str] | None = None,
+    conductor_override_msg_id: str | None = None,
     reply_to: str | None = None,
 ) -> dict[str, Any]:
     """Atomic insert: debate_messages row + per-recipient
@@ -1022,10 +1497,22 @@ def debate_post_with_recipients(
     runtime check — SQLite does not expose the txn mode through the
     Python sqlite3 module).
     """
-    if not isinstance(addressed_to, list) or not addressed_to:
+    if not isinstance(addressed_to, list):
         raise DebateError(
-            "addressed_to required and non-empty (broadcast not "
-            "supported in v3.9.x)",
+            "addressed_to must be a list",
+            error_type="recipient_empty",
+        )
+    if diagnostic_to is None:
+        diagnostic_to = []
+    if not isinstance(diagnostic_to, list):
+        raise DebateError(
+            "diagnostic_to must be a list",
+            error_type="recipient_invalid_session_id",
+        )
+    if not addressed_to and not diagnostic_to:
+        raise DebateError(
+            "addressed_to or diagnostic_to required and non-empty "
+            "(broadcast not supported)",
             error_type="recipient_empty",
         )
 
@@ -1050,11 +1537,19 @@ def debate_post_with_recipients(
         )
 
     deduped = _dedupe_preserve_order(addressed_to)
+    diagnostic_deduped = _dedupe_preserve_order(diagnostic_to)
     for recipient in deduped:
         # Pass the already-loaded debate dict to skip the per-recipient
         # SELECT roles_json round-trip and close the TOCTOU window
         # (v3.9.3 P1.2).
         _validate_recipient(recipient, topic_id, conn, debate=debate)
+    for recipient in diagnostic_deduped:
+        _validate_diagnostic_recipient(
+            recipient,
+            topic_id,
+            conn,
+            conductor_override_msg_id=conductor_override_msg_id,
+        )
 
     # Atomicity is provided by the caller's context manager
     # (db_utils.get_conn() wraps every block in BEGIN/COMMIT). Issuing
@@ -1074,16 +1569,25 @@ def debate_post_with_recipients(
     msg_id = post_result["msg_id"]
     for recipient in deduped:
         conn.execute(
-            "INSERT INTO debate_message_recipients (msg_id, recipient) "
-            "VALUES (?, ?)",
+            "INSERT INTO debate_message_recipients "
+            "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'normal')",
+            (msg_id, recipient),
+        )
+    for recipient in diagnostic_deduped:
+        conn.execute(
+            "INSERT INTO debate_message_recipients "
+            "(msg_id, recipient, recipient_mode) "
+            "VALUES (?, ?, 'diagnostic')",
             (msg_id, recipient),
         )
 
     return {
         "msg_id": msg_id,
         "ts": post_result["ts"],
-        "recipient_count": len(deduped),
+        "recipient_count": len(deduped) + len(diagnostic_deduped),
+        "diagnostic_recipient_count": len(diagnostic_deduped),
         "topic_state": post_result["topic_state"],
+        "schema_version": DEBATE_POST_RESPONSE_SCHEMA_VERSION,
     }
 
 
@@ -1095,11 +1599,7 @@ def _validate_signal_caller(
     Verifies session_id matches SESSION_ID_RE and role is declared in the
     topic's roles_json. Returns the debate row dict for downstream use.
     """
-    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
-        raise DebateError(
-            f"session_id {session_id!r} must match {SESSION_ID_RE.pattern}",
-            error_type="recipient_invalid_session_id",
-        )
+    validate_session_id(session_id)
     validate_role(role)
     validate_topic_id(topic_id)
     debate = get_debate(conn, topic_id)
@@ -1114,6 +1614,27 @@ def _validate_signal_caller(
             error_type="recipient_unknown_role",
         )
     return debate
+
+
+def _signal_recipients_for_binding(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    session_id: str,
+) -> list[str]:
+    binding_count = _binding_count(conn, topic_id, role)
+    if binding_count == 0:
+        # Legacy topics without a binding registry keep v3.9.x behavior.
+        return [role, session_id]
+    binding = _binding_for_session(conn, topic_id, role, session_id)
+    if binding is None:
+        return []
+    if binding["state"] == "active":
+        return [role, session_id]
+    if binding["state"] == "diagnostic":
+        return [session_id]
+    return []
 
 
 def _validate_signal_limit(limit: int) -> int:
@@ -1181,6 +1702,7 @@ def debate_signal_check(
 
     cursor_ts: str | None = None
     cursor_msg_id: str = ""
+    cursor_from_state = False
 
     if since_msg_id is not None:
         validate_msg_id(since_msg_id)
@@ -1213,14 +1735,30 @@ def debate_signal_check(
         if state_row and state_row["last_processed_ts"]:
             cursor_ts = state_row["last_processed_ts"]
             cursor_msg_id = state_row["last_processed_msg_id"] or ""
+            cursor_from_state = True
+
+    signal_recipients = _signal_recipients_for_binding(
+        conn, topic_id=topic_id, role=role, session_id=session_id
+    )
+    if not signal_recipients:
+        return {
+            "pending": [],
+            "count": 0,
+            "truncated": False,
+            "next_cursor": None,
+            "max_priority": None,
+            "topic_state": debate["state"],
+            "limit": effective_limit,
+        }
 
     where = ["m.topic_id = ?"]
     params: list[Any] = [topic_id]
+    recipient_placeholders = ",".join("?" for _ in signal_recipients)
     where.append(
         "EXISTS (SELECT 1 FROM debate_message_recipients r "
-        "WHERE r.msg_id = m.msg_id AND r.recipient IN (?, ?))"
+        f"WHERE r.msg_id = m.msg_id AND r.recipient IN ({recipient_placeholders}))"
     )
-    params.extend([role, session_id])
+    params.extend(signal_recipients)
     if cursor_ts is not None:
         # Dual-branch cursor (v3.9.3 msg:946bcff6 amendment 3,
         # signal_check m.-aliased form). Same strict-exclusive
@@ -1230,8 +1768,25 @@ def debate_signal_check(
             where.append("m.ts > ?")
             params.extend([cursor_ts])
         else:
-            where.append("(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))")
-            params.extend([cursor_ts, cursor_ts, cursor_msg_id])
+            cursor_clause = "(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))"
+            if cursor_from_state:
+                standing_placeholders = ",".join(
+                    "?" for _ in STANDING_SIGNAL_KINDS
+                )
+                where.append(
+                    f"({cursor_clause} OR m.kind IN ({standing_placeholders}))"
+                )
+                params.extend(
+                    [
+                        cursor_ts,
+                        cursor_ts,
+                        cursor_msg_id,
+                        *STANDING_SIGNAL_KINDS,
+                    ]
+                )
+            else:
+                where.append(cursor_clause)
+                params.extend([cursor_ts, cursor_ts, cursor_msg_id])
 
     fetch_limit = effective_limit + 1  # +1 to detect truncation
     rows = conn.execute(
@@ -1325,11 +1880,19 @@ def debate_signal_advance(
             error_type="watermark_msg_id_unknown",
         )
 
-    addressed = conn.execute(
-        "SELECT 1 FROM debate_message_recipients "
-        "WHERE msg_id = ? AND recipient IN (?, ?) LIMIT 1",
-        (last_processed_msg_id, role, session_id),
-    ).fetchone()
+    signal_recipients = _signal_recipients_for_binding(
+        conn, topic_id=topic_id, role=role, session_id=session_id
+    )
+    if signal_recipients:
+        recipient_placeholders = ",".join("?" for _ in signal_recipients)
+        addressed = conn.execute(
+            "SELECT 1 FROM debate_message_recipients "
+            f"WHERE msg_id = ? AND recipient IN ({recipient_placeholders}) "
+            "LIMIT 1",
+            (last_processed_msg_id, *signal_recipients),
+        ).fetchone()
+    else:
+        addressed = None
     if addressed is None:
         raise DebateError(
             f"watermark_advance_unaddressed: msg_id "
@@ -1385,3 +1948,226 @@ def debate_signal_advance(
         "last_processed_ts": ref["ts"],
         "last_check_at": now,
     }
+
+
+# ── v3.10: dry-run wake target resolution/audit ────────────────────────
+
+
+def _insert_wake_log(
+    conn: sqlite3.Connection,
+    *,
+    trigger_msg_id: str,
+    topic_id: str,
+    recipient: str,
+    action: str,
+    result: str,
+    target_role: str | None = None,
+    target_session_id: str | None = None,
+    target_runtime: str | None = None,
+    binding_generation: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    wake_id = new_msg_id()
+    while conn.execute(
+        "SELECT 1 FROM debate_wake_log WHERE wake_id = ? LIMIT 1",
+        (wake_id,),
+    ).fetchone():
+        wake_id = new_msg_id()
+    now = now_iso()
+    row = {
+        "wake_id": wake_id,
+        "trigger_msg_id": trigger_msg_id,
+        "topic_id": topic_id,
+        "recipient": recipient,
+        "target_role": target_role,
+        "target_session_id": target_session_id,
+        "target_runtime": target_runtime,
+        "binding_generation": binding_generation,
+        "action": action,
+        "result": result,
+        "schema_version": DEBATE_WAKE_SCHEMA_VERSION,
+        "details": details or {},
+        "created_at": now,
+    }
+    conn.execute(
+        "INSERT INTO debate_wake_log "
+        "(wake_id, trigger_msg_id, topic_id, recipient, target_role, "
+        " target_session_id, target_runtime, binding_generation, action, "
+        " result, schema_version, details_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            wake_id,
+            trigger_msg_id,
+            topic_id,
+            recipient,
+            target_role,
+            target_session_id,
+            target_runtime,
+            binding_generation,
+            action,
+            result,
+            DEBATE_WAKE_SCHEMA_VERSION,
+            json_dumps(details or {}),
+            now,
+        ),
+    )
+    return row
+
+
+def _wake_already_logged(
+    conn: sqlite3.Connection,
+    *,
+    trigger_msg_id: str,
+    target_session_id: str,
+    action: str,
+) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM debate_wake_log "
+            "WHERE trigger_msg_id = ? AND target_session_id = ? "
+            "AND action = ? LIMIT 1",
+            (trigger_msg_id, target_session_id, action),
+        ).fetchone()
+        is not None
+    )
+
+
+def prepare_wake_dry_run(
+    conn: sqlite3.Connection,
+    *,
+    tool_response: dict[str, Any],
+    action: str = "dry_run_wake",
+    expected_schema_version: str = DEBATE_POST_RESPONSE_SCHEMA_VERSION,
+) -> dict[str, Any]:
+    """Resolve wake targets and write audit rows without waking anything.
+
+    This is deliberately signal-only. It never writes debate_messages and
+    fails closed on response schema drift.
+    """
+    if not isinstance(tool_response, dict):
+        raise DebateError(
+            "tool_response must be a JSON object",
+            error_type="wake_tool_response_invalid",
+        )
+    msg_id = str(tool_response.get("msg_id") or "")
+    response_schema = str(tool_response.get("schema_version") or "")
+    if response_schema != expected_schema_version:
+        log = _insert_wake_log(
+            conn,
+            trigger_msg_id=msg_id,
+            topic_id=str(tool_response.get("topic_id") or ""),
+            recipient="",
+            action=action,
+            result="schema_mismatch",
+            details={
+                "expected_schema_version": expected_schema_version,
+                "actual_schema_version": response_schema,
+            },
+        )
+        return {"targets": [], "logs": [log], "suppressed": 0}
+
+    validate_msg_id(msg_id)
+    msg = conn.execute(
+        "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+        (msg_id,),
+    ).fetchone()
+    if msg is None:
+        log = _insert_wake_log(
+            conn,
+            trigger_msg_id=msg_id,
+            topic_id=str(tool_response.get("topic_id") or ""),
+            recipient="",
+            action=action,
+            result="unknown_trigger_msg_id",
+        )
+        return {"targets": [], "logs": [log], "suppressed": 0}
+
+    topic_id = msg["topic_id"]
+    recipients = conn.execute(
+        "SELECT recipient, recipient_mode FROM debate_message_recipients "
+        "WHERE msg_id = ? ORDER BY recipient",
+        (msg_id,),
+    ).fetchall()
+    targets: list[dict[str, Any]] = []
+    logs: list[dict[str, Any]] = []
+    suppressed = 0
+
+    for rec in recipients:
+        recipient = rec["recipient"]
+        mode = rec["recipient_mode"]
+        binding: sqlite3.Row | None = None
+        result = "dry_run"
+        if mode == "normal":
+            if SESSION_ID_RE.fullmatch(recipient):
+                result = "direct_session_not_diagnostic"
+            else:
+                binding = _active_binding(conn, topic_id, recipient)
+                if binding is None:
+                    result = "no_active_binding"
+        else:
+            binding = conn.execute(
+                "SELECT * FROM debate_role_bindings "
+                "WHERE topic_id = ? AND session_id = ? "
+                "AND state = 'diagnostic' "
+                "ORDER BY generation DESC LIMIT 1",
+                (topic_id, recipient),
+            ).fetchone()
+            if binding is None:
+                result = "no_diagnostic_binding"
+
+        if binding is not None:
+            if _wake_already_logged(
+                conn,
+                trigger_msg_id=msg_id,
+                target_session_id=binding["session_id"],
+                action=action,
+            ):
+                suppressed += 1
+                targets.append(
+                    {
+                        "recipient": recipient,
+                        "target_role": binding["role"],
+                        "target_session_id": binding["session_id"],
+                        "target_runtime": binding["runtime"],
+                        "result": "suppressed",
+                    }
+                )
+                continue
+            log = _insert_wake_log(
+                conn,
+                trigger_msg_id=msg_id,
+                topic_id=topic_id,
+                recipient=recipient,
+                action=action,
+                result=result,
+                target_role=binding["role"],
+                target_session_id=binding["session_id"],
+                target_runtime=binding["runtime"],
+                binding_generation=binding["generation"],
+                details={"recipient_mode": mode},
+            )
+            logs.append(log)
+            targets.append(
+                {
+                    "recipient": recipient,
+                    "target_role": binding["role"],
+                    "target_session_id": binding["session_id"],
+                    "target_runtime": binding["runtime"],
+                    "result": result,
+                }
+            )
+            continue
+
+        logs.append(
+            _insert_wake_log(
+                conn,
+                trigger_msg_id=msg_id,
+                topic_id=topic_id,
+                recipient=recipient,
+                action=action,
+                result=result,
+                details={"recipient_mode": mode},
+            )
+        )
+
+    return {"targets": targets, "logs": logs, "suppressed": suppressed}

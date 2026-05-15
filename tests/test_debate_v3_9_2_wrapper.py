@@ -82,9 +82,9 @@ def test_post_with_recipients_runs_inside_get_conn_wrapper(wrapped_topic):
         out = debate_post_with_recipients(
             conn, topic_id="X1", role="CONDUCTOR",
             priority="H", kind="STATUS", body="wrapper-shaped",
-            addressed_to=["EXECUTOR", "cc-exec1"],
+            addressed_to=["EXECUTOR"],
         )
-        assert out["recipient_count"] == 2
+        assert out["recipient_count"] == 1
 
     # Verify the COMMIT actually landed (read in a fresh wrapper).
     with get_conn(db_path=db) as conn:

@@ -25,6 +25,7 @@ from debate import (
     MAX_SIGNAL_LIMIT,
     SESSION_ID_RE,
     DebateError,
+    bind_role_session,
     debate_post_with_recipients,
     debate_signal_advance,
     debate_signal_check,
@@ -125,14 +126,14 @@ def test_post_with_recipients_happy_path_inserts_atomic_rows(topic):
     out = debate_post_with_recipients(
         conn, topic_id=t, role="CONDUCTOR",
         priority="H", kind="STATUS", body="hello",
-        addressed_to=["EXECUTOR", "cc-exec1"],
+        addressed_to=["EXECUTOR"],
     )
-    assert out["recipient_count"] == 2
+    assert out["recipient_count"] == 1
     rows = conn.execute(
         "SELECT recipient FROM debate_message_recipients WHERE msg_id = ?",
         (out["msg_id"],),
     ).fetchall()
-    assert {r["recipient"] for r in rows} == {"EXECUTOR", "cc-exec1"}
+    assert {r["recipient"] for r in rows} == {"EXECUTOR"}
 
 
 def test_post_with_recipients_empty_addressed_to_raises(topic):
@@ -162,15 +163,18 @@ def test_post_with_recipients_dedupes_role_silently(topic):
     assert rows["c"] == 1
 
 
-def test_post_with_recipients_dedupes_mixed_preserve_order(topic):
-    """['EXECUTOR', 'cc-exec1', 'EXECUTOR', 'cc-exec1'] → 2 rows."""
+def test_post_with_recipients_rejects_direct_session_in_normal_path(topic):
     conn, t = topic
-    out = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
-        priority="M", kind="STATUS", body="x",
-        addressed_to=["EXECUTOR", "cc-exec1", "EXECUTOR", "cc-exec1"],
+    with pytest.raises(DebateError) as exc_info:
+        debate_post_with_recipients(
+            conn, topic_id=t, role="CONDUCTOR",
+            priority="M", kind="STATUS", body="x",
+            addressed_to=["EXECUTOR", "cc-exec1"],
+        )
+    assert (
+        exc_info.value.error_type
+        == "recipient_direct_session_requires_diagnostic"
     )
-    assert out["recipient_count"] == 2
 
 
 def test_post_with_recipients_unknown_role_raises(topic):
@@ -288,12 +292,16 @@ def test_signal_check_returns_only_addressed_messages(topic):
 
 
 def test_signal_check_dedupes_role_and_session_id_match(topic):
-    """Single message addressed to BOTH role + session_id → 1 row, not 2."""
+    """Single message addressed to role + diagnostic session → 1 visible row."""
     conn, t = topic
+    bind_role_session(
+        conn, topic_id=t, role="EXECUTOR", session_id="cc-exec1",
+        state="diagnostic", reason="diagnostic",
+    )
     debate_post_with_recipients(
         conn, topic_id=t, role="CONDUCTOR",
         priority="M", kind="STATUS", body="dual",
-        addressed_to=["EXECUTOR", "cc-exec1"],
+        addressed_to=["EXECUTOR"], diagnostic_to=["cc-exec1"],
     )
     out = debate_signal_check(
         conn, session_id="cc-exec1", role="EXECUTOR", topic_id=t
@@ -369,6 +377,51 @@ def test_signal_check_empty_returns_none_max_priority(topic):
     assert out["count"] == 0
     assert out["max_priority"] is None
     assert out["next_cursor"] is None
+
+
+def test_signal_check_resurfaces_standing_decision_after_cursor(topic):
+    conn, t = topic
+    standing = debate_post_with_recipients(
+        conn, topic_id=t, role="CONDUCTOR",
+        priority="H", kind="DECISION", body="standing mandate",
+        addressed_to=["EXECUTOR"],
+    )
+    transient = debate_post_with_recipients(
+        conn, topic_id=t, role="CONDUCTOR",
+        priority="M", kind="STATUS", body="one-shot status",
+        addressed_to=["EXECUTOR"],
+    )
+
+    debate_signal_advance(
+        conn, session_id="cc-exec1", role="EXECUTOR", topic_id=t,
+        last_processed_msg_id=transient["msg_id"],
+    )
+
+    out = debate_signal_check(
+        conn, session_id="cc-exec1", role="EXECUTOR", topic_id=t
+    )
+    assert [m["msg_id"] for m in out["pending"]] == [standing["msg_id"]]
+    assert out["pending"][0]["kind"] == "DECISION"
+
+
+def test_signal_check_explicit_pagination_does_not_resurface_decision(topic):
+    conn, t = topic
+    standing = debate_post_with_recipients(
+        conn, topic_id=t, role="CONDUCTOR",
+        priority="H", kind="DECISION", body="standing mandate",
+        addressed_to=["EXECUTOR"],
+    )
+    debate_post_with_recipients(
+        conn, topic_id=t, role="CONDUCTOR",
+        priority="M", kind="STATUS", body="after decision",
+        addressed_to=["EXECUTOR"],
+    )
+
+    out = debate_signal_check(
+        conn, session_id="cc-exec1", role="EXECUTOR", topic_id=t,
+        since_msg_id=standing["msg_id"],
+    )
+    assert {m["body"] for m in out["pending"]} == {"after decision"}
 
 
 def test_signal_check_limit_zero_raises_value_error(topic):
@@ -498,10 +551,14 @@ def test_signal_advance_to_role_addressed_msg_succeeds(topic):
 
 def test_signal_advance_to_session_id_addressed_msg_succeeds(topic):
     conn, t = topic
+    bind_role_session(
+        conn, topic_id=t, role="EXECUTOR", session_id="cc-exec1",
+        state="diagnostic", reason="diagnostic",
+    )
     m1 = debate_post_with_recipients(
         conn, topic_id=t, role="CONDUCTOR",
         priority="M", kind="STATUS", body="m1",
-        addressed_to=["cc-exec1"],
+        addressed_to=[], diagnostic_to=["cc-exec1"],
     )
     res = debate_signal_advance(
         conn, session_id="cc-exec1", role="EXECUTOR",
@@ -512,10 +569,14 @@ def test_signal_advance_to_session_id_addressed_msg_succeeds(topic):
 
 def test_signal_advance_to_msg_addressed_to_BOTH_succeeds_once(topic):
     conn, t = topic
+    bind_role_session(
+        conn, topic_id=t, role="EXECUTOR", session_id="cc-exec1",
+        state="diagnostic", reason="diagnostic",
+    )
     m1 = debate_post_with_recipients(
         conn, topic_id=t, role="CONDUCTOR",
         priority="M", kind="STATUS", body="m1",
-        addressed_to=["EXECUTOR", "cc-exec1"],
+        addressed_to=["EXECUTOR"], diagnostic_to=["cc-exec1"],
     )
     debate_signal_advance(
         conn, session_id="cc-exec1", role="EXECUTOR",

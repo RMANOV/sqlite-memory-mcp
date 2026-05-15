@@ -72,14 +72,18 @@ from tools.gbrain_bridge import (
 from debate import (
     DebateError as _DebateError,
     advance_watermark as _debate_advance_watermark_dao,
+    bind_role_session as _debate_bind_role_session_dao,
     compact as _debate_compact,
     debate_post_with_recipients as _debate_post_with_recipients_dao,
     debate_signal_advance as _debate_signal_advance_dao,
     debate_signal_check as _debate_signal_check_dao,
     escalate as _debate_escalate_dao,
     init_debate as _debate_init_dao,
+    list_role_bindings as _debate_list_role_bindings_dao,
     post_message as _debate_post_dao,
+    prepare_wake_dry_run as _debate_prepare_wake_dry_run_dao,
     read_messages as _debate_read_dao,
+    rotate_role_binding as _debate_rotate_role_binding_dao,
     transition_state as _debate_transition_dao,
 )
 from premium_runtime import maybe_mount_premium_extensions
@@ -1327,7 +1331,7 @@ def debate_state(
     starting `[DEFERRED:` to count as resolution-equivalent).
     """
     try:
-        with _get_conn() as conn:
+        with _get_conn_immediate() as conn:
             out = _debate_transition_dao(
                 conn,
                 topic_id=topic_id, role=role,
@@ -1434,6 +1438,8 @@ def debate_post_with_recipients(
     kind: str,
     body: str,
     addressed_to_csv: str,
+    diagnostic_to_csv: str = "",
+    conductor_override_msg_id: str = "",
     reply_to: str = "",
 ) -> str:
     """Post an addressed message: debate_messages + debate_message_recipients
@@ -1451,6 +1457,9 @@ def debate_post_with_recipients(
         addressed_to = [
             r.strip() for r in addressed_to_csv.split(",") if r.strip()
         ]
+        diagnostic_to = [
+            r.strip() for r in diagnostic_to_csv.split(",") if r.strip()
+        ]
         # v3.9.3: BEGIN IMMEDIATE wrapper — write path requires
         # serialized reads + writes against other writers (msg:34adcb3e
         # amendment 1A). Race-safety contract is wrapper-scoped.
@@ -1460,6 +1469,8 @@ def debate_post_with_recipients(
                 topic_id=topic_id, role=role,
                 priority=priority, kind=kind, body=body,
                 addressed_to=addressed_to,
+                diagnostic_to=diagnostic_to,
+                conductor_override_msg_id=conductor_override_msg_id or None,
                 reply_to=reply_to or None,
             )
             return json.dumps(out)
@@ -1547,6 +1558,150 @@ def debate_signal_advance(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_signal_advance failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 35: debate_binding_list (v3.10 role/session lifecycle)
+@mcp.tool()
+def debate_binding_list(topic_id: str) -> str:
+    """List role/session bindings and cursor state for a debate topic."""
+    try:
+        with _get_conn() as conn:
+            return json.dumps(_debate_list_role_bindings_dao(conn, topic_id=topic_id))
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_binding_list failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 36: debate_bind_role (v3.10 role/session lifecycle)
+@mcp.tool()
+def debate_bind_role(
+    topic_id: str,
+    role: str,
+    session_id: str,
+    runtime: str = "",
+    state: str = "active",
+    reason: str = "",
+    bound_by_role: str = "",
+    bound_by_msg_id: str = "",
+    replace_active: bool = False,
+    conductor_override_msg_id: str = "",
+) -> str:
+    """Bind, diagnose, or retire a role/session binding.
+
+    Direct retirement of an active owner requires a CONDUCTOR override
+    DECISION msg_id. Duplicate active primary owners are rejected unless
+    replace_active is explicitly set for an atomic swap.
+    """
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_bind_role_session_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                session_id=session_id,
+                runtime=runtime,
+                state=state,
+                reason=reason,
+                bound_by_role=bound_by_role or None,
+                bound_by_msg_id=bound_by_msg_id or None,
+                replace_active=replace_active,
+                conductor_override_msg_id=conductor_override_msg_id or None,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_bind_role failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 37: debate_rotate_binding (v3.10 role/session lifecycle)
+@mcp.tool()
+def debate_rotate_binding(
+    topic_id: str,
+    role: str,
+    old_session_id: str,
+    new_session_id: str,
+    cursor_mode: str,
+    runtime: str = "",
+    reason: str = "",
+    bound_by_role: str = "",
+    bound_by_msg_id: str = "",
+) -> str:
+    """Atomically rotate a role owner with explicit cursor mode.
+
+    cursor_mode must be head, copy, or replay. Missing/invalid mode fails.
+    """
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_rotate_role_binding_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+                runtime=runtime,
+                cursor_mode=cursor_mode,
+                reason=reason,
+                bound_by_role=bound_by_role or None,
+                bound_by_msg_id=bound_by_msg_id or None,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_rotate_binding failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 38: debate_close_topic (v3.10 close helper)
+@mcp.tool()
+def debate_close_topic(topic_id: str, role: str, new_state: str, reason: str = "") -> str:
+    """Close a topic through the authoritative debate_state transition path.
+
+    Binding retirement happens in the same transaction as RESOLVED/ARCHIVED.
+    """
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_transition_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                new_state=new_state,
+                reason=reason or "",
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_close_topic failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 39: debate_wake_dry_run (v3.10 PostToolUse dry-run)
+@mcp.tool()
+def debate_wake_dry_run(tool_response_json: str, action: str = "dry_run_wake") -> str:
+    """Resolve wake targets and audit them without waking or posting.
+
+    Unknown tool_response schema fails closed and writes a schema_mismatch
+    audit row. Real wake actions are intentionally out of scope.
+    """
+    try:
+        tool_response = json.loads(tool_response_json) if tool_response_json else {}
+        with _get_conn_immediate() as conn:
+            out = _debate_prepare_wake_dry_run_dao(
+                conn,
+                tool_response=tool_response,
+                action=action or "dry_run_wake",
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_wake_dry_run failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

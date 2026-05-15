@@ -295,7 +295,12 @@ def test_validate_recipient_passthrough_path_skips_select(topic):
     # Pass-through path: succeeds because debate_dict is consumed.
     _validate_recipient("CONDUCTOR", t, conn, debate=debate_dict)
     _validate_recipient("EXECUTOR", t, conn, debate=debate_dict)
-    _validate_recipient("cc-cond1", t, conn, debate=debate_dict)
+    with pytest.raises(DebateError) as direct_exc:
+        _validate_recipient("cc-cond1", t, conn, debate=debate_dict)
+    assert (
+        direct_exc.value.error_type
+        == "recipient_direct_session_requires_diagnostic"
+    )
     # Legacy path: fetches fresh, sees no topic, raises.
     with pytest.raises(DebateError) as exc_info:
         _validate_recipient("CONDUCTOR", t, conn)

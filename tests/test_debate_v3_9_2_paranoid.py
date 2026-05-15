@@ -64,7 +64,7 @@ def test_paranoid_socket_blocked_v3_9_2_dao_paths(tmp_path):
         m1 = debate_post_with_recipients(
             c, topic_id="PARANOID", role="CONDUCTOR",
             priority="H", kind="STATUS", body="m1",
-            addressed_to=["EXECUTOR", "cc-exec1"],
+            addressed_to=["EXECUTOR"],
         )
         m2 = debate_post_with_recipients(
             c, topic_id="PARANOID", role="CONDUCTOR",

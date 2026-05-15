@@ -759,6 +759,8 @@ CREATE TABLE IF NOT EXISTS debate_watermarks (
 CREATE TABLE IF NOT EXISTS debate_message_recipients (
     msg_id    TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
     recipient TEXT NOT NULL,
+    recipient_mode TEXT NOT NULL DEFAULT 'normal'
+        CHECK (recipient_mode IN ('normal', 'diagnostic')),
     PRIMARY KEY (msg_id, recipient)
 );
 CREATE INDEX IF NOT EXISTS idx_dmr_recipient
@@ -777,6 +779,57 @@ CREATE INDEX IF NOT EXISTS idx_dss_role_topic
     ON debate_signal_state(role, topic_id);
 CREATE INDEX IF NOT EXISTS idx_dss_last_check
     ON debate_signal_state(last_check_at);
+
+-- ── v3.10: role/session lifecycle authority + dry-run wake audit ───────
+-- roles_json remains the declared debate roster. debate_role_bindings is the
+-- runtime authority for which concrete session owns or diagnoses a role now.
+
+CREATE TABLE IF NOT EXISTS debate_role_bindings (
+    topic_id        TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role            TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    runtime         TEXT NOT NULL,
+    state           TEXT NOT NULL
+        CHECK (state IN ('active', 'retired', 'diagnostic')),
+    generation      INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    retired_at      TEXT,
+    reason          TEXT NOT NULL,
+    bound_by_role   TEXT,
+    bound_by_msg_id TEXT,
+    PRIMARY KEY (topic_id, role, session_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_drb_one_active
+    ON debate_role_bindings(topic_id, role)
+    WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_drb_session
+    ON debate_role_bindings(session_id);
+CREATE INDEX IF NOT EXISTS idx_drb_topic_state
+    ON debate_role_bindings(topic_id, state);
+
+CREATE TABLE IF NOT EXISTS debate_wake_log (
+    wake_id             TEXT PRIMARY KEY,
+    trigger_msg_id      TEXT NOT NULL,
+    topic_id            TEXT NOT NULL,
+    recipient           TEXT NOT NULL,
+    target_role         TEXT,
+    target_session_id   TEXT,
+    target_runtime      TEXT,
+    binding_generation  INTEGER,
+    action              TEXT NOT NULL,
+    result              TEXT NOT NULL,
+    schema_version      TEXT NOT NULL,
+    details_json        TEXT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dwl_trigger
+    ON debate_wake_log(trigger_msg_id);
+CREATE INDEX IF NOT EXISTS idx_dwl_topic_created
+    ON debate_wake_log(topic_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dwl_once
+    ON debate_wake_log(trigger_msg_id, target_session_id, action)
+    WHERE target_session_id IS NOT NULL;
 
 -- ── Memory Reflection (Phase 1) ─────────────────────────────────────────
 -- Reviewable memory consolidation runs. Async job model with state machine
@@ -1585,6 +1638,75 @@ _MIGRATIONS = [
             ON premium_revocations(entitlement_id, feature_id, active);
         """,
         "premium_revocations table (v3.5.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('debate_message_recipients') "
+        "WHERE name='recipient_mode'",
+        "ALTER TABLE debate_message_recipients "
+        "ADD COLUMN recipient_mode TEXT NOT NULL DEFAULT 'normal'",
+        "debate_message_recipients.recipient_mode column (v3.10)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_dmr_mode'",
+        "CREATE INDEX idx_dmr_mode ON debate_message_recipients(recipient_mode)",
+        "idx_dmr_mode index (v3.10)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='debate_role_bindings'",
+        """
+        CREATE TABLE debate_role_bindings (
+            topic_id        TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+            role            TEXT NOT NULL,
+            session_id      TEXT NOT NULL,
+            runtime         TEXT NOT NULL,
+            state           TEXT NOT NULL
+                CHECK (state IN ('active', 'retired', 'diagnostic')),
+            generation      INTEGER NOT NULL,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            retired_at      TEXT,
+            reason          TEXT NOT NULL,
+            bound_by_role   TEXT,
+            bound_by_msg_id TEXT,
+            PRIMARY KEY (topic_id, role, session_id)
+        );
+        CREATE UNIQUE INDEX idx_drb_one_active
+            ON debate_role_bindings(topic_id, role)
+            WHERE state = 'active';
+        CREATE INDEX idx_drb_session
+            ON debate_role_bindings(session_id);
+        CREATE INDEX idx_drb_topic_state
+            ON debate_role_bindings(topic_id, state);
+        """,
+        "debate_role_bindings table and indexes (v3.10)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='debate_wake_log'",
+        """
+        CREATE TABLE debate_wake_log (
+            wake_id             TEXT PRIMARY KEY,
+            trigger_msg_id      TEXT NOT NULL,
+            topic_id            TEXT NOT NULL,
+            recipient           TEXT NOT NULL,
+            target_role         TEXT,
+            target_session_id   TEXT,
+            target_runtime      TEXT,
+            binding_generation  INTEGER,
+            action              TEXT NOT NULL,
+            result              TEXT NOT NULL,
+            schema_version      TEXT NOT NULL,
+            details_json        TEXT,
+            created_at          TEXT NOT NULL
+        );
+        CREATE INDEX idx_dwl_trigger
+            ON debate_wake_log(trigger_msg_id);
+        CREATE INDEX idx_dwl_topic_created
+            ON debate_wake_log(topic_id, created_at);
+        CREATE UNIQUE INDEX idx_dwl_once
+            ON debate_wake_log(trigger_msg_id, target_session_id, action)
+            WHERE target_session_id IS NOT NULL;
+        """,
+        "debate_wake_log table and indexes (v3.10)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='premium_artifact_manifests'",
