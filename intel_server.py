@@ -88,6 +88,7 @@ from debate import (
     reap_worker_claims as _debate_reap_worker_claims_dao,
     rotate_role_binding as _debate_rotate_role_binding_dao,
     transition_state as _debate_transition_dao,
+    worker_no_action as _debate_worker_no_action_dao,
 )
 from premium_runtime import maybe_mount_premium_extensions
 
@@ -1783,6 +1784,34 @@ def debate_message_claim_reclaim(
         logger.error(
             "debate_message_claim_reclaim failed: %s", exc, exc_info=True
         )
+        return _debate_error_response(exc)
+
+
+# Tool 43: debate_worker_no_action (v3.11.4 no-op worker completion)
+@mcp.tool()
+def debate_worker_no_action(
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+    trigger_msg_id: str,
+    reason: str = "",
+) -> str:
+    """Complete a wake worker claim without posting when no work remains."""
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_worker_no_action_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                worker_session_id=worker_session_id,
+                trigger_msg_id=trigger_msg_id,
+                reason=reason,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_worker_no_action failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

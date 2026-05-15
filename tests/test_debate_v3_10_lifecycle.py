@@ -24,6 +24,7 @@ from debate import (
     reap_worker_claims,
     rotate_role_binding,
     transition_state,
+    worker_no_action,
 )
 from schema import init_db
 
@@ -590,6 +591,122 @@ def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
             reply_to=trigger["msg_id"],
         )
     assert exc_info.value.error_type == "terminal_reply_duplicate"
+
+
+def test_worker_no_action_completes_claim_and_advances_worker_cursor(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="wake produced no useful work",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+        details={"source": "test"},
+    )
+    message_count = conn.execute("SELECT COUNT(*) AS n FROM debate_messages").fetchone()[
+        "n"
+    ]
+
+    out = worker_no_action(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        worker_session_id=claim["worker_session_id"],
+        trigger_msg_id=trigger["msg_id"],
+        reason="empty inbox after trigger read",
+    )
+    duplicate = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+    row = conn.execute(
+        "SELECT state, ack_msg_id, details_json FROM debate_worker_claims "
+        "WHERE worker_session_id = ?",
+        (claim["worker_session_id"],),
+    ).fetchone()
+    cursor = conn.execute(
+        "SELECT last_processed_msg_id FROM debate_signal_state "
+        "WHERE session_id = ? AND role = ? AND topic_id = ?",
+        (claim["worker_session_id"], "EXECUTOR", t),
+    ).fetchone()
+
+    assert out["state"] == "completed"
+    assert out["ack_msg_id"] is None
+    assert out["no_action"] is True
+    assert out["details"]["source"] == "test"
+    assert out["details"]["no_action"] is True
+    assert out["details"]["no_action_reason"] == "empty inbox after trigger read"
+    assert row["state"] == "completed"
+    assert row["ack_msg_id"] is None
+    assert cursor["last_processed_msg_id"] == trigger["msg_id"]
+    assert duplicate["worker_session_id"] == claim["worker_session_id"]
+    assert duplicate["no_action"] is True
+    assert conn.execute("SELECT COUNT(*) AS n FROM debate_messages").fetchone()["n"] == message_count
+
+
+def test_worker_no_action_rejects_wrong_trigger(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    first = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="first task",
+        addressed_to=["EXECUTOR"],
+    )
+    second = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="second task",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=first["msg_id"],
+    )
+
+    with pytest.raises(DebateError) as exc_info:
+        worker_no_action(
+            conn,
+            topic_id=t,
+            role="EXECUTOR",
+            worker_session_id=claim["worker_session_id"],
+            trigger_msg_id=second["msg_id"],
+        )
+    assert exc_info.value.error_type == "worker_no_action_trigger_mismatch"
 
 
 def test_worker_reap_removes_completed_claim_and_leaves_audit(topic):

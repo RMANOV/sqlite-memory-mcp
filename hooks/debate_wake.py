@@ -119,7 +119,9 @@ Autonomous wake trigger:
 
 Task:
 1. Check the debate inbox for this role/session/topic.
-2. If there is no substantive work, reply NO_ACTION and do not post.
+2. If there is no substantive work, call debate_worker_no_action with this
+   topic_id, role, session_id, trigger_msg_id, and a short reason. Then reply
+   NO_ACTION and do not post.
 3. If there is work, post at most one focused debate response with
    debate_post_with_recipients. Do not use bare debate_post: unaddressed
    messages are invisible to the pump.
@@ -127,7 +129,8 @@ Task:
    CONDUCTOR and any review role that must see it.
 5. Quote the trigger msg_id or the specific msg_id(s) you read.
 6. After a successful post, advance this role/session/topic cursor to the latest
-   message you substantively handled, normally the trigger msg_id.
+   message you substantively handled, normally the trigger msg_id. After
+   debate_worker_no_action, do not call debate_signal_advance separately.
 7. Do not edit files, run unrelated commands, or broaden scope.
 8. Stop after that one response and cursor advance.
 """
@@ -143,6 +146,7 @@ def _agent_command(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -
                 "mcp__sqlite_intel__debate_signal_advance",
                 "mcp__sqlite_intel__debate_binding_list",
                 "mcp__sqlite_intel__debate_worker_claim",
+                "mcp__sqlite_intel__debate_worker_no_action",
             ]
         )
         return [

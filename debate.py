@@ -555,6 +555,13 @@ def _claim_row_dict(row: sqlite3.Row) -> dict[str, Any]:
     return out
 
 
+def _claim_details_dict(row: sqlite3.Row) -> dict[str, Any]:
+    if not row["details_json"]:
+        return {}
+    details = json_loads(row["details_json"])
+    return details if isinstance(details, dict) else {"value": details}
+
+
 def _worker_claim_for_session(
     conn: sqlite3.Connection,
     *,
@@ -735,6 +742,131 @@ def claim_worker_session(
     out = _claim_row_dict(row)
     out["duplicate"] = False
     out["no_action"] = False
+    return out
+
+
+def worker_no_action(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+    trigger_msg_id: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Mark an active wake worker claim complete without posting a message.
+
+    This is the terminal path for an autonomous worker that inspected its
+    addressed trigger and found no substantive debate work. It advances only
+    the worker cursor, preserving the parent session cursor and avoiding an
+    empty channel post.
+    """
+    validate_topic_id(topic_id)
+    validate_role(role)
+    validate_session_id(worker_session_id)
+    validate_msg_id(trigger_msg_id)
+    claim = _validate_worker_claim_for_signal(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=worker_session_id,
+    )
+    if claim["trigger_msg_id"] != trigger_msg_id:
+        raise DebateError(
+            f"worker_no_action_trigger_mismatch: worker_session_id="
+            f"{worker_session_id!r} is claimed for {claim['trigger_msg_id']!r}, "
+            f"not {trigger_msg_id!r}",
+            error_type="worker_no_action_trigger_mismatch",
+        )
+
+    ref = conn.execute(
+        "SELECT msg_id, ts FROM debate_messages "
+        "WHERE msg_id = ? AND topic_id = ?",
+        (trigger_msg_id, topic_id),
+    ).fetchone()
+    if ref is None:
+        raise DebateError(
+            f"worker_trigger_unknown: {trigger_msg_id}",
+            error_type="worker_trigger_unknown",
+        )
+
+    if claim["state"] != "active":
+        out = _claim_row_dict(claim)
+        details = out.get("details") if isinstance(out.get("details"), dict) else {}
+        out["duplicate"] = True
+        out["no_action"] = bool(details.get("no_action"))
+        return out
+
+    current = conn.execute(
+        "SELECT last_processed_msg_id, last_processed_ts "
+        "FROM debate_signal_state "
+        "WHERE session_id = ? AND role = ? AND topic_id = ?",
+        (worker_session_id, role, topic_id),
+    ).fetchone()
+    if current and current["last_processed_ts"]:
+        cur_ts = current["last_processed_ts"]
+        cur_msg_id = current["last_processed_msg_id"] or ""
+        proposed = (ref["ts"], ref["msg_id"])
+        existing = (cur_ts, cur_msg_id)
+        if proposed < existing:
+            raise DebateError(
+                f"watermark_regression: proposed cursor "
+                f"({ref['ts']}, {ref['msg_id']}) is older than "
+                f"existing ({cur_ts}, {cur_msg_id}); advancing "
+                f"backwards would re-deliver already-processed work",
+                error_type="watermark_regression",
+            )
+
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO debate_signal_state "
+        "(session_id, role, topic_id, last_processed_msg_id, "
+        " last_processed_ts, last_check_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(session_id, role, topic_id) DO UPDATE SET "
+        "last_processed_msg_id = excluded.last_processed_msg_id, "
+        "last_processed_ts = excluded.last_processed_ts, "
+        "last_check_at = excluded.last_check_at",
+        (worker_session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
+    )
+    details = _claim_details_dict(claim)
+    details.update(
+        {
+            "no_action": True,
+            "no_action_reason": str(reason or "").strip(),
+            "no_action_at": now,
+        }
+    )
+    conn.execute(
+        "UPDATE debate_worker_claims SET state = 'completed', "
+        "completed_at = ?, heartbeat_at = ?, ack_msg_id = NULL, "
+        "details_json = ? "
+        "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+        (
+            now,
+            now,
+            json_dumps(details),
+            topic_id,
+            role,
+            worker_session_id,
+        ),
+    )
+    row = _worker_claim_for_session(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=worker_session_id,
+    )
+    out = _claim_row_dict(row)
+    out.update(
+        {
+            "duplicate": False,
+            "no_action": True,
+            "last_processed_msg_id": ref["msg_id"],
+            "last_processed_ts": ref["ts"],
+            "last_check_at": now,
+        }
+    )
     return out
 
 
