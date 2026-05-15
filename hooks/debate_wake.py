@@ -120,12 +120,16 @@ Autonomous wake trigger:
 Task:
 1. Check the debate inbox for this role/session/topic.
 2. If there is no substantive work, reply NO_ACTION and do not post.
-3. If there is work, post at most one focused debate response using the sqlite_intel debate tools.
-4. Quote the trigger msg_id or the specific msg_id(s) you read.
-5. After a successful post, advance this role/session/topic cursor to the latest
+3. If there is work, post at most one focused debate response with
+   debate_post_with_recipients. Do not use bare debate_post: unaddressed
+   messages are invisible to the pump.
+4. Address the response to the role(s) named by the trigger, normally
+   CONDUCTOR and any review role that must see it.
+5. Quote the trigger msg_id or the specific msg_id(s) you read.
+6. After a successful post, advance this role/session/topic cursor to the latest
    message you substantively handled, normally the trigger msg_id.
-6. Do not edit files, run unrelated commands, or broaden scope.
-7. Stop after that one response and cursor advance.
+7. Do not edit files, run unrelated commands, or broaden scope.
+8. Stop after that one response and cursor advance.
 """
 
 

@@ -193,7 +193,7 @@ def main() -> int:
     parser.add_argument(
         "--action-kind",
         action="append",
-        default=os.environ.get("DEBATE_PUMP_ACTION_KINDS", "Q,DECISION,STATE").split(","),
+        default=os.environ.get("DEBATE_PUMP_ACTION_KINDS", "Q,A,DECISION,STATE").split(","),
         help="message kinds that should wake agents; default excludes STATUS",
     )
     parser.add_argument("--interval", type=float, default=2.0)
