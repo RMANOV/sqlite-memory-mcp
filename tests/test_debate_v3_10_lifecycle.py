@@ -13,11 +13,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from debate import (
     DebateError,
     bind_role_session,
+    claim_worker_session,
     debate_post_with_recipients,
+    debate_signal_advance,
     debate_signal_check,
     init_debate,
     post_message,
     prepare_wake_dry_run,
+    reap_worker_claims,
     rotate_role_binding,
     transition_state,
 )
@@ -360,3 +363,382 @@ def test_duplicate_active_primary_rejected_secondary_role_allowed(topic):
         reason="declared secondary role",
     )
     assert out["state"] == "active"
+
+
+def test_worker_claims_allocate_distinct_workers_and_reuse_duplicate_trigger(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    first_trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="first task",
+        addressed_to=["EXECUTOR"],
+    )
+    second_trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="second task",
+        addressed_to=["EXECUTOR"],
+    )
+
+    first = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=first_trigger["msg_id"],
+    )
+    duplicate = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=first_trigger["msg_id"],
+    )
+    second = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=second_trigger["msg_id"],
+    )
+
+    assert first["worker_session_id"] == "codex-exec1-W1"
+    assert duplicate["worker_session_id"] == first["worker_session_id"]
+    assert duplicate["duplicate"] is True
+    assert second["worker_session_id"] == "codex-exec1-W2"
+
+
+def test_worker_signal_requires_claim_and_inherits_active_parent_binding(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="worker task",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+
+    out = debate_signal_check(
+        conn,
+        session_id=claim["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+    )
+    assert [m["msg_id"] for m in out["pending"]] == [trigger["msg_id"]]
+
+    with pytest.raises(DebateError) as exc_info:
+        debate_signal_check(
+            conn,
+            session_id="codex-exec1-W99",
+            role="EXECUTOR",
+            topic_id=t,
+        )
+    assert exc_info.value.error_type == "worker_claim_required"
+
+
+def test_worker_cursor_advance_isolated_from_parent_and_other_workers(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    first = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="first task",
+        addressed_to=["EXECUTOR"],
+    )
+    second = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="second task",
+        addressed_to=["EXECUTOR"],
+    )
+    w1 = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=first["msg_id"],
+    )
+    w2 = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=second["msg_id"],
+    )
+
+    debate_signal_advance(
+        conn,
+        session_id=w1["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=first["msg_id"],
+    )
+
+    rows = conn.execute(
+        "SELECT session_id, last_processed_msg_id FROM debate_signal_state "
+        "WHERE topic_id = ? AND role = ?",
+        (t, "EXECUTOR"),
+    ).fetchall()
+    cursors = {row["session_id"]: row["last_processed_msg_id"] for row in rows}
+    assert cursors[w1["worker_session_id"]] == first["msg_id"]
+    assert "codex-exec1" not in cursors
+    assert w2["worker_session_id"] not in cursors
+
+
+def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="one-shot work",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+    post_message(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        priority="H",
+        kind="A",
+        body="done",
+        reply_to=trigger["msg_id"],
+    )
+    advanced = debate_signal_advance(
+        conn,
+        session_id=claim["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=trigger["msg_id"],
+    )
+    duplicate = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+
+    assert advanced["worker_claim"]["state"] == "completed"
+    assert duplicate["worker_session_id"] == claim["worker_session_id"]
+    assert duplicate["no_action"] is True
+    with pytest.raises(DebateError) as exc_info:
+        post_message(
+            conn,
+            topic_id=t,
+            role="EXECUTOR",
+            priority="H",
+            kind="STATUS",
+            body="duplicate done",
+            reply_to=trigger["msg_id"],
+        )
+    assert exc_info.value.error_type == "terminal_reply_duplicate"
+
+
+def test_worker_reap_removes_completed_claim_and_leaves_audit(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="cleanup work",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+    conn.execute(
+        "UPDATE debate_worker_claims SET state = 'completed', heartbeat_at = ? "
+        "WHERE worker_session_id = ?",
+        ("2026-05-01T00:00:00Z", claim["worker_session_id"]),
+    )
+
+    out = reap_worker_claims(
+        conn,
+        topic_id=t,
+        older_than_ts="2026-05-02T00:00:00Z",
+    )
+    remaining = conn.execute(
+        "SELECT 1 FROM debate_worker_claims WHERE worker_session_id = ?",
+        (claim["worker_session_id"],),
+    ).fetchone()
+    audit = conn.execute(
+        "SELECT result FROM debate_worker_reap_log WHERE worker_session_id = ?",
+        (claim["worker_session_id"],),
+    ).fetchone()
+
+    assert out["count"] == 1
+    assert remaining is None
+    assert audit["result"] == "reaped"
+
+
+def test_nonstanding_decision_claim_survives_cursor_advance_until_terminal_reply(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    task = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="do one thing",
+        addressed_to=["EXECUTOR"],
+        standing=False,
+    )
+
+    first = debate_signal_check(
+        conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
+    )
+    debate_signal_advance(
+        conn,
+        session_id="codex-exec1",
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=task["msg_id"],
+    )
+    still_pending = debate_signal_check(
+        conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
+    )
+    post_message(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        priority="H",
+        kind="A",
+        body="done",
+        reply_to=task["msg_id"],
+    )
+    gone = debate_signal_check(
+        conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
+    )
+
+    assert [m["msg_id"] for m in first["pending"]] == [task["msg_id"]]
+    assert [m["msg_id"] for m in still_pending["pending"]] == [task["msg_id"]]
+    assert gone["pending"] == []
+
+
+def test_standing_false_decision_is_not_resurfaced_as_mandate(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    task = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="one-shot",
+        addressed_to=["EXECUTOR"],
+        standing=False,
+    )
+    standing = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="standing mandate",
+        addressed_to=["EXECUTOR"],
+        standing=True,
+    )
+    post_message(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        priority="H",
+        kind="A",
+        body="task done",
+        reply_to=task["msg_id"],
+    )
+    debate_signal_advance(
+        conn,
+        session_id="codex-exec1",
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=standing["msg_id"],
+    )
+
+    out = debate_signal_check(
+        conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
+    )
+    assert [m["msg_id"] for m in out["pending"]] == [standing["msg_id"]]

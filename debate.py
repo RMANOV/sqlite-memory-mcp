@@ -61,7 +61,13 @@ MAX_READ_LIMIT = 1000
 # so adapters can route messages back to the right session without
 # colliding with role names. Pagination contract mirrors read_messages.
 APPROVED_RUNTIME_PREFIXES = ("cc-", "codex-", "mcp-", "tray-", "human-")
-SESSION_ID_RE = re.compile(r"^(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64}$")
+BASE_SESSION_ID_RE = re.compile(r"^(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64}$")
+WORKER_SESSION_ID_RE = re.compile(
+    r"^(?P<parent>(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64})-W(?P<n>[1-9][0-9]{0,8})$"
+)
+SESSION_ID_RE = re.compile(
+    r"^(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64}(?:-W[1-9][0-9]{0,8})?$"
+)
 DEFAULT_SIGNAL_LIMIT = 200
 MAX_SIGNAL_LIMIT = 1000
 VALID_PRIORITY_ORDER = {"H": 3, "M": 2, "L": 1, "INFO": 0}
@@ -325,6 +331,23 @@ def validate_session_id(session_id: str) -> None:
         )
 
 
+def is_worker_session_id(session_id: str) -> bool:
+    return isinstance(session_id, str) and WORKER_SESSION_ID_RE.fullmatch(session_id) is not None
+
+
+def worker_parent_session_id(session_id: str) -> str | None:
+    m = WORKER_SESSION_ID_RE.fullmatch(session_id) if isinstance(session_id, str) else None
+    return m.group("parent") if m else None
+
+
+def validate_parent_session_id(session_id: str) -> None:
+    if not isinstance(session_id, str) or not BASE_SESSION_ID_RE.fullmatch(session_id):
+        raise DebateError(
+            f"parent_session_id {session_id!r} must match {BASE_SESSION_ID_RE.pattern}",
+            error_type="recipient_invalid_session_id",
+        )
+
+
 def validate_binding_state(state: str) -> None:
     if state not in VALID_BINDING_STATES:
         raise DebateError(
@@ -418,6 +441,389 @@ def _runtime_from_session(session_id: str) -> str:
     return session_id.split("-", 1)[0]
 
 
+def _standing_to_db(standing: bool | None) -> int | None:
+    if standing is None:
+        return None
+    if not isinstance(standing, bool):
+        raise DebateError(
+            "standing must be bool or None",
+            error_type="standing_invalid",
+        )
+    return 1 if standing else 0
+
+
+def _terminal_reply_for_trigger(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT msg_id, ts FROM debate_messages "
+        "WHERE topic_id = ? AND role = ? AND reply_to = ? "
+        "AND kind IN ('A', 'STATUS') "
+        "ORDER BY ts ASC, msg_id ASC LIMIT 1",
+        (topic_id, role, trigger_msg_id),
+    ).fetchone()
+
+
+def _decision_is_nonstanding(conn: sqlite3.Connection, msg_id: str) -> bool:
+    row = conn.execute(
+        "SELECT kind, standing FROM debate_messages WHERE msg_id = ?",
+        (msg_id,),
+    ).fetchone()
+    return bool(row and row["kind"] == "DECISION" and row["standing"] == 0)
+
+
+def _worker_claim_exists(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
+) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM debate_worker_claims "
+            "WHERE topic_id = ? AND role = ? AND trigger_msg_id = ? LIMIT 1",
+            (topic_id, role, trigger_msg_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _complete_nonstanding_decision_claims_for_reply(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    kind: str,
+    reply_to: str | None,
+    ack_msg_id: str,
+    now: str,
+) -> None:
+    if kind not in ("A", "STATUS") or reply_to is None:
+        return
+    if not _decision_is_nonstanding(conn, reply_to):
+        return
+    conn.execute(
+        "INSERT INTO debate_message_claims "
+        "(msg_id, role, owner_session_id, state, claimed_at, heartbeat_at, "
+        " completed_at, ack_msg_id) "
+        "VALUES (?, ?, NULL, 'done', ?, ?, ?, ?) "
+        "ON CONFLICT(msg_id, role) DO UPDATE SET "
+        "state = 'done', heartbeat_at = excluded.heartbeat_at, "
+        "completed_at = COALESCE(debate_message_claims.completed_at, excluded.completed_at), "
+        "ack_msg_id = COALESCE(debate_message_claims.ack_msg_id, excluded.ack_msg_id)",
+        (reply_to, role, now, now, now, ack_msg_id),
+    )
+
+
+def _claim_row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    out = dict(row)
+    if out.get("details_json"):
+        out["details"] = json_loads(out["details_json"])
+    else:
+        out["details"] = None
+    out.pop("details_json", None)
+    return out
+
+
+def _worker_claim_for_session(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM debate_worker_claims "
+        "WHERE topic_id = ? AND role = ? AND worker_session_id = ? "
+        "ORDER BY claimed_at DESC LIMIT 1",
+        (topic_id, role, worker_session_id),
+    ).fetchone()
+
+
+def _validate_worker_claim_for_signal(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+) -> sqlite3.Row:
+    parent_session_id = worker_parent_session_id(worker_session_id)
+    if parent_session_id is None:
+        raise DebateError(
+            f"worker_session_invalid: {worker_session_id}",
+            error_type="worker_session_invalid",
+        )
+    claim = _worker_claim_for_session(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=worker_session_id,
+    )
+    if claim is None or claim["parent_session_id"] != parent_session_id:
+        raise DebateError(
+            f"worker_claim_required: {worker_session_id}",
+            error_type="worker_claim_required",
+        )
+    parent_binding = _binding_for_session(conn, topic_id, role, parent_session_id)
+    if parent_binding is None or parent_binding["state"] != "active":
+        raise DebateError(
+            f"worker_parent_binding_inactive: {parent_session_id}",
+            error_type="worker_parent_binding_inactive",
+        )
+    return claim
+
+
+def claim_worker_session(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    parent_session_id: str,
+    trigger_msg_id: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Idempotently allocate a derived ``-W<n>`` worker for one trigger.
+
+    The parent binding remains the role authority. This row is a scoped
+    execution claim only; workers get their own cursor and inherit read
+    access from the active parent binding.
+    """
+    validate_topic_id(topic_id)
+    validate_role(role)
+    validate_parent_session_id(parent_session_id)
+    validate_msg_id(trigger_msg_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    _validate_role_for_debate(debate, topic_id, role)
+    parent_binding = _binding_for_session(conn, topic_id, role, parent_session_id)
+    if parent_binding is None or parent_binding["state"] != "active":
+        raise DebateError(
+            f"worker_parent_binding_inactive: {parent_session_id}",
+            error_type="worker_parent_binding_inactive",
+        )
+    trigger = conn.execute(
+        "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+        (trigger_msg_id,),
+    ).fetchone()
+    if trigger is None or trigger["topic_id"] != topic_id:
+        raise DebateError(
+            f"worker_trigger_unknown: {trigger_msg_id}",
+            error_type="worker_trigger_unknown",
+        )
+    addressed = conn.execute(
+        "SELECT 1 FROM debate_message_recipients "
+        "WHERE msg_id = ? AND recipient IN (?, ?) LIMIT 1",
+        (trigger_msg_id, role, parent_session_id),
+    ).fetchone()
+    if addressed is None:
+        raise DebateError(
+            f"worker_trigger_unaddressed: {trigger_msg_id}",
+            error_type="worker_trigger_unaddressed",
+        )
+
+    now = now_iso()
+    existing = conn.execute(
+        "SELECT * FROM debate_worker_claims "
+        "WHERE topic_id = ? AND role = ? AND parent_session_id = ? "
+        "AND trigger_msg_id = ?",
+        (topic_id, role, parent_session_id, trigger_msg_id),
+    ).fetchone()
+    if existing is not None:
+        if existing["state"] == "active":
+            conn.execute(
+                "UPDATE debate_worker_claims SET heartbeat_at = ? "
+                "WHERE topic_id = ? AND role = ? AND parent_session_id = ? "
+                "AND trigger_msg_id = ?",
+                (now, topic_id, role, parent_session_id, trigger_msg_id),
+            )
+            existing = conn.execute(
+                "SELECT * FROM debate_worker_claims "
+                "WHERE topic_id = ? AND role = ? AND parent_session_id = ? "
+                "AND trigger_msg_id = ?",
+                (topic_id, role, parent_session_id, trigger_msg_id),
+            ).fetchone()
+        out = _claim_row_dict(existing)
+        out["duplicate"] = True
+        out["no_action"] = existing["state"] != "active"
+        return out
+
+    source_cursor = conn.execute(
+        "SELECT last_processed_msg_id, last_processed_ts "
+        "FROM debate_signal_state "
+        "WHERE session_id = ? AND role = ? AND topic_id = ?",
+        (parent_session_id, role, topic_id),
+    ).fetchone()
+    counter = conn.execute(
+        "SELECT next_worker_n FROM debate_worker_counters "
+        "WHERE topic_id = ? AND role = ? AND parent_session_id = ?",
+        (topic_id, role, parent_session_id),
+    ).fetchone()
+    if counter is None:
+        worker_n = 1
+        conn.execute(
+            "INSERT INTO debate_worker_counters "
+            "(topic_id, role, parent_session_id, next_worker_n, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (topic_id, role, parent_session_id, 2, now),
+        )
+    else:
+        worker_n = int(counter["next_worker_n"])
+        conn.execute(
+            "UPDATE debate_worker_counters SET next_worker_n = ?, updated_at = ? "
+            "WHERE topic_id = ? AND role = ? AND parent_session_id = ?",
+            (worker_n + 1, now, topic_id, role, parent_session_id),
+        )
+    worker_session_id = f"{parent_session_id}-W{worker_n}"
+    conn.execute(
+        "INSERT INTO debate_worker_claims "
+        "(topic_id, role, parent_session_id, trigger_msg_id, "
+        " worker_session_id, state, parent_cursor_msg_id, parent_cursor_ts, "
+        " claimed_at, heartbeat_at, completed_at, ack_msg_id, details_json) "
+        "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, NULL, ?)",
+        (
+            topic_id,
+            role,
+            parent_session_id,
+            trigger_msg_id,
+            worker_session_id,
+            source_cursor["last_processed_msg_id"] if source_cursor else None,
+            source_cursor["last_processed_ts"] if source_cursor else None,
+            now,
+            now,
+            json_dumps(details or {}),
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM debate_worker_claims "
+        "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+        (topic_id, role, worker_session_id),
+    ).fetchone()
+    out = _claim_row_dict(row)
+    out["duplicate"] = False
+    out["no_action"] = False
+    return out
+
+
+def _complete_worker_claim_if_terminal(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+    now: str,
+) -> dict[str, Any] | None:
+    if not is_worker_session_id(worker_session_id):
+        return None
+    claim = _validate_worker_claim_for_signal(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=worker_session_id,
+    )
+    if claim["state"] != "active":
+        return _claim_row_dict(claim)
+    ack = _terminal_reply_for_trigger(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        trigger_msg_id=claim["trigger_msg_id"],
+    )
+    if ack is None:
+        return _claim_row_dict(claim)
+    conn.execute(
+        "UPDATE debate_worker_claims SET state = 'completed', "
+        "completed_at = ?, heartbeat_at = ?, ack_msg_id = ? "
+        "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+        (now, now, ack["msg_id"], topic_id, role, worker_session_id),
+    )
+    row = _worker_claim_for_session(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=worker_session_id,
+    )
+    return _claim_row_dict(row)
+
+
+def reap_worker_claims(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    older_than_ts: str,
+) -> dict[str, Any]:
+    """Retire completed/closed worker claims older than ``older_than_ts``.
+
+    This is deliberately explicit. There is no background cleanup path that
+    could erase recovery evidence without an audit row.
+    """
+    validate_topic_id(topic_id)
+    validate_iso_utc(older_than_ts)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    rows = conn.execute(
+        "SELECT * FROM debate_worker_claims "
+        "WHERE topic_id = ? AND state IN ('completed', 'retired') "
+        "AND heartbeat_at < ? "
+        "ORDER BY heartbeat_at ASC, worker_session_id ASC",
+        (topic_id, older_than_ts),
+    ).fetchall()
+    now = now_iso()
+    reaped: list[dict[str, Any]] = []
+    for row in rows:
+        reap_id = new_msg_id()
+        while conn.execute(
+            "SELECT 1 FROM debate_worker_reap_log WHERE reap_id = ? LIMIT 1",
+            (reap_id,),
+        ).fetchone():
+            reap_id = new_msg_id()
+        details = {
+            "state": row["state"],
+            "completed_at": row["completed_at"],
+            "ack_msg_id": row["ack_msg_id"],
+        }
+        conn.execute(
+            "INSERT INTO debate_worker_reap_log "
+            "(reap_id, topic_id, role, parent_session_id, worker_session_id, "
+            " trigger_msg_id, result, details_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'reaped', ?, ?)",
+            (
+                reap_id,
+                row["topic_id"],
+                row["role"],
+                row["parent_session_id"],
+                row["worker_session_id"],
+                row["trigger_msg_id"],
+                json_dumps(details),
+                now,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM debate_worker_claims "
+            "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+            (row["topic_id"], row["role"], row["worker_session_id"]),
+        )
+        reaped.append(
+            {
+                "reap_id": reap_id,
+                "role": row["role"],
+                "worker_session_id": row["worker_session_id"],
+                "trigger_msg_id": row["trigger_msg_id"],
+            }
+        )
+    return {
+        "topic_id": topic_id,
+        "topic_state": debate["state"],
+        "older_than_ts": older_than_ts,
+        "reaped": reaped,
+        "count": len(reaped),
+    }
+
+
 # ── DAO: messages ─────────────────────────────────────────────────────
 
 
@@ -430,6 +836,7 @@ def post_message(
     kind: str,
     body: str,
     reply_to: str | None = None,
+    standing: bool | None = None,
 ) -> dict[str, Any]:
     """Append a message to a debate. Validates topic state, role membership,
     enums, and all kind-specific semantics BEFORE the INSERT (atomicity
@@ -469,10 +876,11 @@ def post_message(
         )
 
     parent_kind: str | None = None
+    parent_standing: int | None = None
     if reply_to is not None:
         validate_msg_id(reply_to)
         parent = conn.execute(
-            "SELECT topic_id, kind FROM debate_messages WHERE msg_id = ?",
+            "SELECT topic_id, kind, standing FROM debate_messages WHERE msg_id = ?",
             (reply_to,),
         ).fetchone()
         if parent is None:
@@ -482,6 +890,7 @@ def post_message(
                 f"reply_to_cross_topic: {reply_to} not in {topic_id}"
             )
         parent_kind = parent["kind"]
+        parent_standing = parent["standing"]
 
     # ── Kind-specific PRE-INSERT validation (atomicity fix bf45a126) ──
     new_state_target: str | None = None
@@ -566,10 +975,29 @@ def post_message(
                 )
             watermark_resolved = (wm_msg_id, ref_msg["ts"])
 
+    standing_db = _standing_to_db(standing)
+
     if kind == "DECISION" and reply_to is not None and parent_kind != "Q":
         raise DebateError(
             f"decision_reply_to_must_be_Q: parent kind={parent_kind!r}"
         )
+
+    if kind in ("A", "STATUS") and reply_to is not None:
+        one_shot_parent = (
+            (parent_kind == "DECISION" and parent_standing == 0)
+            or _worker_claim_exists(
+                conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
+            )
+        )
+        if one_shot_parent:
+            existing_terminal = _terminal_reply_for_trigger(
+                conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
+            )
+            if existing_terminal is not None:
+                raise DebateError(
+                    f"terminal_reply_duplicate: {reply_to}",
+                    error_type="terminal_reply_duplicate",
+                )
 
     if kind == "COMPACTION" and not _OODA_RE.search(body):
         raise DebateError(
@@ -589,8 +1017,29 @@ def post_message(
 
     conn.execute(
         "INSERT INTO debate_messages (msg_id, topic_id, role, ts, priority, "
-        "kind, reply_to, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (msg_id, topic_id, role, ts, priority, kind, reply_to, body, ts),
+        "kind, standing, reply_to, body, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            msg_id,
+            topic_id,
+            role,
+            ts,
+            priority,
+            kind,
+            standing_db,
+            reply_to,
+            body,
+            ts,
+        ),
+    )
+    _complete_nonstanding_decision_claims_for_reply(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        kind=kind,
+        reply_to=reply_to,
+        ack_msg_id=msg_id,
+        now=ts,
     )
 
     new_state = debate["state"]
@@ -766,7 +1215,7 @@ def read_messages(
     fetch_limit = effective_limit + 1  # one extra row to detect truncation
     rows = conn.execute(
         f"SELECT msg_id, topic_id, role, ts, priority, kind, reply_to, "
-        f"body, created_at FROM debate_messages {where_sql} "
+        f"standing, body, created_at FROM debate_messages {where_sql} "
         f"ORDER BY ts ASC, msg_id ASC LIMIT ?",
         [*params, fetch_limit],
     ).fetchall()
@@ -1461,6 +1910,7 @@ def debate_post_with_recipients(
     diagnostic_to: list[str] | None = None,
     conductor_override_msg_id: str | None = None,
     reply_to: str | None = None,
+    standing: bool | None = None,
 ) -> dict[str, Any]:
     """Atomic insert: debate_messages row + per-recipient
     debate_message_recipients rows.
@@ -1565,6 +2015,7 @@ def debate_post_with_recipients(
         kind=kind,
         body=body,
         reply_to=reply_to,
+        standing=standing,
     )
     msg_id = post_result["msg_id"]
     for recipient in deduped:
@@ -1623,6 +2074,17 @@ def _signal_recipients_for_binding(
     role: str,
     session_id: str,
 ) -> list[str]:
+    if is_worker_session_id(session_id):
+        claim = _validate_worker_claim_for_signal(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            worker_session_id=session_id,
+        )
+        if claim["state"] == "active":
+            return [role, session_id]
+        return []
+
     binding_count = _binding_count(conn, topic_id, role)
     if binding_count == 0:
         # Legacy topics without a binding registry keep v3.9.x behavior.
@@ -1657,6 +2119,60 @@ def _validate_signal_limit(limit: int) -> int:
             error_type="limit_out_of_range",
         )
     return limit
+
+
+def _claim_or_filter_nonstanding_decision(
+    conn: sqlite3.Connection,
+    *,
+    msg: sqlite3.Row,
+    role: str,
+    session_id: str,
+) -> bool:
+    if msg["kind"] != "DECISION" or msg["standing"] != 0:
+        return True
+    msg_id = msg["msg_id"]
+    ack = _terminal_reply_for_trigger(
+        conn, topic_id=msg["topic_id"], role=role, trigger_msg_id=msg_id
+    )
+    if ack is not None:
+        now = now_iso()
+        conn.execute(
+            "INSERT INTO debate_message_claims "
+            "(msg_id, role, owner_session_id, state, claimed_at, heartbeat_at, "
+            " completed_at, ack_msg_id) "
+            "VALUES (?, ?, NULL, 'done', ?, ?, ?, ?) "
+            "ON CONFLICT(msg_id, role) DO UPDATE SET "
+            "state = 'done', heartbeat_at = excluded.heartbeat_at, "
+            "completed_at = COALESCE(debate_message_claims.completed_at, excluded.completed_at), "
+            "ack_msg_id = COALESCE(debate_message_claims.ack_msg_id, excluded.ack_msg_id)",
+            (msg_id, role, now, now, now, ack["msg_id"]),
+        )
+        return False
+
+    now = now_iso()
+    claim = conn.execute(
+        "SELECT * FROM debate_message_claims WHERE msg_id = ? AND role = ?",
+        (msg_id, role),
+    ).fetchone()
+    if claim is None:
+        conn.execute(
+            "INSERT INTO debate_message_claims "
+            "(msg_id, role, owner_session_id, state, claimed_at, heartbeat_at, "
+            " completed_at, ack_msg_id) "
+            "VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL)",
+            (msg_id, role, session_id, now, now),
+        )
+        return True
+    if claim["state"] == "done":
+        return False
+    if claim["owner_session_id"] == session_id:
+        conn.execute(
+            "UPDATE debate_message_claims SET heartbeat_at = ? "
+            "WHERE msg_id = ? AND role = ?",
+            (now, msg_id, role),
+        )
+        return True
+    return False
 
 
 def debate_signal_check(
@@ -1699,6 +2215,14 @@ def debate_signal_check(
     """
     effective_limit = _validate_signal_limit(limit)
     debate = _validate_signal_caller(session_id, role, topic_id, conn)
+    worker_claim: sqlite3.Row | None = None
+    if is_worker_session_id(session_id):
+        worker_claim = _validate_worker_claim_for_signal(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            worker_session_id=session_id,
+        )
 
     cursor_ts: str | None = None
     cursor_msg_id: str = ""
@@ -1736,6 +2260,10 @@ def debate_signal_check(
             cursor_ts = state_row["last_processed_ts"]
             cursor_msg_id = state_row["last_processed_msg_id"] or ""
             cursor_from_state = True
+        elif worker_claim is not None and worker_claim["parent_cursor_ts"]:
+            cursor_ts = worker_claim["parent_cursor_ts"]
+            cursor_msg_id = worker_claim["parent_cursor_msg_id"] or ""
+            cursor_from_state = True
 
     signal_recipients = _signal_recipients_for_binding(
         conn, topic_id=topic_id, role=role, session_id=session_id
@@ -1770,11 +2298,17 @@ def debate_signal_check(
         else:
             cursor_clause = "(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))"
             if cursor_from_state:
-                standing_placeholders = ",".join(
-                    "?" for _ in STANDING_SIGNAL_KINDS
-                )
                 where.append(
-                    f"({cursor_clause} OR m.kind IN ({standing_placeholders}))"
+                    f"({cursor_clause} "
+                    "OR m.standing = 1 "
+                    "OR (m.standing IS NULL AND "
+                    f"m.kind IN ({','.join('?' for _ in STANDING_SIGNAL_KINDS)})) "
+                    "OR (m.kind = 'DECISION' AND m.standing = 0 "
+                    "AND NOT EXISTS ("
+                    " SELECT 1 FROM debate_message_claims c "
+                    " WHERE c.msg_id = m.msg_id AND c.role = ? "
+                    " AND c.state = 'done'"
+                    ")))"
                 )
                 params.extend(
                     [
@@ -1782,6 +2316,7 @@ def debate_signal_check(
                         cursor_ts,
                         cursor_msg_id,
                         *STANDING_SIGNAL_KINDS,
+                        role,
                     ]
                 )
             else:
@@ -1791,7 +2326,7 @@ def debate_signal_check(
     fetch_limit = effective_limit + 1  # +1 to detect truncation
     rows = conn.execute(
         "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
-        "m.reply_to, m.body, m.created_at "
+        "m.reply_to, m.standing, m.body, m.created_at "
         "FROM debate_messages m "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
@@ -1801,7 +2336,13 @@ def debate_signal_check(
     truncated = len(rows) > effective_limit
     if truncated:
         rows = rows[:effective_limit]
-    pending = [dict(r) for r in rows]
+    pending = [
+        dict(r)
+        for r in rows
+        if _claim_or_filter_nonstanding_decision(
+            conn, msg=r, role=role, session_id=session_id
+        )
+    ]
 
     next_cursor: dict[str, str] | None = None
     if truncated and pending:
@@ -1939,8 +2480,15 @@ def debate_signal_advance(
         "last_check_at = excluded.last_check_at",
         (session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
     )
+    worker_claim = _complete_worker_claim_if_terminal(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=session_id,
+        now=now,
+    )
 
-    return {
+    out = {
         "session_id": session_id,
         "role": role,
         "topic_id": topic_id,
@@ -1948,6 +2496,9 @@ def debate_signal_advance(
         "last_processed_ts": ref["ts"],
         "last_check_at": now,
     }
+    if worker_claim is not None:
+        out["worker_claim"] = worker_claim
+    return out
 
 
 # ── v3.10: dry-run wake target resolution/audit ────────────────────────

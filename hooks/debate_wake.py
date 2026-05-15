@@ -142,6 +142,7 @@ def _agent_command(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -
                 "mcp__sqlite_intel__debate_post_with_recipients",
                 "mcp__sqlite_intel__debate_signal_advance",
                 "mcp__sqlite_intel__debate_binding_list",
+                "mcp__sqlite_intel__debate_worker_claim",
             ]
         )
         return [
@@ -182,6 +183,7 @@ def _record_real_spawn(
     action = os.environ.get("DEBATE_WAKE_SPAWN_ACTION_NAME", "external_agent_spawn")
     source_action = os.environ.get("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
     target_session_id = str(target.get("target_session_id") or "")
+    source_target_session_id = str(target.get("source_target_session_id") or target_session_id)
     target_role = str(target.get("target_role") or "")
     target_runtime = str(target.get("target_runtime") or "")
     launched_at = now_iso()
@@ -192,7 +194,7 @@ def _record_real_spawn(
                 "SELECT wake_id FROM debate_wake_log "
                 "WHERE trigger_msg_id = ? AND target_session_id = ? "
                 "AND action = ? ORDER BY created_at DESC LIMIT 1",
-                (trigger_msg_id, target_session_id, source_action),
+                (trigger_msg_id, source_target_session_id, source_action),
             ).fetchone()
             wake_id = new_msg_id()
             while conn.execute(
@@ -207,6 +209,9 @@ def _record_real_spawn(
                 "log": str(log_path),
                 "launched_at": launched_at,
                 "source_action": source_action,
+                "source_target_session_id": source_target_session_id,
+                "parent_session_id": target.get("parent_session_id"),
+                "worker_claim": target.get("worker_claim"),
             }
             conn.execute(
                 "INSERT OR IGNORE INTO debate_wake_log "
@@ -243,7 +248,56 @@ def _record_real_spawn(
         return None
 
 
+def _claim_worker_target(
+    target: dict[str, Any], trigger_msg_id: str, topic_id: str
+) -> dict[str, Any]:
+    """Convert a role wake target into an idempotent derived worker target."""
+    if target.get("recipient") != target.get("target_role"):
+        return target
+    parent_session_id = str(target.get("target_session_id") or "")
+    role = str(target.get("target_role") or "")
+    if not parent_session_id or not role:
+        return target
+
+    sys.path.insert(0, str(REPO))
+    try:
+        from db_utils import get_conn_immediate
+        from debate import claim_worker_session
+    except Exception as exc:
+        _log("worker_claim_import_failed", msg_id=trigger_msg_id, error=repr(exc))
+        return {**target, "claim_error": "import_failed"}
+
+    try:
+        with get_conn_immediate() as conn:
+            claim = claim_worker_session(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                parent_session_id=parent_session_id,
+                trigger_msg_id=trigger_msg_id,
+                details={"source": "debate_wake_hook"},
+            )
+    except Exception as exc:
+        _log("worker_claim_failed", msg_id=trigger_msg_id, error=repr(exc), target=target)
+        return {**target, "claim_error": repr(exc)}
+
+    out = dict(target)
+    out["source_target_session_id"] = parent_session_id
+    out["parent_session_id"] = parent_session_id
+    out["target_session_id"] = claim["worker_session_id"]
+    out["worker_claim"] = claim
+    if claim.get("no_action"):
+        out["result"] = "worker_claim_completed"
+    return out
+
+
 def _launch_agent(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> dict[str, Any]:
+    target = _claim_worker_target(target, trigger_msg_id, topic_id)
+    if target.get("result") == "worker_claim_completed":
+        return {"launched": False, "reason": "worker_claim_completed", "target": target}
+    if target.get("claim_error"):
+        return {"launched": False, "reason": "worker_claim_failed", "target": target}
+
     cmd = _agent_command(target, trigger_msg_id, topic_id)
     if cmd is None:
         return {"launched": False, "reason": "unsupported_runtime"}

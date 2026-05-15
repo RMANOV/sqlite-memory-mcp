@@ -73,6 +73,7 @@ from debate import (
     DebateError as _DebateError,
     advance_watermark as _debate_advance_watermark_dao,
     bind_role_session as _debate_bind_role_session_dao,
+    claim_worker_session as _debate_claim_worker_session_dao,
     compact as _debate_compact,
     debate_post_with_recipients as _debate_post_with_recipients_dao,
     debate_signal_advance as _debate_signal_advance_dao,
@@ -83,6 +84,7 @@ from debate import (
     post_message as _debate_post_dao,
     prepare_wake_dry_run as _debate_prepare_wake_dry_run_dao,
     read_messages as _debate_read_dao,
+    reap_worker_claims as _debate_reap_worker_claims_dao,
     rotate_role_binding as _debate_rotate_role_binding_dao,
     transition_state as _debate_transition_dao,
 )
@@ -1236,6 +1238,7 @@ def debate_post(
     kind: str,
     body: str,
     reply_to: str = "",
+    standing: bool | None = None,
 ) -> str:
     """Append a message to a debate. Validates kind-specific semantics
     BEFORE the INSERT (atomic — failed validation leaves no row).
@@ -1249,11 +1252,12 @@ def debate_post(
         reply_to: optional msg_id in same topic.
     """
     try:
-        with _get_conn() as conn:
+        with _get_conn_immediate() as conn:
             out = _debate_post_dao(
                 conn,
                 topic_id=topic_id, role=role, priority=priority,
                 kind=kind, body=body, reply_to=reply_to or None,
+                standing=standing,
             )
             return json.dumps(out)
     except _DebateError as exc:
@@ -1441,6 +1445,7 @@ def debate_post_with_recipients(
     diagnostic_to_csv: str = "",
     conductor_override_msg_id: str = "",
     reply_to: str = "",
+    standing: bool | None = None,
 ) -> str:
     """Post an addressed message: debate_messages + debate_message_recipients
     in a single atomic transaction.
@@ -1472,6 +1477,7 @@ def debate_post_with_recipients(
                 diagnostic_to=diagnostic_to,
                 conductor_override_msg_id=conductor_override_msg_id or None,
                 reply_to=reply_to or None,
+                standing=standing,
             )
             return json.dumps(out)
     except _DebateError as exc:
@@ -1505,9 +1511,9 @@ def debate_signal_check(
     short-circuit logic, plus topic_state.
     """
     try:
-        # v3.9.3: signal_check stays on regular get_conn (read path —
-        # deferred snapshot is correct semantically per amendment 1A).
-        with _get_conn() as conn:
+        # v3.11: non-standing DECISION delivery performs atomic one-shot
+        # claim writes, so signal_check now needs BEGIN IMMEDIATE.
+        with _get_conn_immediate() as conn:
             out = _debate_signal_check_dao(
                 conn,
                 session_id=session_id, role=role, topic_id=topic_id,
@@ -1702,6 +1708,54 @@ def debate_wake_dry_run(tool_response_json: str, action: str = "dry_run_wake") -
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_wake_dry_run failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 40: debate_worker_claim (v3.11 wake worker identity)
+@mcp.tool()
+def debate_worker_claim(
+    topic_id: str,
+    role: str,
+    parent_session_id: str,
+    trigger_msg_id: str,
+    details_json: str = "",
+) -> str:
+    """Idempotently allocate/reuse a derived -W<n> worker for one trigger."""
+    try:
+        details = json.loads(details_json) if details_json else None
+        with _get_conn_immediate() as conn:
+            out = _debate_claim_worker_session_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                parent_session_id=parent_session_id,
+                trigger_msg_id=trigger_msg_id,
+                details=details,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_worker_claim failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 41: debate_worker_reap (v3.11 worker retention cleanup)
+@mcp.tool()
+def debate_worker_reap(topic_id: str, older_than_ts: str) -> str:
+    """Retire old completed worker claims and leave audit evidence."""
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_reap_worker_claims_dao(
+                conn,
+                topic_id=topic_id,
+                older_than_ts=older_than_ts,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_worker_reap failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

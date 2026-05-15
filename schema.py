@@ -720,6 +720,8 @@ CREATE TABLE IF NOT EXISTS debate_messages (
     kind       TEXT NOT NULL
         CHECK (kind IN ('Q', 'A', 'STATUS', 'DECISION', 'PING',
                         'WATERMARK', 'STATE', 'COMPACTION')),
+    standing   INTEGER DEFAULT NULL
+        CHECK (standing IS NULL OR standing IN (0, 1)),
     reply_to   TEXT REFERENCES debate_messages(msg_id) ON DELETE SET NULL,
     body       TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -830,6 +832,71 @@ CREATE INDEX IF NOT EXISTS idx_dwl_topic_created
 CREATE UNIQUE INDEX IF NOT EXISTS idx_dwl_once
     ON debate_wake_log(trigger_msg_id, target_session_id, action)
     WHERE target_session_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS debate_worker_counters (
+    topic_id          TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role              TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    next_worker_n     INTEGER NOT NULL DEFAULT 1,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (topic_id, role, parent_session_id)
+);
+
+CREATE TABLE IF NOT EXISTS debate_worker_claims (
+    topic_id             TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role                 TEXT NOT NULL,
+    parent_session_id    TEXT NOT NULL,
+    trigger_msg_id       TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    worker_session_id    TEXT NOT NULL,
+    state                TEXT NOT NULL
+        CHECK (state IN ('active', 'completed', 'retired')),
+    parent_cursor_msg_id TEXT,
+    parent_cursor_ts     TEXT,
+    claimed_at           TEXT NOT NULL,
+    heartbeat_at         TEXT NOT NULL,
+    completed_at         TEXT,
+    ack_msg_id           TEXT,
+    details_json         TEXT,
+    PRIMARY KEY (topic_id, role, parent_session_id, trigger_msg_id),
+    UNIQUE (topic_id, role, worker_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dwc_worker
+    ON debate_worker_claims(worker_session_id);
+CREATE INDEX IF NOT EXISTS idx_dwc_trigger
+    ON debate_worker_claims(trigger_msg_id);
+CREATE INDEX IF NOT EXISTS idx_dwc_state
+    ON debate_worker_claims(topic_id, role, state);
+
+CREATE TABLE IF NOT EXISTS debate_message_claims (
+    msg_id           TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    role             TEXT NOT NULL,
+    owner_session_id TEXT,
+    state            TEXT NOT NULL
+        CHECK (state IN ('active', 'done')),
+    claimed_at       TEXT NOT NULL,
+    heartbeat_at     TEXT NOT NULL,
+    completed_at     TEXT,
+    ack_msg_id       TEXT,
+    PRIMARY KEY (msg_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_dmc_owner
+    ON debate_message_claims(owner_session_id);
+CREATE INDEX IF NOT EXISTS idx_dmc_state
+    ON debate_message_claims(state);
+
+CREATE TABLE IF NOT EXISTS debate_worker_reap_log (
+    reap_id           TEXT PRIMARY KEY,
+    topic_id          TEXT NOT NULL,
+    role              TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    worker_session_id TEXT NOT NULL,
+    trigger_msg_id    TEXT NOT NULL,
+    result            TEXT NOT NULL,
+    details_json      TEXT,
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dwrl_topic_created
+    ON debate_worker_reap_log(topic_id, created_at);
 
 -- ── Memory Reflection (Phase 1) ─────────────────────────────────────────
 -- Reviewable memory consolidation runs. Async job model with state machine
@@ -1707,6 +1774,103 @@ _MIGRATIONS = [
             WHERE target_session_id IS NOT NULL;
         """,
         "debate_wake_log table and indexes (v3.10)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('debate_messages') "
+        "WHERE name='standing'",
+        "ALTER TABLE debate_messages "
+        "ADD COLUMN standing INTEGER DEFAULT NULL "
+        "CHECK (standing IS NULL OR standing IN (0, 1))",
+        "debate_messages.standing column (v3.11)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='debate_worker_counters'",
+        """
+        CREATE TABLE debate_worker_counters (
+            topic_id          TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+            role              TEXT NOT NULL,
+            parent_session_id TEXT NOT NULL,
+            next_worker_n     INTEGER NOT NULL DEFAULT 1,
+            updated_at        TEXT NOT NULL,
+            PRIMARY KEY (topic_id, role, parent_session_id)
+        );
+        """,
+        "debate_worker_counters table (v3.11)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='debate_worker_claims'",
+        """
+        CREATE TABLE debate_worker_claims (
+            topic_id             TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+            role                 TEXT NOT NULL,
+            parent_session_id    TEXT NOT NULL,
+            trigger_msg_id       TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+            worker_session_id    TEXT NOT NULL,
+            state                TEXT NOT NULL
+                CHECK (state IN ('active', 'completed', 'retired')),
+            parent_cursor_msg_id TEXT,
+            parent_cursor_ts     TEXT,
+            claimed_at           TEXT NOT NULL,
+            heartbeat_at         TEXT NOT NULL,
+            completed_at         TEXT,
+            ack_msg_id           TEXT,
+            details_json         TEXT,
+            PRIMARY KEY (topic_id, role, parent_session_id, trigger_msg_id),
+            UNIQUE (topic_id, role, worker_session_id)
+        );
+        CREATE INDEX idx_dwc_worker
+            ON debate_worker_claims(worker_session_id);
+        CREATE INDEX idx_dwc_trigger
+            ON debate_worker_claims(trigger_msg_id);
+        CREATE INDEX idx_dwc_state
+            ON debate_worker_claims(topic_id, role, state);
+        """,
+        "debate_worker_claims table and indexes (v3.11)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='debate_message_claims'",
+        """
+        CREATE TABLE debate_message_claims (
+            msg_id           TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+            role             TEXT NOT NULL,
+            owner_session_id TEXT,
+            state            TEXT NOT NULL
+                CHECK (state IN ('active', 'done')),
+            claimed_at       TEXT NOT NULL,
+            heartbeat_at     TEXT NOT NULL,
+            completed_at     TEXT,
+            ack_msg_id       TEXT,
+            PRIMARY KEY (msg_id, role)
+        );
+        CREATE INDEX idx_dmc_owner
+            ON debate_message_claims(owner_session_id);
+        CREATE INDEX idx_dmc_state
+            ON debate_message_claims(state);
+        """,
+        "debate_message_claims table and indexes (v3.11)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='debate_worker_reap_log'",
+        """
+        CREATE TABLE debate_worker_reap_log (
+            reap_id           TEXT PRIMARY KEY,
+            topic_id          TEXT NOT NULL,
+            role              TEXT NOT NULL,
+            parent_session_id TEXT NOT NULL,
+            worker_session_id TEXT NOT NULL,
+            trigger_msg_id    TEXT NOT NULL,
+            result            TEXT NOT NULL,
+            details_json      TEXT,
+            created_at        TEXT NOT NULL
+        );
+        CREATE INDEX idx_dwrl_topic_created
+            ON debate_worker_reap_log(topic_id, created_at);
+        """,
+        "debate_worker_reap_log table and indexes (v3.11)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='premium_artifact_manifests'",
