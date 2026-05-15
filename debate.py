@@ -16,6 +16,7 @@ validators + state machine.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import re
 import secrets
 import sqlite3
@@ -452,6 +453,38 @@ def _standing_to_db(standing: bool | None) -> int | None:
     return 1 if standing else 0
 
 
+def _parse_iso_utc_dt(value: str) -> datetime:
+    validate_iso_utc(value)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _validate_reclaim_cutoff(
+    older_than_ts: str, minimum_age_seconds: int
+) -> None:
+    if isinstance(minimum_age_seconds, bool) or not isinstance(
+        minimum_age_seconds, int
+    ):
+        raise DebateError(
+            "minimum_age_seconds must be int",
+            error_type="message_claim_reclaim_min_age_invalid",
+        )
+    if minimum_age_seconds < 0:
+        raise DebateError(
+            "minimum_age_seconds must be >= 0",
+            error_type="message_claim_reclaim_min_age_invalid",
+        )
+    cutoff = _parse_iso_utc_dt(older_than_ts)
+    safe_cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=minimum_age_seconds
+    )
+    if cutoff > safe_cutoff:
+        raise DebateError(
+            f"message_claim_reclaim_cutoff_too_recent: older_than_ts={older_than_ts} "
+            f"must be at least {minimum_age_seconds}s behind current UTC time",
+            error_type="message_claim_reclaim_cutoff_too_recent",
+        )
+
+
 def _terminal_reply_for_trigger(
     conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
 ) -> sqlite3.Row | None:
@@ -829,6 +862,7 @@ def reclaim_stale_message_claims(
     *,
     topic_id: str,
     older_than_ts: str,
+    minimum_age_seconds: int = 60,
 ) -> dict[str, Any]:
     """Return stale one-shot DECISION claims to claimable state.
 
@@ -837,7 +871,7 @@ def reclaim_stale_message_claims(
     reclaimed so a late cleanup cannot resurrect already-handled work.
     """
     validate_topic_id(topic_id)
-    validate_iso_utc(older_than_ts)
+    _validate_reclaim_cutoff(older_than_ts, minimum_age_seconds)
     debate = get_debate(conn, topic_id)
     if debate is None:
         raise DebateError(
@@ -878,6 +912,7 @@ def reclaim_stale_message_claims(
             "claimed_at": row["claimed_at"],
             "heartbeat_at": row["heartbeat_at"],
             "older_than_ts": older_than_ts,
+            "minimum_age_seconds": minimum_age_seconds,
             "ack_msg_id": ack["msg_id"] if ack else None,
         }
         if ack is not None:
@@ -933,6 +968,7 @@ def reclaim_stale_message_claims(
         "topic_id": topic_id,
         "topic_state": debate["state"],
         "older_than_ts": older_than_ts,
+        "minimum_age_seconds": minimum_age_seconds,
         "reclaimed": reclaimed,
         "completed": completed,
         "reclaimed_count": len(reclaimed),

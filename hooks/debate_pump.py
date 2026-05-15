@@ -16,7 +16,7 @@ import signal
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +155,46 @@ def _dispatch_row(row: sqlite3.Row, suppressed_roles: set[str]) -> None:
         _track_launched_children(before)
 
 
+def _claim_reclaim_cutoff(stale_seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _reclaim_stale_message_claims(
+    *,
+    topics: list[str],
+    stale_seconds: int,
+    minimum_age_seconds: int,
+) -> None:
+    if not topics or stale_seconds <= 0:
+        return
+    sys.path.insert(0, str(REPO))
+    from db_utils import get_conn_immediate
+    from debate import reclaim_stale_message_claims
+
+    older_than_ts = _claim_reclaim_cutoff(stale_seconds)
+    for topic_id in topics:
+        try:
+            with get_conn_immediate() as conn:
+                out = reclaim_stale_message_claims(
+                    conn,
+                    topic_id=topic_id,
+                    older_than_ts=older_than_ts,
+                    minimum_age_seconds=minimum_age_seconds,
+                )
+        except Exception as exc:
+            _log(
+                "message_claim_reclaim_failed",
+                topic_id=topic_id,
+                older_than_ts=older_than_ts,
+                error=repr(exc),
+            )
+            continue
+        if out.get("reclaimed_count") or out.get("completed_count"):
+            _log("message_claim_reclaim", **out)
+
+
 def _track_launched_children(before: set[int]) -> None:
     """Track direct child PIDs so the resident pump does not leave zombies."""
     try:
@@ -201,6 +241,24 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--since", default="")
     parser.add_argument(
+        "--message-claim-reclaim-seconds",
+        type=int,
+        default=int(os.environ.get("DEBATE_MESSAGE_CLAIM_RECLAIM_SECONDS", "900")),
+        help="reclaim standing=false DECISION claims older than this; <=0 disables",
+    )
+    parser.add_argument(
+        "--message-claim-reclaim-interval",
+        type=float,
+        default=float(os.environ.get("DEBATE_MESSAGE_CLAIM_RECLAIM_INTERVAL", "60")),
+        help="seconds between stale message-claim reclaim sweeps",
+    )
+    parser.add_argument(
+        "--message-claim-reclaim-min-age-seconds",
+        type=int,
+        default=int(os.environ.get("DEBATE_MESSAGE_CLAIM_RECLAIM_MIN_AGE_SECONDS", "120")),
+        help="DAO guard against too-recent reclaim cutoffs",
+    )
+    parser.add_argument(
         "--suppress-role",
         action="append",
         default=os.environ.get("DEBATE_PUMP_SUPPRESS_ROLES", "CONDUCTOR").split(","),
@@ -225,10 +283,25 @@ def main() -> int:
         last_msg_id=last_msg_id,
         action_kinds=action_kinds,
         suppressed_roles=sorted(suppressed_roles),
+        message_claim_reclaim_seconds=args.message_claim_reclaim_seconds,
+        message_claim_reclaim_interval=args.message_claim_reclaim_interval,
+        message_claim_reclaim_min_age_seconds=args.message_claim_reclaim_min_age_seconds,
     )
+    last_claim_reclaim_at = 0.0
 
     while not STOP:
         _reap_children()
+        if (
+            args.message_claim_reclaim_seconds > 0
+            and time.monotonic() - last_claim_reclaim_at
+            >= max(1.0, args.message_claim_reclaim_interval)
+        ):
+            _reclaim_stale_message_claims(
+                topics=topics,
+                stale_seconds=args.message_claim_reclaim_seconds,
+                minimum_age_seconds=args.message_claim_reclaim_min_age_seconds,
+            )
+            last_claim_reclaim_at = time.monotonic()
         try:
             rows = _fetch_new(last_ts, last_msg_id, topics, action_kinds, args.limit)
             for row in rows:

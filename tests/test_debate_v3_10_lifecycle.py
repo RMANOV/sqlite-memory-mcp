@@ -901,6 +901,18 @@ def test_stale_nonstanding_decision_claim_reclaim_completes_if_ack_exists(topic)
     assert audit["result"] == "completed_from_terminal"
 
 
+def test_message_claim_reclaim_rejects_too_recent_cutoff(topic):
+    conn, t = topic
+    with pytest.raises(DebateError) as exc_info:
+        reclaim_stale_message_claims(
+            conn,
+            topic_id=t,
+            older_than_ts="9999-01-01T00:00:00Z",
+            minimum_age_seconds=60,
+        )
+    assert exc_info.value.error_type == "message_claim_reclaim_cutoff_too_recent"
+
+
 def test_legacy_null_decision_stays_standing_after_cursor_advance(topic):
     conn, t = topic
     bind_role_session(

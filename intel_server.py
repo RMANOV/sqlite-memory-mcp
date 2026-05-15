@@ -1762,7 +1762,11 @@ def debate_worker_reap(topic_id: str, older_than_ts: str) -> str:
 
 # Tool 42: debate_message_claim_reclaim (v3.11.2 one-shot DECISION recovery)
 @mcp.tool()
-def debate_message_claim_reclaim(topic_id: str, older_than_ts: str) -> str:
+def debate_message_claim_reclaim(
+    topic_id: str,
+    older_than_ts: str,
+    minimum_age_seconds: int = 60,
+) -> str:
     """Reclaim stale active standing=false DECISION claims with audit rows."""
     try:
         with _get_conn_immediate() as conn:
@@ -1770,6 +1774,7 @@ def debate_message_claim_reclaim(topic_id: str, older_than_ts: str) -> str:
                 conn,
                 topic_id=topic_id,
                 older_than_ts=older_than_ts,
+                minimum_age_seconds=minimum_age_seconds,
             )
             return json.dumps(out)
     except _DebateError as exc:
