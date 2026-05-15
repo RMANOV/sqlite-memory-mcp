@@ -884,6 +884,19 @@ CREATE INDEX IF NOT EXISTS idx_dmc_owner
 CREATE INDEX IF NOT EXISTS idx_dmc_state
     ON debate_message_claims(state);
 
+CREATE TABLE IF NOT EXISTS debate_message_claim_reclaim_log (
+    reclaim_id       TEXT PRIMARY KEY,
+    msg_id           TEXT NOT NULL,
+    topic_id         TEXT NOT NULL,
+    role             TEXT NOT NULL,
+    owner_session_id TEXT,
+    result           TEXT NOT NULL,
+    details_json     TEXT,
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dmcrl_topic_created
+    ON debate_message_claim_reclaim_log(topic_id, created_at);
+
 CREATE TABLE IF NOT EXISTS debate_worker_reap_log (
     reap_id           TEXT PRIMARY KEY,
     topic_id          TEXT NOT NULL,
@@ -1851,6 +1864,25 @@ _MIGRATIONS = [
             ON debate_message_claims(state);
         """,
         "debate_message_claims table and indexes (v3.11)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='debate_message_claim_reclaim_log'",
+        """
+        CREATE TABLE debate_message_claim_reclaim_log (
+            reclaim_id       TEXT PRIMARY KEY,
+            msg_id           TEXT NOT NULL,
+            topic_id         TEXT NOT NULL,
+            role             TEXT NOT NULL,
+            owner_session_id TEXT,
+            result           TEXT NOT NULL,
+            details_json     TEXT,
+            created_at       TEXT NOT NULL
+        );
+        CREATE INDEX idx_dmcrl_topic_created
+            ON debate_message_claim_reclaim_log(topic_id, created_at);
+        """,
+        "debate_message_claim_reclaim_log table and index (v3.11.2)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' "

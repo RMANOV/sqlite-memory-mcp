@@ -824,6 +824,122 @@ def reap_worker_claims(
     }
 
 
+def reclaim_stale_message_claims(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    older_than_ts: str,
+) -> dict[str, Any]:
+    """Return stale one-shot DECISION claims to claimable state.
+
+    Only ``standing=false`` DECISION claims in ``active`` state are eligible.
+    If a terminal A/STATUS reply exists, the claim is completed instead of
+    reclaimed so a late cleanup cannot resurrect already-handled work.
+    """
+    validate_topic_id(topic_id)
+    validate_iso_utc(older_than_ts)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+
+    rows = conn.execute(
+        "SELECT c.msg_id, c.role, c.owner_session_id, c.claimed_at, "
+        "c.heartbeat_at, c.ack_msg_id "
+        "FROM debate_message_claims c "
+        "JOIN debate_messages m ON m.msg_id = c.msg_id "
+        "WHERE m.topic_id = ? AND m.kind = 'DECISION' AND m.standing = 0 "
+        "AND c.state = 'active' AND c.heartbeat_at < ? "
+        "ORDER BY c.heartbeat_at ASC, c.msg_id ASC, c.role ASC",
+        (topic_id, older_than_ts),
+    ).fetchall()
+
+    now = now_iso()
+    reclaimed: list[dict[str, Any]] = []
+    completed: list[dict[str, Any]] = []
+    for row in rows:
+        ack = _terminal_reply_for_trigger(
+            conn,
+            topic_id=topic_id,
+            role=row["role"],
+            trigger_msg_id=row["msg_id"],
+        )
+        reclaim_id = new_msg_id()
+        while conn.execute(
+            "SELECT 1 FROM debate_message_claim_reclaim_log "
+            "WHERE reclaim_id = ? LIMIT 1",
+            (reclaim_id,),
+        ).fetchone():
+            reclaim_id = new_msg_id()
+
+        details = {
+            "claimed_at": row["claimed_at"],
+            "heartbeat_at": row["heartbeat_at"],
+            "older_than_ts": older_than_ts,
+            "ack_msg_id": ack["msg_id"] if ack else None,
+        }
+        if ack is not None:
+            result = "completed_from_terminal"
+            conn.execute(
+                "UPDATE debate_message_claims SET state = 'done', "
+                "heartbeat_at = ?, completed_at = ?, ack_msg_id = ? "
+                "WHERE msg_id = ? AND role = ?",
+                (now, now, ack["msg_id"], row["msg_id"], row["role"]),
+            )
+            completed.append(
+                {
+                    "msg_id": row["msg_id"],
+                    "role": row["role"],
+                    "ack_msg_id": ack["msg_id"],
+                    "reclaim_id": reclaim_id,
+                }
+            )
+        else:
+            result = "reclaimed"
+            conn.execute(
+                "DELETE FROM debate_message_claims "
+                "WHERE msg_id = ? AND role = ? AND state = 'active'",
+                (row["msg_id"], row["role"]),
+            )
+            reclaimed.append(
+                {
+                    "msg_id": row["msg_id"],
+                    "role": row["role"],
+                    "owner_session_id": row["owner_session_id"],
+                    "reclaim_id": reclaim_id,
+                }
+            )
+
+        conn.execute(
+            "INSERT INTO debate_message_claim_reclaim_log "
+            "(reclaim_id, msg_id, topic_id, role, owner_session_id, "
+            " result, details_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reclaim_id,
+                row["msg_id"],
+                topic_id,
+                row["role"],
+                row["owner_session_id"],
+                result,
+                json_dumps(details),
+                now,
+            ),
+        )
+
+    return {
+        "topic_id": topic_id,
+        "topic_state": debate["state"],
+        "older_than_ts": older_than_ts,
+        "reclaimed": reclaimed,
+        "completed": completed,
+        "reclaimed_count": len(reclaimed),
+        "completed_count": len(completed),
+    }
+
+
 # ── DAO: messages ─────────────────────────────────────────────────────
 
 

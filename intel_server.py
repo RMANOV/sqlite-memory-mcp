@@ -84,6 +84,7 @@ from debate import (
     post_message as _debate_post_dao,
     prepare_wake_dry_run as _debate_prepare_wake_dry_run_dao,
     read_messages as _debate_read_dao,
+    reclaim_stale_message_claims as _debate_reclaim_message_claims_dao,
     reap_worker_claims as _debate_reap_worker_claims_dao,
     rotate_role_binding as _debate_rotate_role_binding_dao,
     transition_state as _debate_transition_dao,
@@ -1756,6 +1757,27 @@ def debate_worker_reap(topic_id: str, older_than_ts: str) -> str:
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_worker_reap failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 42: debate_message_claim_reclaim (v3.11.2 one-shot DECISION recovery)
+@mcp.tool()
+def debate_message_claim_reclaim(topic_id: str, older_than_ts: str) -> str:
+    """Reclaim stale active standing=false DECISION claims with audit rows."""
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_reclaim_message_claims_dao(
+                conn,
+                topic_id=topic_id,
+                older_than_ts=older_than_ts,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error(
+            "debate_message_claim_reclaim failed: %s", exc, exc_info=True
+        )
         return _debate_error_response(exc)
 
 

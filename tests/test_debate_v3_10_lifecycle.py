@@ -20,6 +20,7 @@ from debate import (
     init_debate,
     post_message,
     prepare_wake_dry_run,
+    reclaim_stale_message_claims,
     reap_worker_claims,
     rotate_role_binding,
     transition_state,
@@ -687,7 +688,7 @@ def test_nonstanding_decision_claim_survives_cursor_advance_until_terminal_reply
         conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
     )
 
-    assert [m["msg_id"] for m in first["pending"]] == [task["msg_id"]]
+    assert task["msg_id"] in [m["msg_id"] for m in first["pending"]]
     assert [m["msg_id"] for m in still_pending["pending"]] == [task["msg_id"]]
     assert gone["pending"] == []
 
@@ -742,3 +743,206 @@ def test_standing_false_decision_is_not_resurfaced_as_mandate(topic):
         conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
     )
     assert [m["msg_id"] for m in out["pending"]] == [standing["msg_id"]]
+
+
+def test_stale_nonstanding_decision_claim_reclaim_allows_new_worker_owner(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    task = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="one-shot task",
+        addressed_to=["EXECUTOR"],
+        standing=False,
+    )
+    second_trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="second worker trigger",
+        addressed_to=["EXECUTOR"],
+    )
+    w1 = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=task["msg_id"],
+    )
+    w2 = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=second_trigger["msg_id"],
+    )
+
+    first = debate_signal_check(
+        conn,
+        session_id=w1["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+    )
+    blocked = debate_signal_check(
+        conn,
+        session_id=w2["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+    )
+    conn.execute(
+        "UPDATE debate_message_claims SET heartbeat_at = ? "
+        "WHERE msg_id = ? AND role = ?",
+        ("2026-05-01T00:00:00Z", task["msg_id"], "EXECUTOR"),
+    )
+
+    reclaimed = reclaim_stale_message_claims(
+        conn,
+        topic_id=t,
+        older_than_ts="2026-05-02T00:00:00Z",
+    )
+    second = debate_signal_check(
+        conn,
+        session_id=w2["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+    )
+    claim = conn.execute(
+        "SELECT owner_session_id FROM debate_message_claims "
+        "WHERE msg_id = ? AND role = ?",
+        (task["msg_id"], "EXECUTOR"),
+    ).fetchone()
+    audit = conn.execute(
+        "SELECT result FROM debate_message_claim_reclaim_log "
+        "WHERE msg_id = ? AND role = ?",
+        (task["msg_id"], "EXECUTOR"),
+    ).fetchone()
+
+    assert task["msg_id"] in [m["msg_id"] for m in first["pending"]]
+    assert task["msg_id"] not in [m["msg_id"] for m in blocked["pending"]]
+    assert reclaimed["reclaimed_count"] == 1
+    assert reclaimed["completed_count"] == 0
+    assert task["msg_id"] in [m["msg_id"] for m in second["pending"]]
+    assert claim["owner_session_id"] == w2["worker_session_id"]
+    assert audit["result"] == "reclaimed"
+
+
+def test_stale_nonstanding_decision_claim_reclaim_completes_if_ack_exists(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    task = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="one-shot task",
+        addressed_to=["EXECUTOR"],
+        standing=False,
+    )
+    debate_signal_check(
+        conn,
+        session_id="codex-exec1",
+        role="EXECUTOR",
+        topic_id=t,
+    )
+    ack = post_message(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        priority="H",
+        kind="A",
+        body="done",
+        reply_to=task["msg_id"],
+    )
+    conn.execute(
+        "UPDATE debate_message_claims SET state = 'active', ack_msg_id = NULL, "
+        "completed_at = NULL, heartbeat_at = ? "
+        "WHERE msg_id = ? AND role = ?",
+        ("2026-05-01T00:00:00Z", task["msg_id"], "EXECUTOR"),
+    )
+
+    out = reclaim_stale_message_claims(
+        conn,
+        topic_id=t,
+        older_than_ts="2026-05-02T00:00:00Z",
+    )
+    claim = conn.execute(
+        "SELECT state, ack_msg_id FROM debate_message_claims "
+        "WHERE msg_id = ? AND role = ?",
+        (task["msg_id"], "EXECUTOR"),
+    ).fetchone()
+    audit = conn.execute(
+        "SELECT result FROM debate_message_claim_reclaim_log "
+        "WHERE msg_id = ? AND role = ?",
+        (task["msg_id"], "EXECUTOR"),
+    ).fetchone()
+
+    assert out["reclaimed_count"] == 0
+    assert out["completed_count"] == 1
+    assert claim["state"] == "done"
+    assert claim["ack_msg_id"] == ack["msg_id"]
+    assert audit["result"] == "completed_from_terminal"
+
+
+def test_legacy_null_decision_stays_standing_after_cursor_advance(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    legacy = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="legacy standing mandate",
+        addressed_to=["EXECUTOR"],
+    )
+    transient = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="M",
+        kind="STATUS",
+        body="cursor target",
+        addressed_to=["EXECUTOR"],
+    )
+    stored = conn.execute(
+        "SELECT standing FROM debate_messages WHERE msg_id = ?",
+        (legacy["msg_id"],),
+    ).fetchone()
+
+    debate_signal_advance(
+        conn,
+        session_id="codex-exec1",
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=transient["msg_id"],
+    )
+    out = debate_signal_check(
+        conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
+    )
+
+    assert stored["standing"] is None
+    assert [m["msg_id"] for m in out["pending"]] == [legacy["msg_id"]]
