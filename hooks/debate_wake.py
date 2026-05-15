@@ -427,6 +427,18 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> None:
     _log("agent_launches", msg_id=tool_response.get("msg_id"), launches=launches)
 
 
+def _agent_budget_remaining() -> int:
+    try:
+        return int(
+            os.environ.get(
+                "DEBATE_WAKE_REMAINING",
+                os.environ.get("DEBATE_WAKE_BUDGET", "1"),
+            )
+        )
+    except ValueError:
+        return 0
+
+
 def _run_hook() -> int:
     try:
         raw = sys.stdin.read()
@@ -442,6 +454,18 @@ def _run_hook() -> int:
     tool_response = _extract_tool_response(payload)
     if tool_response is None:
         _log("missing_tool_response", tool_name=tool_name, keys=sorted(payload.keys()))
+        return 0
+
+    if (
+        os.environ.get("DEBATE_WAKE_ACTION", "dry_run") == "agent"
+        and _agent_budget_remaining() <= 0
+    ):
+        # Spawned agents intentionally run with zero remaining wake budget
+        # to prevent recursive in-process fan-out. Do not resolve/write
+        # wake_log rows here: the resident pump is the catch-up path and
+        # must be able to claim the normal action without seeing a false
+        # duplicate from the exhausted child hook.
+        _log("agent_budget_exhausted_pre_resolution", msg_id=tool_response.get("msg_id"))
         return 0
 
     sys.path.insert(0, str(REPO))
