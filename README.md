@@ -44,6 +44,34 @@ SQLite hits the sweet spot:
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
 
+## FAQ: how is this different from sqlite.ai / sqlite-vector?
+
+[sqlite.ai](https://www.sqlite.ai/) is adjacent, not identical. It is a broader
+SQLite platform around cloud sync, extensions, AI inference, vector search,
+agent memory, and MCP tooling. Its related projects include
+[sqlite-memory](https://github.com/sqliteai/sqlite-memory), a Markdown-based
+agent memory system, and [sqlite-vector](https://github.com/sqliteai/sqlite-vector),
+a vector-search extension for embedded SQLite workloads.
+
+sqlite-memory-mcp is focused on **local-first MCP memory governance for coding
+agents**, not on vector search as the center of the product:
+
+- WAL-backed task, session, entity, and note memory in one local SQLite file
+- FTS5-first retrieval, with vector search as an optional backend
+- cross-machine bridge sync for private multi-machine workflows
+- event/provenance tracking for memory mutations
+- reviewable consolidation instead of silent memory rewriting
+- debate/protocol workflows for conductor, executor, and devil's advocate agents
+- an explicit OSS/premium runtime boundary with signed entitlement, manifest,
+  and policy checks
+
+`sqlite-vec` is therefore not the product center; it is one possible local
+retrieval backend. If `sqlite-vector` proves better for this workload, it can
+become a candidate backend. The harder problem this project targets is memory
+governance: how agents remember, revise, sync, debate, and promote durable
+context without turning the memory store into an unreviewable pile of
+contradictions.
+
 ## Premium / Enterprise Boundary
 
 This repository now includes the **public-core boundary** for a separate premium runtime.
