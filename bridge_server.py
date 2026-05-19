@@ -54,6 +54,7 @@ from db_utils import (
     git_run as _git_run,
     ensure_bridge_git_identity as _ensure_bridge_git_identity,
     ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
+    inspect_bridge_repo_blocker as _inspect_bridge_repo_blocker,
     source_hash as _source_hash,
     validate_github_username as _validate_github_user,
 )
@@ -143,7 +144,13 @@ def _tmp_write_path(path: Path) -> Path:
 
 def _bridge_repo_blocked_error(message: str) -> str:
     """Return a structured bridge repo preflight error."""
-    return json.dumps({"error": message, "blocked_by_repo_state": True})
+    return json.dumps(
+        {
+            "error": message,
+            "message": message,
+            "blocked_by_repo_state": True,
+        }
+    )
 
 
 def _is_known_collaborator(
@@ -464,18 +471,11 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     # v2.0.0: Pull before push (prevents overwriting remote changes)
     pull_result = _git("pull", "--rebase", "--autostash")
     if pull_result.returncode != 0:
-        logger.warning("bridge_push: git pull failed: %s", pull_result.stderr.strip())
-        # Auto-recover from merge conflicts: DB is source of truth, export will re-create
-        _stderr = pull_result.stderr or ""
-        if any(kw in _stderr for kw in ("unmerged", "conflict", "CONFLICT")):
-            logger.warning(
-                "bridge_push: merge conflict — aborting rebase, resetting to origin/main"
-            )
-            _git("rebase", "--abort")
-            _git("reset", "--hard", "origin/main")
-            logger.warning(
-                "bridge_push: reset to origin/main; export will re-create shared.json"
-            )
+        detail = (pull_result.stderr or pull_result.stdout).strip()
+        logger.warning("bridge_push: git pull failed: %s", detail)
+        return _bridge_repo_blocked_error(
+            f"bridge_push git pull failed; sync blocked: {detail or 'unknown git error'}"
+        )
 
     # v2.0.0: One-time migration shared.json → per-task files
     _migrate_to_per_task_files(BRIDGE_REPO)
@@ -959,7 +959,22 @@ def bridge_pull() -> str:
     pull_result = _git("pull", "--rebase", "--autostash")
     git_pull_failed = pull_result.returncode != 0
     if git_pull_failed:
-        logger.warning("bridge_pull: git pull failed, proceeding with local copy")
+        detail = (pull_result.stderr or pull_result.stdout).strip()
+        logger.warning("bridge_pull: git pull failed, blocking import: %s", detail)
+        return json.dumps(
+            {
+                "error": (
+                    "bridge_pull git pull failed; import blocked: "
+                    f"{detail or 'unknown git error'}"
+                ),
+                "message": (
+                    "bridge_pull git pull failed; import blocked: "
+                    f"{detail or 'unknown git error'}"
+                ),
+                "blocked_by_repo_state": True,
+                "git_pull_failed": True,
+            }
+        )
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     _pull_index_path = Path(BRIDGE_REPO) / "index.json"
@@ -1397,6 +1412,8 @@ def bridge_status() -> str:
     if not Path(BRIDGE_REPO).is_dir():
         return _error(f"Bridge repo not found at {BRIDGE_REPO}")
 
+    repo_blocker = _inspect_bridge_repo_blocker(BRIDGE_REPO)
+
     with _get_conn() as conn:
         local_rows = conn.execute(
             "SELECT name FROM entities WHERE project LIKE 'shared%' ORDER BY name"
@@ -1439,6 +1456,31 @@ def bridge_status() -> str:
             "SELECT COUNT(*) as cnt FROM rating_anomalies WHERE resolved = 0"
         ).fetchone()["cnt"]
     local_names = {r["name"] for r in local_rows}
+
+    if repo_blocker:
+        return json.dumps(
+            {
+                "blocked_by_repo_state": True,
+                "error": repo_blocker,
+                "message": repo_blocker,
+                "bridge_repo": BRIDGE_REPO,
+                "remote_status": "suppressed_repo_blocked",
+                "local_shared_count": len(local_names),
+                "local_tasks": local_task_count,
+                "collaborators": [dict(r) for r in collab_rows],
+                "collaborator_count": len(collab_rows),
+                "pending_shared_knowledge": pending_knowledge,
+                "pending_shared_relations": pending_rels,
+                "sharing_rules": sharing_rule_count,
+                "public_entities": public_ent_count,
+                "pending_public_entities": pending_pub_ent_count,
+                "public_tasks": public_task_count,
+                "pending_public_tasks": pending_pub_task_count,
+                "total_ratings": total_ratings,
+                "rated_entities": rated_entities,
+                "anomalies": anomaly_count,
+            }
+        )
 
     shared_path = Path(BRIDGE_REPO) / "shared.json"
     _status_eidx_path = Path(BRIDGE_REPO) / "entities_index.json"

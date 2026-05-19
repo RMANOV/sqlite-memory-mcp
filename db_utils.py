@@ -926,15 +926,72 @@ def _bridge_generated_symlink_issues(repo_dir: str, limit: int = 3) -> list[str]
     return flagged
 
 
+def _bridge_git_path(repo_dir: str, path_name: str) -> Path:
+    """Return a git metadata path without mutating the repo."""
+    return Path(repo_dir) / ".git" / path_name
+
+
+def _bridge_git_operation_blocker(repo_dir: str) -> str | None:
+    """Return a fail-closed blocker for active git sequencing state."""
+    sequence_markers = (
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    )
+    active = [
+        marker for marker in sequence_markers if _bridge_git_path(repo_dir, marker).exists()
+    ]
+    if active:
+        return (
+            "bridge repo has active git operation "
+            f"({', '.join(active)}); manual recovery required before sync"
+        )
+    return None
+
+
+def inspect_bridge_repo_blocker(repo_dir: str) -> str | None:
+    """Return a fail-closed blocker message for unsafe bridge repo states.
+
+    This helper is intentionally read-only. It detects active git sequencing and
+    unresolved conflicts before higher-level sync code can run recovery logic.
+    """
+    blocker = _bridge_git_operation_blocker(repo_dir)
+    if blocker:
+        return blocker
+
+    status = git_run(repo_dir, "status", "--porcelain")
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout).strip()
+        return f"cannot inspect bridge status: {detail or 'unknown git error'}"
+
+    lines = [ln for ln in status.stdout.splitlines() if ln.strip()]
+    conflict_lines = [ln for ln in lines if ln[:2] in _BRIDGE_CONFLICT_STATES]
+    if not conflict_lines:
+        return None
+
+    conflict_paths = [_bridge_status_path(ln) for ln in conflict_lines]
+    unsafe = [p for p in conflict_paths if not is_generated_bridge_path(p)]
+    shown = ", ".join((unsafe or conflict_paths)[:3])
+    if unsafe:
+        return f"bridge repo has unresolved user-managed conflicts: {shown}"
+    return f"bridge repo has unresolved generated conflicts: {shown}"
+
+
 def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     """Prepare the bridge repo for sync without discarding user-managed files.
 
     Safe behavior:
     - detached HEAD -> try to return to main
-    - conflicts in generated artifacts -> auto-reset to origin/main
+    - active git operation/conflicts -> block sync, do not mutate recovery state
     - edits in generated artifacts -> discard/rebuild
     - edits in user-managed files -> block sync and surface the paths
     """
+    blocker = _bridge_git_operation_blocker(repo_dir)
+    if blocker:
+        return False, blocker
+
     branch = git_run(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
     if branch.returncode != 0:
         detail = (branch.stderr or branch.stdout).strip()
@@ -979,25 +1036,8 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
                 False,
                 f"resolve bridge conflicts in user-managed files first: {shown}",
             )
-
-        git_run(repo_dir, "rebase", "--abort")
-        git_run(repo_dir, "merge", "--abort")
-        git_run(repo_dir, "fetch", "origin")
-        reset = git_run(repo_dir, "reset", "--hard", "origin/main")
-        if reset.returncode != 0:
-            detail = (reset.stderr or reset.stdout).strip()
-            return False, f"failed to reset generated bridge conflicts: {detail}"
-
-        status = git_run(repo_dir, "status", "--porcelain")
-        if status.returncode != 0:
-            detail = (status.stderr or status.stdout).strip()
-            return (
-                False,
-                f"cannot re-check bridge status: {detail or 'unknown git error'}",
-            )
-        lines = [ln for ln in status.stdout.splitlines() if ln.strip()]
-        if not lines:
-            return True, None
+        shown = ", ".join(conflict_paths[:3])
+        return False, f"resolve bridge conflicts in generated files first: {shown}"
 
     dirty_paths = [_bridge_status_path(ln) for ln in lines]
     unsafe = [p for p in dirty_paths if not is_generated_bridge_path(p)]

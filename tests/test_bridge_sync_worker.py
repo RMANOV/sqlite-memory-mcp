@@ -158,6 +158,49 @@ def test_bridge_repo_ready_blocks_user_managed_dirty_files(monkeypatch):
     ) not in calls
 
 
+def test_bridge_repo_ready_blocks_active_rebase_without_git_mutation(
+    tmp_path, monkeypatch
+):
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / ".git" / "rebase-merge").mkdir(parents=True)
+    calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready(str(bridge_dir))
+
+    assert ok is False
+    assert "active git operation" in msg
+    assert "rebase-merge" in msg
+    assert calls == []
+
+
+def test_bridge_repo_ready_blocks_generated_conflict_without_reset(monkeypatch):
+    calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _cp(args, stdout="main\n")
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout="UU shared.json\n")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(db_utils, "git_run", fake_git_run)
+
+    ok, msg = db_utils.ensure_bridge_repo_ready("bridge")
+
+    assert ok is False
+    assert "generated" in msg
+    assert "shared.json" in msg
+    assert not any(args[:2] == ("rebase", "--abort") for args in calls)
+    assert not any(args[:2] == ("reset", "--hard") for args in calls)
+
+
 def test_bridge_repo_ready_discards_generated_artifacts(monkeypatch):
     calls = []
     statuses = iter(
@@ -405,6 +448,43 @@ def test_bridge_sync_worker_pull_only_skips_export_and_push(tmp_path, monkeypatc
     assert result["pull_only"] is True
     assert result["pushed"] is False
     assert git_calls == [("pull", "--rebase", "--autostash")]
+
+
+def test_bridge_sync_worker_pull_conflict_fails_closed_without_reset(
+    tmp_path, monkeypatch
+):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    git_calls = []
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        return _cp(args, returncode=1, stderr="CONFLICT (content): shared.json\n")
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        git_calls.append(args)
+        return _cp(args)
+
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+
+    result = bridge_sync_worker._main_locked(
+        progress_callback=None,
+        db_path=str(tmp_path / "memory.db"),
+        bridge_dir=str(bridge_dir),
+        force=False,
+        pull_only=True,
+        ui_profile=None,
+        machine_id="fedora",
+    )
+
+    assert result["blocked_by_repo_state"] is True
+    assert result["git_pull_failed"] is True
+    assert "CONFLICT" in result["message"]
+    assert git_calls == []
 
 
 def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):

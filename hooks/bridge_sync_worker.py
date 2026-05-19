@@ -110,23 +110,14 @@ def _pid_alive(pid):
 def fix_remote_ahead():
     """Handle remote-ahead: pull --rebase, then push again.
 
-    On conflict: reset to origin/main (DB is source of truth, export will re-create).
+    On conflict: fail closed. Recovery must be explicit and backed up.
     """
     ok, out = git_run("pull", "--rebase", "--autostash", "origin", "main")
     if not ok:
         if "CONFLICT" in out or "unmerged" in out:
-            git_run("rebase", "--abort")
-            git_run("fetch", "origin")
-            reset_ok, reset_out = git_run("reset", "--hard", "origin/main")
-            if not reset_ok:
-                notify(
-                    "error",
-                    f"BRIDGE: failed to reset after conflict: {reset_out[:200]}",
-                )
-                return False
             notify(
-                "warning",
-                "BRIDGE: conflict reset to origin/main; local DB changes will retry on next sync",
+                "error",
+                "BRIDGE: pull conflict; sync blocked pending explicit recovery",
             )
             return False
         notify("warning", f"BRIDGE: pull --rebase failed: {out[:200]}")

@@ -713,32 +713,30 @@ def _main_locked(
         timeout=_GIT_PULL_TIMEOUT,
     )
     if pull_result.returncode != 0:
-        log.error("git pull failed: %s", pull_result.stderr)
+        detail = (pull_result.stderr or pull_result.stdout).strip()
+        log.error("git pull failed: %s", detail)
         # Log conflict for debugging
         _conflict_log = Path.home() / ".claude" / "memory" / "bridge_conflicts.log"
         try:
             with open(_conflict_log, "a", encoding="utf-8") as f:
-                f.write(f"{now_iso()} git_pull_failed: {pull_result.stderr.strip()}\n")
+                f.write(f"{now_iso()} git_pull_failed: {detail}\n")
         except OSError:
             pass
-        # Auto-recover from merge conflicts: DB is source of truth, export will re-create
-        _stderr = pull_result.stderr or ""
-        if any(kw in _stderr for kw in ("unmerged", "conflict", "CONFLICT")):
-            log.warning(
-                "Merge conflict detected — aborting rebase and resetting to remote"
-            )
-            git_run(bridge_dir, "rebase", "--abort")
-            git_run(bridge_dir, "reset", "--hard", "origin/main")
-            log.warning("Reset to origin/main; export phase will re-create shared.json")
-        else:
-            _progress(progress_callback, 100, "Done (pull failed)")
-            return {
-                "entities": 0,
-                "tasks": 0,
-                "pushed": False,
-                "imported_new": 0,
-                "imported_updated": 0,
-            }
+        message = (
+            "git pull failed; bridge sync blocked before import/export: "
+            f"{detail or 'unknown git error'}"
+        )
+        _progress(progress_callback, -1, f"BLOCKED: {message}")
+        return {
+            "entities": 0,
+            "tasks": 0,
+            "pushed": False,
+            "imported_new": 0,
+            "imported_updated": 0,
+            "blocked_by_repo_state": True,
+            "git_pull_failed": True,
+            "message": message,
+        }
 
     # Phase 3a-1: Import entities (own transaction — survives task merge failures)
     shared_path = Path(bridge_dir) / "shared.json"

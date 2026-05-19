@@ -129,6 +129,80 @@ def test_bridge_push_blocks_when_bridge_repo_is_not_safe(tmp_path, monkeypatch):
     assert git_calls == []
 
 
+def test_bridge_push_pull_failure_fails_closed_without_reset(bridge_env, monkeypatch):
+    _db_path, _bridge_dir = bridge_env
+    git_calls = []
+
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_repo_ready",
+        lambda repo: (True, None),
+    )
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[:3] == ("pull", "--rebase", "--autostash"):
+            return _cp(args, returncode=1, stderr="CONFLICT (content): shared.json")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+
+    result = json.loads(bridge_server.bridge_push.fn())
+
+    assert result["blocked_by_repo_state"] is True
+    assert "CONFLICT" in result["error"]
+    assert not any(args[:2] == ("reset", "--hard") for args in git_calls)
+    assert not any(args[:2] == ("rebase", "--abort") for args in git_calls)
+
+
+def test_bridge_pull_git_failure_blocks_import(bridge_env, monkeypatch):
+    _db_path, _bridge_dir = bridge_env
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_repo_ready",
+        lambda repo: (True, None),
+    )
+    monkeypatch.setattr(
+        bridge_server,
+        "_git",
+        lambda *args: _cp(args, returncode=1, stderr="fatal: unresolved conflict"),
+    )
+
+    result = json.loads(bridge_server.bridge_pull.fn())
+
+    assert result["blocked_by_repo_state"] is True
+    assert result["git_pull_failed"] is True
+    assert "unresolved conflict" in result["error"]
+
+
+def test_bridge_status_blocks_and_suppresses_remote_counts(bridge_env, monkeypatch):
+    _db_path, _bridge_dir = bridge_env
+    monkeypatch.setattr(
+        bridge_server,
+        "_inspect_bridge_repo_blocker",
+        lambda repo: "bridge repo has active git operation (rebase-merge)",
+    )
+
+    def fail_git(*args):
+        raise AssertionError(f"bridge_status must not call git while blocked: {args}")
+
+    monkeypatch.setattr(bridge_server, "_git", fail_git)
+
+    result = json.loads(bridge_server.bridge_status.fn())
+
+    assert result["blocked_by_repo_state"] is True
+    assert "rebase-merge" in result["error"]
+    assert result["remote_status"] == "suppressed_repo_blocked"
+    assert "last_commit" not in result
+    assert "remote_count" not in result
+    assert "remote_tasks" not in result
+
+
 def test_bridge_push_missing_repo_error_includes_real_path(tmp_path, monkeypatch):
     missing_repo = tmp_path / "missing-bridge"
     monkeypatch.setattr(bridge_server, "BRIDGE_REPO", str(missing_repo))
