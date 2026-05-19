@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from bridge_sync_worker import _ui_profile_changed
 import task_tray
+import tray_sync
 from tray_sync import BridgeSyncMixin
 
 
@@ -269,6 +270,13 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
         )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
+    heads = ["old-head", "new-head"]
+    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: heads.pop(0))
+    monkeypatch.setattr(
+        tray_sync,
+        "_bridge_git_pull",
+        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
 
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
@@ -290,6 +298,72 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
 
     assert captured["pull_only"] is True
     assert refreshes == ["signal"]
+
+
+def test_periodic_pull_skips_heavy_import_when_git_head_unchanged(
+    bridge_env, monkeypatch
+):
+    refreshes = []
+    bridge_sync_worker = SimpleNamespace(
+        main=lambda **kwargs: pytest.fail("heavy worker should not run")
+    )
+    monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
+    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: "same-head")
+    monkeypatch.setattr(
+        tray_sync,
+        "_bridge_git_pull",
+        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._db_refresh_debounce = SimpleNamespace(
+        start=lambda: refreshes.append("timer")
+    )
+    window._bridge_refresh_requested = SimpleNamespace(
+        emit=lambda: refreshes.append("signal")
+    )
+    window._bridge_progress = SimpleNamespace(emit=lambda *args: None)
+    window._bridge_done = SimpleNamespace(emit=lambda *args: None)
+    monkeypatch.setattr(
+        window,
+        "_start_bridge_sync_thread",
+        lambda target, busy_message=None, **kwargs: (target(), True)[1],
+    )
+
+    window._periodic_pull()
+
+    assert refreshes == []
+
+
+def test_bootstrap_pull_skips_heavy_import_even_when_git_head_changes(
+    bridge_env, monkeypatch
+):
+    bridge_sync_worker = SimpleNamespace(
+        main=lambda **kwargs: pytest.fail("bootstrap should not run heavy worker")
+    )
+    monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
+    heads = ["old-head", "new-head"]
+    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: heads.pop(0))
+    monkeypatch.setattr(
+        tray_sync,
+        "_bridge_git_pull",
+        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._db_refresh_debounce = SimpleNamespace(start=lambda: None)
+    window._bridge_refresh_requested = SimpleNamespace(emit=lambda: None)
+    window._bridge_progress = SimpleNamespace(emit=lambda *args: None)
+    window._bridge_done = SimpleNamespace(emit=lambda *args: None)
+    monkeypatch.setattr(
+        window,
+        "_start_bridge_sync_thread",
+        lambda target, busy_message=None, **kwargs: (target(), True)[1],
+    )
+
+    window._periodic_pull(initiator="bootstrap")
 
 
 def test_request_db_refresh_from_worker_falls_back_to_timer(bridge_env):
@@ -344,6 +418,24 @@ def test_start_bridge_sync_thread_releases_lock_after_worker_finishes(bridge_env
     assert window._bridge_thread_lock.locked() is False
     assert window._sync_run_active is False
     assert window._sync_cooldown_until > 0
+
+
+def test_start_bridge_sync_thread_sets_post_sync_db_watch_cooldown(
+    bridge_env,
+):
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._auto_sync_timer = SimpleNamespace(stop=lambda: None)
+    before = time.monotonic()
+
+    assert window._start_bridge_sync_thread(lambda: None) is True
+    deadline = time.time() + 1.0
+    while time.time() < deadline and window._bridge_thread_lock.locked():
+        time.sleep(0.01)
+
+    assert window._sync_cooldown_until >= (
+        before + tray_sync._POST_SYNC_DB_WATCH_COOLDOWN_SECONDS - 1.0
+    )
 
 
 def test_start_bridge_sync_thread_marks_sync_active_while_worker_runs(bridge_env):
@@ -493,6 +585,22 @@ def test_auto_sync_triggered_uses_pending_initiator():
     BridgeSyncMixin._auto_sync_triggered(dummy)
 
     assert captured == ["db_file_change"]
+    assert dummy._pending_auto_sync_initiator is None
+
+
+def test_bootstrap_auto_sync_uses_pull_only_mode():
+    captured = []
+    dummy = SimpleNamespace(
+        _pending_auto_sync_initiator="bootstrap",
+        _periodic_pull=lambda initiator="periodic_pull": captured.append(
+            ("pull", initiator)
+        ),
+        _sync_bridge=lambda initiator="manual": captured.append(("sync", initiator)),
+    )
+
+    BridgeSyncMixin._auto_sync_triggered(dummy)
+
+    assert captured == [("pull", "bootstrap")]
     assert dummy._pending_auto_sync_initiator is None
 
 

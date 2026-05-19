@@ -23,6 +23,7 @@ from typing import Any
 
 
 REPO = Path(os.environ.get("DEBATE_REPO", "/home/rmanov/sqlite-memory-mcp"))
+HOOK_DIR = Path(__file__).resolve().parent
 LOG_PATH = Path(
     os.environ.get(
         "DEBATE_WAKE_HOOK_LOG",
@@ -98,13 +99,16 @@ def _notify(target: dict[str, Any], trigger_msg_id: str) -> None:
         return
     title = f"Debate wake: {target.get('target_role') or 'role'}"
     body = f"msg={trigger_msg_id} session={target.get('target_session_id') or '-'}"
-    subprocess.run(
-        ["notify-send", title, body],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=2,
-        check=False,
-    )
+    try:
+        subprocess.run(
+            ["notify-send", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        pass
 
 
 def _wake_prompt(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> str:
@@ -119,21 +123,103 @@ Autonomous wake trigger:
 
 Task:
 1. Check the debate inbox for this role/session/topic.
-2. If there is no substantive work, call debate_worker_no_action with this
+2. The launcher has already written exactly one human-readable RECEIVED line
+   to stdout/log for this wake. Do not print a second RECEIVED line.
+3. If there is no substantive work, call debate_worker_no_action with this
    topic_id, role, session_id, trigger_msg_id, and a short reason. Then reply
    NO_ACTION and do not post.
-3. If there is work, post at most one focused debate response with
+4. If there is work, post at most one focused debate response with
    debate_post_with_recipients. Do not use bare debate_post: unaddressed
    messages are invisible to the pump.
-4. Address the response to the role(s) named by the trigger, normally
+5. Address the response to the role(s) named by the trigger, normally
    CONDUCTOR and any review role that must see it.
-5. Quote the trigger msg_id or the specific msg_id(s) you read.
-6. After a successful post, advance this role/session/topic cursor to the latest
+6. Quote the trigger msg_id or the specific msg_id(s) you read.
+7. After a successful post, advance this role/session/topic cursor to the latest
    message you substantively handled, normally the trigger msg_id. After
    debate_worker_no_action, do not call debate_signal_advance separately.
-7. Do not edit files, run unrelated commands, or broaden scope.
-8. Stop after that one response and cursor advance.
+8. Do not edit files, run unrelated commands, or broaden scope.
+9. Stop after that one response and cursor advance.
 """
+
+
+def _brief_text(text: str, limit: int = 96) -> str:
+    normalized = str(text or "").replace("\n", " ").replace("\t", " ")
+    words = " ".join(normalized.split())
+    if len(words) <= limit:
+        return words
+    return words[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _default_write_to(role: str) -> str:
+    if role == "EXECUTOR":
+        return "CONDUCTOR,ADVOCATE"
+    if role == "ADVOCATE":
+        return "CONDUCTOR,EXECUTOR"
+    if role == "CONDUCTOR":
+        return "EXECUTOR,ADVOCATE"
+    return "CONDUCTOR"
+
+
+def _receipt_event(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> dict[str, Any]:
+    role = str(target.get("target_role") or "")
+    sender = "UNKNOWN"
+    what = "process addressed debate message"
+    try:
+        import sqlite3
+
+        db_path = os.environ.get(
+            "SQLITE_MEMORY_DB", os.path.expanduser("~/.claude/memory/memory.db")
+        )
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute(
+                "SELECT role, body FROM debate_messages WHERE msg_id = ?",
+                (trigger_msg_id,),
+            ).fetchone()
+            if row:
+                sender = str(row[0] or "UNKNOWN")
+                what = _brief_text(str(row[1] or what))
+        finally:
+            con.close()
+    except Exception as exc:
+        _log("receipt_lookup_failed", msg_id=trigger_msg_id, error=repr(exc))
+
+    return {
+        "event": "agent_wake_receipt",
+        "from_role": sender,
+        "from_msg_id": trigger_msg_id,
+        "topic_id": topic_id,
+        "target_role": role,
+        "target_session_id": str(target.get("target_session_id") or ""),
+        "target_runtime": str(target.get("target_runtime") or ""),
+        "what": what,
+        "will": "check_inbox_and_post_or_no_action",
+        "write_to": _default_write_to(role),
+    }
+
+
+def _receipt_line(event: dict[str, Any]) -> str:
+    return (
+        f"RECEIVED from={event['from_role']}/{event['from_msg_id']} "
+        f"to={event['target_role']}/{event['target_session_id']} "
+        f"topic={event['topic_id']} what={event['what']} "
+        f"will={event['will']} write_to={event['write_to']}"
+    )
+
+
+def _record_receipt_event(event: dict[str, Any]) -> None:
+    try:
+        sys.path.insert(0, str(HOOK_DIR))
+        from debate_agent_events import record_receipt
+
+        record_receipt(event)
+    except Exception as exc:
+        _log(
+            "agent_receipt_event_failed",
+            msg_id=event.get("from_msg_id"),
+            target_session_id=event.get("target_session_id"),
+            error=repr(exc),
+        )
 
 
 def _agent_command(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> list[str] | None:
@@ -332,6 +418,12 @@ def _launch_agent(target: dict[str, Any], trigger_msg_id: str, topic_id: str) ->
         }
     )
     with log_path.open("ab") as log:
+        receipt_event = _receipt_event(target, trigger_msg_id, topic_id)
+        receipt_line = _receipt_line(receipt_event)
+        receipt_event["receipt_line"] = receipt_line
+        log.write((receipt_line + "\n").encode("utf-8"))
+        log.flush()
+        _record_receipt_event(receipt_event)
         proc = subprocess.Popen(
             cmd,
             cwd=str(REPO),
@@ -367,7 +459,7 @@ def _handle_tool_response(tool_response: dict[str, Any]) -> dict[str, Any] | Non
         )
 
 
-def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> None:
+def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
     targets = out.get("targets", []) if isinstance(out, dict) else []
     mode = os.environ.get("DEBATE_WAKE_ACTION", "dry_run")
     _log(
@@ -379,20 +471,22 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> None:
     )
 
     if mode == "notify":
+        notified = 0
         for target in targets:
             if target.get("result") != "suppressed":
                 _notify(target, str(tool_response.get("msg_id") or ""))
-        return
+                notified += 1
+        return {"mode": mode, "notified": notified, "launches": []}
 
     if mode != "agent":
-        return
+        return {"mode": mode, "launches": []}
 
     budget = int(
         os.environ.get("DEBATE_WAKE_REMAINING", os.environ.get("DEBATE_WAKE_BUDGET", "1"))
     )
     if budget <= 0:
         _log("agent_budget_exhausted", msg_id=tool_response.get("msg_id"))
-        return
+        return {"mode": mode, "launches": [], "reason": "agent_budget_exhausted"}
 
     topic_id = str(tool_response.get("topic_id") or "")
     if not topic_id:
@@ -414,7 +508,7 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> None:
             con.close()
     if not topic_id:
         _log("agent_launch_skipped", reason="unknown_topic", msg_id=tool_response.get("msg_id"))
-        return
+        return {"mode": mode, "launches": [], "reason": "unknown_topic"}
 
     launches = []
     for target in targets:
@@ -429,6 +523,7 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> None:
             }
         )
     _log("agent_launches", msg_id=tool_response.get("msg_id"), launches=launches)
+    return {"mode": mode, "launches": launches}
 
 
 def _agent_budget_remaining() -> int:

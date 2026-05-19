@@ -44,6 +44,16 @@ STOP = False
 CHILDREN: set[int] = set()
 
 
+def _split_csv_values(values: list[str] | str | None) -> list[str]:
+    if values is None:
+        return []
+    raw_values = values if isinstance(values, list) else [values]
+    out: list[str] = []
+    for raw in raw_values:
+        out.extend(part.strip() for part in str(raw).split(",") if part.strip())
+    return out
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -135,7 +145,35 @@ def _filter_targets(out: dict[str, Any], suppressed_roles: set[str]) -> dict[str
     return filtered
 
 
-def _dispatch_row(row: sqlite3.Row, suppressed_roles: set[str]) -> None:
+def _estimate_worker_demand(msg_id: str, suppressed_roles: set[str]) -> int:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT recipient FROM debate_message_recipients "
+            "WHERE msg_id = ? ORDER BY recipient",
+            (msg_id,),
+        ).fetchall()
+    finally:
+        con.close()
+    return sum(
+        1 for row in rows if str(row["recipient"] or "").strip().upper() not in suppressed_roles
+    )
+
+
+def _count_launched(dispatch_result: dict[str, Any] | None) -> int:
+    if not isinstance(dispatch_result, dict):
+        return 0
+    return sum(
+        1
+        for item in dispatch_result.get("launches", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("launch"), dict)
+        and item["launch"].get("launched")
+    )
+
+
+def _dispatch_row(row: sqlite3.Row, suppressed_roles: set[str]) -> int:
     sys.path.insert(0, str(HOOK_DIR))
     import debate_wake
 
@@ -151,8 +189,33 @@ def _dispatch_row(row: sqlite3.Row, suppressed_roles: set[str]) -> None:
     out = debate_wake._handle_tool_response(tool_response)
     if isinstance(out, dict):
         before = set(CHILDREN)
-        debate_wake._maybe_dispatch(tool_response, _filter_targets(out, suppressed_roles))
-        _track_launched_children(before)
+        dispatch_result = debate_wake._maybe_dispatch(
+            tool_response, _filter_targets(out, suppressed_roles)
+        )
+        tracked_launched = _track_launched_children(before)
+        return max(_count_launched(dispatch_result), tracked_launched)
+    return 0
+
+
+def _throttle_reason(
+    *,
+    estimated_worker_demand: int,
+    launched_this_scan: int,
+    live_children: int,
+    max_workers_per_scan: int,
+    max_concurrent_workers: int,
+) -> str | None:
+    if estimated_worker_demand <= 0:
+        return None
+    if max_workers_per_scan > 0:
+        remaining_scan = max_workers_per_scan - launched_this_scan
+        if remaining_scan <= 0 or estimated_worker_demand > remaining_scan:
+            return "max_workers_per_scan"
+    if max_concurrent_workers > 0:
+        remaining_concurrent = max_concurrent_workers - live_children
+        if remaining_concurrent <= 0 or estimated_worker_demand > remaining_concurrent:
+            return "max_concurrent_workers"
+    return None
 
 
 def _claim_reclaim_cutoff(stale_seconds: int) -> str:
@@ -195,7 +258,7 @@ def _reclaim_stale_message_claims(
             _log("message_claim_reclaim", **out)
 
 
-def _track_launched_children(before: set[int]) -> None:
+def _track_launched_children(before: set[int]) -> int:
     """Track direct child PIDs so the resident pump does not leave zombies."""
     try:
         after = {
@@ -205,8 +268,10 @@ def _track_launched_children(before: set[int]) -> None:
             and Path("/proc") .joinpath(pid, "stat").read_text().split()[3] == str(os.getpid())
         }
     except Exception:
-        return
-    CHILDREN.update(after - before)
+        return 0
+    launched = after - before
+    CHILDREN.update(launched)
+    return len(launched)
 
 
 def _reap_children() -> None:
@@ -229,7 +294,12 @@ def _handle_signal(_signum: int, _frame: Any) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--topic", action="append", default=[])
+    parser.add_argument(
+        "--topic",
+        action="append",
+        default=_split_csv_values(os.environ.get("DEBATE_PUMP_TOPICS", "")),
+        help="topic filter; repeat or comma-separate; default from DEBATE_PUMP_TOPICS",
+    )
     parser.add_argument(
         "--action-kind",
         action="append",
@@ -238,6 +308,18 @@ def main() -> int:
     )
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument(
+        "--max-workers-per-scan",
+        type=int,
+        default=int(os.environ.get("DEBATE_PUMP_MAX_WORKERS_PER_SCAN", "2")),
+        help="max launched workers per scan; <=0 disables this throttle",
+    )
+    parser.add_argument(
+        "--max-concurrent-workers",
+        type=int,
+        default=int(os.environ.get("DEBATE_PUMP_MAX_CONCURRENT_WORKERS", "2")),
+        help="max live workers launched by this pump; <=0 disables this throttle",
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--since", default="")
     parser.add_argument(
@@ -265,9 +347,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    topics = [t for t in args.topic if t]
-    action_kinds = [k.strip().upper() for k in args.action_kind if k and k.strip()]
-    suppressed_roles = {r.strip().upper() for r in args.suppress_role if r and r.strip()}
+    topics = _split_csv_values(args.topic)
+    action_kinds = [k.upper() for k in _split_csv_values(args.action_kind)]
+    suppressed_roles = {r.upper() for r in _split_csv_values(args.suppress_role)}
+    max_workers_per_scan = max(0, args.max_workers_per_scan)
+    max_concurrent_workers = max(0, args.max_concurrent_workers)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
@@ -283,6 +367,8 @@ def main() -> int:
         last_msg_id=last_msg_id,
         action_kinds=action_kinds,
         suppressed_roles=sorted(suppressed_roles),
+        max_workers_per_scan=max_workers_per_scan,
+        max_concurrent_workers=max_concurrent_workers,
         message_claim_reclaim_seconds=args.message_claim_reclaim_seconds,
         message_claim_reclaim_interval=args.message_claim_reclaim_interval,
         message_claim_reclaim_min_age_seconds=args.message_claim_reclaim_min_age_seconds,
@@ -304,16 +390,54 @@ def main() -> int:
             last_claim_reclaim_at = time.monotonic()
         try:
             rows = _fetch_new(last_ts, last_msg_id, topics, action_kinds, args.limit)
+            dispatched_rows = 0
+            launched_this_scan = 0
+            throttled = False
             for row in rows:
+                _reap_children()
+                estimated_worker_demand = _estimate_worker_demand(row["msg_id"], suppressed_roles)
+                reason = _throttle_reason(
+                    estimated_worker_demand=estimated_worker_demand,
+                    launched_this_scan=launched_this_scan,
+                    live_children=len(CHILDREN),
+                    max_workers_per_scan=max_workers_per_scan,
+                    max_concurrent_workers=max_concurrent_workers,
+                )
+                if reason is not None:
+                    throttled = True
+                    _log(
+                        "pump_dispatch_throttled",
+                        reason=reason,
+                        msg_id=row["msg_id"],
+                        topic_id=row["topic_id"],
+                        estimated_worker_demand=estimated_worker_demand,
+                        launched_this_scan=launched_this_scan,
+                        live_children=len(CHILDREN),
+                        max_workers_per_scan=max_workers_per_scan,
+                        max_concurrent_workers=max_concurrent_workers,
+                        last_ts=last_ts,
+                        last_msg_id=last_msg_id,
+                    )
+                    break
                 try:
-                    _dispatch_row(row, suppressed_roles)
+                    launched_this_scan += _dispatch_row(row, suppressed_roles)
+                    dispatched_rows += 1
                 except Exception as exc:
                     _log("dispatch_failed", msg_id=row["msg_id"], error=repr(exc))
                 last_ts = row["ts"]
                 last_msg_id = row["msg_id"]
                 _save_state(last_ts, last_msg_id)
             if rows:
-                _log("scan_batch", count=len(rows), last_ts=last_ts, last_msg_id=last_msg_id)
+                _log(
+                    "scan_batch",
+                    count=len(rows),
+                    dispatched_rows=dispatched_rows,
+                    launched_workers=launched_this_scan,
+                    throttled=throttled,
+                    live_children=len(CHILDREN),
+                    last_ts=last_ts,
+                    last_msg_id=last_msg_id,
+                )
         except Exception as exc:
             _log("scan_failed", error=repr(exc))
         if args.once:

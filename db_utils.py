@@ -32,6 +32,42 @@ _NOWIN: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 )
 
+
+def _false_askpass_path() -> str | None:
+    if os.name == "nt":
+        return None
+    for candidate in ("/bin/false", "/usr/bin/false"):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _git_ssh_command(value: str | None = None) -> str:
+    command = value or "ssh"
+    if "BatchMode" in command:
+        return command
+    command_name = os.path.basename(command.strip().split(maxsplit=1)[0].strip("\"'"))
+    if value and os.name == "nt" and "ssh" not in command_name.lower():
+        return command
+    return f"{command} -o BatchMode=yes"
+
+
+def noninteractive_git_env() -> dict[str, str]:
+    """Return a git environment that cannot open terminal or GUI prompts."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = _git_ssh_command(env.get("GIT_SSH_COMMAND"))
+    env["SSH_ASKPASS_REQUIRE"] = "never"
+
+    askpass = _false_askpass_path()
+    if askpass is None:
+        env.pop("GIT_ASKPASS", None)
+        env.pop("SSH_ASKPASS", None)
+    else:
+        env["GIT_ASKPASS"] = askpass
+        env["SSH_ASKPASS"] = askpass
+    return env
+
 try:
     import orjson
 
@@ -738,6 +774,7 @@ def git_run(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=noninteractive_git_env(),
         **_NOWIN,
     )
 

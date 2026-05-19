@@ -40,6 +40,29 @@ from datetime import date, datetime
 from pathlib import Path
 
 logger = logging.getLogger("task_tray")
+_GIT_PULL_TIMEOUT = 120
+_POST_SYNC_DB_WATCH_COOLDOWN_SECONDS = 90.0
+
+
+def _bridge_head(repo_dir: str) -> str | None:
+    from db_utils import git_run
+
+    result = git_run(repo_dir, "rev-parse", "HEAD", timeout=10)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _bridge_git_pull(repo_dir: str):
+    from db_utils import git_retry
+
+    return git_retry(
+        repo_dir,
+        "pull",
+        "--rebase",
+        "--autostash",
+        timeout=_GIT_PULL_TIMEOUT,
+    )
 
 
 def _normalize_filter_payload(filter_payload):
@@ -65,9 +88,12 @@ class BridgeSyncMixin:
     # ── Sync entry points ───────────────────────────────────────────────
 
     def _auto_sync_triggered(self):
-        """Debounce elapsed — run bridge sync."""
+        """Debounce elapsed — run the appropriate bridge sync mode."""
         initiator = getattr(self, "_pending_auto_sync_initiator", "auto")
         self._pending_auto_sync_initiator = None
+        if initiator == "bootstrap":
+            self._periodic_pull(initiator=initiator)
+            return
         self._sync_bridge(initiator=initiator)
 
     def _arm_auto_sync(self, initiator: str):
@@ -191,7 +217,9 @@ class BridgeSyncMixin:
                     with background_lock:
                         target()
             finally:
-                self._sync_cooldown_until = time.monotonic() + 5.0
+                self._sync_cooldown_until = (
+                    time.monotonic() + _POST_SYNC_DB_WATCH_COOLDOWN_SECONDS
+                )
                 self._sync_run_active = False
                 self._log_sync_event("finished", initiator=initiator, mode=mode)
                 self._bridge_thread_lock.release()
@@ -208,6 +236,45 @@ class BridgeSyncMixin:
 
         def _run():
             try:
+                before_head = _bridge_head(self._BRIDGE_DIR)
+                pull_result = _bridge_git_pull(self._BRIDGE_DIR)
+                if pull_result.returncode != 0:
+                    detail = (pull_result.stderr or pull_result.stdout).strip()
+                    self._log_sync_event(
+                        "result",
+                        initiator=initiator,
+                        mode="pull_only",
+                        pulled=False,
+                        changed=False,
+                        error=detail or "git pull failed",
+                    )
+                    return
+
+                after_head = _bridge_head(self._BRIDGE_DIR)
+                if initiator == "bootstrap":
+                    self._log_sync_event(
+                        "result",
+                        initiator=initiator,
+                        mode="pull_only",
+                        pulled=True,
+                        changed=bool(
+                            before_head and after_head and before_head != after_head
+                        ),
+                        imported=0,
+                    )
+                    return
+
+                if before_head and after_head and before_head == after_head:
+                    self._log_sync_event(
+                        "result",
+                        initiator=initiator,
+                        mode="pull_only",
+                        pulled=True,
+                        changed=False,
+                        imported=0,
+                    )
+                    return
+
                 import bridge_sync_worker
 
                 stats = bridge_sync_worker.main(
