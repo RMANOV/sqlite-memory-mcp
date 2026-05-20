@@ -97,7 +97,7 @@ def _attach_fn_alias(owner: Any, tool_obj: Any, fn: Any) -> Any:
             tool_obj.fn = tool_obj
             tool_obj.__wrapped__ = fn
             return tool_obj
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
     if callable(tool_obj):
@@ -106,7 +106,7 @@ def _attach_fn_alias(owner: Any, tool_obj: Any, fn: Any) -> Any:
     if not hasattr(tool_obj, "fn"):
         try:
             setattr(tool_obj, "fn", fn)
-        except Exception:
+        except (AttributeError, TypeError):
             pass
     return tool_obj
 

@@ -29,6 +29,7 @@ from db_utils import (
     get_entity_id as _get_entity_id,
     fts_sync_entity as _fts_sync,
     TaskDAO,
+    TASK_EXPORT_COLS as _TASK_EXPORT_COLS,
     PUBLISH_STANDBY_MINUTES as _PUBLISH_STANDBY_MINUTES,
     bridge_change_summary as _bridge_change_summary,
     promote_pending_public_entities as _promote_pending_public_entities,
@@ -49,6 +50,7 @@ from db_utils import (
     EXTENDED_MEMORY_KEYS as _EXTENDED_MEMORY_KEYS,  # noqa: F401
     migrate_entities_to_per_files as _migrate_entities_to_per_files,
     sync_task_attachments_from_remote as _sync_task_attachments_from_remote,
+    _task_storage_path,
     BRIDGE_REPO,
     BRIDGE_SYNC_DELAY,
     git_run as _git_run,
@@ -174,18 +176,42 @@ def _is_known_collaborator(
     return row is not None
 
 
-def _write_shared_js(shared_path: Path, payload_text: str | None = None) -> None:
+def _write_shared_js(shared_path: Path, payload_text: str | None = None) -> str | None:
     """Write shared.js wrapper next to shared.json for file:// consumers."""
     try:
         raw = payload_text
         if raw is None:
             raw = shared_path.read_text(encoding="utf-8")
-        shared_path.with_name("shared.js").write_text(
-            f"window.__BRIDGE_DATA__ = {raw};",
-            encoding="utf-8",
-        )
+        js_path = shared_path.with_name("shared.js")
+        tmp_path = _tmp_write_path(js_path)
+        tmp_path.write_text(f"window.__BRIDGE_DATA__ = {raw};", encoding="utf-8")
+        os.replace(tmp_path, js_path)
     except OSError as exc:
-        logger.warning("bridge shared.js generation failed: %s", exc)
+        message = f"bridge shared.js generation failed: {exc}"
+        logger.warning(message)
+        return message
+    return None
+
+
+def _git_detail(result: subprocess.CompletedProcess) -> str:
+    return (result.stderr or result.stdout or "").strip() or "unknown git error"
+
+
+def _ensure_stage_dirs(bridge_dir: str) -> None:
+    for rel_path in _BRIDGE_GIT_STAGE_PATHS:
+        if rel_path.endswith("/"):
+            (Path(bridge_dir) / rel_path.rstrip("/")).mkdir(parents=True, exist_ok=True)
+
+
+def _bridge_task_files_complete(conn: sqlite3.Connection, bridge_dir: str) -> bool:
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status NOT IN ('archived', 'cancelled')"
+    ).fetchall()
+    return all(
+        _task_storage_path(str(row["id"]), bridge_dir).is_file()
+        for row in rows
+        if row["id"]
+    )
 
 
 def _push_to_assignee(assignee: str, tasks: list[dict]) -> None:
@@ -514,9 +540,17 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "absorbed remote tombstones; pushing stale state would "
                 "resurrect deletions made on other peers"
             )
-            return _error(
+            message = (
                 "bridge_push aborted: task merge failed; remote tombstones "
                 "not absorbed. Resolve DB lock contention and retry."
+            )
+            return json.dumps(
+                {
+                    "error": message,
+                    "message": message,
+                    "pushed_to_remote": False,
+                    "blocked_by_merge_failure": True,
+                }
             )
 
         # Incremental check: skip if no changes since last push
@@ -612,9 +646,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
 
         # Export all non-archived tasks for cross-machine sync
         task_rows = conn.execute(
-            "SELECT id, title, description, status, priority, section, due_date, "
-            "project, parent_id, notes, recurring, type, assignee, shared_by, "
-            "created_at, updated_at "
+            f"SELECT {_TASK_EXPORT_COLS} "
             "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
         ).fetchall()
         tasks_out = [dict(r) for r in task_rows]
@@ -626,7 +658,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         ).fetchone()
         if lp_row:
             last_push_at = lp_row["value"]
-        _export_task_files(conn, BRIDGE_REPO, changed_since=last_push_at)
+        task_export_since = last_push_at
+        if task_export_since and not _bridge_task_files_complete(conn, BRIDGE_REPO):
+            logger.warning(
+                "bridge_push: missing per-task files detected; forcing full task export"
+            )
+            task_export_since = None
+        _export_task_files(conn, BRIDGE_REPO, changed_since=task_export_since)
         _export_index_json(conn, BRIDGE_REPO)
         # v4: Export per-entity files + entities_index.json
         _, _entity_rows = _export_entity_files(conn, BRIDGE_REPO)
@@ -774,7 +812,16 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
     tmp_path = _tmp_write_path(shared_path)
     tmp_path.write_text(payload_json, encoding="utf-8")
     os.replace(tmp_path, shared_path)
-    _write_shared_js(shared_path, payload_text=payload_json)
+    js_error = _write_shared_js(shared_path, payload_text=payload_json)
+    if js_error:
+        return json.dumps(
+            {
+                "error": js_error,
+                "message": js_error,
+                "pushed_to_remote": False,
+                "generated_file_failed": True,
+            }
+        )
 
     # Cross-account push: send assigned tasks to other users' repos
     by_assignee: dict[str, list] = {}
@@ -832,7 +879,31 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         f"{len(tasks_out)} tasks from {hostname}"
     )
 
-    _git("add", *_BRIDGE_GIT_STAGE_PATHS)
+    try:
+        _ensure_stage_dirs(BRIDGE_REPO)
+    except OSError as exc:
+        message = f"git add failed before staging generated bridge artifacts: {exc}"
+        logger.error("bridge_push: %s", message)
+        return json.dumps(
+            {
+                "error": message,
+                "message": message,
+                "pushed_to_remote": False,
+                "git_add_failed": True,
+            }
+        )
+    add_result = _git("add", *_BRIDGE_GIT_STAGE_PATHS)
+    if add_result.returncode != 0:
+        message = f"git add failed: {_git_detail(add_result)}"
+        logger.error("bridge_push: %s", message)
+        return json.dumps(
+            {
+                "error": message,
+                "message": message,
+                "pushed_to_remote": False,
+                "git_add_failed": True,
+            }
+        )
     # Use --porcelain to check staged changes without locale-dependent text parsing
     status_result = _git("status", "--porcelain")
     if not status_result.stdout.strip():
@@ -840,11 +911,20 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         return json.dumps({"pushed": 0, "message": "No changes — already up to date"})
     commit_result = _git("commit", "-m", msg)
     if commit_result.returncode != 0:
-        logger.error("bridge_push: commit failed: %s", commit_result.stderr)
+        detail = _git_detail(commit_result)
+        logger.error("bridge_push: commit failed: %s", detail)
         # Restore shared.json to last committed state to prevent dirty file
         # from being overwritten by a future bridge_pull --rebase
         _git("checkout", "--", "shared.json", "shared.js")
-        return _error(f"git commit failed: {commit_result.stderr.strip()}")
+        message = f"git commit failed: {detail}"
+        return json.dumps(
+            {
+                "error": message,
+                "message": message,
+                "pushed_to_remote": False,
+                "git_commit_failed": True,
+            }
+        )
 
     push_result = _git("push")
     pushed = push_result.returncode == 0

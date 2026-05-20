@@ -518,6 +518,27 @@ def _worker_claim_exists(
     )
 
 
+def _retire_worker_claims_for_parent_sessions(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    parent_session_ids: list[str],
+    now: str,
+) -> int:
+    sessions = list(dict.fromkeys(s for s in parent_session_ids if s))
+    if not sessions:
+        return 0
+    placeholders = ",".join("?" for _ in sessions)
+    cur = conn.execute(
+        "UPDATE debate_worker_claims SET state = 'retired', heartbeat_at = ? "
+        f"WHERE topic_id = ? AND role = ? AND state = 'active' "
+        f"AND parent_session_id IN ({placeholders})",
+        (now, topic_id, role, *sessions),
+    )
+    return int(cur.rowcount or 0)
+
+
 def _complete_nonstanding_decision_claims_for_reply(
     conn: sqlite3.Connection,
     *,
@@ -1633,6 +1654,7 @@ def bind_role_session(
 
     existing_active = _active_binding(conn, topic_id, role)
     retired_sessions: list[str] = []
+    retired_worker_claims = 0
 
     if state == "active":
         if (
@@ -1658,6 +1680,13 @@ def bind_role_session(
                 ),
             )
             retired_sessions.append(existing_active["session_id"])
+            retired_worker_claims += _retire_worker_claims_for_parent_sessions(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                parent_session_ids=[existing_active["session_id"]],
+                now=now,
+            )
         generation = _next_binding_generation(conn, topic_id, role)
         conn.execute(
             "INSERT INTO debate_role_bindings "
@@ -1692,9 +1721,23 @@ def bind_role_session(
             "state": "active",
             "generation": generation,
             "retired_sessions": retired_sessions,
+            "retired_worker_claims": retired_worker_claims,
         }
 
     if state == "diagnostic":
+        target = _binding_for_session(conn, topic_id, role, session_id)
+        would_uncover = bool(target and target["state"] == "active")
+        if would_uncover:
+            _validate_conductor_override(
+                conn, topic_id=topic_id, override_msg_id=conductor_override_msg_id
+            )
+            retired_worker_claims += _retire_worker_claims_for_parent_sessions(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                parent_session_ids=[session_id],
+                now=now,
+            )
         generation = _next_binding_generation(conn, topic_id, role)
         conn.execute(
             "INSERT INTO debate_role_bindings "
@@ -1728,6 +1771,8 @@ def bind_role_session(
             "runtime": runtime,
             "state": "diagnostic",
             "generation": generation,
+            "ownership_gap_override": would_uncover,
+            "retired_worker_claims": retired_worker_claims,
         }
 
     # Retiring a role owner without replacement is an explicit override path.
@@ -1742,6 +1787,13 @@ def bind_role_session(
         _validate_conductor_override(
             conn, topic_id=topic_id, override_msg_id=conductor_override_msg_id
         )
+        retired_worker_claims += _retire_worker_claims_for_parent_sessions(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            parent_session_ids=[session_id],
+            now=now,
+        )
     conn.execute(
         "UPDATE debate_role_bindings SET state = 'retired', retired_at = ?, "
         "updated_at = ?, reason = ? "
@@ -1754,6 +1806,7 @@ def bind_role_session(
         "session_id": session_id,
         "state": "retired",
         "ownership_gap_override": would_uncover,
+        "retired_worker_claims": retired_worker_claims,
     }
 
 
@@ -1865,14 +1918,19 @@ def rotate_role_binding(
 
 def _retire_bindings_for_transition(
     conn: sqlite3.Connection, *, topic_id: str, new_state: str, reason: str
-) -> int:
+) -> tuple[int, int]:
     now = now_iso()
     if new_state == "RESOLVED":
         states = ("active",)
     elif new_state == "ARCHIVED":
         states = ("active", "diagnostic")
     else:
-        return 0
+        return 0, 0
+    worker_parents = conn.execute(
+        "SELECT role, session_id FROM debate_role_bindings "
+        "WHERE topic_id = ? AND state = 'active'",
+        (topic_id,),
+    ).fetchall()
     placeholders = ",".join("?" for _ in states)
     cur = conn.execute(
         "UPDATE debate_role_bindings SET state = 'retired', "
@@ -1886,7 +1944,16 @@ def _retire_bindings_for_transition(
             *states,
         ),
     )
-    return int(cur.rowcount or 0)
+    retired_worker_claims = 0
+    for row in worker_parents:
+        retired_worker_claims += _retire_worker_claims_for_parent_sessions(
+            conn,
+            topic_id=topic_id,
+            role=row["role"],
+            parent_session_ids=[row["session_id"]],
+            now=now,
+        )
+    return int(cur.rowcount or 0), retired_worker_claims
 
 
 # ── State transitions outside of post_message ──────────────────────────
@@ -1949,7 +2016,7 @@ def transition_state(
         kind="STATE",
         body=state_body,
     )
-    retired_bindings = _retire_bindings_for_transition(
+    retired_bindings, retired_worker_claims = _retire_bindings_for_transition(
         conn, topic_id=topic_id, new_state=new_state, reason=reason
     )
     return {
@@ -1960,6 +2027,7 @@ def transition_state(
         "transition_msg_id": msg["msg_id"],
         "body": state_body,
         "retired_bindings": retired_bindings,
+        "retired_worker_claims": retired_worker_claims,
     }
 
 
@@ -2571,6 +2639,15 @@ def debate_signal_check(
         f"WHERE r.msg_id = m.msg_id AND r.recipient IN ({recipient_placeholders}))"
     )
     params.extend(signal_recipients)
+    where.append(
+        "NOT (m.kind = 'DECISION' AND m.standing = 0 AND EXISTS ("
+        " SELECT 1 FROM debate_message_claims c "
+        " WHERE c.msg_id = m.msg_id AND c.role = ? "
+        " AND (c.state = 'done' OR (c.state = 'active' "
+        " AND COALESCE(c.owner_session_id, '') <> ?))"
+        "))"
+    )
+    params.extend([role, session_id])
     if cursor_ts is not None:
         # Dual-branch cursor (v3.9.3 msg:946bcff6 amendment 3,
         # signal_check m.-aliased form). Same strict-exclusive
@@ -2587,12 +2664,7 @@ def debate_signal_check(
                     "OR m.standing = 1 "
                     "OR (m.standing IS NULL AND "
                     f"m.kind IN ({','.join('?' for _ in STANDING_SIGNAL_KINDS)})) "
-                    "OR (m.kind = 'DECISION' AND m.standing = 0 "
-                    "AND NOT EXISTS ("
-                    " SELECT 1 FROM debate_message_claims c "
-                    " WHERE c.msg_id = m.msg_id AND c.role = ? "
-                    " AND c.state = 'done'"
-                    ")))"
+                    "OR (m.kind = 'DECISION' AND m.standing = 0))"
                 )
                 params.extend(
                     [
@@ -2600,7 +2672,6 @@ def debate_signal_check(
                         cursor_ts,
                         cursor_msg_id,
                         *STANDING_SIGNAL_KINDS,
-                        role,
                     ]
                 )
             else:
@@ -2849,22 +2920,20 @@ def _insert_wake_log(
     return row
 
 
-def _wake_already_logged(
+def _latest_wake_result(
     conn: sqlite3.Connection,
     *,
     trigger_msg_id: str,
     target_session_id: str,
     action: str,
-) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM debate_wake_log "
-            "WHERE trigger_msg_id = ? AND target_session_id = ? "
-            "AND action = ? LIMIT 1",
-            (trigger_msg_id, target_session_id, action),
-        ).fetchone()
-        is not None
-    )
+) -> str | None:
+    row = conn.execute(
+        "SELECT result FROM debate_wake_log "
+        "WHERE trigger_msg_id = ? AND target_session_id = ? "
+        "AND action = ? ORDER BY created_at DESC LIMIT 1",
+        (trigger_msg_id, target_session_id, action),
+    ).fetchone()
+    return str(row["result"]) if row is not None else None
 
 
 def prepare_wake_dry_run(
@@ -2951,11 +3020,15 @@ def prepare_wake_dry_run(
                 result = "no_diagnostic_binding"
 
         if binding is not None:
-            if _wake_already_logged(
+            latest_result = _latest_wake_result(
                 conn,
                 trigger_msg_id=msg_id,
                 target_session_id=binding["session_id"],
                 action=action,
+            )
+            if latest_result and (
+                action == "dry_run_wake"
+                or latest_result in {"dispatched", "notified", "terminal_no_action"}
             ):
                 suppressed += 1
                 targets.append(
@@ -2965,6 +3038,17 @@ def prepare_wake_dry_run(
                         "target_session_id": binding["session_id"],
                         "target_runtime": binding["runtime"],
                         "result": "suppressed",
+                    }
+                )
+                continue
+            if latest_result == "dry_run":
+                targets.append(
+                    {
+                        "recipient": recipient,
+                        "target_role": binding["role"],
+                        "target_session_id": binding["session_id"],
+                        "target_runtime": binding["runtime"],
+                        "result": result,
                     }
                 )
                 continue

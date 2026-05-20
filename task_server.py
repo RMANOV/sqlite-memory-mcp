@@ -9,6 +9,7 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from typing import Any
 
@@ -43,17 +44,24 @@ _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
 
 logger = setup_logger("sqlite-tasks", "task_server.log")
 
-_search_engine = TaskSearchEngine()
+_search_engine: TaskSearchEngine | None = None
+
+
+def _get_search_engine() -> TaskSearchEngine:
+    global _search_engine
+    if _search_engine is None:
+        _search_engine = TaskSearchEngine()
+    return _search_engine
 
 
 def _vec_sync_task_safe(conn, task_id: str) -> None:
-    """Sync task embedding, swallowing errors for graceful degradation."""
+    """Sync task embedding, logging failures for graceful degradation."""
     try:
         from vec_search import vec_sync_task
 
         vec_sync_task(conn, task_id)
     except Exception as e:
-        logger.debug("vec_sync_task(%s) skipped: %s", task_id, e)
+        logger.debug("vec_sync_task(%s) skipped: %s", task_id, e, exc_info=True)
 
 
 def _normalize_title_key(value: str | None) -> str:
@@ -526,15 +534,20 @@ def query_tasks(
                             f"(SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH ?)"
                         )
                         fts_params.append(fts_match)
-                    except Exception:
-                        pass  # FTS5 failed — fall back to unfiltered scan
+                    except sqlite3.Error as e:
+                        logger.debug(
+                            "Task FTS5 prefilter failed for %r: %s",
+                            search,
+                            e,
+                            exc_info=True,
+                        )
 
             sql = (
                 f"SELECT {cols} FROM {from_clause} WHERE {fts_where} "
                 f"ORDER BY {order_clause}"
             )
             all_rows = conn.execute(sql, fts_params).fetchall()
-            results = _search_engine.search(
+            results = _get_search_engine().search(
                 search, [dict(r) for r in all_rows], conn=conn
             )
             total = len(results)

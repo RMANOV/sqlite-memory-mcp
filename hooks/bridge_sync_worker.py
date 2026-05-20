@@ -219,6 +219,36 @@ def _read_dirty_timestamp():
     return None
 
 
+def _call_tool(tool, **kwargs):
+    fn = tool.fn
+    if inspect.iscoroutinefunction(fn):
+        return asyncio.run(fn(**kwargs))
+    return fn(**kwargs)
+
+
+def _parse_result(result):
+    try:
+        return json.loads(result) if isinstance(result, str) else result
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _sync_block_message(result, default):
+    if not isinstance(result, dict):
+        return None
+    blocked = (
+        result.get("blocked_by_repo_state")
+        or result.get("git_pull_failed")
+        or result.get("blocked_by_merge_failure")
+        or result.get("blocked_by_safety")
+        or result.get("git_add_failed")
+        or result.get("git_commit_failed")
+    )
+    if not blocked:
+        return None
+    return str(result.get("error") or result.get("message") or default)
+
+
 def main(progress_callback=None):
     """Run bridge pull + push cycle.
 
@@ -260,44 +290,31 @@ def main(progress_callback=None):
 
             # Step 1: Pull remote changes into local DB
             _progress(5, "git pull...")
-            pull_fn = bridge_pull.fn
-            if inspect.iscoroutinefunction(pull_fn):
-                pull_result = asyncio.run(pull_fn())
-            else:
-                pull_result = pull_fn()
-            logging.info("bridge_pull result: %s", pull_result)
+            pull_result_raw = _call_tool(bridge_pull)
+            logging.info("bridge_pull result: %s", pull_result_raw)
+            pull_result = _parse_result(pull_result_raw)
+            block_msg = _sync_block_message(pull_result, "bridge pull blocked")
+            if block_msg:
+                notify("warning", f"BRIDGE: sync blocked — {block_msg}")
+                return
             _progress(35, "Preparing push...")
 
             # Step 2: Push local (now merged) DB to remote
-            fn = bridge_push.fn
             _progress(40, "Pushing...")
 
-            if inspect.iscoroutinefunction(fn):
-                result_str = asyncio.run(fn(tag="shared"))
-            else:
-                result_str = fn(tag="shared")
-
+            result_str = _call_tool(bridge_push, tag="shared")
             logging.info("bridge_push result: %s", result_str)
 
             # Parse result to check pushed_to_remote
-            try:
-                result = (
-                    json.loads(result_str)
-                    if isinstance(result_str, str)
-                    else result_str
-                )
-            except (json.JSONDecodeError, TypeError):
-                result = {}
+            result = _parse_result(result_str)
 
             pushed = False
             tasks_count = result.get("tasks", 0) if isinstance(result, dict) else 0
             if isinstance(result, dict):
                 pushed = bool(result.get("pushed_to_remote", False))
-                if result.get("blocked_by_repo_state"):
-                    notify(
-                        "warning",
-                        f"BRIDGE: sync blocked — {result.get('error', 'bridge repo is not ready')}",
-                    )
+                block_msg = _sync_block_message(result, "bridge push blocked")
+                if block_msg:
+                    notify("warning", f"BRIDGE: sync blocked — {block_msg}")
                     return
                 message = str(result.get("message", ""))
                 if (

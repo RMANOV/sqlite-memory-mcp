@@ -224,6 +224,43 @@ def test_find_by_title_returns_contract_metadata_and_hides_low_confidence_noise(
     assert all(item["confidence"] != "low" for item in result["matches"])
 
 
+def test_query_tasks_lazily_constructs_search_engine(task_env, monkeypatch):
+    calls = []
+
+    class FakeSearchEngine:
+        def search(self, query, tasks, limit=50, conn=None, use_vector=True):
+            calls.append(
+                {
+                    "query": query,
+                    "task_count": len(tasks),
+                    "has_conn": conn is not None,
+                    "use_vector": use_vector,
+                }
+            )
+            return tasks
+
+    monkeypatch.setattr(task_server, "_search_engine", None)
+    monkeypatch.setattr(task_server, "TaskSearchEngine", FakeSearchEngine)
+    task_server.create_task_or_note.fn(
+        title="Lazy search engine probe",
+        description="distinctive lazy search phrase",
+    )
+
+    result = json.loads(task_server.query_tasks.fn(search="lazy search"))
+
+    assert result["count"] == 1
+    assert result["tasks"][0]["title"] == "Lazy search engine probe"
+    assert calls == [
+        {
+            "query": "lazy search",
+            "task_count": 1,
+            "has_conn": True,
+            "use_vector": True,
+        }
+    ]
+    assert isinstance(task_server._search_engine, FakeSearchEngine)
+
+
 def test_find_by_title_eval_corpus_keeps_top1_and_top3_hit_rate(task_env):
     _seed_lookup_corpus()
     corpus_path = Path(__file__).with_name("fixtures") / "retrieval_eval_corpus.json"

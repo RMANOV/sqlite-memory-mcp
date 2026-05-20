@@ -338,6 +338,40 @@ def _record_real_spawn(
         return None
 
 
+def _mark_source_wake_result(
+    target: dict[str, Any],
+    trigger_msg_id: str,
+    result: str,
+) -> None:
+    sys.path.insert(0, str(REPO))
+    try:
+        from db_utils import get_conn_immediate
+    except Exception as exc:
+        _log("source_wake_mark_import_failed", msg_id=trigger_msg_id, error=repr(exc))
+        return
+
+    action = os.environ.get("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
+    target_session_id = str(
+        target.get("source_target_session_id") or target.get("target_session_id") or ""
+    )
+    if not target_session_id:
+        return
+    try:
+        with get_conn_immediate() as conn:
+            conn.execute(
+                "UPDATE debate_wake_log SET result = ? "
+                "WHERE wake_id = ("
+                " SELECT wake_id FROM debate_wake_log "
+                " WHERE trigger_msg_id = ? AND target_session_id = ? "
+                " AND action = ? AND result = 'dry_run' "
+                " ORDER BY created_at DESC LIMIT 1"
+                ")",
+                (result, trigger_msg_id, target_session_id, action),
+            )
+    except Exception as exc:
+        _log("source_wake_mark_failed", msg_id=trigger_msg_id, error=repr(exc))
+
+
 def _claim_worker_target(
     target: dict[str, Any], trigger_msg_id: str, topic_id: str
 ) -> dict[str, Any]:
@@ -475,6 +509,9 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
         for target in targets:
             if target.get("result") != "suppressed":
                 _notify(target, str(tool_response.get("msg_id") or ""))
+                _mark_source_wake_result(
+                    target, str(tool_response.get("msg_id") or ""), "notified"
+                )
                 notified += 1
         return {"mode": mode, "notified": notified, "launches": []}
 
@@ -511,18 +548,36 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
         return {"mode": mode, "launches": [], "reason": "unknown_topic"}
 
     launches = []
+    remaining = budget
     for target in targets:
         if target.get("result") == "suppressed":
             continue
-        launches.append(
-            {
-                "target": target,
-                "launch": _launch_agent(
-                    target, str(tool_response.get("msg_id") or ""), topic_id
-                ),
-            }
+        if remaining <= 0:
+            _log(
+                "agent_budget_exhausted_mid_dispatch",
+                msg_id=tool_response.get("msg_id"),
+                skipped_target=target,
+            )
+            break
+        launch = _launch_agent(
+            target, str(tool_response.get("msg_id") or ""), topic_id
         )
-    _log("agent_launches", msg_id=tool_response.get("msg_id"), launches=launches)
+        if launch.get("launched"):
+            remaining -= 1
+            _mark_source_wake_result(
+                target, str(tool_response.get("msg_id") or ""), "dispatched"
+            )
+        elif launch.get("reason") == "worker_claim_completed":
+            _mark_source_wake_result(
+                target, str(tool_response.get("msg_id") or ""), "terminal_no_action"
+            )
+        launches.append({"target": target, "launch": launch})
+    _log(
+        "agent_launches",
+        msg_id=tool_response.get("msg_id"),
+        launches=launches,
+        remaining_budget=remaining,
+    )
     return {"mode": mode, "launches": launches}
 
 

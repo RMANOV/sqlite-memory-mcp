@@ -213,8 +213,13 @@ class TaskSearchEngine:
                         from vec_search import task_vector_search, task_rrf_merge
 
                         vec_results = task_vector_search(conn, query, limit)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug(
+                            "Vector task search failed for %r, falling back: %s",
+                            query,
+                            exc,
+                            exc_info=True,
+                        )
 
             if fts_results is not None and vec_results:
                 # RRF merge FTS5 + vector, filter to task pool
@@ -297,7 +302,7 @@ class TaskSearchEngine:
                 "ORDER BY rank LIMIT ?",
                 (fts_q, limit),
             ).fetchall()
-        except Exception:
+        except sqlite3.Error:
             log.debug("FTS5 search failed for %r, falling back", query, exc_info=True)
             return None
         if not rows:
@@ -313,8 +318,8 @@ class TaskSearchEngine:
                     "ORDER BY rank LIMIT ?",
                     (fts_q_or, limit),
                 ).fetchall()
-            except Exception as e:
-                log.debug("FTS5 fallback failed: %s", e)
+            except sqlite3.Error as e:
+                log.debug("FTS5 fallback failed: %s", e, exc_info=True)
                 return None
         if not rows:
             return None

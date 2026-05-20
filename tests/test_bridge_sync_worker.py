@@ -534,6 +534,61 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
 
 
+def test_bridge_sync_worker_git_add_failure_fails_closed_without_commit_or_push(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    now = db_utils.now_iso()
+    conn.execute(
+        "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        ("task-001", "Task", now, now),
+    )
+    conn.close()
+
+    git_calls = []
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        git_calls.append(args)
+        if args[0] == "add":
+            return _cp(args, returncode=128, stderr="fatal: pathspec failed")
+        if args[0] in {"commit", "push"}:
+            raise AssertionError(f"git {args[0]} must not run after add failure")
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        git_calls.append(args)
+        if args[0] == "push":
+            raise AssertionError("git push must not run after add failure")
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    result = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+
+    assert result["pushed"] is False
+    assert result["git_add_failed"] is True
+    assert "pathspec failed" in result["message"]
+    assert any(args[0] == "add" for args in git_calls)
+    assert not any(args[0] in {"commit", "push"} for args in git_calls)
+
+
 def test_bridge_sync_worker_auto_heals_shrink_instead_of_blocking(
     tmp_path, monkeypatch
 ):

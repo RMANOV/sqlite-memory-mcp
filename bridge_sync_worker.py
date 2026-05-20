@@ -162,6 +162,16 @@ def _write_shared_js(shared_path: Path, payload_text: str) -> None:
     os.replace(tmp_path, js_path)
 
 
+def _git_detail(result: subprocess.CompletedProcess) -> str:
+    return (result.stderr or result.stdout or "").strip() or "unknown git error"
+
+
+def _ensure_stage_dirs(bridge_dir: str) -> None:
+    for rel_path in BRIDGE_GIT_STAGE_PATHS:
+        if rel_path.endswith("/"):
+            (Path(bridge_dir) / rel_path.rstrip("/")).mkdir(parents=True, exist_ok=True)
+
+
 def _ui_profile_changed(
     shared_path: Path, machine_id: str, ui_profile: dict | None
 ) -> bool:
@@ -1010,29 +1020,63 @@ def _main_locked(
     os.replace(tmp_shared_path, shared_path)
     _write_shared_js(shared_path, payload_json)
 
+    n_ent = len(entities_out)
+    n_tasks = len(payload["tasks"])
+
     _progress(progress_callback, 80, "git add...")
-    git_run(
+    try:
+        _ensure_stage_dirs(bridge_dir)
+    except OSError as exc:
+        message = f"git add failed before staging generated bridge artifacts: {exc}"
+        log.error("bridge sync %s", message)
+        _progress(progress_callback, -1, f"BLOCKED: {message}")
+        return {
+            "entities": n_ent,
+            "tasks": n_tasks,
+            "pushed": False,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+            "git_add_failed": True,
+            "message": message,
+        }
+    add_result = git_run(
         bridge_dir,
         "add",
         *BRIDGE_GIT_STAGE_PATHS,
     )
+    if add_result.returncode != 0:
+        detail = _git_detail(add_result)
+        message = f"git add failed: {detail}"
+        log.error("bridge sync %s", message)
+        _progress(progress_callback, -1, f"BLOCKED: {message}")
+        return {
+            "entities": n_ent,
+            "tasks": n_tasks,
+            "pushed": False,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+            "git_add_failed": True,
+            "message": message,
+        }
 
     _progress(progress_callback, 90, "git commit...")
-    n_ent = len(entities_out)
-    n_tasks = len(payload["tasks"])
     msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {machine_id}"
     result = git_run(bridge_dir, "commit", "-m", msg, timeout=_GIT_COMMIT_TIMEOUT)
 
     if result.returncode != 0:
         if "nothing to commit" not in (result.stdout + result.stderr):
-            log.error("bridge sync commit failed: %s", result.stderr)
-            _progress(progress_callback, 100, "Done")
+            detail = _git_detail(result)
+            message = f"git commit failed: {detail}"
+            log.error("bridge sync %s", message)
+            _progress(progress_callback, -1, f"BLOCKED: {message}")
             return {
                 "entities": n_ent,
                 "tasks": n_tasks,
                 "pushed": False,
                 "imported_new": new_t,
                 "imported_updated": upd_t,
+                "git_commit_failed": True,
+                "message": message,
             }
 
     _progress(progress_callback, 95, "git push...")

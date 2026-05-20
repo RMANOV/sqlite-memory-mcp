@@ -174,6 +174,72 @@ def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "retired"
 
 
+def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_workers(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="claimed work",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+
+    with pytest.raises(DebateError) as exc_info:
+        bind_role_session(
+            conn,
+            topic_id=t,
+            role="EXECUTOR",
+            session_id="codex-exec1",
+            state="diagnostic",
+            reason="demote without replacement",
+        )
+    assert exc_info.value.error_type == "conductor_override_required"
+    assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
+
+    override = post_message(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="DECISION",
+        body="allow temporary diagnostic demotion",
+    )
+    out = bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        state="diagnostic",
+        reason="diagnostic investigation",
+        conductor_override_msg_id=override["msg_id"],
+    )
+    worker = conn.execute(
+        "SELECT state FROM debate_worker_claims WHERE worker_session_id = ?",
+        (claim["worker_session_id"],),
+    ).fetchone()
+
+    assert out["ownership_gap_override"] is True
+    assert out["retired_worker_claims"] == 1
+    assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "diagnostic"
+    assert worker["state"] == "retired"
+
+
 def test_rotate_requires_cursor_mode_and_copy_missing_cursor_warns(topic):
     conn, t = topic
     bind_role_session(
@@ -251,6 +317,43 @@ def test_wake_adapter_signal_only_and_loop_suppressed(topic):
     assert first["targets"][0]["target_session_id"] == "codex-exec1"
     assert second["suppressed"] == 1
     assert wake_logs == 1
+
+
+def test_agent_wake_resolution_retries_until_dispatch_is_marked(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    post = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="wake executor",
+        addressed_to=["EXECUTOR"],
+    )
+
+    first = prepare_wake_dry_run(conn, tool_response=post, action="post_tool_use_wake")
+    second = prepare_wake_dry_run(conn, tool_response=post, action="post_tool_use_wake")
+
+    assert first["suppressed"] == 0
+    assert second["suppressed"] == 0
+    assert [target["result"] for target in second["targets"]] == ["dry_run"]
+
+    assert second["logs"] == []
+    conn.execute(
+        "UPDATE debate_wake_log SET result = 'dispatched' WHERE wake_id = ?",
+        (first["logs"][0]["wake_id"],),
+    )
+    third = prepare_wake_dry_run(conn, tool_response=post, action="post_tool_use_wake")
+
+    assert third["suppressed"] == 1
+    assert third["targets"][0]["result"] == "suppressed"
 
 
 def test_unknown_tool_response_schema_fails_closed_and_logs_audit(topic):
@@ -759,6 +862,43 @@ def test_worker_reap_removes_completed_claim_and_leaves_audit(topic):
     assert audit["result"] == "reaped"
 
 
+def test_transition_resolved_retires_active_worker_claims(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="in flight",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+
+    out = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    worker = conn.execute(
+        "SELECT state FROM debate_worker_claims WHERE worker_session_id = ?",
+        (claim["worker_session_id"],),
+    ).fetchone()
+
+    assert out["retired_bindings"] == 1
+    assert out["retired_worker_claims"] == 1
+    assert worker["state"] == "retired"
+
+
 def test_nonstanding_decision_claim_survives_cursor_advance_until_terminal_reply(topic):
     conn, t = topic
     bind_role_session(
@@ -860,6 +1000,74 @@ def test_standing_false_decision_is_not_resurfaced_as_mandate(topic):
         conn, session_id="codex-exec1", role="EXECUTOR", topic_id=t
     )
     assert [m["msg_id"] for m in out["pending"]] == [standing["msg_id"]]
+
+
+def test_signal_check_limit_skips_done_one_shot_decisions_without_starving_later_work(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    cursor = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="M",
+        kind="STATUS",
+        body="cursor",
+        addressed_to=["EXECUTOR"],
+    )
+    debate_signal_advance(
+        conn,
+        session_id="codex-exec1",
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=cursor["msg_id"],
+    )
+    for body in ("done task 1", "done task 2"):
+        task = debate_post_with_recipients(
+            conn,
+            topic_id=t,
+            role="CONDUCTOR",
+            priority="H",
+            kind="DECISION",
+            body=body,
+            addressed_to=["EXECUTOR"],
+            standing=False,
+        )
+        post_message(
+            conn,
+            topic_id=t,
+            role="EXECUTOR",
+            priority="H",
+            kind="A",
+            body=f"ack {body}",
+            reply_to=task["msg_id"],
+        )
+    visible = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="M",
+        kind="STATUS",
+        body="later visible work",
+        addressed_to=["EXECUTOR"],
+    )
+
+    out = debate_signal_check(
+        conn,
+        session_id="codex-exec1",
+        role="EXECUTOR",
+        topic_id=t,
+        limit=1,
+    )
+
+    assert out["count"] == 1
+    assert out["pending"][0]["msg_id"] == visible["msg_id"]
+    assert out["truncated"] is False
 
 
 def test_stale_nonstanding_decision_claim_reclaim_allows_new_worker_owner(topic):

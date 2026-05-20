@@ -69,15 +69,14 @@ mcp.mount(intel_mcp)
 mcp.mount(bridge_mcp)
 mcp.mount(collab_mcp)
 
-logger.info(
-    "Unified server ready: %d mounted servers, tools from 7 domains",
-    7,
-)
-
 
 def main() -> None:
     ensure_db_initialized()
     maybe_mount_premium_extensions(mcp, server_name="sqlite-unified")
+    logger.info(
+        "Unified server ready: %d mounted servers, tools from 7 domains",
+        7,
+    )
     mcp.run(transport="stdio")
 
 

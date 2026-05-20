@@ -341,6 +341,24 @@ class TestExportTaskFiles:
         assert not os.path.exists(stale)
         assert os.path.isfile(os.path.join(tasks_dir, "task-001.json"))
 
+    def test_full_export_with_no_tasks_removes_stale_generated_files(self, setup):
+        """Full export with an empty task set still removes stale generated files."""
+        _conn, bridge_dir = setup
+        tasks_dir = os.path.join(bridge_dir, "tasks")
+        attachments_dir = os.path.join(bridge_dir, "attachments", "aa")
+        os.makedirs(tasks_dir, exist_ok=True)
+        os.makedirs(attachments_dir, exist_ok=True)
+        stale_task = os.path.join(tasks_dir, "task-ghost.json")
+        stale_attachment = os.path.join(attachments_dir, "old.bin")
+        open(stale_task, "w", encoding="utf-8").write("{}")
+        open(stale_attachment, "wb").write(b"old")
+
+        exported = export_task_files(_conn, bridge_dir)
+
+        assert exported == []
+        assert not os.path.exists(stale_task)
+        assert not os.path.exists(stale_attachment)
+
     def test_incremental_export_no_stale_cleanup(self, setup):
         """Incremental export (changed_since set) does NOT delete other task files."""
         conn, bridge_dir = setup

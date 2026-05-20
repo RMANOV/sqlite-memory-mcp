@@ -238,6 +238,68 @@ def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
 
 
+def test_bridge_push_git_add_failure_fails_closed_without_commit_or_push(
+    bridge_env, monkeypatch
+):
+    _db_path, _bridge_dir = bridge_env
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "add":
+            return _cp(args, returncode=128, stderr="fatal: pathspec failed")
+        if args[0] in {"commit", "push", "status"}:
+            raise AssertionError(f"git {args[0]} must not run after add failure")
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_repo_ready",
+        lambda repo: (True, None),
+    )
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+
+    result = json.loads(bridge_server.bridge_push.fn(force=True))
+
+    assert result["pushed_to_remote"] is False
+    assert result["git_add_failed"] is True
+    assert "pathspec failed" in result["error"]
+    assert any(args[0] == "add" for args in git_calls)
+    assert not any(args[0] in {"commit", "push", "status"} for args in git_calls)
+
+
+def test_bridge_push_shared_js_generation_failure_fails_closed(
+    bridge_env, monkeypatch
+):
+    _db_path, _bridge_dir = bridge_env
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] in {"add", "commit", "push", "status"}:
+            raise AssertionError(f"git {args[0]} must not run after shared.js failure")
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_repo_ready",
+        lambda repo: (True, None),
+    )
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+    monkeypatch.setattr(
+        bridge_server,
+        "_write_shared_js",
+        lambda *args, **kwargs: "bridge shared.js generation failed: denied",
+    )
+
+    result = json.loads(bridge_server.bridge_push.fn(force=True))
+
+    assert result["pushed_to_remote"] is False
+    assert result["generated_file_failed"] is True
+    assert "shared.js generation failed" in result["error"]
+    assert not any(args[0] in {"add", "commit", "push", "status"} for args in git_calls)
+
+
 def test_bridge_doctor_returns_runtime_parity_and_surface_contract(
     bridge_env, monkeypatch
 ):
@@ -680,6 +742,97 @@ def test_bridge_push_promotes_ready_pending_public_tasks_before_skip(
     assert result["pushed_to_remote"] is True
     assert result["promoted_to_public"]["tasks"] == 1
     assert row["visibility"] == "public"
+
+
+def test_bridge_push_shared_payload_uses_canonical_task_export_columns(
+    bridge_env, monkeypatch
+):
+    db_path, bridge_dir = bridge_env
+    created = "2026-03-29T08:00:00+00:00"
+    reminder = "2026-03-30T09:00:00+00:00"
+    publish_requested = "2026-03-29T09:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, section, reminder_at, "
+            "visibility, publish_requested_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-canonical-cols",
+                "Canonical columns",
+                "not_started",
+                "medium",
+                "inbox",
+                reminder,
+                "private",
+                publish_requested,
+                created,
+                created,
+            ),
+        )
+
+    def fake_git(*args):
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout="M shared.json\nM index.json\n")
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+
+    result = json.loads(bridge_server.bridge_push.fn(force=True))
+    payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+    task = next(item for item in payload["tasks"] if item["id"] == "task-canonical-cols")
+
+    assert result["pushed_to_remote"] is True
+    assert task["reminder_at"] == reminder
+    assert task["visibility"] == "private"
+    assert task["publish_requested_at"] == publish_requested
+
+
+def test_bridge_push_forces_full_task_export_when_index_would_reference_missing_file(
+    bridge_env, monkeypatch
+):
+    db_path, bridge_dir = bridge_env
+    old = "2026-03-29T08:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, section, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-missing-file",
+                "Missing file task",
+                "description must survive",
+                "not_started",
+                "medium",
+                "inbox",
+                old,
+                old,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
+            ("2099-01-01T00:00:00+00:00",),
+        )
+
+    def fake_git(*args):
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout="M shared.json\nM index.json\nM tasks/task-missing-file.json\n")
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+
+    result = json.loads(bridge_server.bridge_push.fn(force=True))
+    task_file = bridge_dir / "tasks" / "task-missing-file.json"
+
+    assert result["pushed_to_remote"] is True
+    assert task_file.is_file()
+    assert json.loads(task_file.read_text(encoding="utf-8"))["description"] == (
+        "description must survive"
+    )
 
 
 def test_bridge_pull_skips_spoofed_collaboration_payloads(bridge_env, monkeypatch):

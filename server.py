@@ -218,8 +218,10 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                 if _VEC_AVAILABLE:
                     try:
                         _vec_sync(conn, eid)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "vec_sync(%s) skipped: %s", eid, exc, exc_info=True
+                        )
                 if new_obs_ids:
                     try:
                         from lazy_enrichment import extract_inline_claims
@@ -282,8 +284,10 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
             if _VEC_AVAILABLE:
                 try:
                     _vec_sync(conn, eid)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "vec_sync(%s) skipped: %s", eid, exc, exc_info=True
+                    )
             if contents:
                 try:
                     from lazy_enrichment import extract_inline_claims
@@ -392,8 +396,10 @@ def delete_entities(entityNames: list[str]) -> str:
             if _VEC_AVAILABLE:
                 try:
                     _vec_remove(conn, eid)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "vec_remove(%s) skipped: %s", eid, exc, exc_info=True
+                    )
             conn.execute("DELETE FROM entities WHERE id = ?", (eid,))
             deleted += 1
 
@@ -442,8 +448,10 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
             if _VEC_AVAILABLE:
                 try:
                     _vec_sync(conn, eid)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "vec_sync(%s) skipped: %s", eid, exc, exc_info=True
+                    )
 
     logger.info("delete_observations: %d deleted", deleted)
     return json.dumps({"deleted": deleted})
@@ -595,7 +603,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                     # Vector found results that FTS5 missed (semantic match)
                     rows = _rrf_merge([], vec_rows)
             except Exception as e:
-                logger.debug("Vector search failed: %s", e)
+                logger.debug("Vector search failed: %s", e, exc_info=True)
 
         if not rows:
             return json.dumps({"entities": [], "query": query})

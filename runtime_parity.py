@@ -16,7 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parent
 REPO_HOOK_DIR = REPO_ROOT / "hooks"
 RUNTIME_HOOK_DIR = Path.home() / ".claude" / "hooks"
 MANIFEST_PATH = Path.home() / ".claude" / "memory" / ".bridge_runtime_parity.json"
-TRACKED_RUNTIME_FILES = ("bridge_auto_sync.py", "bridge_sync_worker.py")
+TRACKED_RUNTIME_FILES = (
+    "bridge_auto_sync.py",
+    "bridge_sync_worker.py",
+    "debate_agent_events.py",
+    "debate_pump.py",
+    "debate_wake.py",
+)
 
 
 def _now_iso() -> str:

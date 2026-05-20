@@ -424,6 +424,7 @@ def main() -> int:
                     dispatched_rows += 1
                 except Exception as exc:
                     _log("dispatch_failed", msg_id=row["msg_id"], error=repr(exc))
+                    break
                 last_ts = row["ts"]
                 last_msg_id = row["msg_id"]
                 _save_state(last_ts, last_msg_id)

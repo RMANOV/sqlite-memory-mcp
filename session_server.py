@@ -9,6 +9,7 @@ Exists because Claude Code 2.x has a tool-count limit per MCP server
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any
 
 from fastmcp_compat import FastMCP
@@ -134,7 +135,7 @@ def search_by_project(query: str, project: str) -> str:
             from smart_retrieval import RERANKING_POOL_SIZE
 
             pool_size = RERANKING_POOL_SIZE
-        except Exception:
+        except ImportError:
             pool_size = 50
 
         rows = conn.execute(
@@ -163,8 +164,10 @@ def search_by_project(query: str, project: str) -> str:
                     query_entity_ids=None,
                     limit=50,
                 )
-            except Exception as e:
-                logger.warning("Re-ranking failed, using default pool: %s", e)
+            except (ImportError, sqlite3.Error, KeyError, TypeError, ValueError) as e:
+                logger.warning(
+                    "Re-ranking failed, using default pool: %s", e, exc_info=True
+                )
 
             if reranked:
                 eids = [r["eid"] for r in reranked]

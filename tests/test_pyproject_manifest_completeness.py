@@ -25,6 +25,7 @@ exits cleanly — must timeout-then-grep-stderr, not exit-0).
 from __future__ import annotations
 
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -257,8 +258,47 @@ def test_installed_package_metadata_version_matches_pyproject():
     )
 
 
-def test_sqlite_memory_intel_entrypoint_starts_without_module_errors(tmp_path):
-    """The ``sqlite-memory-intel`` console script (installed via
+def test_runtime_dunder_version_matches_pyproject():
+    """The in-tree runtime version constant must not drift from pyproject."""
+    manifest = _load_manifest()
+    declared_version = manifest["project"]["version"]
+    runtime_metadata = runpy.run_path(str(REPO_ROOT / "__init__.py"))
+
+    assert runtime_metadata["__version__"] == declared_version
+
+
+def test_package_dunder_version_matches_pyproject():
+    """The import-level ``__version__`` must not drift from pyproject.
+
+    Editable install metadata catches packaging drift, but direct imports from
+    the checkout can still report stale versions if ``__init__.py`` is not
+    updated. That stale value is especially misleading during local release
+    gates and runtime diagnostics.
+    """
+    import __init__ as package_root
+
+    manifest = _load_manifest()
+    declared_version = manifest["project"]["version"]
+
+    assert package_root.__version__ == declared_version
+
+
+_STDIO_MCP_ENTRYPOINTS = (
+    "sqlite-memory-mcp",
+    "sqlite-memory-core",
+    "sqlite-memory-session",
+    "sqlite-memory-tasks",
+    "sqlite-memory-bridge",
+    "sqlite-memory-collab",
+    "sqlite-memory-entity",
+    "sqlite-memory-intel",
+    "sqlite-memory-unified",
+)
+
+
+@pytest.mark.parametrize("entrypoint", _STDIO_MCP_ENTRYPOINTS)
+def test_stdio_mcp_entrypoint_starts_without_module_errors(tmp_path, entrypoint):
+    """Each stdio MCP console script (installed via
     pyproject ``[project.scripts]``) MUST start without raising a
     ``ModuleNotFoundError`` or any other unhandled Python exception
     when invoked from an arbitrary cwd.
@@ -274,10 +314,10 @@ def test_sqlite_memory_intel_entrypoint_starts_without_module_errors(tmp_path):
     # back to ~/.local/bin in user-site installs.
     import shutil
 
-    binary = shutil.which("sqlite-memory-intel")
+    binary = shutil.which(entrypoint)
     if binary is None:
         pytest.skip(
-            "sqlite-memory-intel not on PATH — likely a CI sandbox "
+            f"{entrypoint} not on PATH — likely a CI sandbox "
             "without the editable install. The manifest tests above "
             "cover the underlying contract anyway."
         )
@@ -296,7 +336,7 @@ def test_sqlite_memory_intel_entrypoint_starts_without_module_errors(tmp_path):
     # Exit code 0 = server exited cleanly after stdin EOF (acceptable).
     # Any OTHER non-zero exit means the server crashed during boot.
     assert result.returncode in (0, 124, 143, -15), (
-        f"sqlite-memory-intel exited with unexpected code "
+        f"{entrypoint} exited with unexpected code "
         f"{result.returncode}. stderr:\n{result.stderr}\n"
         f"stdout:\n{result.stdout}"
     )
@@ -307,7 +347,7 @@ def test_sqlite_memory_intel_entrypoint_starts_without_module_errors(tmp_path):
     forbidden = ("Traceback", "ModuleNotFoundError", "ImportError")
     hits = [token for token in forbidden if token in combined]
     assert not hits, (
-        f"sqlite-memory-intel boot surfaced forbidden tokens "
+        f"{entrypoint} boot surfaced forbidden tokens "
         f"{hits} in stderr/stdout. This means a manifest regression "
         f"— a module imported during entrypoint boot is no longer "
         f"reachable via the editable MAPPING.\n\n"

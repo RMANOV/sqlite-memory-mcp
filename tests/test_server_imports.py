@@ -2,6 +2,7 @@
 
 import logging
 import os
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -66,6 +67,62 @@ def test_project_scripts_call_main_wrappers():
     assert scripts["sqlite-memory-entity"] == "entity_server:main"
     assert scripts["sqlite-memory-intel"] == "intel_server:main"
     assert scripts["sqlite-memory-unified"] == "unified_server:main"
+
+
+def test_stdio_server_imports_do_not_write_to_stdout(tmp_path):
+    modules = (
+        "server",
+        "task_server",
+        "session_server",
+        "entity_server",
+        "collab_server",
+        "unified_server",
+    )
+    code = "import " + ", ".join(modules)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_stdio_server_loggers_do_not_attach_stdout_or_stderr_handlers():
+    for logger_name in (
+        "sqlite-kb",
+        "sqlite-tasks",
+        "sqlite-session",
+        "sqlite-entity",
+        "sqlite-collab",
+        "sqlite-unified",
+    ):
+        logger = logging.getLogger(logger_name)
+        assert logger.handlers, (
+            f"{logger_name} should have an explicit file/null logger"
+        )
+        for handler in logger.handlers:
+            assert getattr(handler, "stream", None) not in {sys.stdout, sys.stderr}
+
+
+def test_task_server_import_does_not_construct_search_engine(tmp_path):
+    code = (
+        "import task_server; "
+        "raise SystemExit(0 if task_server._search_engine is None else 1)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
 
 
 @pytest.mark.parametrize(

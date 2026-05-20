@@ -7,9 +7,13 @@ Falls back gracefully to pure BM25 on any error.
 from __future__ import annotations
 
 import math
+import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # ── Tunable constants ──────────────────────────────────────────────────────
 
@@ -164,8 +168,8 @@ def rerank_entities(
                 name_list,
             ):
                 facts_subjects.add(row["subject"])
-        except Exception:
-            pass  # canonical_facts may not exist yet
+        except sqlite3.OperationalError as exc:
+            log.debug("canonical_facts lookup skipped: %s", exc, exc_info=True)
 
     # Session active files
     active_file_entities: set[str] = set()
@@ -176,12 +180,11 @@ def rerank_entities(
                 (session_id,),
             ).fetchone()
             if srow and srow["active_files"]:
-                import json
                 files = json.loads(srow["active_files"])
                 if isinstance(files, list):
                     active_file_entities = set(files)
-        except Exception:
-            pass
+        except (sqlite3.Error, json.JSONDecodeError, TypeError) as exc:
+            log.debug("session active_files lookup skipped: %s", exc, exc_info=True)
 
     # Compute scores and build results
     scored: list[tuple[float, dict]] = []

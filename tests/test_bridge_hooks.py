@@ -184,6 +184,113 @@ def test_hook_worker_treats_no_change_push_as_success(tmp_path, monkeypatch):
     assert notifications[-1] == ("info", "BRIDGE: synced 3 tasks OK")
 
 
+def test_hook_worker_blocks_push_when_pull_fails_closed(tmp_path, monkeypatch):
+    module = _load_module(
+        "bridge_hook_worker_pull_block_test", ROOT / "hooks" / "bridge_sync_worker.py"
+    )
+    module.LOCK_FILE = str(tmp_path / ".lock")
+    module.LAST_SYNC = str(tmp_path / ".last_sync")
+    module.DIRTY_FLAG = str(tmp_path / ".dirty")
+    module.NOTIFY_FILE = str(tmp_path / ".notify")
+    module.FAIL_COUNTER = str(tmp_path / ".fail_count")
+    module.SERVER_DIR = str(tmp_path)
+    notifications = []
+
+    monkeypatch.setattr(module, "acquire_lock", lambda: True)
+    monkeypatch.setattr(module, "release_lock", lambda: None)
+    monkeypatch.setattr(module, "preflight_git_check", lambda: (True, None))
+    monkeypatch.setattr(module, "_read_fail_count", lambda: 0)
+    monkeypatch.setattr(module, "_write_fail_count", lambda count: None)
+    monkeypatch.setattr(
+        module, "notify", lambda level, msg: notifications.append((level, msg))
+    )
+
+    class Tool:
+        def __init__(self, fn):
+            self.fn = fn
+
+    def fail_push(tag="shared"):
+        raise AssertionError("bridge_push must not run after pull is blocked")
+
+    fake_bridge_server = types.SimpleNamespace(
+        bridge_pull=Tool(
+            lambda: json.dumps(
+                {
+                    "blocked_by_repo_state": True,
+                    "git_pull_failed": True,
+                    "error": "bridge_pull git pull failed; import blocked",
+                }
+            )
+        ),
+        bridge_push=Tool(fail_push),
+    )
+    monkeypatch.setitem(sys.modules, "bridge_server", fake_bridge_server)
+
+    module.main()
+
+    assert not Path(module.LAST_SYNC).exists()
+    assert notifications == [
+        (
+            "warning",
+            "BRIDGE: sync blocked — bridge_pull git pull failed; import blocked",
+        )
+    ]
+
+
+def test_hook_worker_treats_git_add_failure_as_blocked(tmp_path, monkeypatch):
+    module = _load_module(
+        "bridge_hook_worker_git_add_block_test", ROOT / "hooks" / "bridge_sync_worker.py"
+    )
+    module.LOCK_FILE = str(tmp_path / ".lock")
+    module.LAST_SYNC = str(tmp_path / ".last_sync")
+    module.DIRTY_FLAG = str(tmp_path / ".dirty")
+    module.NOTIFY_FILE = str(tmp_path / ".notify")
+    module.FAIL_COUNTER = str(tmp_path / ".fail_count")
+    module.SERVER_DIR = str(tmp_path)
+    notifications = []
+    fail_counts = []
+
+    monkeypatch.setattr(module, "acquire_lock", lambda: True)
+    monkeypatch.setattr(module, "release_lock", lambda: None)
+    monkeypatch.setattr(module, "preflight_git_check", lambda: (True, None))
+    monkeypatch.setattr(module, "_read_fail_count", lambda: 0)
+    monkeypatch.setattr(module, "_write_fail_count", fail_counts.append)
+    monkeypatch.setattr(
+        module, "notify", lambda level, msg: notifications.append((level, msg))
+    )
+    monkeypatch.setattr(
+        module,
+        "fix_remote_ahead",
+        lambda: (_ for _ in ()).throw(AssertionError("should not retry remote-ahead")),
+    )
+
+    class Tool:
+        def __init__(self, fn):
+            self.fn = fn
+
+    fake_bridge_server = types.SimpleNamespace(
+        bridge_pull=Tool(lambda: json.dumps({"new_tasks": 0})),
+        bridge_push=Tool(
+            lambda tag="shared": json.dumps(
+                {
+                    "pushed_to_remote": False,
+                    "git_add_failed": True,
+                    "error": "git add failed: fatal: pathspec failed",
+                }
+            )
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "bridge_server", fake_bridge_server)
+
+    module.main()
+
+    assert not Path(module.LAST_SYNC).exists()
+    assert fail_counts == []
+    assert notifications == [
+        ("warning", "BRIDGE: sync blocked — git add failed: fatal: pathspec failed")
+    ]
+
+
 def test_bridge_auto_sync_prefers_repo_worker_path(tmp_path, monkeypatch):
     module = _load_module(
         "bridge_auto_sync_repo_worker_test", ROOT / "hooks" / "bridge_auto_sync.py"

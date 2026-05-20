@@ -107,7 +107,7 @@ TASK_ATTACHMENT_ROOT = os.environ.get(
 
 # ── Task constants (canonical ordering) ──────────────────────────────────
 
-TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting")
+TASK_SECTIONS = ("inbox", "today", "next", "someday", "waiting", "done")
 TASK_PRIORITIES = ("low", "medium", "high", "critical")  # ascending rank
 TASK_STATUSES = ("not_started", "in_progress", "done", "archived", "cancelled")
 TASK_TYPES = ("task", "note")
@@ -3503,6 +3503,26 @@ def export_task_files(
     attachments_dir = Path(bridge_dir) / "attachments"
     attachments_dir.mkdir(exist_ok=True)
 
+    def _cleanup_stale_generated_files(
+        active_stems: set[str],
+        active_attachment_paths: set[str],
+    ) -> None:
+        for stale in tasks_dir.iterdir():
+            if stale.suffix == ".json" and stale.stem not in active_stems:
+                stale.unlink()
+        for stale in attachments_dir.rglob("*"):
+            if not stale.is_file():
+                continue
+            rel = stale.relative_to(attachments_dir).as_posix()
+            if rel not in active_attachment_paths:
+                stale.unlink()
+        for maybe_empty in sorted(attachments_dir.rglob("*"), reverse=True):
+            if maybe_empty.is_dir():
+                try:
+                    maybe_empty.rmdir()
+                except OSError:
+                    pass
+
     cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
     export_filter = (
         "WHERE (status NOT IN ('archived', 'cancelled') "
@@ -3530,6 +3550,8 @@ def export_task_files(
         task_ids.append(tid)
         task_map[tid] = dict(row)
     if not task_ids:
+        if not changed_since:
+            _cleanup_stale_generated_files(set(), set())
         return exported
 
     # Batch fetch all field versions in one query
@@ -3638,21 +3660,7 @@ def export_task_files(
     # During incremental export, task_ids is partial — cleanup would delete valid files.
     if not changed_since:
         active_stems = {_task_storage_stem(tid) for tid in task_ids}
-        for stale in tasks_dir.iterdir():
-            if stale.suffix == ".json" and stale.stem not in active_stems:
-                stale.unlink()
-        for stale in attachments_dir.rglob("*"):
-            if not stale.is_file():
-                continue
-            rel = stale.relative_to(attachments_dir).as_posix()
-            if rel not in active_attachment_paths:
-                stale.unlink()
-        for maybe_empty in sorted(attachments_dir.rglob("*"), reverse=True):
-            if maybe_empty.is_dir():
-                try:
-                    maybe_empty.rmdir()
-                except OSError:
-                    pass
+        _cleanup_stale_generated_files(active_stems, active_attachment_paths)
 
     return exported
 
