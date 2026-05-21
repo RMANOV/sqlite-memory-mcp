@@ -172,6 +172,15 @@ def _ensure_stage_dirs(bridge_dir: str) -> None:
             (Path(bridge_dir) / rel_path.rstrip("/")).mkdir(parents=True, exist_ok=True)
 
 
+def _stage_generated_bridge_artifacts(bridge_dir: str) -> subprocess.CompletedProcess:
+    """Stage generated bridge artifacts without force-adding ignored large files."""
+    normal_paths = tuple(path for path in BRIDGE_GIT_STAGE_PATHS if path != "shared.js")
+    add_result = git_run(bridge_dir, "add", *normal_paths)
+    if add_result.returncode != 0:
+        return add_result
+    return git_run(bridge_dir, "add", "-f", "shared.js")
+
+
 def _ui_profile_changed(
     shared_path: Path, machine_id: str, ui_profile: dict | None
 ) -> bool:
@@ -1039,11 +1048,7 @@ def _main_locked(
             "git_add_failed": True,
             "message": message,
         }
-    add_result = git_run(
-        bridge_dir,
-        "add",
-        *BRIDGE_GIT_STAGE_PATHS,
-    )
+    add_result = _stage_generated_bridge_artifacts(bridge_dir)
     if add_result.returncode != 0:
         detail = _git_detail(add_result)
         message = f"git add failed: {detail}"

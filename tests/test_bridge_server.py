@@ -236,6 +236,8 @@ def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     assert result["pushed_to_remote"] is True
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
+    assert any(args[:2] == ("add", "-f") for args in git_calls)
+    assert not any(args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls)
 
 
 def test_bridge_push_git_add_failure_fails_closed_without_commit_or_push(

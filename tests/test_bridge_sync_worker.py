@@ -532,6 +532,8 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert result["pushed"] is True
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
+    assert any(args[:2] == ("add", "-f") for args in git_calls)
+    assert not any(args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls)
 
 
 def test_bridge_sync_worker_git_add_failure_fails_closed_without_commit_or_push(

@@ -203,6 +203,20 @@ def _ensure_stage_dirs(bridge_dir: str) -> None:
             (Path(bridge_dir) / rel_path.rstrip("/")).mkdir(parents=True, exist_ok=True)
 
 
+def _stage_generated_bridge_artifacts() -> subprocess.CompletedProcess:
+    """Stage generated bridge artifacts while respecting explicit ignore rules.
+
+    The bridge repo intentionally ignores some large generated files under
+    extended_memory/. Only shared.js is force-added because it is a small file://
+    compatibility wrapper that is also intentionally ignored in local checkouts.
+    """
+    normal_paths = tuple(path for path in _BRIDGE_GIT_STAGE_PATHS if path != "shared.js")
+    add_result = _git("add", *normal_paths)
+    if add_result.returncode != 0:
+        return add_result
+    return _git("add", "-f", "shared.js")
+
+
 def _bridge_task_files_complete(conn: sqlite3.Connection, bridge_dir: str) -> bool:
     rows = conn.execute(
         "SELECT id FROM tasks WHERE status NOT IN ('archived', 'cancelled')"
@@ -892,7 +906,7 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "git_add_failed": True,
             }
         )
-    add_result = _git("add", *_BRIDGE_GIT_STAGE_PATHS)
+    add_result = _stage_generated_bridge_artifacts()
     if add_result.returncode != 0:
         message = f"git add failed: {_git_detail(add_result)}"
         logger.error("bridge_push: %s", message)
