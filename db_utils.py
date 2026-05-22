@@ -1853,6 +1853,21 @@ def _timestamp_is_newer(candidate_ts: str | None, baseline_ts: str | None) -> bo
     ) > parse_iso_datetime_for_compare(baseline_ts)
 
 
+def _max_iso_timestamp(*timestamps: str | None) -> str:
+    """Return the newest non-empty timestamp string using normalized ISO ordering."""
+    best = ""
+    best_dt = datetime.min.replace(tzinfo=timezone.utc)
+    for ts in timestamps:
+        raw = (ts or "").strip()
+        if not raw:
+            continue
+        dt = parse_iso_datetime_for_compare(raw)
+        if dt > best_dt:
+            best = raw
+            best_dt = dt
+    return best
+
+
 def parse_iso_date(s: str | None) -> date | None:
     """Parse YYYY-MM-DD to date, or None on invalid/missing input."""
     if not s:
@@ -3949,7 +3964,15 @@ def merge_import_tasks(
                 if not tombstone_wins and remote_ts == local_ts:
                     remote_updated = remote.get("updated_at", "")
                     local_updated = existing["updated_at"] or ""
-                    if remote_updated > local_updated:
+                    remote_has_explicit_status_ts = isinstance(remote_fts, dict) and (
+                        "status" in remote_fts
+                    )
+                    local_has_status_ts = bool(local_fv_data)
+                    if (
+                        not remote_has_explicit_status_ts
+                        and not local_has_status_ts
+                        and remote_updated > local_updated
+                    ):
                         tombstone_wins = True
                         _log.info(
                             "Tombstone fallback: %s wins via updated_at (%s > %s)",
@@ -3959,9 +3982,18 @@ def merge_import_tasks(
                         )
 
                 if tombstone_wins:
+                    local_status = task_content_map.get(tid, {}).get("status")
+                    row_updated_at = existing["updated_at"] or ""
+                    if local_status != remote["status"]:
+                        row_updated_at = (
+                            _max_iso_timestamp(row_updated_at, remote_ts, fallback_ts)
+                            or row_updated_at
+                            or remote_ts
+                            or fallback_ts
+                        )
                     conn.execute(
                         "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                        (remote["status"], now, tid),
+                        (remote["status"], row_updated_at, tid),
                     )
                     _store_task_field_version(
                         conn,
@@ -4047,7 +4079,11 @@ def merge_import_tasks(
             ):
                 fields_to_update["status"] = local_status_value
                 task_content_map[local_id]["status"] = local_status_value
+                status_ts = str((local_status_state or {}).get("updated_at") or "")
+                semantic_update_timestamps = [status_ts] if status_ts else []
                 updated_fields += 1
+            else:
+                semantic_update_timestamps = []
             for field in fields_to_merge:
                 if field not in remote:
                     continue
@@ -4136,6 +4172,7 @@ def merge_import_tasks(
                     )
                     if local_val != remote_val:
                         fields_to_update[field] = remote_val
+                        semantic_update_timestamps.append(remote_ts or fallback_ts)
                         updated_fields += 1
                         record_memory_conflict(
                             conn,
@@ -4186,6 +4223,10 @@ def merge_import_tasks(
                     and local_content.get(content_field) is None
                 ):
                     fields_to_update[content_field] = remote_val
+                    remote_ts, _, _, _ = _parse_field_ts(
+                        remote_fts, content_field, fallback_ts
+                    )
+                    semantic_update_timestamps.append(remote_ts or fallback_ts)
                     updated_fields += 1
 
             if fields_to_update:
@@ -4194,9 +4235,12 @@ def merge_import_tasks(
                     k: v for k, v in fields_to_update.items() if k in MERGEABLE_FIELDS
                 }
                 if safe_fields:
-                    safe_fields["updated_at"] = (
-                        now  # ensure incremental export picks up merged tasks
+                    semantic_updated_at = _max_iso_timestamp(
+                        local_updated_at,
+                        *semantic_update_timestamps,
                     )
+                    if semantic_updated_at:
+                        safe_fields["updated_at"] = semantic_updated_at
                     set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
                     values = list(safe_fields.values()) + [local_id]
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
@@ -4215,15 +4259,13 @@ def merge_import_tasks(
                             else None,
                         )
             elif _timestamp_is_newer(remote_updated_at, local_updated_at):
-                conn.execute(
-                    "UPDATE tasks SET updated_at = ? WHERE id = ?",
-                    (remote_updated_at, local_id),
+                _log.debug(
+                    "Bridge metadata-only freshness ignored for task %s "
+                    "(remote updated_at %s > local %s, no field winner)",
+                    local_id,
+                    remote_updated_at,
+                    local_updated_at,
                 )
-                existing_map[tid] = {
-                    **existing_map[tid],
-                    "updated_at": remote_updated_at,
-                }
-                updated_fields += 1
         else:
             # New task — insert (content only if import_content)
             # Note: cancelled tasks still exist as rows (soft-delete), so they're

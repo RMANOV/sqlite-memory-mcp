@@ -540,9 +540,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             logger,
         )
         merge_failed = False
+        merged_new_tasks = 0
+        merged_updated_fields = 0
         if remote_tasks:
             try:
-                _merge_import_tasks(conn, remote_tasks, import_content=True)
+                merged_new_tasks, merged_updated_fields = _merge_import_tasks(
+                    conn, remote_tasks, import_content=True
+                )
                 _sync_task_attachments_from_remote(conn, remote_tasks, BRIDGE_REPO)
             except (sqlite3.Error, ValueError) as exc:
                 logger.warning("bridge_push: task merge failed: %s", exc)
@@ -676,6 +680,14 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
         if task_export_since and not _bridge_task_files_complete(conn, BRIDGE_REPO):
             logger.warning(
                 "bridge_push: missing per-task files detected; forcing full task export"
+            )
+            task_export_since = None
+        if task_export_since and (merged_new_tasks or merged_updated_fields):
+            logger.info(
+                "bridge_push: remote task merge changed local DB "
+                "(new=%d, fields=%d); forcing full task export",
+                merged_new_tasks,
+                merged_updated_fields,
             )
             task_export_since = None
         _export_task_files(conn, BRIDGE_REPO, changed_since=task_export_since)
@@ -1500,6 +1512,66 @@ def bridge_pull() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 3: bridge_status
 # ═══════════════════════════════════════════════════════════════════════════
+def _task_status_counts_from_db(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS cnt FROM tasks "
+        "WHERE status NOT IN ('archived', 'cancelled') "
+        "GROUP BY status ORDER BY status"
+    ).fetchall()
+    return {str(r["status"]): int(r["cnt"]) for r in rows}
+
+
+def _task_status_counts_from_payload(payload: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in payload.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _bridge_updated_at_churn_report(
+    conn: sqlite3.Connection,
+    *,
+    min_cluster_size: int = 25,
+    limit: int = 10,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT updated_at,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status IN ('archived','cancelled') THEN 1 ELSE 0 END) AS hidden,
+               SUM(CASE WHEN status NOT IN ('archived','cancelled') THEN 1 ELSE 0 END) AS exportable
+        FROM tasks
+        WHERE updated_at IS NOT NULL AND updated_at != ''
+        GROUP BY updated_at
+        HAVING total >= ?
+        ORDER BY total DESC, updated_at DESC
+        LIMIT ?
+        """,
+        (min_cluster_size, limit),
+    ).fetchall()
+    clusters = []
+    for row in rows:
+        total = int(row["total"] or 0)
+        hidden = int(row["hidden"] or 0)
+        clusters.append(
+            {
+                "updated_at": row["updated_at"],
+                "total": total,
+                "hidden": hidden,
+                "exportable": int(row["exportable"] or 0),
+                "suspicious": total >= min_cluster_size and hidden >= total // 2,
+            }
+        )
+    return {
+        "min_cluster_size": min_cluster_size,
+        "clusters": clusters,
+        "suspicious_count": sum(1 for c in clusters if c["suspicious"]),
+    }
+
+
 @mcp.tool()
 def bridge_status() -> str:
     """Show bridge sync status — local shared entities vs repo contents."""
@@ -1513,6 +1585,7 @@ def bridge_status() -> str:
             "SELECT name FROM entities WHERE project LIKE 'shared%' ORDER BY name"
         ).fetchall()
         local_task_count = TaskDAO.count_active(conn)
+        local_task_status_counts = _task_status_counts_from_db(conn)
 
         # v0.6.0: collaboration stats
         collab_rows = conn.execute(
@@ -1561,6 +1634,7 @@ def bridge_status() -> str:
                 "remote_status": "suppressed_repo_blocked",
                 "local_shared_count": len(local_names),
                 "local_tasks": local_task_count,
+                "local_task_status_counts": local_task_status_counts,
                 "collaborators": [dict(r) for r in collab_rows],
                 "collaborator_count": len(collab_rows),
                 "pending_shared_knowledge": pending_knowledge,
@@ -1580,6 +1654,7 @@ def bridge_status() -> str:
     _status_eidx_path = Path(BRIDGE_REPO) / "entities_index.json"
     remote_names: set[str] = set()
     remote_task_count = 0
+    remote_task_status_counts: dict[str, int] = {}
     repo_meta = {}
     # v4: entity names from entities_index.json (independent of shared.json)
     if _status_eidx_path.exists():
@@ -1596,6 +1671,7 @@ def bridge_status() -> str:
             if not remote_names:
                 remote_names = {e["name"] for e in payload.get("entities", [])}
             remote_task_count = len(payload.get("tasks", []))
+            remote_task_status_counts = _task_status_counts_from_payload(payload)
             repo_meta = {
                 "pushed_at": payload.get("pushed_at"),
                 "machine_id": payload.get("machine_id"),
@@ -1621,7 +1697,11 @@ def bridge_status() -> str:
             "only_local": only_local,
             "only_remote": only_remote,
             "local_tasks": local_task_count,
+            "local_task_status_counts": local_task_status_counts,
             "remote_tasks": remote_task_count,
+            "remote_task_status_counts": remote_task_status_counts,
+            "task_count_delta": local_task_count - remote_task_count,
+            "task_counts_match": local_task_count == remote_task_count,
             "last_commit": last_commit,
             "repo_meta": repo_meta,
             "collaborators": [dict(r) for r in collab_rows],
@@ -1652,6 +1732,8 @@ def bridge_doctor(write_manifest: bool = True) -> str:
         parity = _collect_runtime_parity()
     warning = _runtime_warning_summary(parity)
     repo_exists = Path(BRIDGE_REPO).is_dir()
+    with _get_conn() as conn:
+        updated_at_churn = _bridge_updated_at_churn_report(conn)
     return json.dumps(
         {
             "repo_exists": repo_exists,
@@ -1659,6 +1741,7 @@ def bridge_doctor(write_manifest: bool = True) -> str:
             "runtime_parity": parity,
             "runtime_warning": warning,
             "surface_contract": _build_surface_contract_report(),
+            "updated_at_churn": updated_at_churn,
         }
     )
 

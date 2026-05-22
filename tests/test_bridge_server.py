@@ -201,6 +201,56 @@ def test_bridge_status_blocks_and_suppresses_remote_counts(bridge_env, monkeypat
     assert "last_commit" not in result
     assert "remote_count" not in result
     assert "remote_tasks" not in result
+    assert result["local_task_status_counts"] == {}
+
+
+def test_bridge_status_reports_task_count_delta_and_status_counts(
+    bridge_env, monkeypatch
+):
+    db_path, bridge_dir = bridge_env
+    ts = "2026-05-22T05:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("local-done", "Done", "done", ts, ts),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("local-open", "Open", "not_started", ts, ts),
+        )
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(
+            {
+                "version": 4,
+                "pushed_at": ts,
+                "machine_id": "windows-rmanov",
+                "tasks": [
+                    {"id": "remote-open", "status": "not_started"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        bridge_server, "_inspect_bridge_repo_blocker", lambda repo: None
+    )
+    monkeypatch.setattr(
+        bridge_server,
+        "_git",
+        lambda *args: _cp(args, stdout="2026-05-22 08:00:00 +0300 bridge: push"),
+    )
+
+    result = json.loads(bridge_server.bridge_status.fn())
+
+    assert result["local_tasks"] == 2
+    assert result["remote_tasks"] == 1
+    assert result["task_count_delta"] == 1
+    assert result["task_counts_match"] is False
+    assert result["local_task_status_counts"] == {"done": 1, "not_started": 1}
+    assert result["remote_task_status_counts"] == {"not_started": 1}
 
 
 def test_bridge_push_missing_repo_error_includes_real_path(tmp_path, monkeypatch):
@@ -332,6 +382,26 @@ def test_bridge_doctor_returns_runtime_parity_and_surface_contract(
         result["surface_contract"]["bridge_artifacts"]["shared.json"]["git_stage"]
         is True
     )
+    assert "updated_at_churn" in result
+
+
+def test_bridge_doctor_flags_updated_at_churn_clusters(bridge_env):
+    db_path, _ = bridge_env
+    ts = "2026-05-22T05:34:57.560101+00:00"
+    with _db_conn(db_path) as conn:
+        for i in range(25):
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (f"archived-{i}", f"Archived {i}", "archived", ts, ts),
+            )
+
+    result = json.loads(bridge_server.bridge_doctor.fn(write_manifest=False))
+
+    churn = result["updated_at_churn"]
+    assert churn["suspicious_count"] == 1
+    assert churn["clusters"][0]["updated_at"] == ts
+    assert churn["clusters"][0]["total"] == 25
 
 
 def test_bridge_pull_falls_back_to_shared_json_when_index_is_corrupt(

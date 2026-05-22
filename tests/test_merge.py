@@ -170,7 +170,9 @@ def test_remote_newer_field_wins(conn):
     _, updated = merge_import_tasks(conn, remote)
 
     assert updated >= 1
-    assert _task(conn, tid)["title"] == "Updated title"
+    row = _task(conn, tid)
+    assert row["title"] == "Updated title"
+    assert row["updated_at"] == new_ts
     fv = _fv(conn, tid, "title")
     assert fv is not None
     assert fv[0] == new_ts
@@ -302,11 +304,11 @@ def test_tombstone_older_does_not_overwrite_local(conn):
     assert _task(conn, tid)["status"] == "done"
 
 
-def test_tombstone_wins_when_field_ts_equal_but_updated_at_newer(conn):
-    """Tombstone with equal _field_ts but newer updated_at should win.
+def test_tombstone_with_stale_field_ts_does_not_win_via_metadata_updated_at(conn):
+    """A tombstone with explicit stale _field_ts must not win via row metadata.
 
-    This covers the blind-audit-trail bug: archival updates updated_at but
-    not field_versions, so _field_ts[status] is stale. Fallback to updated_at.
+    Bridge peers can carry fresh task-level updated_at from metadata-only import
+    while the status field itself is old. That must not resurrect stale state.
     """
     tid = "tomb-fallback"
     same_ts = "2026-03-09T08:00:00"
@@ -324,9 +326,33 @@ def test_tombstone_wins_when_field_ts_equal_but_updated_at_newer(conn):
         }
     ]
     _, updated = merge_import_tasks(conn, remote, import_content=False)
+    assert updated == 0
+    row = _task(conn, tid)
+    assert row["status"] == "done"
+    assert row["updated_at"] == same_ts
+
+
+def test_legacy_tombstone_without_field_ts_can_win_via_updated_at(conn):
+    tid = "legacy-tombstone"
+    local_ts = "2026-03-09T08:00:00"
+    remote_ts = "2026-03-19T06:00:00"
+    _insert_task(conn, tid, title="Old task", status="done", updated_at=local_ts)
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Old task",
+            "status": "archived",
+            "updated_at": remote_ts,
+            "_tombstone": True,
+        }
+    ]
+    _, updated = merge_import_tasks(conn, remote, import_content=False)
+
     assert updated > 0
     row = _task(conn, tid)
     assert row["status"] == "archived"
+    assert row["updated_at"] == remote_ts
 
 
 def test_tombstone_nonexistent_task_materialized(conn):
@@ -501,7 +527,7 @@ def test_import_content_true_merges_content_fields(conn):
     assert _task(conn, tid)["description"] == "Remote desc wins"
 
 
-def test_metadata_only_merge_preserves_newer_task_updated_at(conn):
+def test_metadata_only_merge_does_not_pollute_task_updated_at(conn):
     tid = "task-meta-updated-at"
     local_ts = "2026-01-01T10:00:00"
     remote_ts = "2026-01-03T12:00:00"
@@ -536,9 +562,46 @@ def test_metadata_only_merge_preserves_newer_task_updated_at(conn):
 
     _, updated = merge_import_tasks(conn, remote, import_content=False)
 
-    assert updated == 1
-    assert _task(conn, tid)["updated_at"] == remote_ts
+    assert updated == 0
+    assert _task(conn, tid)["updated_at"] == local_ts
     assert _fv(conn, tid, "title") == (local_ts, "machine-A")
+
+
+def test_stale_remote_status_does_not_win_with_newer_task_updated_at(conn):
+    tid = "task-stale-status"
+    local_status_ts = "2026-05-21T13:36:31.617013+00:00"
+    remote_status_ts = "2026-05-18T20:19:22.198077+00:00"
+    metadata_ts = "2026-05-22T05:34:57.560101+00:00"
+
+    _insert_task(conn, tid, title="Migrated note", status="done", updated_at=local_status_ts)
+    upsert_field_versions(
+        conn,
+        tid,
+        ["status"],
+        timestamp=local_status_ts,
+        machine_id="RManov",
+    )
+
+    remote = [
+        {
+            "id": tid,
+            "title": "Migrated note",
+            "status": "not_started",
+            "updated_at": metadata_ts,
+            "_field_ts": {
+                "status": [remote_status_ts, "fedora"],
+                "title": [local_status_ts, "RManov"],
+            },
+        }
+    ]
+
+    _, updated = merge_import_tasks(conn, remote, import_content=False)
+
+    row = _task(conn, tid)
+    assert updated == 0
+    assert row["status"] == "done"
+    assert row["updated_at"] == local_status_ts
+    assert _fv(conn, tid, "status") == (local_status_ts, "RManov")
 
 
 def test_new_task_content_excluded_when_import_content_false(conn):
