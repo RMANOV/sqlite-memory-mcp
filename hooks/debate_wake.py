@@ -224,7 +224,7 @@ def _record_receipt_event(event: dict[str, Any]) -> None:
 
 def _agent_command(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> list[str] | None:
     runtime = str(target.get("target_runtime") or "")
-    if runtime == "cc":
+    if runtime in {"cc", "claude"}:
         allowed = ",".join(
             [
                 "mcp__sqlite_intel__debate_signal_check",

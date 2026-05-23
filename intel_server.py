@@ -87,6 +87,7 @@ from debate import (
     reclaim_stale_message_claims as _debate_reclaim_message_claims_dao,
     reap_worker_claims as _debate_reap_worker_claims_dao,
     rotate_role_binding as _debate_rotate_role_binding_dao,
+    seed_initial_role_bindings as _debate_seed_initial_role_bindings_dao,
     transition_state as _debate_transition_dao,
     worker_no_action as _debate_worker_no_action_dao,
 )
@@ -1218,9 +1219,17 @@ def debate_init(
                 resolve_by=resolve_by or None,
                 metadata=metadata,
             )
+            seeded_bindings = _debate_seed_initial_role_bindings_dao(
+                conn,
+                topic_id=topic_id,
+                roles=roles,
+                bound_by_role=created_by_role,
+                reason="debate_init seeded active role binding",
+            )
+            out["seeded_bindings"] = seeded_bindings
             logger.info(
-                "debate_init: topic=%s state=%s roles=%d",
-                out["topic_id"], out["state"], len(out["roles"]),
+                "debate_init: topic=%s state=%s roles=%d seeded_bindings=%d",
+                out["topic_id"], out["state"], len(out["roles"]), len(seeded_bindings),
             )
             return json.dumps(out)
     except _DebateError as exc:

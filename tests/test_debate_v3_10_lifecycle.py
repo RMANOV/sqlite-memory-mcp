@@ -23,6 +23,7 @@ from debate import (
     reclaim_stale_message_claims,
     reap_worker_claims,
     rotate_role_binding,
+    seed_initial_role_bindings,
     transition_state,
     worker_no_action,
 )
@@ -60,6 +61,50 @@ def _binding_state(conn, topic_id, role, session_id):
         (topic_id, role, session_id),
     ).fetchone()
     return row["state"] if row else None
+
+
+def test_seed_initial_role_bindings_installs_wake_authority_for_roles_json(topic):
+    conn, t = topic
+
+    seeded = seed_initial_role_bindings(
+        conn,
+        topic_id=t,
+        roles=[
+            {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+            {"role": "EXECUTOR", "session_id": "codex-exec1"},
+            {"role": "ADVOCATE", "session_id": "cc-adv1"},
+        ],
+        bound_by_role="CONDUCTOR",
+    )
+
+    assert {row["role"] for row in seeded} == {"CONDUCTOR", "EXECUTOR", "ADVOCATE"}
+    assert _binding_state(conn, t, "CONDUCTOR", "codex-cond1") == "active"
+    assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
+    assert _binding_state(conn, t, "ADVOCATE", "cc-adv1") == "active"
+
+
+def test_seed_initial_role_bindings_is_idempotent(topic):
+    conn, t = topic
+    roles = [
+        {"role": "EXECUTOR", "session_id": "codex-exec1"},
+        {"role": "EXECUTOR", "session_id": "codex-exec2"},
+    ]
+
+    first = seed_initial_role_bindings(
+        conn, topic_id=t, roles=roles, bound_by_role="CONDUCTOR"
+    )
+    second = seed_initial_role_bindings(
+        conn, topic_id=t, roles=roles, bound_by_role="CONDUCTOR"
+    )
+
+    assert len(first) == 1
+    assert second == []
+    active = conn.execute(
+        "SELECT session_id FROM debate_role_bindings "
+        "WHERE topic_id = ? AND role = 'EXECUTOR' AND state = 'active'",
+        (t,),
+    ).fetchall()
+    assert [row["session_id"] for row in active] == ["codex-exec1"]
 
 
 def test_debate_state_resolved_retires_active_bindings_atomically(topic):

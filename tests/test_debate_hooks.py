@@ -1,3 +1,4 @@
+import os
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -50,6 +51,60 @@ def test_debate_wake_agent_budget_caps_successful_launches(monkeypatch):
 
     assert len(out["launches"]) == 1
     assert launches == [("codex-exec1", "abc123", "T")]
+
+
+def test_debate_wake_accepts_claude_runtime_alias():
+    module = _load_hook_module("debate_wake_claude_alias_test", "hooks/debate_wake.py")
+
+    cmd = module._agent_command(
+        {"target_runtime": "claude"},
+        trigger_msg_id="abc123",
+        topic_id="T",
+    )
+
+    assert cmd is not None
+    assert cmd[0] == "claude"
+
+
+def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tmp_path):
+    module = _load_hook_module("debate_pump_budget_default_test", "hooks/debate_pump.py")
+    module.LOG_PATH = tmp_path / "pump.jsonl"
+    module.STATE_PATH = tmp_path / "pump_state.json"
+    module.STOP = False
+    rows = [{"msg_id": "m1", "topic_id": "T", "ts": "2026-05-20T00:00:01Z"}]
+    seen_budget = []
+
+    monkeypatch.delenv("DEBATE_WAKE_BUDGET", raising=False)
+    monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(module, "_reap_children", lambda: None)
+    monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
+    monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: None)
+
+    def capture_dispatch(row, suppressed_roles):
+        seen_budget.append(os.environ.get("DEBATE_WAKE_BUDGET"))
+        return 0
+
+    monkeypatch.setattr(module, "_dispatch_row", capture_dispatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate_pump.py",
+            "--once",
+            "--since",
+            "2026-05-20T00:00:00Z",
+            "--max-workers-per-scan",
+            "3",
+            "--max-concurrent-workers",
+            "2",
+            "--message-claim-reclaim-seconds",
+            "0",
+        ],
+    )
+
+    assert module.main() == 0
+    assert seen_budget == ["3"]
 
 
 def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(monkeypatch, tmp_path):

@@ -352,6 +352,12 @@ def main() -> int:
     suppressed_roles = {r.upper() for r in _split_csv_values(args.suppress_role)}
     max_workers_per_scan = max(0, args.max_workers_per_scan)
     max_concurrent_workers = max(0, args.max_concurrent_workers)
+    default_wake_budget = max(
+        1,
+        max_workers_per_scan or 0,
+        max_concurrent_workers or 0,
+    )
+    os.environ.setdefault("DEBATE_WAKE_BUDGET", str(default_wake_budget))
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 

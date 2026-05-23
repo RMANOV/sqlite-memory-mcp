@@ -1810,6 +1810,53 @@ def bind_role_session(
     }
 
 
+def seed_initial_role_bindings(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    roles: list[dict[str, Any]],
+    bound_by_role: str,
+    reason: str = "seeded from debate_init roles_json",
+) -> list[dict[str, Any]]:
+    """Ensure roles_json has matching active primary bindings.
+
+    ``roles_json`` declares the topic roles, but wake delivery resolves through
+    debate_role_bindings.  MCP-created topics must seed the binding authority,
+    otherwise the first addressed messages resolve to ``no_active_binding`` and
+    require manual wake.
+    """
+    validate_topic_id(topic_id)
+    validate_role(bound_by_role)
+    seeded: list[dict[str, Any]] = []
+    seen_roles: set[str] = set()
+    for entry in roles:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        session_id = entry.get("session_id")
+        if not isinstance(role, str) or not isinstance(session_id, str):
+            continue
+        validate_role(role)
+        validate_session_id(session_id)
+        if role in seen_roles:
+            continue
+        seen_roles.add(role)
+        if _active_binding(conn, topic_id, role) is not None:
+            continue
+        seeded.append(
+            bind_role_session(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                session_id=session_id,
+                runtime=_runtime_from_session(session_id),
+                reason=reason,
+                bound_by_role=bound_by_role,
+            )
+        )
+    return seeded
+
+
 def rotate_role_binding(
     conn: sqlite3.Connection,
     *,
