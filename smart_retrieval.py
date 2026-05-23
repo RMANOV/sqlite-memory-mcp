@@ -436,7 +436,6 @@ def _ready_state(
 ) -> str:
     status = task.get("status")
     section = task.get("section")
-    task_type = task.get("type") or "task"
 
     if status in TASK_ACTIVE_EXCLUSIONS:
         reopen_codes = {
@@ -448,8 +447,8 @@ def _ready_state(
             return "cleanup_candidate"
         return "excluded"
 
-    if task_type == "note" and _ready_is_reading(task) and not include_readings:
-        if section == "today" or due is not None or _ready_has_explicit_surface(task):
+    if _ready_is_reading(task) and not include_readings:
+        if _ready_has_explicit_surface(task):
             return "suggested_ready"
         return "excluded"
 
@@ -581,6 +580,7 @@ def attach_ready_metadata(record: dict[str, Any]) -> dict[str, Any]:
     task["_ready_blockers"] = list(record["blockers"])
     task["_ready_stale_warning"] = record["stale_warning"]
     task["_ready_confidence"] = record["confidence"]
+    task["_ready_provenance"] = dict(record["provenance"])
     return task
 
 
@@ -601,7 +601,7 @@ def suggested_ready(
             today=today,
         )
         if record["ready_state"]
-        in {"ready_now", "suggested_ready", "blocked", "waiting"}
+        in {"ready_now", "suggested_ready", "blocked", "waiting", "cleanup_candidate"}
     ]
     rows = [attach_ready_metadata(record) for record in records]
     return rows if limit is None else rows[:limit]

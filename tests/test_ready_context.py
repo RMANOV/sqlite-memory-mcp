@@ -90,6 +90,35 @@ def test_suggested_ready_excludes_closed_max_style_rows():
     assert [row["id"] for row in suggested] == ["redis"]
 
 
+def test_suggested_ready_keeps_provenance_metadata():
+    rows = [_task("work", "Concrete work", priority="high")]
+
+    suggested = suggested_ready(rows, today=date(2026, 5, 24))
+
+    assert suggested[0]["_ready_provenance"]["source_id"] == "work"
+    assert (
+        suggested[0]["_ready_provenance"]["rule_version"]
+        == READY_CONTEXT_CONTRACT_VERSION
+    )
+
+
+def test_closed_reopen_confusion_can_surface_as_cleanup_candidate():
+    rows = [
+        _task(
+            "closed-confused",
+            "Closed task",
+            status="done",
+            notes="reopen_requested_by_user after sync confusion",
+        )
+    ]
+
+    record = ready_context(rows, today=date(2026, 5, 24))[0]
+    suggested = suggested_ready(rows, today=date(2026, 5, 24))
+
+    assert record["ready_state"] == "cleanup_candidate"
+    assert suggested[0]["_ready_state"] == "cleanup_candidate"
+
+
 def test_under_specified_acceptance_rule_stays_visible_as_blocked():
     record = build_ready_record(
         _task(
@@ -149,6 +178,46 @@ def test_readings_do_not_flood_default_suggested_ready():
 
     assert default_ids == ["work"]
     assert "reading" in reading_ids
+
+
+def test_due_today_reading_tasks_stay_out_of_default_suggested_ready():
+    rows = [
+        _task(
+            "reading-due",
+            "OODA reading about agent memory",
+            priority="critical",
+            section="today",
+            due_date="2026-05-24",
+            project="readings",
+        ),
+        _task("work", "Concrete work", priority="high"),
+    ]
+
+    default_ids = [row["id"] for row in suggested_ready(rows, today=date(2026, 5, 24))]
+    reading_ids = [
+        row["id"]
+        for row in suggested_ready(rows, include_readings=True, today=date(2026, 5, 24))
+    ]
+
+    assert default_ids == ["work"]
+    assert "reading-due" in reading_ids
+
+
+def test_explicitly_surfaced_reading_can_enter_default_suggested_ready():
+    rows = [
+        _task(
+            "reading-surfaced",
+            "Critical reading surface_until=2026-05-24",
+            priority="critical",
+            section="today",
+            project="readings",
+        ),
+        _task("work", "Concrete work", priority="high"),
+    ]
+
+    default_ids = [row["id"] for row in suggested_ready(rows, today=date(2026, 5, 24))]
+
+    assert "reading-surfaced" in default_ids
 
 
 def test_prime_context_uses_same_ready_records():

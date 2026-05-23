@@ -969,6 +969,7 @@ def ready_context(
     safe_limit = max(1, min(int(limit or 12), 100))
     with _get_conn() as conn:
         tasks = TaskDAO.get_active(conn)
+        tasks.extend(TaskDAO.get_ready_review_candidates(conn, limit=50))
 
     normalized_mode = (mode or "ready").strip().lower()
     if normalized_mode == "suggested":

@@ -205,14 +205,23 @@ class TaskDB:
         """Return completed tasks, newest first."""
         return TaskDAO.get_done(self._conn, columns=_UI_COLS)
 
+    def get_ready_review_tasks(self, limit=50):
+        """Return closed rows explicitly marked for ready-context review."""
+        return TaskDAO.get_ready_review_candidates(
+            self._conn,
+            columns=_UI_COLS,
+            limit=limit,
+        )
+
     def purge_old_done(self, days=30):
         """Delete done tasks older than `days` days. Returns count deleted."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         return TaskDAO.purge_done(self._conn, cutoff)
 
     def get_suggested_tasks(self, limit=20):
-        """Return prioritized mix: overdue + high/critical + nearest due."""
-        return TaskDAO.get_suggested(self._conn, limit)
+        """Return Suggested popup rows through ready-context policy."""
+        tasks = self.get_all_active() + self.get_ready_review_tasks(limit=50)
+        return suggested_ready(tasks, include_readings=False, limit=limit)
 
     def get_all_notes(self):
         """Visible open notes. Excludes done/archived/cancelled."""
@@ -1779,7 +1788,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # Rebuild SmartKey search index (skips if fingerprint unchanged)
         self._search_engine.rebuild_index(all_active + done + premium_rows)
 
-        suggested = suggested_ready(all_active, include_readings=False, limit=None)
+        ready_review = self.db.get_ready_review_tasks(limit=50)
+        suggested = suggested_ready(
+            all_active + ready_review,
+            include_readings=False,
+            limit=None,
+        )
         notes = [t for t in all_active if t.get("type") == "note"] + [
             t for t in done if t.get("type") == "note"
         ]

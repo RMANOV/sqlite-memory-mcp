@@ -2179,6 +2179,39 @@ class TaskDAO:
         return [dict(r) for r in rows]
 
     @staticmethod
+    def get_ready_review_candidates(
+        conn: sqlite3.Connection,
+        columns: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return closed rows explicitly marked for ready-context review."""
+        cols = columns or TaskDAO.ALL_COLS
+        exclusions = ",".join("?" * len(TASK_ACTIVE_EXCLUSIONS))
+        markers = (
+            "cleanup_candidate",
+            "done_but_recently_confused",
+            "reopen_requested_by_user",
+            "reopen",
+            "superseded",
+            "duplicate",
+        )
+        marker_sql = " OR ".join(["instr(task_text, ?) > 0"] * len(markers))
+        rows = conn.execute(
+            f"SELECT {cols} FROM ("
+            f"SELECT {cols}, lower("
+            "coalesce(title, '') || ' ' || "
+            "coalesce(description, '') || ' ' || "
+            "coalesce(notes, '')"
+            ") AS task_text "
+            "FROM tasks "
+            f"WHERE status IN ({exclusions})"
+            f") WHERE {marker_sql} "
+            "ORDER BY updated_at DESC LIMIT ?",
+            list(TASK_ACTIVE_EXCLUSIONS) + list(markers) + [max(1, int(limit))],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
     def search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
         """FTS5 search across tasks. Returns matching tasks ranked by relevance."""
         if not query or not query.strip():

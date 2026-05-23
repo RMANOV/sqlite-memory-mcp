@@ -340,6 +340,29 @@ def test_get_active_empty_db(conn):
     assert TaskDAO.get_active(conn) == []
 
 
+def test_get_ready_review_candidates_returns_only_marked_terminal_rows(conn):
+    _make_task(conn, "active", "Active task")
+    _make_task(conn, "plain_done", "Plain done", status="done")
+    _make_task(
+        conn,
+        "reopen",
+        "Closed but confused",
+        status="done",
+        notes="reopen_requested_by_user after bridge sync confusion",
+    )
+    _make_task(
+        conn,
+        "archived_dup",
+        "Archived duplicate",
+        status="archived",
+        description="duplicate resolved elsewhere",
+    )
+
+    candidates = TaskDAO.get_ready_review_candidates(conn)
+
+    assert {row["id"] for row in candidates} == {"reopen", "archived_dup"}
+
+
 # ── get_notes ────────────────────────────────────────────────────────────
 
 
