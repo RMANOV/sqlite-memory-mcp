@@ -490,6 +490,7 @@ class TestExportTaskFiles:
             "fedora",
             clock,
             "event-status-1",
+            "done",
         ]
 
 

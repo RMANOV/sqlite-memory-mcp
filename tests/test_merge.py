@@ -604,6 +604,202 @@ def test_stale_remote_status_does_not_win_with_newer_task_updated_at(conn):
     assert _fv(conn, tid, "status") == (local_status_ts, "RManov")
 
 
+def test_legacy_same_field_ts_source_machine_repairs_status_and_section_once(conn):
+    tid = "task-legacy-source-authority"
+    field_ts = "2026-05-22T05:34:57.560101+00:00"
+    stale_ts = "2026-05-22T05:00:00.000000+00:00"
+
+    _insert_task(conn, tid, title="Source authority", status="not_started", updated_at=stale_ts)
+    upsert_field_versions(
+        conn,
+        tid,
+        ["status", "section"],
+        timestamp=field_ts,
+        machine_id="fedora",
+    )
+
+    authoritative_remote = {
+        "id": tid,
+        "machine_id": "fedora",
+        "source_machine": "fedora",
+        "title": "Source authority",
+        "status": "done",
+        "section": "today",
+        "updated_at": field_ts,
+        "_field_ts": {
+            "status": [field_ts, "fedora"],
+            "section": [field_ts, "fedora"],
+        },
+    }
+    peer_remote = {
+        "id": tid,
+        "machine_id": "windows",
+        "source_machine": "windows",
+        "title": "Source authority",
+        "status": "not_started",
+        "section": "inbox",
+        "updated_at": field_ts,
+        "_field_ts": {
+            "status": [field_ts, "fedora"],
+            "section": [field_ts, "fedora"],
+        },
+    }
+
+    merge_import_tasks(conn, [authoritative_remote], import_content=False)
+    row = _task(conn, tid)
+    assert row["status"] == "done"
+    assert row["section"] == "today"
+
+    merge_import_tasks(conn, [peer_remote], import_content=False)
+    row = _task(conn, tid)
+    assert row["status"] == "done"
+    assert row["section"] == "today"
+    assert _fv(conn, tid, "status") == (field_ts, "fedora")
+    assert _fv(conn, tid, "section") == (field_ts, "fedora")
+
+
+def test_status_event_authority_repairs_then_peer_payload_cannot_revert(conn):
+    tid = "task-status-event-authority-peer"
+    field_ts = "2026-05-22T05:34:57.560101+00:00"
+    clock = 116616599801692170
+
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    _insert_task(conn, tid, title="Event authority", status="not_started", updated_at=field_ts)
+    upsert_field_versions(
+        conn,
+        tid,
+        ["status"],
+        timestamp=field_ts,
+        machine_id="fedora",
+    )
+
+    remote_events = [
+        {
+            "event_id": "event-status-done",
+            "event_type": "task_field_set",
+            "aggregate_kind": "task",
+            "aggregate_id": tid,
+            "field_name": "status",
+            "machine_id": "fedora",
+            "logical_clock": clock,
+            "event_ts": field_ts,
+            "new_value": "done",
+        }
+    ]
+    event_authoritative_remote = {
+        "id": tid,
+        "machine_id": "windows",
+        "source_machine": "windows",
+        "title": "Event authority",
+        "status": "not_started",
+        "updated_at": field_ts,
+        "_field_ts": {"status": [field_ts, "fedora", clock, "event-status-done"]},
+    }
+    stale_peer_remote = {
+        "id": tid,
+        "machine_id": "windows",
+        "source_machine": "windows",
+        "title": "Event authority",
+        "status": "not_started",
+        "updated_at": field_ts,
+        "_field_ts": {"status": [field_ts, "fedora", clock, "event-status-done"]},
+    }
+
+    merge_import_tasks(
+        conn,
+        [event_authoritative_remote],
+        import_content=False,
+        remote_events=remote_events,
+    )
+    assert _task(conn, tid)["status"] == "done"
+
+    merge_import_tasks(conn, [stale_peer_remote], import_content=False)
+    assert _task(conn, tid)["status"] == "done"
+    assert _fv(conn, tid, "status") == (field_ts, "fedora")
+
+
+def test_source_legacy_status_payload_can_outrank_stale_event_head(conn):
+    tid = "task-source-legacy-outranks-event-head"
+    stale_ts = "2026-05-22T10:49:20.981515+00:00"
+    source_ts = "2026-05-22T10:51:37.961187+00:00"
+    stale_clock = 116617836034850816
+    source_clock = 116617845011972097
+
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    _insert_task(conn, tid, title="Legacy source status", status="in_progress", updated_at=source_ts)
+    conn.execute(
+        "INSERT OR REPLACE INTO task_field_versions "
+        "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id) "
+        "VALUES (?, 'status', ?, 'fedora', ?, ?)",
+        (tid, stale_ts, stale_clock, "event-fedora-in-progress"),
+    )
+
+    remote_events = [
+        {
+            "event_id": "event-fedora-in-progress",
+            "event_type": "task_field_set",
+            "aggregate_kind": "task",
+            "aggregate_id": tid,
+            "field_name": "status",
+            "machine_id": "fedora",
+            "logical_clock": stale_clock,
+            "event_ts": stale_ts,
+            "new_value": "in_progress",
+        }
+    ]
+    rmanov_remote = {
+        "id": tid,
+        "machine_id": "RManov",
+        "source_machine": "RManov",
+        "title": "Legacy source status",
+        "status": "done",
+        "updated_at": source_ts,
+        "_field_ts": {
+            "status": [
+                source_ts,
+                "RManov",
+                source_clock,
+                "event-rmanov-done",
+            ]
+        },
+    }
+
+    _, updated = merge_import_tasks(
+        conn,
+        [rmanov_remote],
+        import_content=False,
+        remote_events=remote_events,
+    )
+
+    assert updated == 1
+    assert _task(conn, tid)["status"] == "done"
+    assert _fv(conn, tid, "status") == (source_ts, "RManov")
+
+
 def test_new_task_content_excluded_when_import_content_false(conn):
     """New task inserted with import_content=False must have NULL description/notes."""
     remote = [

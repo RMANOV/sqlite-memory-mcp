@@ -1167,7 +1167,10 @@ def bridge_pull() -> str:
         if tasks_from_index:
             try:
                 new_tasks, updated_tasks = _merge_import_tasks(
-                    conn, remote_tasks, import_content=True
+                    conn,
+                    remote_tasks,
+                    import_content=True,
+                    remote_events=payload.get("memory_events", []),
                 )
                 _sync_task_attachments_from_remote(conn, remote_tasks, BRIDGE_REPO)
             except (

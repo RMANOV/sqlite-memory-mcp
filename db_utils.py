@@ -450,6 +450,9 @@ MERGEABLE_FIELDS = (
     "notes",
 )
 
+FIELD_TS_VALUE_FIELDS = ("status", "section")
+_FIELD_VALUE_MISSING = object()
+
 _TOMBSTONE_DAYS = 30
 
 # Path traversal defense for direct filename usage: raw task IDs may only use
@@ -3197,6 +3200,8 @@ def _task_field_version_select(
     conn: sqlite3.Connection,
 ) -> tuple[str, bool, bool]:
     cols = ["task_id", "field_name", "updated_at", "updated_by"]
+    if _sqlite_has_column(conn, "task_field_versions", "new_value"):
+        cols.append("new_value")
     has_order = _sqlite_has_column(conn, "task_field_versions", "updated_order")
     has_event = _sqlite_has_column(conn, "task_field_versions", "source_event_id")
     if has_order:
@@ -3207,13 +3212,21 @@ def _task_field_version_select(
 
 
 def _field_version_entry(
-    row: sqlite3.Row, *, has_order: bool, has_event: bool
+    row: sqlite3.Row,
+    *,
+    has_order: bool,
+    has_event: bool,
+    current_value: Any = _FIELD_VALUE_MISSING,
 ) -> list[Any]:
     entry: list[Any] = [row["updated_at"], row["updated_by"]]
     if has_order:
         entry.append(row["updated_order"])
     if has_event:
         entry.append(row["source_event_id"])
+    if current_value is not _FIELD_VALUE_MISSING:
+        while len(entry) < 4:
+            entry.append(0 if len(entry) == 2 else None)
+        entry.append(current_value)
     return entry
 
 
@@ -3233,6 +3246,7 @@ def _field_ts_entry_from_status(
     updated_by: str,
     updated_order: int = 0,
     source_event_id: str | None = None,
+    value: Any = _FIELD_VALUE_MISSING,
 ) -> list[Any]:
     entry: list[Any] = [str(updated_at or ""), str(updated_by or "")]
     if int(updated_order or 0) or source_event_id is not None:
@@ -3241,7 +3255,66 @@ def _field_ts_entry_from_status(
         if len(entry) == 2:
             entry.append(int(updated_order or 0))
         entry.append(source_event_id)
+    if value is not _FIELD_VALUE_MISSING:
+        while len(entry) < 4:
+            entry.append(0 if len(entry) == 2 else None)
+        entry.append(value)
     return entry
+
+
+def _field_ts_explicit_value(remote_fts: dict, field: str) -> Any:
+    """Return a value embedded in _field_ts, or a sentinel when absent."""
+    entry = remote_fts.get(field)
+    if isinstance(entry, dict):
+        for key in ("value", "new_value"):
+            if key in entry:
+                return entry[key]
+        return _FIELD_VALUE_MISSING
+    if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+        return entry[4]
+    return _FIELD_VALUE_MISSING
+
+
+def _machine_aliases(machine_id: str | None) -> set[str]:
+    raw = str(machine_id or "").strip().lower()
+    if not raw:
+        return set()
+    aliases = {raw}
+    compact = raw.replace("_", "-")
+    aliases.add(compact)
+    if compact in {"rmanov", "windows-rmanov"}:
+        aliases.update({"rmanov", "windows-rmanov"})
+    if compact.endswith("-rmanov"):
+        aliases.add("rmanov")
+    return aliases
+
+
+def _source_machine_matches_field_writer(
+    source_machine_id: str | None,
+    updated_by: str | None,
+) -> bool:
+    source_aliases = _machine_aliases(source_machine_id)
+    writer_aliases = _machine_aliases(updated_by)
+    return bool(source_aliases and writer_aliases and source_aliases & writer_aliases)
+
+
+def _legacy_payload_value_is_authoritative(
+    *,
+    field: str,
+    source_machine_id: str | None,
+    updated_by: str | None,
+) -> bool:
+    """Allow legacy value repair only from the machine that wrote the field.
+
+    Older peers exported _field_ts as [timestamp, machine] without the value or
+    event id. If another peer later re-emits the same field timestamp with a
+    stale row value, accepting that row value flips status/section back. The
+    only safe legacy fallback is to trust the payload value from the writer
+    machine itself; modern peers should use explicit _field_ts value/event data.
+    """
+    return field in FIELD_TS_VALUE_FIELDS and _source_machine_matches_field_writer(
+        source_machine_id, updated_by
+    )
 
 
 def _build_event_lookup_by_id(
@@ -3502,6 +3575,7 @@ def canonicalize_exported_task_statuses(
                 state.get("updated_by", ""),
                 int(state.get("updated_order") or 0),
                 state.get("source_event_id"),
+                resolved_status,
             )
 
 
@@ -3578,10 +3652,15 @@ def export_task_files(
     ).fetchall()
     fv_map: dict[str, dict] = {}
     for fvr in fv_rows:
-        fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = _field_version_entry(
+        current_value = _FIELD_VALUE_MISSING
+        field_name = fvr["field_name"]
+        if field_name in FIELD_TS_VALUE_FIELDS:
+            current_value = task_map.get(fvr["task_id"], {}).get(field_name)
+        fv_map.setdefault(fvr["task_id"], {})[field_name] = _field_version_entry(
             fvr,
             has_order=has_order,
             has_event=has_event,
+            current_value=current_value,
         )
 
     # Batch fetch task-entity links
@@ -3703,6 +3782,8 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
 
     # Batch-fetch field versions for all tasks + tombstones (avoid N+1)
     all_ids = [r["id"] for r in rows] + [r["id"] for r in tombstone_rows]
+    row_by_id = {r["id"]: r for r in rows}
+    row_by_id.update({r["id"]: r for r in tombstone_rows})
     fv_map: dict[str, dict[str, list]] = {}
     if all_ids:
         ph = ",".join("?" * len(all_ids))
@@ -3712,11 +3793,18 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
             all_ids,
         ).fetchall()
         for fvr in fv_rows:
+            field_name = fvr["field_name"]
+            current_value = _FIELD_VALUE_MISSING
+            if field_name in FIELD_TS_VALUE_FIELDS:
+                source_row = row_by_id.get(fvr["task_id"])
+                if source_row is not None and field_name in source_row.keys():
+                    current_value = source_row[field_name]
             fv_map.setdefault(fvr["task_id"], {})[fvr["field_name"]] = (
                 _field_version_entry(
                     fvr,
                     has_order=has_order,
                     has_event=has_event,
+                    current_value=current_value,
                 )
             )
 
@@ -3772,6 +3860,18 @@ def _parse_field_ts(
     # Backward compat: no _field_ts → task-level updated_at.
     # Use MACHINE_ID (not "") so old peers don't systematically lose ties.
     return fallback_ts, MACHINE_ID, 0, None
+
+
+def _field_ts_has_explicit_authority(remote_fts: dict, field: str) -> bool:
+    """True when _field_ts carries a value or event pointer for this field."""
+    if _field_ts_explicit_value(remote_fts, field) is not _FIELD_VALUE_MISSING:
+        return True
+    entry = remote_fts.get(field)
+    if isinstance(entry, dict):
+        return bool(entry.get("source_event_id"))
+    if isinstance(entry, (list, tuple)) and len(entry) >= 4:
+        return bool(entry[3])
+    return False
 
 
 def _field_version_sort_key(
@@ -3869,6 +3969,11 @@ def merge_import_tasks(
         remote["project"] = normalize_project_name(remote.get("project"))
         remote_fts = remote.get("_field_ts", {})
         fallback_ts = remote.get("updated_at", "")
+        source_machine_id = (
+            remote.get("_source_machine_id")
+            or remote.get("source_machine")
+            or remote.get("machine_id")
+        )
         parent_id = remote.get("parent_id")
         if (
             isinstance(parent_id, str)
@@ -3883,12 +3988,31 @@ def merge_import_tasks(
             remote_status_order,
             remote_status_event_id,
         ) = _parse_field_ts(remote_fts, "status", fallback_ts)
+        remote_status_explicit_value = _field_ts_explicit_value(
+            remote_fts, "status"
+        )
+        status_has_legacy_value_authority = (
+            isinstance(remote_fts, dict)
+            and "status" in remote_fts
+            and _legacy_payload_value_is_authoritative(
+                field="status",
+                source_machine_id=source_machine_id,
+                updated_by=remote_status_by,
+            )
+        )
+        remote_status_source_value = remote_status_explicit_value
+        if (
+            remote_status_source_value is _FIELD_VALUE_MISSING
+            and status_has_legacy_value_authority
+        ):
+            remote_status_source_value = remote.get("status")
         remote_status_state = _resolve_task_status_authority(
             remote.get("status"),
             field_updated_at=remote_status_ts,
             field_updated_by=remote_status_by,
             field_updated_order=remote_status_order,
             source_event_id=remote_status_event_id,
+            source_new_value=remote_status_source_value,
             event_by_id=remote_event_by_id,
             event_head=remote_status_heads.get(tid),
         )
@@ -3898,13 +4022,29 @@ def merge_import_tasks(
         if resolved_remote_status is not None:
             remote["status"] = resolved_remote_status
             remote_fts = dict(remote_fts or {})
-            if remote_status_state.get("updated_at"):
-                remote_fts["status"] = _field_ts_entry_from_status(
-                    remote_status_state.get("updated_at", ""),
-                    remote_status_state.get("updated_by", ""),
-                    int(remote_status_state.get("updated_order") or 0),
-                    remote_status_state.get("source_event_id"),
+            status_has_explicit_value = (
+                remote_status_explicit_value is not _FIELD_VALUE_MISSING
+            )
+            status_has_event_authority = bool(
+                remote_status_event_id
+                and (
+                    remote_status_event_id in remote_event_by_id
+                    or remote_status_heads.get(tid)
                 )
+            )
+            if remote_status_state.get("updated_at"):
+                if (
+                    status_has_explicit_value
+                    or status_has_event_authority
+                    or status_has_legacy_value_authority
+                ):
+                    remote_fts["status"] = _field_ts_entry_from_status(
+                        remote_status_state.get("updated_at", ""),
+                        remote_status_state.get("updated_by", ""),
+                        int(remote_status_state.get("updated_order") or 0),
+                        remote_status_state.get("source_event_id"),
+                        resolved_remote_status,
+                    )
                 remote["_field_ts"] = remote_fts
                 if _timestamp_is_newer(
                     remote_status_state.get("updated_at", ""), fallback_ts
@@ -4094,6 +4234,16 @@ def merge_import_tasks(
                 remote_ts, remote_by, remote_order, remote_event_id = _parse_field_ts(
                     remote_fts, field, fallback_ts
                 )
+                explicit_value = _field_ts_explicit_value(remote_fts, field)
+                has_explicit_authority = (
+                    explicit_value is not _FIELD_VALUE_MISSING
+                    or bool(remote_event_id and remote_event_id in remote_event_by_id)
+                )
+                remote_has_field_ts = (
+                    isinstance(remote_fts, dict) and field in remote_fts
+                )
+                if explicit_value is not _FIELD_VALUE_MISSING:
+                    remote_val = explicit_value
 
                 local_fv = local_fvs.get(field)
                 local_val = task_content_map.get(local_id, {}).get(field)
@@ -4103,8 +4253,57 @@ def merge_import_tasks(
                 local_event_id = local_fv[3] if local_fv and len(local_fv) > 3 else None
                 remote_key = _field_version_sort_key(remote_ts, remote_by, remote_order)
                 local_key = _field_version_sort_key(local_ts, local_by, local_order)
+                legacy_value_authority = (
+                    remote_has_field_ts
+                    and _legacy_payload_value_is_authoritative(
+                        field=field,
+                        source_machine_id=source_machine_id,
+                        updated_by=remote_by,
+                    )
+                )
+                remote_wins = remote_key > local_key
+                remote_repairs_equal_key = (
+                    remote_key == local_key
+                    and local_val != remote_val
+                    and (has_explicit_authority or legacy_value_authority)
+                )
 
-                if remote_key > local_key:
+                if remote_wins or remote_repairs_equal_key:
+                    if (
+                        field in FIELD_TS_VALUE_FIELDS
+                        and remote_has_field_ts
+                        and not has_explicit_authority
+                        and not legacy_value_authority
+                    ):
+                        if local_val != remote_val:
+                            record_memory_conflict(
+                                conn,
+                                aggregate_kind="task",
+                                aggregate_id=local_id,
+                                field_name=field,
+                                local_value=local_val,
+                                remote_value=remote_val,
+                                local_updated_at=local_ts,
+                                remote_updated_at=remote_ts,
+                                local_updated_order=local_order,
+                                remote_updated_order=remote_order,
+                                local_source_event_id=local_event_id,
+                                remote_source_event_id=remote_event_id,
+                                winner="guard_local",
+                                rationale=(
+                                    "legacy bridge field timestamp lacks value/event "
+                                    "and payload source does not match field writer"
+                                ),
+                            )
+                        _log.warning(
+                            "LWW legacy value guard: keeping local %s for task %s "
+                            "(payload source %s, field writer %s)",
+                            field,
+                            local_id,
+                            source_machine_id,
+                            remote_by,
+                        )
+                        continue
                     # Content protection: never nullify or drastically shrink local content
                     if field in CONTENT_FIELDS:
                         if has_meaningful_content(
@@ -4167,6 +4366,12 @@ def merge_import_tasks(
                         field,
                         updated_at=remote_ts,
                         updated_by=remote_by,
+                        old_value=str(local_val)[:500]
+                        if local_val is not None
+                        else None,
+                        new_value=str(remote_val)[:500]
+                        if remote_val is not None
+                        else None,
                         updated_order=remote_order,
                         source_event_id=remote_event_id,
                     )
@@ -4616,14 +4821,17 @@ def load_entities_from_files(bridge_dir: str) -> list[dict]:
 
 def collect_legacy_bridge_tasks(payload: dict[str, Any]) -> list[dict]:
     """Collect legacy task arrays from shared.json-style bridge payloads."""
-    tasks = list(payload.get("tasks", []))
+    source_machine_id = payload.get("machine_id")
+    tasks = [dict(task) for task in payload.get("tasks", []) if isinstance(task, dict)]
     for key, value in payload.items():
         if (
             key.endswith("_tasks")
             and key not in {"tasks", "shared_tasks"}
             and isinstance(value, list)
         ):
-            tasks.extend(value)
+            tasks.extend(dict(task) for task in value if isinstance(task, dict))
+    for task in tasks:
+        task.setdefault("_source_machine_id", source_machine_id)
     return tasks
 
 
@@ -4671,9 +4879,13 @@ def load_remote_tasks_for_merge(
             )
         return collect_legacy_bridge_tasks(payload), False
 
-    remote_tasks = idx_data.get("tasks", [])
+    source_machine_id = idx_data.get("machine_id") or payload.get("machine_id")
+    remote_tasks = [
+        dict(task) for task in idx_data.get("tasks", []) if isinstance(task, dict)
+    ]
     enriched = 0
     for task in remote_tasks:
+        task.setdefault("_source_machine_id", source_machine_id)
         content = load_task_content(task.get("id", ""), bridge_dir)
         if not content:
             continue
@@ -4683,6 +4895,7 @@ def load_remote_tasks_for_merge(
         for field in TASK_FILE_HYDRATION_FIELDS:
             if field in content:
                 task[field] = content[field]
+        task.setdefault("_source_machine_id", source_machine_id)
         if content.get("description") or content.get("notes"):
             enriched += 1
 
