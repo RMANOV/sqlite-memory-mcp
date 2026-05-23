@@ -1,0 +1,26 @@
+[Unit]
+Description=sqlite-memory debate wake pump
+After=default.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sqlite-memory-mcp
+Environment=DEBATE_REPO=%h/sqlite-memory-mcp
+Environment=SQLITE_MEMORY_DB=%h/.claude/memory/memory.db
+Environment=DEBATE_WAKE_ACTION=agent
+Environment=DEBATE_PUMP_MAX_WORKERS_PER_SCAN=3
+Environment=DEBATE_PUMP_MAX_CONCURRENT_WORKERS=3
+Environment=DEBATE_MESSAGE_CLAIM_RECLAIM_SECONDS=900
+Environment=DEBATE_MESSAGE_CLAIM_RECLAIM_INTERVAL=60
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/sqlite-memory-mcp/hooks/debate_pump.py --interval 2 --limit 20 --action-kind Q,A,DECISION,STATE,STATUS
+Restart=always
+RestartSec=5
+KillMode=process
+TimeoutStopSec=10
+StandardOutput=append:%h/.claude/memory/debate_pump.out
+StandardError=append:%h/.claude/memory/debate_pump.err
+
+[Install]
+WantedBy=default.target

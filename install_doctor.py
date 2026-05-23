@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -25,6 +26,9 @@ _EXPECTED_LOCAL_MCP_SERVERS = (
     "sqlite_entity",
     "sqlite_intel",
 )
+_DEBATE_PUMP_SERVICE = "sqlite-memory-debate-pump.service"
+_DEFAULT_CODEX_BIN = Path.home() / ".npm-global/bin/codex"
+_DEFAULT_CODEX_WRAPPER = Path.home() / ".local/bin/codex-debate-wrapper"
 
 
 def _check(name: str, ok: bool, detail: str, *, required: bool = True) -> dict[str, Any]:
@@ -39,6 +43,7 @@ def run_doctor(
     check_bridge: bool = False,
     check_claude_mcp: bool = False,
     check_codex_mcp: bool = False,
+    check_debate_runtime: bool = False,
 ) -> dict[str, Any]:
     """Return a structured install/runtime health report."""
     target_db = str(Path(db_path or DB_PATH).expanduser())
@@ -137,9 +142,135 @@ def run_doctor(
                 ),
             )
         )
+    if check_debate_runtime:
+        checks.extend(_check_debate_runtime())
 
     ok = all(item["ok"] for item in checks if item.get("required", True))
     return {"ok": ok, "db_path": target_db, "checks": checks}
+
+
+def _check_debate_runtime() -> list[dict[str, Any]]:
+    return [
+        _check_codex_debate_wrapper(),
+        _check_debate_hook_runtime_parity(),
+        _check_debate_pump_service(),
+        _check_user_linger(),
+    ]
+
+
+def _check_codex_debate_wrapper(
+    *,
+    codex_bin: Path | None = None,
+    expected_wrapper: Path | None = None,
+) -> dict[str, Any]:
+    codex_path = Path(
+        os.environ.get("CODEX_DEBATE_CODEX_BIN", str(codex_bin or _DEFAULT_CODEX_BIN))
+    ).expanduser()
+    wrapper_path = Path(
+        os.environ.get(
+            "CODEX_DEBATE_WRAPPER", str(expected_wrapper or _DEFAULT_CODEX_WRAPPER)
+        )
+    ).expanduser()
+    codex_real = codex_path.with_name("codex-real")
+
+    if not codex_path.exists():
+        return _check("codex_debate_wrapper", False, f"missing codex at {codex_path}")
+    if not codex_path.is_symlink():
+        return _check(
+            "codex_debate_wrapper",
+            False,
+            f"{codex_path} is not a symlink to {wrapper_path}",
+        )
+    if not wrapper_path.is_file() or not os.access(wrapper_path, os.X_OK):
+        return _check(
+            "codex_debate_wrapper",
+            False,
+            f"wrapper missing or not executable: {wrapper_path}",
+        )
+    if codex_path.resolve() != wrapper_path.resolve():
+        return _check(
+            "codex_debate_wrapper",
+            False,
+            f"{codex_path} -> {codex_path.resolve()}, expected {wrapper_path}",
+        )
+    if not codex_real.is_file() or not os.access(codex_real, os.X_OK):
+        return _check(
+            "codex_debate_wrapper",
+            False,
+            f"codex-real missing or not executable: {codex_real}",
+        )
+    return _check(
+        "codex_debate_wrapper",
+        True,
+        f"{codex_path} -> {wrapper_path}; codex-real={codex_real}",
+    )
+
+
+def _check_debate_hook_runtime_parity() -> dict[str, Any]:
+    try:
+        from runtime_parity import collect_runtime_parity
+
+        report = collect_runtime_parity()
+    except Exception as exc:
+        return _check(
+            "debate_hook_runtime_parity",
+            False,
+            f"{type(exc).__name__}: {exc}",
+        )
+    debate_files = {
+        entry["name"]: entry["status"]
+        for entry in report.get("files", [])
+        if entry.get("name") in {"debate_pump.py", "debate_wake.py"}
+    }
+    bad = {name: status for name, status in debate_files.items() if status != "in_sync"}
+    missing = sorted({"debate_pump.py", "debate_wake.py"} - set(debate_files))
+    if bad or missing:
+        detail = []
+        if bad:
+            detail.append(
+                "drift: " + ", ".join(f"{name}={status}" for name, status in bad.items())
+            )
+        if missing:
+            detail.append("missing: " + ", ".join(missing))
+        return _check("debate_hook_runtime_parity", False, "; ".join(detail))
+    return _check("debate_hook_runtime_parity", True, "debate hooks in sync")
+
+
+def _check_debate_pump_service() -> dict[str, Any]:
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return _check("debate_pump_service", False, "systemctl not found")
+    states: dict[str, str] = {}
+    for verb in ("is-active", "is-enabled"):
+        result = subprocess.run(
+            [systemctl, "--user", verb, _DEBATE_PUMP_SERVICE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        states[verb] = (result.stdout or result.stderr or "").strip() or str(result.returncode)
+    ok = states.get("is-active") == "active" and states.get("is-enabled") == "enabled"
+    return _check(
+        "debate_pump_service",
+        ok,
+        f"active={states.get('is-active')} enabled={states.get('is-enabled')}",
+    )
+
+
+def _check_user_linger() -> dict[str, Any]:
+    loginctl = shutil.which("loginctl")
+    if not loginctl:
+        return _check("user_linger", False, "loginctl not found")
+    result = subprocess.run(
+        [loginctl, "show-user", os.environ.get("USER", ""), "-p", "Linger"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    detail = (result.stdout or result.stderr or "").strip() or str(result.returncode)
+    return _check("user_linger", detail == "Linger=yes", detail)
 
 
 def _check_cli_mcp_registration(
@@ -244,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also check whether Codex lists the local sqlite MCP servers.",
     )
+    parser.add_argument(
+        "--check-debate-runtime",
+        action="store_true",
+        help="Also check debate hook parity, Codex wrapper routing, and pump service.",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
 
@@ -257,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         check_bridge=args.check_bridge,
         check_claude_mcp=args.check_claude_mcp,
         check_codex_mcp=args.check_codex_mcp,
+        check_debate_runtime=args.check_debate_runtime,
     )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
