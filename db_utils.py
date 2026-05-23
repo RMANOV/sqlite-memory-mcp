@@ -3317,6 +3317,43 @@ def _legacy_payload_value_is_authoritative(
     )
 
 
+def _legacy_terminal_status_row_can_promote(
+    *,
+    remote_value: Any,
+    local_value: Any,
+    source_machine_id: str | None,
+    remote_updated_at: str | None,
+    remote_field_ts: str | None,
+    local_updated_at: str | None,
+    has_explicit_authority: bool,
+    legacy_value_authority: bool,
+) -> bool:
+    """Let legacy row-level terminal closures repair stale status metadata.
+
+    Older writers could update tasks.status without updating task_field_versions.
+    That is dangerous for active states, because a peer can re-emit a stale
+    `not_started` row forever. Terminal states are different: if the exporting
+    source row says done/archived/cancelled and its row timestamp is newer than
+    the stale status field timestamp, promote that closure once into field
+    history so later stale active payloads cannot resurrect it.
+    """
+    remote_status = _normalize_task_status_value(remote_value)
+    local_status = _normalize_task_status_value(local_value)
+    if remote_status not in TASK_ACTIVE_EXCLUSIONS:
+        return False
+    if local_status in TASK_ACTIVE_EXCLUSIONS:
+        return False
+    if has_explicit_authority or legacy_value_authority:
+        return False
+    if not str(source_machine_id or "").strip():
+        return False
+    if not str(remote_updated_at or "").strip():
+        return False
+    if _timestamp_is_newer(local_updated_at, remote_updated_at):
+        return False
+    return _timestamp_is_newer(remote_updated_at, remote_field_ts)
+
+
 def _build_event_lookup_by_id(
     events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
 ) -> dict[str, dict[str, Any]]:
@@ -4261,6 +4298,25 @@ def merge_import_tasks(
                         updated_by=remote_by,
                     )
                 )
+                legacy_terminal_promotion = _legacy_terminal_status_row_can_promote(
+                    remote_value=remote_val,
+                    local_value=local_val,
+                    source_machine_id=source_machine_id,
+                    remote_updated_at=remote_updated_at,
+                    remote_field_ts=remote_ts,
+                    local_updated_at=local_updated_at,
+                    has_explicit_authority=has_explicit_authority,
+                    legacy_value_authority=legacy_value_authority,
+                )
+                if legacy_terminal_promotion:
+                    remote_ts = remote_updated_at or fallback_ts
+                    remote_by = str(source_machine_id or remote_by or MACHINE_ID)
+                    remote_order = _pack_logical_clock(_iso_to_epoch_ms(remote_ts), 0)
+                    remote_event_id = None
+                    remote_key = _field_version_sort_key(
+                        remote_ts, remote_by, remote_order
+                    )
+                    legacy_value_authority = True
                 remote_wins = remote_key > local_key
                 remote_repairs_equal_key = (
                     remote_key == local_key
@@ -4393,7 +4449,11 @@ def merge_import_tasks(
                             local_source_event_id=local_event_id,
                             remote_source_event_id=remote_event_id,
                             winner="remote",
-                            rationale="remote field version outranked local field version",
+                            rationale=(
+                                "legacy terminal row promoted stale status field version"
+                                if legacy_terminal_promotion
+                                else "remote field version outranked local field version"
+                            ),
                         )
                 elif local_val != remote_val and (local_ts or remote_ts):
                     record_memory_conflict(

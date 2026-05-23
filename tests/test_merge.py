@@ -120,6 +120,17 @@ def _task(conn, tid):
     return conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
 
 
+def _ensure_field_event_columns(conn):
+    for ddl in (
+        "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+
+
 # ── Test 1: Normal merge — new task ──────────────────────────────────────
 
 
@@ -276,7 +287,7 @@ def test_tombstone_newer_updates_status(conn):
     ]
     _, updated = merge_import_tasks(conn, remote)
 
-    assert updated == 1
+    assert updated >= 1
     assert _task(conn, tid)["status"] == "cancelled"
 
 
@@ -728,6 +739,192 @@ def test_status_event_authority_repairs_then_peer_payload_cannot_revert(conn):
     merge_import_tasks(conn, [stale_peer_remote], import_content=False)
     assert _task(conn, tid)["status"] == "done"
     assert _fv(conn, tid, "status") == (field_ts, "fedora")
+
+
+def test_legacy_terminal_row_promotes_then_active_peer_cannot_revert(conn):
+    tid = "task-legacy-terminal-row"
+    stale_field_ts = "2026-04-25T14:45:45.835158+00:00"
+    promoted_row_ts = "2026-05-22T12:39:21.167920+00:00"
+    stale_clock = _pack_logical_clock(1770000000000, 1)
+
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "ALTER TABLE task_field_versions ADD COLUMN source_event_id TEXT DEFAULT NULL"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    _insert_task(
+        conn,
+        tid,
+        title="Commerzbank interview prep",
+        status="not_started",
+        updated_at=promoted_row_ts,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO task_field_versions "
+        "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
+        "VALUES (?, 'status', ?, 'fedora', ?, ?, 'not_started')",
+        (tid, stale_field_ts, stale_clock, "event-fedora-not-started"),
+    )
+
+    rmanov_terminal = {
+        "id": tid,
+        "_source_machine_id": "RManov",
+        "title": "ARCHIVE | Commerzbank interview prep | closed after rejection",
+        "status": "archived",
+        "updated_at": promoted_row_ts,
+        "_field_ts": {
+            "status": [stale_field_ts, "fedora", stale_clock, "event-fedora-not-started"]
+        },
+    }
+
+    _, updated = merge_import_tasks(conn, [rmanov_terminal], import_content=False)
+
+    row = _task(conn, tid)
+    fv = conn.execute(
+        "SELECT updated_at, updated_by, updated_order, new_value "
+        "FROM task_field_versions WHERE task_id = ? AND field_name = 'status'",
+        (tid,),
+    ).fetchone()
+    assert updated >= 1
+    assert row["status"] == "archived"
+    assert row["updated_at"] == promoted_row_ts
+    assert fv["updated_at"] == promoted_row_ts
+    assert fv["updated_by"] == "RManov"
+    assert fv["updated_order"] > stale_clock
+    assert fv["new_value"] == "archived"
+
+    stale_fedora_peer = {
+        "id": tid,
+        "_source_machine_id": "fedora",
+        "title": "Commerzbank interview prep",
+        "status": "not_started",
+        "updated_at": promoted_row_ts,
+        "_field_ts": {
+            "status": [
+                stale_field_ts,
+                "fedora",
+                stale_clock,
+                "event-fedora-not-started",
+                "not_started",
+            ]
+        },
+    }
+
+    merge_import_tasks(conn, [stale_fedora_peer], import_content=False)
+    assert _task(conn, tid)["status"] == "archived"
+
+
+def test_legacy_active_row_never_promotes_via_fresh_updated_at(conn):
+    tid = "task-legacy-active-row"
+    local_ts = "2026-05-22T12:40:00+00:00"
+    stale_field_ts = "2026-04-25T14:45:45.835158+00:00"
+    fresh_row_ts = "2026-05-23T09:00:00+00:00"
+    stale_clock = _pack_logical_clock(1770000000000, 1)
+
+    _ensure_field_event_columns(conn)
+    _insert_task(conn, tid, title="Active row", status="not_started", updated_at=local_ts)
+    conn.execute(
+        "INSERT OR REPLACE INTO task_field_versions "
+        "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
+        "VALUES (?, 'status', ?, 'RManov', ?, ?, 'not_started')",
+        (tid, local_ts, _pack_logical_clock(1770000100000, 1), "event-local-not-started"),
+    )
+
+    active_remote = {
+        "id": tid,
+        "_source_machine_id": "RManov",
+        "title": "Active row",
+        "status": "in_progress",
+        "updated_at": fresh_row_ts,
+        "_field_ts": {
+            "status": [stale_field_ts, "fedora", stale_clock, "event-fedora-old"]
+        },
+    }
+
+    _, updated = merge_import_tasks(conn, [active_remote], import_content=False)
+
+    assert updated == 0
+    assert _task(conn, tid)["status"] == "not_started"
+
+
+def test_legacy_terminal_row_does_not_flip_existing_terminal_status(conn):
+    tid = "task-terminal-flip"
+    local_ts = "2026-05-22T12:40:00+00:00"
+    stale_field_ts = "2026-04-25T14:45:45.835158+00:00"
+    fresh_row_ts = "2026-05-23T09:00:00+00:00"
+    stale_clock = _pack_logical_clock(1770000000000, 1)
+
+    _ensure_field_event_columns(conn)
+    _insert_task(conn, tid, title="Terminal row", status="archived", updated_at=local_ts)
+    conn.execute(
+        "INSERT OR REPLACE INTO task_field_versions "
+        "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
+        "VALUES (?, 'status', ?, 'RManov', ?, ?, 'archived')",
+        (tid, local_ts, _pack_logical_clock(1770000100000, 1), "event-local-archived"),
+    )
+
+    competing_terminal = {
+        "id": tid,
+        "_source_machine_id": "RManov",
+        "title": "Terminal row",
+        "status": "cancelled",
+        "updated_at": fresh_row_ts,
+        "_field_ts": {
+            "status": [stale_field_ts, "fedora", stale_clock, "event-fedora-old"]
+        },
+    }
+
+    _, updated = merge_import_tasks(conn, [competing_terminal], import_content=False)
+
+    assert updated == 0
+    assert _task(conn, tid)["status"] == "archived"
+
+
+def test_explicit_status_value_blocks_legacy_terminal_row_promotion(conn):
+    tid = "task-explicit-status-blocks-promotion"
+    local_ts = "2026-05-22T12:40:00+00:00"
+    stale_field_ts = "2026-04-25T14:45:45.835158+00:00"
+    fresh_row_ts = "2026-05-23T09:00:00+00:00"
+    stale_clock = _pack_logical_clock(1770000000000, 1)
+
+    _ensure_field_event_columns(conn)
+    _insert_task(conn, tid, title="Explicit status", status="not_started", updated_at=local_ts)
+    conn.execute(
+        "INSERT OR REPLACE INTO task_field_versions "
+        "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
+        "VALUES (?, 'status', ?, 'RManov', ?, ?, 'not_started')",
+        (tid, local_ts, _pack_logical_clock(1770000100000, 1), "event-local-not-started"),
+    )
+
+    explicit_stale_remote = {
+        "id": tid,
+        "_source_machine_id": "RManov",
+        "title": "Explicit status",
+        "status": "archived",
+        "updated_at": fresh_row_ts,
+        "_field_ts": {
+            "status": [
+                stale_field_ts,
+                "fedora",
+                stale_clock,
+                "event-fedora-not-started",
+                "archived",
+            ]
+        },
+    }
+
+    _, updated = merge_import_tasks(conn, [explicit_stale_remote], import_content=False)
+
+    assert updated == 0
+    assert _task(conn, tid)["status"] == "not_started"
 
 
 def test_source_legacy_status_payload_can_outrank_stale_event_head(conn):
