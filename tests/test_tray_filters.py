@@ -15,10 +15,15 @@ class _SearchStub:
         return tasks
 
 
+class _DBStub:
+    _conn = None
+
+
 class _DummyWindow(FilterMixin):
     def __init__(self):
         self._search_text = ""
         self._search_engine = _SearchStub()
+        self.db = _DBStub()
         self._active_filters = _empty_filters()
         self._excluded_filters = _empty_filters()
 
@@ -51,3 +56,18 @@ def test_filter_excludes_project_aliases_using_canonical_name():
     filtered = window._filter(tasks)
 
     assert {task["id"] for task in filtered} == {"c"}
+
+
+def test_search_results_still_apply_chip_filters():
+    window = _DummyWindow()
+    window._search_text = "anything"
+    window._active_filters["priority"] = {"critical"}
+
+    tasks = [
+        {"id": "a", "priority": "critical", "title": "A"},
+        {"id": "b", "priority": "low", "title": "B"},
+    ]
+
+    filtered = window._filter(tasks)
+
+    assert {task["id"] for task in filtered} == {"a"}

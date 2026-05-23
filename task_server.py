@@ -36,6 +36,12 @@ from retrieval_contract import (
 )
 from premium_runtime import maybe_mount_premium_extensions
 from task_search import TaskSearchEngine
+from smart_retrieval import (
+    READY_CONTEXT_CONTRACT_VERSION as _READY_CONTEXT_CONTRACT_VERSION,
+    prime_context as _prime_context,
+    ready_context as _ready_context,
+    suggested_ready as _suggested_ready,
+)
 
 # Pre-built SQL for active-task exclusion
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
@@ -930,6 +936,97 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
 
     logger.info("bump_overdue_priority: %d bumped to %s", bumped, target_priority)
     return json.dumps({"bumped": bumped, "target_priority": target_priority})
+
+
+def _strip_ready_task_payload(record: dict[str, Any]) -> dict[str, Any]:
+    out = dict(record)
+    out.pop("task", None)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool 8: ready_context
+# ═══════════════════════════════════════════════════════════════════════════
+@mcp.tool()
+def ready_context(
+    mode: str = "ready",
+    include_readings: bool = False,
+    limit: int = 12,
+) -> str:
+    """Return deterministic ready/prime context with reasons and provenance.
+
+    This is sqlite-memory-mcp's cross-project/cross-machine answer to Beads
+    ``bd ready`` / ``bd prime``.
+
+    Args:
+        mode: ready | suggested | prime.
+            ready returns structured ready-context records.
+            suggested returns the bounded Suggested-tab candidate set.
+            prime returns a compact session boot pack from the same records.
+        include_readings: include reading notes in work surfaces.
+        limit: max items per list.
+    """
+    safe_limit = max(1, min(int(limit or 12), 100))
+    with _get_conn() as conn:
+        tasks = TaskDAO.get_active(conn)
+
+    normalized_mode = (mode or "ready").strip().lower()
+    if normalized_mode == "suggested":
+        rows = _suggested_ready(
+            tasks,
+            include_readings=include_readings,
+            limit=safe_limit,
+        )
+        return json.dumps(
+            {
+                "contract_version": _READY_CONTEXT_CONTRACT_VERSION,
+                "mode": "suggested",
+                "count": len(rows),
+                "items": rows,
+            },
+            ensure_ascii=False,
+        )
+
+    if normalized_mode == "prime":
+        pack = _prime_context(
+            tasks,
+            include_readings=include_readings,
+            limit=min(safe_limit, 50),
+        )
+        for key in (
+            "top_ready_items",
+            "blocked_or_waiting",
+            "cleanup_candidates",
+            "explicit_exclusions",
+            "risk_or_escalation_items",
+        ):
+            pack[key] = [
+                _strip_ready_task_payload(record) for record in pack.get(key, [])
+            ]
+        pack["mode"] = "prime"
+        return json.dumps(pack, ensure_ascii=False)
+
+    if normalized_mode != "ready":
+        return json.dumps(
+            {
+                "error": f"Invalid mode: {mode}",
+                "valid_modes": ["ready", "suggested", "prime"],
+            },
+            ensure_ascii=False,
+        )
+
+    records = _ready_context(tasks, include_readings=include_readings)
+    selected = [_strip_ready_task_payload(record) for record in records[:safe_limit]]
+    return json.dumps(
+        {
+            "contract_version": _READY_CONTEXT_CONTRACT_VERSION,
+            "mode": "ready",
+            "count": len(selected),
+            "truncated": len(records) > safe_limit,
+            "items": selected,
+        },
+        ensure_ascii=False,
+    )
 
 
 # ── Entry point ──────────────────────────────────────────────────────────

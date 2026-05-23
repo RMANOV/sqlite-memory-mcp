@@ -547,6 +547,13 @@ def _get_truth_score_badge(task, db_path=None):
 def _format_task_text(task, include_project=True, prefix=""):
     """Build display text: [N] [🔄] [⏳/🌐] [TS] [PRIORITY] title | Due: date | project — preview."""
     type_prefix = "[N] " if task.get("type") == "note" else ""
+    ready_badge = {
+        "ready_now": "[READY] ",
+        "suggested_ready": "[SUG] ",
+        "blocked": "[BLOCKED] ",
+        "waiting": "[WAIT] ",
+        "cleanup_candidate": "[CLEAN] ",
+    }.get(task.get("_ready_state"), "")
     recur = "\U0001f504 " if task.get("recurring") else ""
     vis = task.get("visibility", "private")
     vis_badge = (
@@ -567,7 +574,7 @@ def _format_task_text(task, include_project=True, prefix=""):
         if len(preview_source) > 50
         else (f" — {preview_source}" if preview_source else "")
     )
-    return f"{prefix}{type_prefix}{recur}{vis_badge}{ts_badge}[{priority}] {task['title']}{due}{proj}{preview}"
+    return f"{prefix}{ready_badge}{type_prefix}{recur}{vis_badge}{ts_badge}[{priority}] {task['title']}{due}{proj}{preview}"
 
 
 def _apply_task_item_colors(item, task):
@@ -590,6 +597,22 @@ def _build_rich_tooltip(task):
         parts.append(f"\U0001f504 {rl}")
     if task.get("description"):
         parts.append(task["description"])
+    if task.get("_ready_state"):
+        parts.append(f"Ready state: {task['_ready_state']}")
+    if task.get("_ready_urgency"):
+        parts.append(f"Urgency: {task['_ready_urgency']}")
+    if task.get("_ready_reason_codes"):
+        parts.append(f"Reasons: {', '.join(task['_ready_reason_codes'])}")
+    if task.get("_ready_next_action"):
+        parts.append(f"Next action: {task['_ready_next_action']}")
+    if task.get("_ready_blockers"):
+        blocker_labels = [
+            str(b.get("category") or b)
+            for b in task["_ready_blockers"]
+        ]
+        parts.append(f"Blockers: {', '.join(blocker_labels)}")
+    if task.get("_ready_stale_warning"):
+        parts.append(f"Stale warning: {task['_ready_stale_warning']}")
     if task.get("notes"):
         parts.append(f"Notes: {task['notes']}")
     if task.get("priority"):
@@ -3065,7 +3088,16 @@ class TaskListWidget(QListWidget):
 
     @staticmethod
     def _fingerprint(tasks):
-        return tuple((t["id"], t.get("updated_at", "")) for t in tasks)
+        return tuple(
+            (
+                t["id"],
+                t.get("updated_at", ""),
+                t.get("_ready_state", ""),
+                t.get("_ready_urgency", ""),
+                tuple(t.get("_ready_reason_codes") or ()),
+            )
+            for t in tasks
+        )
 
     @staticmethod
     def _item_is_readonly(task):

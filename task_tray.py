@@ -101,6 +101,7 @@ from db_utils import (
     resolve_task_attachment_path,
 )
 from schema import init_db
+from smart_retrieval import suggested_ready
 
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200
@@ -738,7 +739,6 @@ from tray_dialogs import (
     ReminderPopupDialog,
     TaskListWidget,
     create_tray_icon_pixmap,
-    _suggested_sort_key,
 )
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
@@ -838,9 +838,9 @@ class _TrayStatusProxy:
 
 
 # Per-tab sort/filter constants
-_FIXED_VIEW_TABS = frozenset({"suggested", "projects"})
+_FIXED_VIEW_TABS = frozenset({"projects"})
 _DEFAULT_TAB_VIEW = {
-    "sort": "priority",
+    "sort": "ready",
     "active": {"priority": set(), "due": set(), "project": set()},
     "excluded": {"priority": set(), "due": set(), "project": set()},
     "params": {},
@@ -867,8 +867,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     _entity_search_done = pyqtSignal(list, int)  # (entity_results, seq_id)
 
     # Sort modes cycle: priority → due → created → priority ...
-    _SORT_MODES = ("priority", "due", "created", "project")
+    _SORT_MODES = ("ready", "priority", "due", "created", "project")
     _SORT_LABELS = {
+        "ready": "Sort: Ready",
         "priority": "Sort: Priority",
         "due": "Sort: Due Date",
         "created": "Sort: Created",
@@ -1649,6 +1650,25 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def _sort_tasks(self, tasks, sort_mode=None):
         """Sort tasks by given sort mode (or current working sort mode)."""
         mode = sort_mode or self._sort_mode
+        if mode == "ready":
+            state_rank = {
+                "ready_now": 0,
+                "suggested_ready": 1,
+                "blocked": 2,
+                "waiting": 3,
+                "cleanup_candidate": 4,
+            }
+            urgency_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+            return sorted(
+                tasks,
+                key=lambda t: (
+                    state_rank.get(t.get("_ready_state"), 9),
+                    urgency_rank.get(t.get("_ready_urgency"), 9),
+                    priority_sort_key(t),
+                    t.get("due_date") or "9999-12-31",
+                    t.get("created_at") or "",
+                ),
+            )
         if mode == "priority":
             return sorted(tasks, key=priority_sort_key)
         if mode == "due":
@@ -1759,7 +1779,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # Rebuild SmartKey search index (skips if fingerprint unchanged)
         self._search_engine.rebuild_index(all_active + done + premium_rows)
 
-        suggested = sorted(all_active, key=_suggested_sort_key)[:20]
+        suggested = suggested_ready(all_active, include_readings=False, limit=None)
         notes = [t for t in all_active if t.get("type") == "note"] + [
             t for t in done if t.get("type") == "note"
         ]
@@ -1791,13 +1811,18 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             global_ids = {t["id"] for t in global_results}
             for key in self._tab_keys:
                 if key == "suggested":
-                    # Use full search results, not the pre-limited top-20 list
-                    source = global_results
+                    # Suggested is policy-first: only ready-context candidates
+                    # can appear here, then search/chips/sort/cap apply.
+                    source = [t for t in raw[key] if t["id"] in global_ids]
                 else:
                     source = [t for t in raw[key] if t["id"] in global_ids]
                 if key in self._tab_views:
                     v = self._tab_views[key]
-                    self._filtered_cache[key] = self._sort_tasks(source, v["sort"])
+                    source = self._filter_chips_only(source, v["active"], v["excluded"])
+                    sorted_source = self._sort_tasks(source, v["sort"])
+                    self._filtered_cache[key] = (
+                        sorted_source[:12] if key == "suggested" else sorted_source
+                    )
                 else:
                     self._filtered_cache[key] = self._sort_tasks(source)
         else:
@@ -1807,7 +1832,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 if key in self._tab_views:
                     v = self._tab_views[key]
                     filtered = self._filter(raw[key], v["active"], v["excluded"])
-                    self._filtered_cache[key] = self._sort_tasks(filtered, v["sort"])
+                    sorted_filtered = self._sort_tasks(filtered, v["sort"])
+                    self._filtered_cache[key] = (
+                        sorted_filtered[:12] if key == "suggested" else sorted_filtered
+                    )
                 else:
                     self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
 

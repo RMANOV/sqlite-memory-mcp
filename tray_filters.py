@@ -245,15 +245,8 @@ class FilterMixin:
                 return True
         return False
 
-    def _filter(self, tasks, active_filters=None, excluded_filters=None):
-        """Apply chip filters. Accepts explicit filter dicts or falls back to working state."""
-        q = self._search_text
-        if q:
-            # SmartKey fuzzy search (falls back to substring if unavailable)
-            return self._search_engine.search(
-                q, tasks, conn=self.db._conn, use_vector=False
-            )
-
+    def _filter_chips_only(self, tasks, active_filters=None, excluded_filters=None):
+        """Apply chip filters without running text search."""
         af = active_filters if active_filters is not None else self._active_filters
         ef = (
             excluded_filters if excluded_filters is not None else self._excluded_filters
@@ -313,3 +306,17 @@ class FilterMixin:
             ]
 
         return tasks
+
+    def _filter(self, tasks, active_filters=None, excluded_filters=None):
+        """Apply text search and chip filters.
+
+        Search narrows the task pool first, then chips still apply.  This keeps
+        tab policy/filter semantics consistent while searching.
+        """
+        q = self._search_text
+        if q:
+            # SmartKey fuzzy search (falls back to substring if unavailable)
+            tasks = self._search_engine.search(
+                q, tasks, conn=self.db._conn, use_vector=False
+            )
+        return self._filter_chips_only(tasks, active_filters, excluded_filters)
