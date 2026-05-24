@@ -17,6 +17,7 @@ SERVICE_SRC = ROOT / "systemd" / "user" / SERVICE_NAME
 SERVICE_DST = Path.home() / ".config/systemd/user" / SERVICE_NAME
 SMOKE_TESTS = [
     "tests/test_debate_hooks.py",
+    "tests/test_debate_priority.py",
     "tests/test_debate_v3_10_lifecycle.py",
     "tests/test_runtime_parity.py",
     "tests/test_debate_ops.py",
@@ -100,6 +101,41 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     return _run(cmd).returncode
 
 
+def cmd_work_queue(args: argparse.Namespace) -> int:
+    from db_utils import get_conn
+    from debate import list_open_debate_work
+
+    states = [s.strip() for s in args.states.split(",") if s.strip()]
+    topics = [t.strip() for t in args.topics.split(",") if t.strip()]
+    with get_conn() as conn:
+        payload = list_open_debate_work(
+            conn,
+            states=states or None,
+            topics=topics or None,
+            limit=args.limit,
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_set_priority(args: argparse.Namespace) -> int:
+    from db_utils import get_conn_immediate
+    from debate import set_topic_priority
+
+    with get_conn_immediate() as conn:
+        payload = set_topic_priority(
+            conn,
+            topic_id=args.topic_id,
+            role="CONDUCTOR",
+            lane=args.lane,
+            reason=args.reason,
+            next_action=args.next_action,
+            blocked_by=args.blocked_by,
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local debate wake pump and runtime hardening helpers."
@@ -131,6 +167,26 @@ def build_parser() -> argparse.ArgumentParser:
     smoke = sub.add_parser("smoke", help="Run focused debate runtime smoke tests.")
     smoke.add_argument("--verbose", action="store_true")
     smoke.set_defaults(func=cmd_smoke)
+
+    queue = sub.add_parser(
+        "work-queue",
+        help="Print deterministic open debate work priority queue.",
+    )
+    queue.add_argument("--states", default="INIT,ACTIVE")
+    queue.add_argument("--topics", default="")
+    queue.add_argument("--limit", type=int, default=50)
+    queue.set_defaults(func=cmd_work_queue)
+
+    priority = sub.add_parser(
+        "set-priority",
+        help="Set CONDUCTOR topic priority lane P0..P7.",
+    )
+    priority.add_argument("topic_id")
+    priority.add_argument("lane")
+    priority.add_argument("reason")
+    priority.add_argument("--next-action", default="")
+    priority.add_argument("--blocked-by", default="")
+    priority.set_defaults(func=cmd_set_priority)
 
     return parser
 

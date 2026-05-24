@@ -287,6 +287,23 @@ def _reap_children() -> None:
             CHILDREN.discard(pid)
 
 
+def _current_auto_budget() -> Any | None:
+    if os.environ.get("DEBATE_RESOURCE_BUDGET", "auto") == "off":
+        return None
+    sys.path.insert(0, str(HOOK_DIR))
+    from debate_resource_budget import current_debate_resource_budget
+
+    return current_debate_resource_budget()
+
+
+def _cap_positive(base: int, cap: int) -> int:
+    if cap <= 0:
+        return 0
+    if base <= 0:
+        return cap
+    return min(base, cap)
+
+
 def _handle_signal(_signum: int, _frame: Any) -> None:
     global STOP
     STOP = True
@@ -303,7 +320,7 @@ def main() -> int:
     parser.add_argument(
         "--action-kind",
         action="append",
-        default=os.environ.get("DEBATE_PUMP_ACTION_KINDS", "Q,A,DECISION,STATE").split(","),
+        default=None,
         help="message kinds that should wake agents; default excludes STATUS",
     )
     parser.add_argument("--interval", type=float, default=2.0)
@@ -343,13 +360,19 @@ def main() -> int:
     parser.add_argument(
         "--suppress-role",
         action="append",
-        default=os.environ.get("DEBATE_PUMP_SUPPRESS_ROLES", "CONDUCTOR").split(","),
+        default=None,
     )
     args = parser.parse_args()
 
     topics = _split_csv_values(args.topic)
-    action_kinds = [k.upper() for k in _split_csv_values(args.action_kind)]
-    suppressed_roles = {r.upper() for r in _split_csv_values(args.suppress_role)}
+    action_kind_values = args.action_kind or os.environ.get(
+        "DEBATE_PUMP_ACTION_KINDS", "Q,A,DECISION,STATE"
+    ).split(",")
+    suppress_role_values = args.suppress_role or os.environ.get(
+        "DEBATE_PUMP_SUPPRESS_ROLES", "CONDUCTOR"
+    ).split(",")
+    action_kinds = [k.upper() for k in _split_csv_values(action_kind_values)]
+    suppressed_roles = {r.upper() for r in _split_csv_values(suppress_role_values)}
     max_workers_per_scan = max(0, args.max_workers_per_scan)
     max_concurrent_workers = max(0, args.max_concurrent_workers)
     default_wake_budget = max(
@@ -395,7 +418,58 @@ def main() -> int:
             )
             last_claim_reclaim_at = time.monotonic()
         try:
-            rows = _fetch_new(last_ts, last_msg_id, topics, action_kinds, args.limit)
+            loop_interval = max(0.2, args.interval)
+            effective_action_kinds = action_kinds
+            effective_limit = args.limit
+            effective_max_workers_per_scan = max_workers_per_scan
+            effective_max_concurrent_workers = max_concurrent_workers
+            auto_budget = None
+            try:
+                auto_budget = _current_auto_budget()
+            except Exception as exc:
+                _log("pump_resource_budget_failed", error=repr(exc))
+                auto_budget = None
+            if auto_budget is not None:
+                _log("pump_resource_budget", **auto_budget.to_dict())
+                if not auto_budget.allow_agent:
+                    _log("pump_paused_by_resource_budget", **auto_budget.to_dict())
+                    if args.once:
+                        break
+                    time.sleep(max(loop_interval, auto_budget.interval_seconds))
+                    continue
+                effective_action_kinds = [
+                    kind for kind in action_kinds if kind in set(auto_budget.action_kinds)
+                ]
+                effective_limit = min(args.limit, auto_budget.limit) if args.limit > 0 else auto_budget.limit
+                effective_max_workers_per_scan = _cap_positive(
+                    max_workers_per_scan,
+                    auto_budget.max_workers_per_scan,
+                )
+                effective_max_concurrent_workers = _cap_positive(
+                    max_concurrent_workers,
+                    auto_budget.max_concurrent_workers,
+                )
+                os.environ["DEBATE_WAKE_BUDGET"] = str(
+                    min(
+                        int(os.environ.get("DEBATE_WAKE_BUDGET", str(default_wake_budget))),
+                        max(0, auto_budget.wake_budget),
+                    )
+                )
+                loop_interval = max(loop_interval, auto_budget.interval_seconds)
+                if not effective_action_kinds or effective_limit <= 0:
+                    _log("pump_paused_by_empty_resource_budget", **auto_budget.to_dict())
+                    if args.once:
+                        break
+                    time.sleep(loop_interval)
+                    continue
+
+            rows = _fetch_new(
+                last_ts,
+                last_msg_id,
+                topics,
+                effective_action_kinds,
+                effective_limit,
+            )
             dispatched_rows = 0
             launched_this_scan = 0
             throttled = False
@@ -406,8 +480,8 @@ def main() -> int:
                     estimated_worker_demand=estimated_worker_demand,
                     launched_this_scan=launched_this_scan,
                     live_children=len(CHILDREN),
-                    max_workers_per_scan=max_workers_per_scan,
-                    max_concurrent_workers=max_concurrent_workers,
+                    max_workers_per_scan=effective_max_workers_per_scan,
+                    max_concurrent_workers=effective_max_concurrent_workers,
                 )
                 if reason is not None:
                     throttled = True
@@ -419,8 +493,8 @@ def main() -> int:
                         estimated_worker_demand=estimated_worker_demand,
                         launched_this_scan=launched_this_scan,
                         live_children=len(CHILDREN),
-                        max_workers_per_scan=max_workers_per_scan,
-                        max_concurrent_workers=max_concurrent_workers,
+                        max_workers_per_scan=effective_max_workers_per_scan,
+                        max_concurrent_workers=effective_max_concurrent_workers,
                         last_ts=last_ts,
                         last_msg_id=last_msg_id,
                     )
@@ -442,6 +516,8 @@ def main() -> int:
                     launched_workers=launched_this_scan,
                     throttled=throttled,
                     live_children=len(CHILDREN),
+                    effective_action_kinds=effective_action_kinds,
+                    effective_limit=effective_limit,
                     last_ts=last_ts,
                     last_msg_id=last_msg_id,
                 )
@@ -449,7 +525,7 @@ def main() -> int:
             _log("scan_failed", error=repr(exc))
         if args.once:
             break
-        time.sleep(max(0.2, args.interval))
+        time.sleep(loop_interval)
 
     _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)

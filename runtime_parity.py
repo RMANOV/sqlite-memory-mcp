@@ -21,6 +21,7 @@ TRACKED_RUNTIME_FILES = (
     "bridge_sync_worker.py",
     "debate_agent_events.py",
     "debate_pump.py",
+    "debate_resource_budget.py",
     "debate_wake.py",
 )
 

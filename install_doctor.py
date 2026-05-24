@@ -220,10 +220,14 @@ def _check_debate_hook_runtime_parity() -> dict[str, Any]:
     debate_files = {
         entry["name"]: entry["status"]
         for entry in report.get("files", [])
-        if entry.get("name") in {"debate_pump.py", "debate_wake.py"}
+        if entry.get("name")
+        in {"debate_pump.py", "debate_resource_budget.py", "debate_wake.py"}
     }
     bad = {name: status for name, status in debate_files.items() if status != "in_sync"}
-    missing = sorted({"debate_pump.py", "debate_wake.py"} - set(debate_files))
+    missing = sorted(
+        {"debate_pump.py", "debate_resource_budget.py", "debate_wake.py"}
+        - set(debate_files)
+    )
     if bad or missing:
         detail = []
         if bad:

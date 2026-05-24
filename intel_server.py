@@ -80,6 +80,7 @@ from debate import (
     debate_signal_check as _debate_signal_check_dao,
     escalate as _debate_escalate_dao,
     init_debate as _debate_init_dao,
+    list_open_debate_work as _debate_list_open_work_dao,
     list_role_bindings as _debate_list_role_bindings_dao,
     post_message as _debate_post_dao,
     prepare_wake_dry_run as _debate_prepare_wake_dry_run_dao,
@@ -88,6 +89,7 @@ from debate import (
     reap_worker_claims as _debate_reap_worker_claims_dao,
     rotate_role_binding as _debate_rotate_role_binding_dao,
     seed_initial_role_bindings as _debate_seed_initial_role_bindings_dao,
+    set_topic_priority as _debate_set_topic_priority_dao,
     transition_state as _debate_transition_dao,
     worker_no_action as _debate_worker_no_action_dao,
 )
@@ -1821,6 +1823,62 @@ def debate_worker_no_action(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_worker_no_action failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 44: debate_set_topic_priority (CONDUCTOR cross-topic scheduling)
+@mcp.tool()
+def debate_set_topic_priority(
+    topic_id: str,
+    role: str,
+    lane: str,
+    reason: str,
+    next_action: str = "",
+    blocked_by: str = "",
+) -> str:
+    """Set a CONDUCTOR-owned P0..P7 priority lane in topic metadata."""
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_set_topic_priority_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                lane=lane,
+                reason=reason,
+                next_action=next_action,
+                blocked_by=blocked_by,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_set_topic_priority failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 45: debate_work_queue (deterministic open-work priority view)
+@mcp.tool()
+def debate_work_queue(
+    states_csv: str = "INIT,ACTIVE",
+    topics_csv: str = "",
+    limit: int = 50,
+) -> str:
+    """List open debate topics in deterministic CONDUCTOR priority order."""
+    try:
+        states = [s.strip() for s in states_csv.split(",") if s.strip()]
+        topics = [t.strip() for t in topics_csv.split(",") if t.strip()]
+        with _get_conn() as conn:
+            out = _debate_list_open_work_dao(
+                conn,
+                states=states or None,
+                topics=topics or None,
+                limit=limit,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_work_queue failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

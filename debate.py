@@ -72,6 +72,30 @@ SESSION_ID_RE = re.compile(
 DEFAULT_SIGNAL_LIMIT = 200
 MAX_SIGNAL_LIMIT = 1000
 VALID_PRIORITY_ORDER = {"H": 3, "M": 2, "L": 1, "INFO": 0}
+VALID_TOPIC_PRIORITY_LANES = (
+    "P0",
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5",
+    "P6",
+    "P7",
+)
+TOPIC_PRIORITY_LANE_ORDER = {
+    lane: len(VALID_TOPIC_PRIORITY_LANES) - idx
+    for idx, lane in enumerate(VALID_TOPIC_PRIORITY_LANES)
+}
+WORK_KIND_ORDER = {
+    "PING": 7,
+    "Q": 6,
+    "DECISION": 5,
+    "STATE": 4,
+    "A": 3,
+    "STATUS": 2,
+    "COMPACTION": 1,
+    "WATERMARK": 0,
+}
 
 # Canonical WATERMARK body parser — turn-3 correction msg:4c8a91be.
 # Supports two forms:
@@ -180,6 +204,15 @@ def validate_priority(priority: str) -> None:
     if priority not in VALID_PRIORITIES:
         raise DebateError(
             f"invalid_priority: {priority!r} not in {VALID_PRIORITIES}"
+        )
+
+
+def validate_topic_priority_lane(lane: str) -> None:
+    if lane not in VALID_TOPIC_PRIORITY_LANES:
+        raise DebateError(
+            f"invalid_topic_priority_lane: {lane!r} not in "
+            f"{VALID_TOPIC_PRIORITY_LANES}",
+            error_type="topic_priority_lane_invalid",
         )
 
 
@@ -312,12 +345,43 @@ def get_debate(
     return _row_to_debate_dict(row) if row else None
 
 
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if value is None or value == "":
+        return {}
+    parsed = json_loads(value)
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _row_to_debate_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["roles"] = json_loads(d.pop("roles_json")) if d.get("roles_json") else []
     md = d.pop("metadata_json", None)
     d["metadata"] = json_loads(md) if md else None
     return d
+
+
+def _topic_priority_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    value = metadata.get("conductor_priority")
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        return {"lane": value}
+    value = metadata.get("priority_lane")
+    if isinstance(value, str) and value:
+        return {"lane": value}
+    return {}
+
+
+def _explicit_topic_priority_lane(metadata: dict[str, Any] | None) -> str | None:
+    priority = _topic_priority_metadata(metadata)
+    lane = priority.get("lane")
+    if isinstance(lane, str) and lane in TOPIC_PRIORITY_LANE_ORDER:
+        return lane
+    return None
 
 
 def role_in_debate(roles: list[dict[str, Any]], role: str) -> bool:
@@ -2100,6 +2164,332 @@ def _open_blocking_questions(
         (topic_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_topic_priority(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    lane: str,
+    reason: str,
+    next_action: str = "",
+    blocked_by: str = "",
+) -> dict[str, Any]:
+    """Set the CONDUCTOR-owned deterministic priority lane for a topic.
+
+    This updates ``debates.metadata_json`` rather than posting a STATUS row.
+    Debate messages still carry local H/M/L/INFO priority; the topic lane is
+    the cross-topic scheduling authority used by work-queue views.
+    """
+    validate_topic_id(topic_id)
+    validate_role(role)
+    lane = lane.upper()
+    validate_topic_priority_lane(lane)
+    if role != "CONDUCTOR":
+        raise DebateError(
+            "topic_priority_requires_conductor",
+            error_type="topic_priority_requires_conductor",
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise DebateError(
+            "topic_priority_reason_required",
+            error_type="topic_priority_reason_required",
+        )
+    row = conn.execute(
+        "SELECT topic_id, roles_json, metadata_json FROM debates WHERE topic_id = ?",
+        (topic_id,),
+    ).fetchone()
+    if row is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    roles = json_loads(row["roles_json"]) if row["roles_json"] else []
+    if not role_in_debate(roles, role):
+        raise DebateError(
+            f"unknown_role_for_topic: {role} not in declared roles",
+            error_type="recipient_unknown_role",
+        )
+
+    now = now_iso()
+    metadata = _metadata_dict(row["metadata_json"])
+    metadata["conductor_priority"] = {
+        "lane": lane,
+        "rank": TOPIC_PRIORITY_LANE_ORDER[lane],
+        "reason": reason.strip(),
+        "next_action": str(next_action or "").strip(),
+        "blocked_by": str(blocked_by or "").strip(),
+        "updated_by_role": role,
+        "updated_at": now,
+    }
+    conn.execute(
+        "UPDATE debates SET metadata_json = ? WHERE topic_id = ?",
+        (json_dumps(metadata), topic_id),
+    )
+    return {
+        "topic_id": topic_id,
+        "lane": lane,
+        "rank": TOPIC_PRIORITY_LANE_ORDER[lane],
+        "reason": reason.strip(),
+        "next_action": str(next_action or "").strip(),
+        "blocked_by": str(blocked_by or "").strip(),
+        "updated_at": now,
+    }
+
+
+def _due_reason_and_score(resolve_by: str | None, now_dt: datetime) -> tuple[str | None, int]:
+    if not resolve_by:
+        return None, 0
+    try:
+        due = _parse_iso_utc_dt(resolve_by)
+    except DebateError:
+        return "resolve_by_invalid", 0
+    seconds = (due - now_dt).total_seconds()
+    if seconds < 0:
+        return "resolve_by_overdue", 60_000
+    if seconds <= 4 * 3600:
+        return "resolve_by_due_4h", 40_000
+    if seconds <= 24 * 3600:
+        return "resolve_by_due_24h", 20_000
+    return None, 0
+
+
+def _default_topic_lane(
+    *,
+    explicit_lane: str | None,
+    open_questions: list[dict[str, Any]],
+    max_priority: str | None,
+    stale_active_claims: int,
+    missing_active_roles: list[str],
+    due_reason: str | None,
+) -> str:
+    if explicit_lane is not None:
+        return explicit_lane
+    if missing_active_roles:
+        return "P1"
+    if any(q.get("priority") == "H" for q in open_questions):
+        return "P1"
+    if due_reason in {"resolve_by_overdue", "resolve_by_due_4h"}:
+        return "P2"
+    if stale_active_claims:
+        return "P2"
+    if open_questions:
+        return "P3"
+    if max_priority == "H":
+        return "P4"
+    return "P5"
+
+
+def _default_next_action(
+    *,
+    metadata_priority: dict[str, Any],
+    open_questions: list[dict[str, Any]],
+    missing_active_roles: list[str],
+    stale_active_claims: int,
+    due_reason: str | None,
+) -> str:
+    explicit = metadata_priority.get("next_action")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    if missing_active_roles:
+        return "bind active owners for missing roles before waking workers"
+    if open_questions:
+        top = sorted(
+            open_questions,
+            key=lambda q: (
+                -VALID_PRIORITY_ORDER.get(str(q.get("priority")), -1),
+                str(q.get("ts") or ""),
+                str(q.get("msg_id") or ""),
+            ),
+        )[0]
+        return f"answer open {top['priority']} Q {top['msg_id']}"
+    if stale_active_claims:
+        return "reclaim or reap stale worker claims before spawning more work"
+    if due_reason:
+        return "advance gate before resolve_by deadline"
+    return "monitor; close/archive if no remaining material work"
+
+
+def list_open_debate_work(
+    conn: sqlite3.Connection,
+    *,
+    states: list[str] | None = None,
+    topics: list[str] | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return active debate topics in deterministic CONDUCTOR priority order."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise DebateError(
+            "invalid_limit: must be positive int",
+            error_type="limit_out_of_range",
+        )
+    effective_limit = min(limit, MAX_SIGNAL_LIMIT)
+    states = states or ["INIT", "ACTIVE"]
+    for state in states:
+        validate_state(state)
+    topics = topics or []
+    for topic_id in topics:
+        validate_topic_id(topic_id)
+
+    where = [f"d.state IN ({','.join('?' for _ in states)})"]
+    params: list[Any] = list(states)
+    if topics:
+        where.append(f"d.topic_id IN ({','.join('?' for _ in topics)})")
+        params.extend(topics)
+
+    rows = conn.execute(
+        "SELECT d.topic_id, d.title, d.state, d.created_at, d.created_by_role, "
+        "d.resolve_by, d.archived_at, d.roles_json, d.metadata_json "
+        "FROM debates d "
+        f"WHERE {' AND '.join(where)}",
+        params,
+    ).fetchall()
+    now_dt = datetime.now(timezone.utc)
+    items: list[dict[str, Any]] = []
+
+    for row in rows:
+        debate = _row_to_debate_dict(row)
+        topic_id = debate["topic_id"]
+        metadata = debate.get("metadata") if isinstance(debate.get("metadata"), dict) else {}
+        priority_metadata = _topic_priority_metadata(metadata)
+        explicit_lane = _explicit_topic_priority_lane(metadata)
+        messages = conn.execute(
+            "SELECT msg_id, ts, priority, kind, role, reply_to "
+            "FROM debate_messages WHERE topic_id = ? "
+            "ORDER BY ts ASC, msg_id ASC",
+            (topic_id,),
+        ).fetchall()
+        latest = dict(messages[-1]) if messages else None
+        max_priority = None
+        max_kind = None
+        if messages:
+            max_priority = max(
+                (m["priority"] for m in messages),
+                key=lambda p: VALID_PRIORITY_ORDER.get(p, -1),
+            )
+            max_kind = max(
+                (m["kind"] for m in messages),
+                key=lambda k: WORK_KIND_ORDER.get(k, -1),
+            )
+        open_questions = _open_blocking_questions(conn, topic_id)
+        active_claim_rows = conn.execute(
+            "SELECT worker_session_id, role, trigger_msg_id, claimed_at, heartbeat_at "
+            "FROM debate_worker_claims "
+            "WHERE topic_id = ? AND state = 'active'",
+            (topic_id,),
+        ).fetchall()
+        active_claims = [dict(r) for r in active_claim_rows]
+        stale_active_claims = 0
+        for claim in active_claims:
+            try:
+                heartbeat = _parse_iso_utc_dt(claim["heartbeat_at"])
+            except DebateError:
+                continue
+            if (now_dt - heartbeat).total_seconds() >= 900:
+                stale_active_claims += 1
+
+        declared_roles = [
+            r.get("role")
+            for r in debate["roles"]
+            if isinstance(r, dict) and isinstance(r.get("role"), str)
+        ]
+        active_roles = {
+            r["role"]
+            for r in conn.execute(
+                "SELECT role FROM debate_role_bindings "
+                "WHERE topic_id = ? AND state = 'active'",
+                (topic_id,),
+            ).fetchall()
+        }
+        missing_active_roles = sorted(
+            role for role in declared_roles if role not in active_roles
+        )
+        due_reason, due_score = _due_reason_and_score(debate.get("resolve_by"), now_dt)
+        lane = _default_topic_lane(
+            explicit_lane=explicit_lane,
+            open_questions=open_questions,
+            max_priority=max_priority,
+            stale_active_claims=stale_active_claims,
+            missing_active_roles=missing_active_roles,
+            due_reason=due_reason,
+        )
+
+        reason_codes: list[str] = []
+        if explicit_lane:
+            reason_codes.append("explicit_conductor_priority")
+        if due_reason:
+            reason_codes.append(due_reason)
+        if open_questions:
+            reason_codes.append(f"open_questions_{len(open_questions)}")
+        if any(q.get("priority") == "H" for q in open_questions):
+            reason_codes.append("open_h_question")
+        if stale_active_claims:
+            reason_codes.append(f"stale_active_claims_{stale_active_claims}")
+        if missing_active_roles:
+            reason_codes.append("missing_active_role_binding")
+        if not reason_codes:
+            reason_codes.append("default_open_topic")
+
+        priority_score = (
+            TOPIC_PRIORITY_LANE_ORDER[lane] * 1_000_000
+            + due_score
+            + len(open_questions) * 5_000
+            + sum(1 for q in open_questions if q.get("priority") == "H") * 10_000
+            + stale_active_claims * 2_000
+            + len(missing_active_roles) * 20_000
+            + VALID_PRIORITY_ORDER.get(max_priority or "INFO", 0) * 1_000
+            + WORK_KIND_ORDER.get(max_kind or "WATERMARK", 0) * 100
+        )
+        item = {
+            "topic_id": topic_id,
+            "title": debate["title"],
+            "state": debate["state"],
+            "lane": lane,
+            "priority_score": priority_score,
+            "reason_codes": reason_codes,
+            "next_action": _default_next_action(
+                metadata_priority=priority_metadata,
+                open_questions=open_questions,
+                missing_active_roles=missing_active_roles,
+                stale_active_claims=stale_active_claims,
+                due_reason=due_reason,
+            ),
+            "blocked_by": str(priority_metadata.get("blocked_by") or "").strip(),
+            "resolve_by": debate.get("resolve_by"),
+            "open_question_count": len(open_questions),
+            "open_h_question_count": sum(
+                1 for q in open_questions if q.get("priority") == "H"
+            ),
+            "active_claim_count": len(active_claims),
+            "stale_active_claim_count": stale_active_claims,
+            "missing_active_roles": missing_active_roles,
+            "max_message_priority": max_priority,
+            "max_work_kind": max_kind,
+            "latest_message": latest,
+        }
+        items.append(item)
+
+    items.sort(
+        key=lambda item: (
+            -int(item["priority_score"]),
+            str(item.get("resolve_by") or "9999-12-31T23:59:59Z"),
+            str(item["topic_id"]),
+        )
+    )
+    return {
+        "items": items[:effective_limit],
+        "count": min(len(items), effective_limit),
+        "total": len(items),
+        "limit": effective_limit,
+        "ordering": [
+            "explicit conductor lane P0..P7",
+            "resolve_by urgency",
+            "open H/Q and active-claim/binding blockers",
+            "message priority/kind",
+            "topic_id tie-break",
+        ],
+    }
 
 
 # ── Escalation + compaction ───────────────────────────────────────────

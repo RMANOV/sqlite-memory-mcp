@@ -27,7 +27,12 @@ def _seed_runtime_tree(
     (hooks_dir / "bridge_sync_worker.py").write_text(
         "print('repo worker')\n", encoding="utf-8"
     )
-    for name in ("debate_agent_events.py", "debate_pump.py", "debate_wake.py"):
+    for name in (
+        "debate_agent_events.py",
+        "debate_pump.py",
+        "debate_resource_budget.py",
+        "debate_wake.py",
+    ):
         (hooks_dir / name).write_text(f"print('repo {name}')\n", encoding="utf-8")
         (runtime_root / name).write_text(f"print('repo {name}')\n", encoding="utf-8")
     (runtime_root / "bridge_auto_sync.py").write_text(
@@ -73,7 +78,7 @@ def test_write_runtime_parity_manifest_persists_report(tmp_path):
 
     assert saved["version"] == report["version"]
     assert saved["manifest_path"] == str(manifest_path)
-    assert len(saved["files"]) == 5
+    assert len(saved["files"]) == 6
     assert {entry["status"] for entry in saved["files"]} == {
         "in_sync",
         "mismatch",

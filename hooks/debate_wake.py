@@ -496,6 +496,34 @@ def _handle_tool_response(tool_response: dict[str, Any]) -> dict[str, Any] | Non
 def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
     targets = out.get("targets", []) if isinstance(out, dict) else []
     mode = os.environ.get("DEBATE_WAKE_ACTION", "dry_run")
+    resource_budget = None
+    if os.environ.get("DEBATE_RESOURCE_BUDGET", "auto") != "off":
+        try:
+            sys.path.insert(0, str(HOOK_DIR))
+            from debate_resource_budget import current_debate_resource_budget
+
+            resource_budget = current_debate_resource_budget()
+            _log("wake_resource_budget", msg_id=tool_response.get("msg_id"), **resource_budget.to_dict())
+            if mode == "agent" and not resource_budget.allow_agent:
+                mode = "dry_run"
+        except Exception as exc:
+            _log("wake_resource_budget_failed", msg_id=tool_response.get("msg_id"), error=repr(exc))
+            if mode == "agent":
+                mode = "dry_run"
+    disable_file = Path(
+        os.environ.get(
+            "DEBATE_WAKE_DISABLE_FILE",
+            os.path.expanduser("~/.claude/memory/debate_wake.disable"),
+        )
+    )
+    if disable_file.exists():
+        _log(
+            "wake_agent_disabled_by_file",
+            msg_id=tool_response.get("msg_id"),
+            disable_file=str(disable_file),
+            requested_mode=mode,
+        )
+        mode = "dry_run"
     _log(
         "wake_resolved",
         msg_id=tool_response.get("msg_id"),
@@ -521,6 +549,8 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
     budget = int(
         os.environ.get("DEBATE_WAKE_REMAINING", os.environ.get("DEBATE_WAKE_BUDGET", "1"))
     )
+    if resource_budget is not None:
+        budget = min(budget, max(0, resource_budget.wake_budget))
     if budget <= 0:
         _log("agent_budget_exhausted", msg_id=tool_response.get("msg_id"))
         return {"mode": mode, "launches": [], "reason": "agent_budget_exhausted"}
@@ -593,6 +623,43 @@ def _agent_budget_remaining() -> int:
         return 0
 
 
+def _agent_resolution_disabled(tool_response: dict[str, Any]) -> bool:
+    mode = os.environ.get("DEBATE_WAKE_ACTION", "dry_run")
+    if mode != "agent":
+        return False
+    disable_file = Path(
+        os.environ.get(
+            "DEBATE_WAKE_DISABLE_FILE",
+            os.path.expanduser("~/.claude/memory/debate_wake.disable"),
+        )
+    )
+    if disable_file.exists():
+        _log(
+            "agent_resolution_disabled_by_file",
+            msg_id=tool_response.get("msg_id"),
+            disable_file=str(disable_file),
+        )
+        return True
+    if os.environ.get("DEBATE_RESOURCE_BUDGET", "auto") == "off":
+        return False
+    try:
+        sys.path.insert(0, str(HOOK_DIR))
+        from debate_resource_budget import current_debate_resource_budget
+
+        budget = current_debate_resource_budget()
+    except Exception as exc:
+        _log("agent_resolution_resource_budget_failed", msg_id=tool_response.get("msg_id"), error=repr(exc))
+        return True
+    if not budget.allow_agent:
+        _log(
+            "agent_resolution_disabled_by_resource_budget",
+            msg_id=tool_response.get("msg_id"),
+            **budget.to_dict(),
+        )
+        return True
+    return False
+
+
 def _run_hook() -> int:
     try:
         raw = sys.stdin.read()
@@ -608,6 +675,9 @@ def _run_hook() -> int:
     tool_response = _extract_tool_response(payload)
     if tool_response is None:
         _log("missing_tool_response", tool_name=tool_name, keys=sorted(payload.keys()))
+        return 0
+
+    if _agent_resolution_disabled(tool_response):
         return 0
 
     if (
@@ -658,6 +728,8 @@ def _scan_since(since_ts: str) -> int:
             "topic_id": row["topic_id"],
             "schema_version": POST_SCHEMA_VERSION,
         }
+        if _agent_resolution_disabled(tool_response):
+            continue
         try:
             out = _handle_tool_response(tool_response)
             if isinstance(out, dict):

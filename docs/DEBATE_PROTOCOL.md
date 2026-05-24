@@ -36,9 +36,77 @@ addresses each by enforcing structure at the storage layer.
 - **Escalation hooks.** `debate_escalate` writes an `H`-priority `PING`
   tagged for a target role (default `HUMAN`) to surface unanswered
   high-priority questions, deadline misses, contradiction signals.
+- **High-signal message economy.** The debate channel is for messages with
+  material decision value: new evidence, a falsifiable objection, a concrete
+  implementation patch, a gate decision, or an operator-visible completion.
+  Agreement, duplicate acknowledgement, repeated status adoption, and
+  "nothing to add" are handled through silent approval/refusal, normally by
+  completing the wake with `debate_worker_no_action` instead of posting.
+- **Deterministic open-work priority.** Cross-topic scheduling is not inferred
+  from chat prose. `CONDUCTOR` assigns topic lanes with
+  `debate_set_topic_priority(P0..P7)`, and `debate_work_queue` is the canonical
+  sorted view for operators and automation. Message-level `H/M/L/INFO` remains
+  local to a topic; it does not by itself make all active topics equal.
 - **Compaction.** `kind=COMPACTION` snapshots are append-only OODA
   digests (regex-validated body). Future readers bootstrap from the
   latest compaction + incremental tail instead of full history.
+
+## Message Economy
+
+Every autonomous role must treat a debate post as a scarce coordination event.
+Before posting, the role asks whether the message changes another role's next
+action or the topic's gate state. If the answer is no, the correct terminal
+action is silence plus cursor/claim completion.
+
+Post when the message contains at least one of:
+
+- new source-backed evidence or a direct quote of the artifact checked;
+- a concrete rebuttal that changes a risk assessment;
+- an implementation plan, patch report, or test result that another role must
+  review;
+- a CONDUCTOR gate decision, override, escalation, or operator-facing
+  completion notice;
+- a `[DEFERRED:...]` answer that intentionally moves unresolved work out of the
+  current gate.
+
+Do not post for:
+
+- bare ACKs, "agree", "no objection", or duplicated summaries;
+- repeated adoption of an already-adopted verdict;
+- status messages whose only content is that the worker woke up;
+- second copies of another role's evidence when no conclusion changes.
+
+Autonomous workers should use `debate_worker_no_action(...)` for these
+low-value cases. This records the claim/cursor outcome without adding another
+`debate_messages` row, preserving zero-touch operation while keeping the log
+readable.
+
+## Open-Work Priority
+
+The debate runtime has two different priority layers:
+
+- Message priority: `H`, `M`, `L`, `INFO` inside one topic.
+- Topic lane: `P0` through `P7` across open topics.
+
+`P0` is the emergency lane: resource safety, data-loss/privacy exposure,
+corruption, or any operator-declared stop-the-line item. `P1` is the next
+blocking operational lane. `P2` is urgent/time-sensitive. `P3` is normal
+active execution. `P4` through `P7` are progressively deferred, monitor-only,
+or archive candidates.
+
+The deterministic ordering contract is:
+
+1. explicit `CONDUCTOR` topic lane stored in `debates.metadata_json`;
+2. deadline urgency from `resolve_by`;
+3. open H/Q blockers, stale active claims, and missing active role bindings;
+4. highest message priority and actionable kind inside the topic;
+5. `topic_id` tie-break.
+
+The only sanctioned way to set cross-topic priority is
+`debate_set_topic_priority(topic_id, role="CONDUCTOR", lane="P0".."P7",
+reason=..., next_action=..., blocked_by=...)`. The canonical queue view is
+`debate_work_queue(...)`. Human summaries may mirror that queue, but they are
+not the authority.
 
 ## Quick-start: three sessions coordinating
 
@@ -209,6 +277,20 @@ a `msg_id`, looks up its `ts` from the message row, and writes a
 canonical msg_id-only WATERMARK message. Reduces caller error surface
 vs constructing the body by hand. Raises
 `unknown_msg_id_for_watermark` if the `msg_id` is not in the topic.
+
+### `debate_set_topic_priority(topic_id, role, lane, reason, next_action="", blocked_by="")`
+
+Sets the CONDUCTOR-owned cross-topic priority lane in `debates.metadata_json`.
+Only `role="CONDUCTOR"` may set it. The lane must be `P0`..`P7`, and `reason`
+is mandatory.
+
+### `debate_work_queue(states_csv="INIT,ACTIVE", topics_csv="", limit=50)`
+
+Returns open topics in canonical scheduling order with `lane`,
+`priority_score`, `reason_codes`, `next_action`, `blocked_by`, open-question
+counts, stale-claim counts, missing active role bindings, and latest message
+metadata. Automation and operators should consult this surface before waking
+workers when there is a backlog.
 
 ### `debate_state(topic_id, role, new_state, reason="")`
 
