@@ -405,3 +405,112 @@ def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(monkeypatc
     assert module.main() == 0
     assert dispatches == ["m1"]
     assert saved == []
+
+
+def test_debate_pump_allows_partial_dispatch_when_message_has_more_targets_than_scan_budget():
+    module = _load_hook_module("debate_pump_partial_throttle_test", "hooks/debate_pump.py")
+
+    assert (
+        module._throttle_reason(
+            estimated_worker_demand=3,
+            launched_this_scan=0,
+            live_children=0,
+            max_workers_per_scan=1,
+            max_concurrent_workers=1,
+        )
+        is None
+    )
+    assert (
+        module._throttle_reason(
+            estimated_worker_demand=1,
+            launched_this_scan=1,
+            live_children=0,
+            max_workers_per_scan=1,
+            max_concurrent_workers=1,
+        )
+        == "max_workers_per_scan"
+    )
+
+
+def test_debate_pump_keeps_cursor_on_partially_dispatched_multi_recipient_message(
+    monkeypatch, tmp_path
+):
+    module = _load_hook_module("debate_pump_partial_cursor_test", "hooks/debate_pump.py")
+    module.LOG_PATH = tmp_path / "pump.jsonl"
+    module.STATE_PATH = tmp_path / "pump_state.json"
+    module.STOP = False
+    rows = [{"msg_id": "m1", "topic_id": "T", "ts": "2026-05-20T00:00:01Z"}]
+    demand = iter([3, 2])
+    dispatches = []
+    saved = []
+
+    monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
+    monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: next(demand))
+    monkeypatch.setattr(module, "_reap_children", lambda: None)
+    monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
+    monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id)))
+
+    def dispatch_one(row, suppressed_roles):
+        dispatches.append(row["msg_id"])
+        return 1
+
+    monkeypatch.setattr(module, "_dispatch_row", dispatch_one)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate_pump.py",
+            "--once",
+            "--since",
+            "2026-05-20T00:00:00Z",
+            "--max-workers-per-scan",
+            "1",
+            "--max-concurrent-workers",
+            "1",
+            "--message-claim-reclaim-seconds",
+            "0",
+        ],
+    )
+
+    assert module.main() == 0
+    assert dispatches == ["m1"]
+    assert saved == []
+    assert "pump_partial_dispatch_pending" in module.LOG_PATH.read_text(encoding="utf-8")
+
+
+def test_debate_pump_advances_cursor_after_last_recipient_is_handled(monkeypatch, tmp_path):
+    module = _load_hook_module("debate_pump_complete_cursor_test", "hooks/debate_pump.py")
+    module.LOG_PATH = tmp_path / "pump.jsonl"
+    module.STATE_PATH = tmp_path / "pump_state.json"
+    module.STOP = False
+    rows = [{"msg_id": "m1", "topic_id": "T", "ts": "2026-05-20T00:00:01Z"}]
+    demand = iter([1, 0])
+    saved = []
+
+    monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
+    monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: next(demand))
+    monkeypatch.setattr(module, "_reap_children", lambda: None)
+    monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
+    monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id)))
+    monkeypatch.setattr(module, "_dispatch_row", lambda row, suppressed_roles: 1)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate_pump.py",
+            "--once",
+            "--since",
+            "2026-05-20T00:00:00Z",
+            "--max-workers-per-scan",
+            "1",
+            "--max-concurrent-workers",
+            "1",
+            "--message-claim-reclaim-seconds",
+            "0",
+        ],
+    )
+
+    assert module.main() == 0
+    assert saved == [("2026-05-20T00:00:01Z", "m1")]

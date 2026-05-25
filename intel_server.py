@@ -1206,7 +1206,10 @@ def debate_init(
         roles_json: JSON array of {role, session_id} dicts.
         created_by_role: role posting the init.
         resolve_by: optional ISO 8601 UTC deadline.
-        metadata_json: optional JSON object, free-form.
+        metadata_json: JSON object. New official topics must include either
+            conductor_priority.lane or priority_lane (P0..P7) plus a priority
+            reason, so human-entered topics are asked for priority or
+            CONDUCTOR assesses priority before creation.
     """
     try:
         roles = json.loads(roles_json) if roles_json else []
@@ -1220,6 +1223,7 @@ def debate_init(
                 created_by_role=created_by_role,
                 resolve_by=resolve_by or None,
                 metadata=metadata,
+                require_priority=True,
             )
             seeded_bindings = _debate_seed_initial_role_bindings_dao(
                 conn,

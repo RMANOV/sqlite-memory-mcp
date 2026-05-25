@@ -266,6 +266,7 @@ def init_debate(
     created_by_role: str,
     resolve_by: str | None = None,
     metadata: dict[str, Any] | None = None,
+    require_priority: bool = False,
 ) -> dict[str, Any]:
     """Bootstrap a new debate. Idempotent: returns existing row when topic_id
     exists with same roles_json.
@@ -306,6 +307,12 @@ def init_debate(
         )
 
     now = now_iso()
+    metadata = _normalize_initial_topic_priority_metadata(
+        metadata,
+        created_by_role=created_by_role,
+        now=now,
+        require_priority=require_priority,
+    )
     conn.execute(
         "INSERT INTO debates (topic_id, title, state, created_at, "
         "created_by_role, resolve_by, archived_at, roles_json, metadata_json) "
@@ -379,9 +386,76 @@ def _topic_priority_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
 def _explicit_topic_priority_lane(metadata: dict[str, Any] | None) -> str | None:
     priority = _topic_priority_metadata(metadata)
     lane = priority.get("lane")
-    if isinstance(lane, str) and lane in TOPIC_PRIORITY_LANE_ORDER:
-        return lane
+    if isinstance(lane, str) and lane.upper() in TOPIC_PRIORITY_LANE_ORDER:
+        return lane.upper()
     return None
+
+
+def _topic_priority_reason(metadata: dict[str, Any] | None) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    priority = _topic_priority_metadata(metadata)
+    for key in ("reason", "priority_reason", "conductor_priority_reason"):
+        value = priority.get(key) if key in priority else metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _normalize_initial_topic_priority_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    created_by_role: str,
+    now: str,
+    require_priority: bool,
+) -> dict[str, Any] | None:
+    """Validate and normalize the initial cross-topic priority gate."""
+    if metadata is None and not require_priority:
+        return None
+
+    normalized = _metadata_dict(metadata)
+    lane = _explicit_topic_priority_lane(normalized)
+    reason = _topic_priority_reason(normalized)
+
+    if lane is None:
+        if require_priority:
+            raise DebateError(
+                "topic_priority_required: debate_init requires metadata_json "
+                "with conductor_priority.lane or priority_lane (P0..P7) plus "
+                "a priority reason; ask the human for priority or have "
+                "CONDUCTOR assess it before creating the topic",
+                error_type="topic_priority_required",
+            )
+        return normalized if metadata is not None else None
+
+    validate_topic_priority_lane(lane)
+    if not reason:
+        raise DebateError(
+            "topic_priority_reason_required",
+            error_type="topic_priority_reason_required",
+        )
+
+    priority = dict(_topic_priority_metadata(normalized))
+    priority["lane"] = lane
+    priority["rank"] = TOPIC_PRIORITY_LANE_ORDER[lane]
+    priority["reason"] = reason
+    priority.setdefault("next_action", str(normalized.get("next_action") or "").strip())
+    priority.setdefault("blocked_by", str(normalized.get("blocked_by") or "").strip())
+    priority.setdefault("updated_by_role", created_by_role)
+    priority.setdefault("updated_at", now)
+    priority.setdefault(
+        "source",
+        "conductor_assessed" if created_by_role == "CONDUCTOR" else "human_requested",
+    )
+    normalized["conductor_priority"] = priority
+    normalized["initial_priority_gate"] = {
+        "required": bool(require_priority),
+        "lane": lane,
+        "reason": reason,
+        "created_by_role": created_by_role,
+        "created_at": now,
+    }
+    return normalized
 
 
 def role_in_debate(roles: list[dict[str, Any]], role: str) -> bool:

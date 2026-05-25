@@ -108,6 +108,13 @@ reason=..., next_action=..., blocked_by=...)`. The canonical queue view is
 `debate_work_queue(...)`. Human summaries may mirror that queue, but they are
 not the authority.
 
+Human/operator topic creation is not allowed to enter the queue without an
+initial lane. The official `debate_init` MCP tool rejects new topics unless
+`metadata_json` includes either `conductor_priority.lane` or `priority_lane`
+(`P0`..`P7`) plus a priority reason. Operationally this means the launcher must
+ask the human for priority, or `CONDUCTOR` must assess and encode the lane
+before creating the topic.
+
 ## Quick-start: three sessions coordinating
 
 Three roles, one weekend topic, full lifecycle in 12 calls.
@@ -211,7 +218,13 @@ debate_escalate(
 Bootstraps a topic. Idempotent — re-calling with the same `topic_id` and
 identical `roles_json` returns the existing record. Validates `topic_id`
 matches `^[A-Z][A-Z0-9_]+$`, roles is a non-empty list of `{role,
-session_id}` dicts, every role matches the role regex.
+session_id}` dicts, every role matches the role regex. For new official MCP
+topics, `metadata_json` must carry an initial topic lane and reason, for
+example:
+
+```json
+{"priority_lane":"P1","priority_reason":"active trading risk blocks live use"}
+```
 
 ### `debate_post(topic_id, role, priority, kind, body, reply_to="")`
 

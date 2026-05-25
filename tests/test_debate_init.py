@@ -137,3 +137,76 @@ def test_debate_init_metadata_round_trip(conn):
         created_by_role="CONDUCTOR", metadata=md,
     )
     assert get_debate(conn, "X10")["metadata"] == md
+
+
+def test_debate_init_require_priority_rejects_missing_initial_lane(conn):
+    with pytest.raises(DebateError) as exc_info:
+        init_debate(
+            conn,
+            topic_id="X11",
+            title="human-requested topic",
+            roles=_VALID_ROLES,
+            created_by_role="CONDUCTOR",
+            require_priority=True,
+        )
+
+    assert exc_info.value.error_type == "topic_priority_required"
+
+
+def test_debate_init_require_priority_rejects_lane_without_reason(conn):
+    with pytest.raises(DebateError) as exc_info:
+        init_debate(
+            conn,
+            topic_id="X12",
+            title="human-requested topic",
+            roles=_VALID_ROLES,
+            created_by_role="CONDUCTOR",
+            metadata={"priority_lane": "P1"},
+            require_priority=True,
+        )
+
+    assert exc_info.value.error_type == "topic_priority_reason_required"
+
+
+def test_debate_init_require_priority_normalizes_initial_lane(conn):
+    out = init_debate(
+        conn,
+        topic_id="X13",
+        title="human-requested topic",
+        roles=_VALID_ROLES,
+        created_by_role="CONDUCTOR",
+        metadata={
+            "priority_lane": "p1",
+            "priority_reason": "operator says this blocks active risk",
+            "next_action": "wake ADVOCATE",
+        },
+        require_priority=True,
+    )
+
+    priority = out["metadata"]["conductor_priority"]
+    assert priority["lane"] == "P1"
+    assert priority["rank"] > 0
+    assert priority["reason"] == "operator says this blocks active risk"
+    assert priority["source"] == "conductor_assessed"
+    assert out["metadata"]["initial_priority_gate"]["required"] is True
+
+
+def test_debate_init_existing_topic_idempotent_before_priority_gate(conn):
+    init_debate(
+        conn,
+        topic_id="X14",
+        title="legacy topic",
+        roles=_VALID_ROLES,
+        created_by_role="CONDUCTOR",
+    )
+
+    out = init_debate(
+        conn,
+        topic_id="X14",
+        title="ignored",
+        roles=_VALID_ROLES,
+        created_by_role="CONDUCTOR",
+        require_priority=True,
+    )
+
+    assert out["title"] == "legacy topic"

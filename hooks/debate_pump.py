@@ -149,16 +149,56 @@ def _estimate_worker_demand(msg_id: str, suppressed_roles: set[str]) -> int:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
+        msg = con.execute(
+            "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        if msg is None:
+            return 0
         rows = con.execute(
-            "SELECT recipient FROM debate_message_recipients "
+            "SELECT recipient, recipient_mode FROM debate_message_recipients "
             "WHERE msg_id = ? ORDER BY recipient",
             (msg_id,),
         ).fetchall()
+        demand = 0
+        action = os.environ.get("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
+        for row in rows:
+            recipient = str(row["recipient"] or "").strip()
+            if recipient.upper() in suppressed_roles:
+                continue
+            binding: sqlite3.Row | None = None
+            if row["recipient_mode"] == "normal":
+                binding = con.execute(
+                    "SELECT session_id FROM debate_role_bindings "
+                    "WHERE topic_id = ? AND role = ? AND state = 'active' "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (msg["topic_id"], recipient),
+                ).fetchone()
+            else:
+                binding = con.execute(
+                    "SELECT session_id FROM debate_role_bindings "
+                    "WHERE topic_id = ? AND session_id = ? AND state = 'diagnostic' "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (msg["topic_id"], recipient),
+                ).fetchone()
+            if binding is None:
+                continue
+            latest = con.execute(
+                "SELECT result FROM debate_wake_log "
+                "WHERE trigger_msg_id = ? AND target_session_id = ? "
+                "AND action = ? ORDER BY created_at DESC LIMIT 1",
+                (msg_id, binding["session_id"], action),
+            ).fetchone()
+            if latest is not None and str(latest["result"]) in {
+                "dispatched",
+                "notified",
+                "terminal_no_action",
+            }:
+                continue
+            demand += 1
+        return demand
     finally:
         con.close()
-    return sum(
-        1 for row in rows if str(row["recipient"] or "").strip().upper() not in suppressed_roles
-    )
 
 
 def _count_launched(dispatch_result: dict[str, Any] | None) -> int:
@@ -209,11 +249,11 @@ def _throttle_reason(
         return None
     if max_workers_per_scan > 0:
         remaining_scan = max_workers_per_scan - launched_this_scan
-        if remaining_scan <= 0 or estimated_worker_demand > remaining_scan:
+        if remaining_scan <= 0:
             return "max_workers_per_scan"
     if max_concurrent_workers > 0:
         remaining_concurrent = max_concurrent_workers - live_children
-        if remaining_concurrent <= 0 or estimated_worker_demand > remaining_concurrent:
+        if remaining_concurrent <= 0:
             return "max_concurrent_workers"
     return None
 
@@ -473,6 +513,7 @@ def main() -> int:
             dispatched_rows = 0
             launched_this_scan = 0
             throttled = False
+            partial_pending = False
             for row in rows:
                 _reap_children()
                 estimated_worker_demand = _estimate_worker_demand(row["msg_id"], suppressed_roles)
@@ -505,6 +546,24 @@ def main() -> int:
                 except Exception as exc:
                     _log("dispatch_failed", msg_id=row["msg_id"], error=repr(exc))
                     break
+                remaining_worker_demand = _estimate_worker_demand(
+                    row["msg_id"], suppressed_roles
+                )
+                if remaining_worker_demand > 0:
+                    partial_pending = True
+                    _log(
+                        "pump_partial_dispatch_pending",
+                        msg_id=row["msg_id"],
+                        topic_id=row["topic_id"],
+                        remaining_worker_demand=remaining_worker_demand,
+                        launched_this_scan=launched_this_scan,
+                        live_children=len(CHILDREN),
+                        max_workers_per_scan=effective_max_workers_per_scan,
+                        max_concurrent_workers=effective_max_concurrent_workers,
+                        last_ts=last_ts,
+                        last_msg_id=last_msg_id,
+                    )
+                    break
                 last_ts = row["ts"]
                 last_msg_id = row["msg_id"]
                 _save_state(last_ts, last_msg_id)
@@ -515,6 +574,7 @@ def main() -> int:
                     dispatched_rows=dispatched_rows,
                     launched_workers=launched_this_scan,
                     throttled=throttled,
+                    partial_pending=partial_pending,
                     live_children=len(CHILDREN),
                     effective_action_kinds=effective_action_kinds,
                     effective_limit=effective_limit,
