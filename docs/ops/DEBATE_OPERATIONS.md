@@ -57,8 +57,8 @@ cursor; healthy machines can run a small bounded worker budget automatically.
 Temperature throttling is based on sustained heat, not a single sensor point.
 Raw core spikes in the hot-but-not-critical range are soft signals; the
 governor blocks only after a short exponentially weighted moving average stays
-hot for enough samples. Only an extreme critical temperature is allowed to
-block immediately.
+at or above 96C for enough samples. Only an extreme critical temperature
+of 105C or above is allowed to block immediately.
 
 Emergency spawn stop is explicit and auditable: creating
 `~/.claude/memory/debate_wake.disable` forces PostToolUse wake resolution to

@@ -433,7 +433,7 @@ def apply_recovery_hysteresis(
     required_healthy_samples: int = 3,
     temp_alpha: float = 0.2,
     min_temp_samples: int = 5,
-    temp_block_c: float = 90.0,
+    temp_block_c: float = 96.0,
 ) -> DebateResourceBudget:
     """Require repeated healthy samples before leaving a blocked state."""
     if required_healthy_samples <= 1:

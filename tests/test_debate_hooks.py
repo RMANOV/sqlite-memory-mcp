@@ -299,6 +299,30 @@ def test_resource_budget_recovery_hysteresis_requires_repeated_healthy_samples(t
     assert third.allow_agent is True
 
 
+def test_resource_budget_recovery_hysteresis_allows_sustained_mid_90s(tmp_path):
+    module = _load_hook_module("debate_resource_budget_mid_90s_test", "hooks/debate_resource_budget.py")
+    path = tmp_path / "state.json"
+    hot_but_workable = module.compute_debate_resource_budget(
+        module.ResourceSnapshot(
+            mem_total_mib=32768,
+            mem_available_mib=18000,
+            swap_total_mib=4096,
+            swap_free_mib=4096,
+            cpu_count=8,
+            load1=2,
+            memory_full_avg10=0,
+            max_temp_c=95,
+            live_agent_count=1,
+        )
+    )
+
+    for _ in range(6):
+        budget = module.apply_recovery_hysteresis(hot_but_workable, state_path=path)
+
+    assert budget.allow_agent is True
+    assert budget.wake_budget == 1
+
+
 def test_resource_budget_live_agent_count_ignores_sqlite_memory_sidecars(monkeypatch, tmp_path):
     module = _load_hook_module("debate_resource_budget_count_test", "hooks/debate_resource_budget.py")
     proc = tmp_path / "proc"
