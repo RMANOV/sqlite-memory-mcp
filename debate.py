@@ -962,32 +962,38 @@ def worker_no_action(
         "WHERE session_id = ? AND role = ? AND topic_id = ?",
         (worker_session_id, role, topic_id),
     ).fetchone()
+    cursor_msg_id = ref["msg_id"]
+    cursor_ts = ref["ts"]
+    advance_cursor = True
     if current and current["last_processed_ts"]:
         cur_ts = current["last_processed_ts"]
         cur_msg_id = current["last_processed_msg_id"] or ""
         proposed = (ref["ts"], ref["msg_id"])
         existing = (cur_ts, cur_msg_id)
         if proposed < existing:
-            raise DebateError(
-                f"watermark_regression: proposed cursor "
-                f"({ref['ts']}, {ref['msg_id']}) is older than "
-                f"existing ({cur_ts}, {cur_msg_id}); advancing "
-                f"backwards would re-deliver already-processed work",
-                error_type="watermark_regression",
-            )
+            cursor_msg_id = cur_msg_id
+            cursor_ts = cur_ts
+            advance_cursor = False
 
     now = now_iso()
-    conn.execute(
-        "INSERT INTO debate_signal_state "
-        "(session_id, role, topic_id, last_processed_msg_id, "
-        " last_processed_ts, last_check_at) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(session_id, role, topic_id) DO UPDATE SET "
-        "last_processed_msg_id = excluded.last_processed_msg_id, "
-        "last_processed_ts = excluded.last_processed_ts, "
-        "last_check_at = excluded.last_check_at",
-        (worker_session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
-    )
+    if advance_cursor:
+        conn.execute(
+            "INSERT INTO debate_signal_state "
+            "(session_id, role, topic_id, last_processed_msg_id, "
+            " last_processed_ts, last_check_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, role, topic_id) DO UPDATE SET "
+            "last_processed_msg_id = excluded.last_processed_msg_id, "
+            "last_processed_ts = excluded.last_processed_ts, "
+            "last_check_at = excluded.last_check_at",
+            (worker_session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
+        )
+    else:
+        conn.execute(
+            "UPDATE debate_signal_state SET last_check_at = ? "
+            "WHERE session_id = ? AND role = ? AND topic_id = ?",
+            (now, worker_session_id, role, topic_id),
+        )
     details = _claim_details_dict(claim)
     details.update(
         {
@@ -1021,8 +1027,9 @@ def worker_no_action(
         {
             "duplicate": False,
             "no_action": True,
-            "last_processed_msg_id": ref["msg_id"],
-            "last_processed_ts": ref["ts"],
+            "cursor_unchanged": not advance_cursor,
+            "last_processed_msg_id": cursor_msg_id,
+            "last_processed_ts": cursor_ts,
             "last_check_at": now,
         }
     )

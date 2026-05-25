@@ -811,6 +811,69 @@ def test_worker_no_action_completes_claim_and_advances_worker_cursor(topic):
     assert conn.execute("SELECT COUNT(*) AS n FROM debate_messages").fetchone()["n"] == message_count
 
 
+def test_worker_no_action_keeps_newer_worker_cursor_when_trigger_is_stale(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    first = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="first stale wake",
+        addressed_to=["EXECUTOR"],
+    )
+    second = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="newer wake already processed",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=first["msg_id"],
+    )
+    debate_signal_advance(
+        conn,
+        session_id=claim["worker_session_id"],
+        role="EXECUTOR",
+        topic_id=t,
+        last_processed_msg_id=second["msg_id"],
+    )
+
+    out = worker_no_action(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        worker_session_id=claim["worker_session_id"],
+        trigger_msg_id=first["msg_id"],
+        reason="stale claim already covered",
+    )
+    cursor = conn.execute(
+        "SELECT last_processed_msg_id FROM debate_signal_state "
+        "WHERE session_id = ? AND role = ? AND topic_id = ?",
+        (claim["worker_session_id"], "EXECUTOR", t),
+    ).fetchone()
+
+    assert out["state"] == "completed"
+    assert out["no_action"] is True
+    assert out["cursor_unchanged"] is True
+    assert out["last_processed_msg_id"] == second["msg_id"]
+    assert cursor["last_processed_msg_id"] == second["msg_id"]
+
+
 def test_worker_no_action_rejects_wrong_trigger(topic):
     conn, t = topic
     bind_role_session(
