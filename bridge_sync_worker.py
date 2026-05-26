@@ -101,6 +101,55 @@ _PUSH_BACKOFF_BASE = 60
 _PUSH_BACKOFF_MAX = 600
 
 
+def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
+    """Fetch remote bridge state without starting conflict-prone rebases."""
+    fetch = git_retry(
+        bridge_dir,
+        "fetch",
+        "origin",
+        "main",
+        timeout=_GIT_PULL_TIMEOUT,
+    )
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout).strip()
+        return False, f"bridge git fetch failed: {detail or 'unknown git error'}"
+
+    local = git_retry(bridge_dir, "rev-parse", "HEAD", timeout=30)
+    remote = git_retry(bridge_dir, "rev-parse", "origin/main", timeout=30)
+    base = git_retry(bridge_dir, "merge-base", "HEAD", "origin/main", timeout=30)
+    if local.returncode != 0 or remote.returncode != 0 or base.returncode != 0:
+        detail = " ".join(
+            (cp.stderr or cp.stdout).strip()
+            for cp in (local, remote, base)
+            if cp.returncode != 0
+        ).strip()
+        return False, f"bridge git graph inspection failed: {detail or 'unknown git error'}"
+
+    local_sha = local.stdout.strip()
+    remote_sha = remote.stdout.strip()
+    base_sha = base.stdout.strip()
+    if local_sha == remote_sha or base_sha == remote_sha:
+        return True, None
+    if base_sha == local_sha:
+        merge = git_retry(
+            bridge_dir,
+            "merge",
+            "--ff-only",
+            "origin/main",
+            timeout=_GIT_PULL_TIMEOUT,
+        )
+        if merge.returncode != 0:
+            detail = (merge.stderr or merge.stdout).strip()
+            return False, f"bridge git fast-forward failed: {detail or 'unknown git error'}"
+        return True, None
+
+    return (
+        False,
+        "bridge repo local and origin/main diverged; explicit recovery required "
+        f"(local={local_sha[:12]}, remote={remote_sha[:12]}, base={base_sha[:12]})",
+    )
+
+
 class _RepoSyncLock:
     """Cross-process repo lock for bridge sync."""
 
@@ -722,27 +771,23 @@ def _main_locked(
                     tool_name="bridge_sync_worker.promote_pending_public",
                 )
 
-    # Phase 2: Git pull (no transaction held)
-    _progress(progress_callback, 5, "git pull...")
-    pull_result = git_retry(
-        bridge_dir,
-        "pull",
-        "--rebase",
-        "--autostash",
-        timeout=_GIT_PULL_TIMEOUT,
-    )
-    if pull_result.returncode != 0:
-        detail = (pull_result.stderr or pull_result.stdout).strip()
-        log.error("git pull failed: %s", detail)
+    # Phase 2: Git fetch/fast-forward (no transaction held).
+    # Avoid pull --rebase: generated bridge exports conflict frequently and a
+    # failed rebase leaves the repo blocked until manual recovery.
+    _progress(progress_callback, 5, "git fetch/ff...")
+    sync_ok, sync_msg = _sync_bridge_repo_fast_forward(bridge_dir)
+    if not sync_ok:
+        detail = sync_msg or "unknown git error"
+        log.error("git sync failed: %s", detail)
         # Log conflict for debugging
         _conflict_log = Path.home() / ".claude" / "memory" / "bridge_conflicts.log"
         try:
             with open(_conflict_log, "a", encoding="utf-8") as f:
-                f.write(f"{now_iso()} git_pull_failed: {detail}\n")
+                f.write(f"{now_iso()} git_sync_failed: {detail}\n")
         except OSError:
             pass
         message = (
-            "git pull failed; bridge sync blocked before import/export: "
+            "git sync failed; bridge sync blocked before import/export: "
             f"{detail or 'unknown git error'}"
         )
         _progress(progress_callback, -1, f"BLOCKED: {message}")

@@ -101,6 +101,131 @@ def test_bridge_pull_imports_task_content_from_per_task_files(bridge_env, monkey
     assert row["notes"] == "Bridge notes"
 
 
+def test_bridge_pull_does_not_resurrect_archived_task_from_remote_done(
+    bridge_env, monkeypatch
+):
+    db_path, bridge_dir = bridge_env
+    task_id = "task-archived"
+    old = "2026-05-23T22:54:59+00:00"
+    new = "2026-05-26T07:22:12+00:00"
+
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, status, priority, section, due_date, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                "ARCHIVE | stale remote must not reopen",
+                "archived",
+                "low",
+                "done",
+                None,
+                old,
+                old,
+            ),
+        )
+        for field, value in (
+            ("status", "archived"),
+            ("section", "done"),
+            ("priority", "low"),
+            ("due_date", None),
+        ):
+            conn.execute(
+                "INSERT INTO task_field_versions "
+                "(task_id, field_name, updated_at, updated_by, new_value, updated_order) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, field, old, "fedora", value, 116626351682748440),
+            )
+
+    (bridge_dir / "tasks").mkdir()
+    (bridge_dir / "index.json").write_text(
+        json.dumps(
+            {
+                "version": 4,
+                "tasks": [
+                    {
+                        "id": task_id,
+                        "title": "ARCHIVE | stale remote must not reopen",
+                        "status": "done",
+                        "priority": "medium",
+                        "section": "waiting",
+                        "due_date": "2026-05-20",
+                        "created_at": old,
+                        "updated_at": new,
+                        "_field_ts": {
+                            "status": [new, "RManov", 116639670793142275, "evt-status"],
+                            "section": [new, "RManov", 116639670793142276, "evt-section"],
+                            "priority": [new, "RManov", 116639670793142277, "evt-priority"],
+                            "due_date": [new, "RManov", 116639670793142278, "evt-due"],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bridge_dir / "tasks" / f"{task_id}.json").write_text(
+        json.dumps(
+            {
+                "id": task_id,
+                "status": "done",
+                "priority": "medium",
+                "section": "waiting",
+                "due_date": "2026-05-20",
+                "_field_ts": {
+                    "status": [new, "RManov", 116639670793142275, "evt-status"],
+                    "section": [new, "RManov", 116639670793142276, "evt-section"],
+                    "priority": [new, "RManov", 116639670793142277, "evt-priority"],
+                    "due_date": [new, "RManov", 116639670793142278, "evt-due"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bridge_dir / "shared.json").write_text(
+        json.dumps({"version": 4, "memory_events": []}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_repo_ready",
+        lambda repo: (True, None),
+    )
+    monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
+
+    result = json.loads(bridge_server.bridge_pull.fn())
+
+    with _db_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT status, priority, section, due_date FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        conflicts = conn.execute(
+            "SELECT field_name, winner, rationale FROM memory_conflicts "
+            "WHERE aggregate_kind='task' AND aggregate_id=? "
+            "ORDER BY field_name",
+            (task_id,),
+        ).fetchall()
+
+    assert result["updated_tasks"] == 0
+    assert dict(row) == {
+        "status": "archived",
+        "priority": "low",
+        "section": "done",
+        "due_date": None,
+    }
+    assert {c["field_name"] for c in conflicts} == {
+        "due_date",
+        "priority",
+        "section",
+        "status",
+    }
+    assert {c["winner"] for c in conflicts} == {"guard_local"}
+    assert all("hidden terminal" in c["rationale"] for c in conflicts)
+
+
 def test_bridge_push_blocks_when_bridge_repo_is_not_safe(tmp_path, monkeypatch):
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -129,7 +254,7 @@ def test_bridge_push_blocks_when_bridge_repo_is_not_safe(tmp_path, monkeypatch):
     assert git_calls == []
 
 
-def test_bridge_push_pull_failure_fails_closed_without_reset(bridge_env, monkeypatch):
+def test_bridge_push_git_sync_failure_fails_closed_without_reset(bridge_env, monkeypatch):
     _db_path, _bridge_dir = bridge_env
     git_calls = []
 
@@ -146,7 +271,7 @@ def test_bridge_push_pull_failure_fails_closed_without_reset(bridge_env, monkeyp
 
     def fake_git(*args):
         git_calls.append(args)
-        if args[:3] == ("pull", "--rebase", "--autostash"):
+        if args[:3] == ("fetch", "origin", "main"):
             return _cp(args, returncode=1, stderr="CONFLICT (content): shared.json")
         raise AssertionError(f"Unexpected git call: {args}")
 
@@ -156,7 +281,45 @@ def test_bridge_push_pull_failure_fails_closed_without_reset(bridge_env, monkeyp
 
     assert result["blocked_by_repo_state"] is True
     assert "CONFLICT" in result["error"]
+    assert not any(args and args[0] == "pull" for args in git_calls)
     assert not any(args[:2] == ("reset", "--hard") for args in git_calls)
+    assert not any(args[:2] == ("rebase", "--abort") for args in git_calls)
+
+
+def test_bridge_push_diverged_history_blocks_before_rebase(bridge_env, monkeypatch):
+    _db_path, _bridge_dir = bridge_env
+    git_calls = []
+
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_repo_ready",
+        lambda repo: (True, None),
+    )
+    monkeypatch.setattr(
+        bridge_server,
+        "_ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[:3] == ("fetch", "origin", "main"):
+            return _cp(args)
+        if args == ("rev-parse", "HEAD"):
+            return _cp(args, stdout="local-sha\n")
+        if args == ("rev-parse", "origin/main"):
+            return _cp(args, stdout="remote-sha\n")
+        if args == ("merge-base", "HEAD", "origin/main"):
+            return _cp(args, stdout="base-sha\n")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+
+    result = json.loads(bridge_server.bridge_push.fn())
+
+    assert result["blocked_by_repo_state"] is True
+    assert "diverged" in result["error"]
+    assert not any(args and args[0] == "pull" for args in git_calls)
     assert not any(args[:2] == ("rebase", "--abort") for args in git_calls)
 
 

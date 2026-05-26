@@ -108,24 +108,41 @@ def _pid_alive(pid):
 
 
 def fix_remote_ahead():
-    """Handle remote-ahead: pull --rebase, then push again.
+    """Handle simple remote-ahead cases without starting a rebase.
 
-    On conflict: fail closed. Recovery must be explicit and backed up.
+    Generated bridge exports are not good candidates for automatic rebase. If
+    history diverged, fail closed and require explicit recovery.
     """
-    ok, out = git_run("pull", "--rebase", "--autostash", "origin", "main")
+    ok, out = git_run("fetch", "origin", "main")
     if not ok:
-        if "CONFLICT" in out or "unmerged" in out:
-            notify(
-                "error",
-                "BRIDGE: pull conflict; sync blocked pending explicit recovery",
-            )
+        notify("warning", f"BRIDGE: fetch failed: {out[:200]}")
+        return False
+
+    ok_local, local = git_run("rev-parse", "HEAD")
+    ok_remote, remote = git_run("rev-parse", "origin/main")
+    ok_base, base = git_run("merge-base", "HEAD", "origin/main")
+    if not (ok_local and ok_remote and ok_base):
+        notify("warning", "BRIDGE: cannot inspect git graph; sync blocked")
+        return False
+
+    local = local.strip()
+    remote = remote.strip()
+    base = base.strip()
+    if local != remote and base == local:
+        ok, out = git_run("merge", "--ff-only", "origin/main")
+        if not ok:
+            notify("warning", f"BRIDGE: fast-forward failed: {out[:200]}")
             return False
-        notify("warning", f"BRIDGE: pull --rebase failed: {out[:200]}")
+    elif local != remote and base != remote:
+        notify(
+            "error",
+            "BRIDGE: local and remote diverged; explicit recovery required",
+        )
         return False
 
     ok, out = git_run("push", "origin", "main")
     if ok:
-        notify("info", "BRIDGE: auto-resolved remote-ahead (rebase + push)")
+        notify("info", "BRIDGE: auto-resolved remote-ahead (ff + push)")
         return True
     notify("error", f"BRIDGE: push failed after rebase: {out[:200]}")
     return False

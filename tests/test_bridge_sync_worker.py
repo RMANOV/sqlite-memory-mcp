@@ -419,8 +419,14 @@ def test_bridge_sync_worker_pull_only_skips_export_and_push(tmp_path, monkeypatc
 
     def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
         git_calls.append(args)
-        if args[:3] == ("pull", "--rebase", "--autostash"):
+        if args[:3] == ("fetch", "origin", "main"):
             return _cp(args)
+        if args == ("rev-parse", "HEAD"):
+            return _cp(args, stdout="same-sha\n")
+        if args == ("rev-parse", "origin/main"):
+            return _cp(args, stdout="same-sha\n")
+        if args == ("merge-base", "HEAD", "origin/main"):
+            return _cp(args, stdout="same-sha\n")
         raise AssertionError(f"Unexpected git_retry call: {args}")
 
     monkeypatch.setattr(
@@ -447,7 +453,12 @@ def test_bridge_sync_worker_pull_only_skips_export_and_push(tmp_path, monkeypatc
 
     assert result["pull_only"] is True
     assert result["pushed"] is False
-    assert git_calls == [("pull", "--rebase", "--autostash")]
+    assert git_calls == [
+        ("fetch", "origin", "main"),
+        ("rev-parse", "HEAD"),
+        ("rev-parse", "origin/main"),
+        ("merge-base", "HEAD", "origin/main"),
+    ]
 
 
 def test_bridge_sync_worker_pull_conflict_fails_closed_without_reset(

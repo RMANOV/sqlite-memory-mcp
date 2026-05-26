@@ -155,6 +155,48 @@ def _bridge_repo_blocked_error(message: str) -> str:
     )
 
 
+def _sync_bridge_repo_fast_forward() -> tuple[bool, str | None]:
+    """Fetch remote bridge state without starting conflict-prone rebases.
+
+    The bridge worktree is generated data. A divergent local/remote history is
+    a recovery condition, not a merge problem to solve with ``pull --rebase``:
+    rebase conflicts leave the repo half-mutated and block every later sync.
+    """
+    fetch = _git("fetch", "origin", "main")
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout).strip()
+        return False, f"bridge git fetch failed: {detail or 'unknown git error'}"
+
+    local = _git("rev-parse", "HEAD")
+    remote = _git("rev-parse", "origin/main")
+    base = _git("merge-base", "HEAD", "origin/main")
+    if local.returncode != 0 or remote.returncode != 0 or base.returncode != 0:
+        detail = " ".join(
+            (cp.stderr or cp.stdout).strip()
+            for cp in (local, remote, base)
+            if cp.returncode != 0
+        ).strip()
+        return False, f"bridge git graph inspection failed: {detail or 'unknown git error'}"
+
+    local_sha = local.stdout.strip()
+    remote_sha = remote.stdout.strip()
+    base_sha = base.stdout.strip()
+    if local_sha == remote_sha or base_sha == remote_sha:
+        return True, None
+    if base_sha == local_sha:
+        merge = _git("merge", "--ff-only", "origin/main")
+        if merge.returncode != 0:
+            detail = (merge.stderr or merge.stdout).strip()
+            return False, f"bridge git fast-forward failed: {detail or 'unknown git error'}"
+        return True, None
+
+    return (
+        False,
+        "bridge repo local and origin/main diverged; explicit recovery required "
+        f"(local={local_sha[:12]}, remote={remote_sha[:12]}, base={base_sha[:12]})",
+    )
+
+
 def _is_known_collaborator(
     conn: sqlite3.Connection,
     github_user: str | None,
@@ -508,13 +550,14 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
             identity.get("user_email") or "",
         )
 
-    # v2.0.0: Pull before push (prevents overwriting remote changes)
-    pull_result = _git("pull", "--rebase", "--autostash")
-    if pull_result.returncode != 0:
-        detail = (pull_result.stderr or pull_result.stdout).strip()
-        logger.warning("bridge_push: git pull failed: %s", detail)
+    # v2.0.0: Fetch/fast-forward before push (prevents overwriting remote changes).
+    # Do not use pull --rebase here: generated bridge exports conflict often, and
+    # a failed rebase leaves the repo in a blocked half-rebased state.
+    sync_ok, sync_msg = _sync_bridge_repo_fast_forward()
+    if not sync_ok:
+        logger.warning("bridge_push: git sync failed: %s", sync_msg)
         return _bridge_repo_blocked_error(
-            f"bridge_push git pull failed; sync blocked: {detail or 'unknown git error'}"
+            f"bridge_push git sync failed; sync blocked: {sync_msg or 'unknown git error'}"
         )
 
     # v2.0.0: One-time migration shared.json → per-task files
@@ -1062,20 +1105,19 @@ def bridge_pull() -> str:
         logger.warning("bridge_pull: preflight blocked pull: %s", repo_msg)
         return _bridge_repo_blocked_error(repo_msg or "bridge repo is not ready")
 
-    pull_result = _git("pull", "--rebase", "--autostash")
-    git_pull_failed = pull_result.returncode != 0
+    sync_ok, sync_msg = _sync_bridge_repo_fast_forward()
+    git_pull_failed = not sync_ok
     if git_pull_failed:
-        detail = (pull_result.stderr or pull_result.stdout).strip()
-        logger.warning("bridge_pull: git pull failed, blocking import: %s", detail)
+        logger.warning("bridge_pull: git sync failed, blocking import: %s", sync_msg)
         return json.dumps(
             {
                 "error": (
-                    "bridge_pull git pull failed; import blocked: "
-                    f"{detail or 'unknown git error'}"
+                    "bridge_pull git sync failed; import blocked: "
+                    f"{sync_msg or 'unknown git error'}"
                 ),
                 "message": (
-                    "bridge_pull git pull failed; import blocked: "
-                    f"{detail or 'unknown git error'}"
+                    "bridge_pull git sync failed; import blocked: "
+                    f"{sync_msg or 'unknown git error'}"
                 ),
                 "blocked_by_repo_state": True,
                 "git_pull_failed": True,

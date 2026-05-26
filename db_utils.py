@@ -4358,6 +4358,53 @@ def merge_import_tasks(
                 )
 
                 if remote_wins or remote_repairs_equal_key:
+                    local_task_status = _normalize_task_status_value(
+                        task_content_map.get(local_id, {}).get("status")
+                    )
+                    remote_task_status = _normalize_task_status_value(
+                        remote.get("status")
+                    )
+                    hidden_local_remote_reopens = (
+                        local_task_status in TASK_HIDDEN_STATUSES
+                        and remote_task_status not in TASK_HIDDEN_STATUSES
+                    )
+                    if hidden_local_remote_reopens and field in {
+                        "status",
+                        "section",
+                        "priority",
+                        "due_date",
+                        "reminder_at",
+                        "recurring",
+                    }:
+                        if local_val != remote_val:
+                            record_memory_conflict(
+                                conn,
+                                aggregate_kind="task",
+                                aggregate_id=local_id,
+                                field_name=field,
+                                local_value=local_val,
+                                remote_value=remote_val,
+                                local_updated_at=local_ts,
+                                remote_updated_at=remote_ts,
+                                local_updated_order=local_order,
+                                remote_updated_order=remote_order,
+                                local_source_event_id=local_event_id,
+                                remote_source_event_id=remote_event_id,
+                                winner="guard_local",
+                                rationale=(
+                                    "hidden terminal local task state blocks "
+                                    "remote non-hidden resurrection"
+                                ),
+                            )
+                        _log.warning(
+                            "Bridge hidden-status guard: keeping local %s for task %s "
+                            "(local status %s, remote status %s)",
+                            field,
+                            local_id,
+                            local_task_status,
+                            remote_task_status,
+                        )
+                        continue
                     if (
                         field in FIELD_TS_VALUE_FIELDS
                         and remote_has_field_ts
