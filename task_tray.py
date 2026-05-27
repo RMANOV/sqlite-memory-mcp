@@ -103,8 +103,81 @@ from db_utils import (
 from schema import init_db
 from smart_retrieval import suggested_ready
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
 # Page size cap for "All" and "Done" tabs to keep QListWidget responsive
 _TAB_PAGE_SIZE = 200
+_TRAY_READY_REVIEW_LIMIT = 50
+_TRAY_SUGGESTED_LIMIT = _env_int("SQLITE_MEMORY_TRAY_SUGGESTED_LIMIT", 50, 1)
+_TRAY_SEARCH_INDEX_LIMIT = _env_int("SQLITE_MEMORY_TRAY_SEARCH_INDEX_LIMIT", 300, 1)
+_TRAY_INDEX_TEXT_CHARS = _env_int("SQLITE_MEMORY_TRAY_INDEX_TEXT_CHARS", 800, 80)
+_TRAY_RSS_LOG_MB = _env_int("SQLITE_MEMORY_TRAY_RSS_LOG_MB", 512, 0)
+_TRAY_RSS_EXIT_MB = _env_int("SQLITE_MEMORY_TRAY_RSS_EXIT_MB", 3072, 0)
+_TRAY_RSS_CHECK_INTERVAL_MS = _env_int(
+    "SQLITE_MEMORY_TRAY_RSS_CHECK_INTERVAL_MS", 60_000, 10_000
+)
+
+
+def _bounded_tray_limit(limit: int | None, hard_cap: int) -> int:
+    if limit is None:
+        return hard_cap
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return hard_cap
+    return min(max(1, value), hard_cap)
+
+
+def _current_rss_mb() -> float:
+    """Return current process RSS in MiB from procfs."""
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as fh:
+            rss_pages = int(fh.read().split()[1])
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return rss_pages * page_size / (1024 * 1024)
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
+def _trim_index_text(value):
+    if isinstance(value, str) and len(value) > _TRAY_INDEX_TEXT_CHARS:
+        return value[:_TRAY_INDEX_TEXT_CHARS]
+    return value
+
+
+def _tray_search_index_rows(*groups: list[dict]) -> list[dict]:
+    """Build a bounded, lightweight search-index projection for the tray."""
+    rows = []
+    seen = set()
+    fields = (
+        "id",
+        "title",
+        "description",
+        "notes",
+        "project",
+        "section",
+        "status",
+        "priority",
+        "due_date",
+        "type",
+        "updated_at",
+    )
+    for group in groups:
+        for task in group:
+            task_id = task.get("id")
+            if not task_id or task_id in seen:
+                continue
+            seen.add(task_id)
+            rows.append({field: _trim_index_text(task.get(field)) for field in fields})
+            if len(rows) >= _TRAY_SEARCH_INDEX_LIMIT:
+                return rows
+    return rows
 
 
 class TaskDB:
@@ -220,8 +293,14 @@ class TaskDB:
 
     def get_suggested_tasks(self, limit=20):
         """Return Suggested popup rows through ready-context policy."""
-        tasks = self.get_all_active() + self.get_ready_review_tasks(limit=50)
-        return suggested_ready(tasks, include_readings=False, limit=limit)
+        tasks = self.get_all_active() + self.get_ready_review_tasks(
+            limit=_TRAY_READY_REVIEW_LIMIT
+        )
+        return suggested_ready(
+            tasks,
+            include_readings=False,
+            limit=_bounded_tray_limit(limit, _TRAY_SUGGESTED_LIMIT),
+        )
 
     def get_all_notes(self):
         """Visible open notes. Excludes done/archived/cancelled."""
@@ -904,6 +983,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._last_projects = None
         self._project_cache_time: float = 0.0  # monotonic time of last project query
         self._filtered_cache: dict[str, list] = {}  # lazy tab rendering cache
+        self._raw_cache: dict[str, list] = {}
+        self._tab_total_counts: dict[str, int] = {}
         self._search_engine = db.search_engine
         self._premium_tray_extension = maybe_load_task_tray_extension(
             server_name="sqlite-task-tray"
@@ -1785,14 +1866,17 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 logger.warning("premium tray rows unavailable: %s", exc, exc_info=True)
                 premium_rows = []
 
-        # Rebuild SmartKey search index (skips if fingerprint unchanged)
-        self._search_engine.rebuild_index(all_active + done + premium_rows)
+        # Rebuild SmartKey search index with a bounded projection. The tray must
+        # not retain every closed note/task body just to keep fuzzy search warm.
+        self._search_engine.rebuild_index(
+            _tray_search_index_rows(all_active, premium_rows, done)
+        )
 
-        ready_review = self.db.get_ready_review_tasks(limit=50)
+        ready_review = self.db.get_ready_review_tasks(limit=_TRAY_READY_REVIEW_LIMIT)
         suggested = suggested_ready(
             all_active + ready_review,
             include_readings=False,
-            limit=None,
+            limit=_TRAY_SUGGESTED_LIMIT,
         )
         notes = [t for t in all_active if t.get("type") == "note"] + [
             t for t in done if t.get("type") == "note"
@@ -1811,65 +1895,25 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if premium_key:
             raw[premium_key] = premium_rows
 
-        # Pre-compute filtered+sorted data for all tabs (cheap Python ops)
+        # Keep only raw buckets. Filtering/sorting/rendering is lazy per active tab.
+        self._raw_cache = raw
         self._filtered_cache = {}
+        self._tab_total_counts = {}
         if self._search_text:
-            # Global search: search ALL tasks, then distribute into tabs
-            all_tasks = all_active + done + premium_rows
-            global_results = self._search_engine.search(
-                self._search_text, all_tasks, conn=self.db._conn, use_vector=False
-            )
             # Async entity search — tasks render immediately, entities arrive via signal
             self._entity_results = []
             self._request_entity_search(self._search_text)
-            global_ids = {t["id"] for t in global_results}
-            for key in self._tab_keys:
-                if key == "suggested":
-                    # Suggested is policy-first: only ready-context candidates
-                    # can appear here, then search/chips/sort/cap apply.
-                    source = [t for t in raw[key] if t["id"] in global_ids]
-                else:
-                    source = [t for t in raw[key] if t["id"] in global_ids]
-                if key in self._tab_views:
-                    v = self._tab_views[key]
-                    source = self._filter_chips_only(source, v["active"], v["excluded"])
-                    sorted_source = self._sort_tasks(source, v["sort"])
-                    self._filtered_cache[key] = (
-                        sorted_source[:12] if key == "suggested" else sorted_source
-                    )
-                else:
-                    self._filtered_cache[key] = self._sort_tasks(source)
         else:
             self._cancel_entity_searches()
             self._entity_results = []
-            for key in self._tab_keys:
-                if key in self._tab_views:
-                    v = self._tab_views[key]
-                    filtered = self._filter(raw[key], v["active"], v["excluded"])
-                    sorted_filtered = self._sort_tasks(filtered, v["sort"])
-                    self._filtered_cache[key] = (
-                        sorted_filtered[:12] if key == "suggested" else sorted_filtered
-                    )
-                else:
-                    self._filtered_cache[key] = self._sort_tasks(self._filter(raw[key]))
 
         # Update tab visibility (suggested, notes, projects always visible)
         always_visible = ("suggested", "today", "notes", "projects")
         if premium_key:
             always_visible = (*always_visible, premium_key)
         for i, key in enumerate(self._tab_keys):
-            count = len(self._filtered_cache[key])
+            count = len(raw.get(key, []))
             self.tabs.setTabVisible(i, count > 0 or key in always_visible)
-
-        # Auto-switch to first tab with results when searching
-        if self._search_text:
-            cur = self.tabs.currentIndex()
-            current_key = self._tab_keys[cur] if cur < len(self._tab_keys) else ""
-            if not self._filtered_cache.get(current_key):
-                for i, key in enumerate(self._tab_keys):
-                    if self._filtered_cache.get(key):
-                        self.tabs.setCurrentIndex(i)
-                        break
 
         # Actual current index AFTER all tab visibility and search changes
         current_idx = self.tabs.currentIndex()
@@ -1955,15 +1999,55 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if idx < len(self._tab_keys):
             self._load_tab(self._tab_keys[idx])
 
+    def _build_tab_rows(self, key):
+        """Filter/sort a single tab on demand and cache only that result."""
+        source = list(self._raw_cache.get(key, []))
+
+        if self._search_text:
+            search_results = self._search_engine.search(
+                self._search_text,
+                source,
+                conn=self.db._conn,
+                use_vector=False,
+            )
+            result_ids = {task["id"] for task in search_results}
+            source = [task for task in source if task.get("id") in result_ids]
+            if key in self._tab_views:
+                view = self._tab_views[key]
+                source = self._filter_chips_only(
+                    source,
+                    view["active"],
+                    view["excluded"],
+                )
+                sort_mode = view["sort"]
+            else:
+                sort_mode = None
+        elif key in self._tab_views:
+            view = self._tab_views[key]
+            source = self._filter(source, view["active"], view["excluded"])
+            sort_mode = view["sort"]
+        else:
+            source = self._filter(source)
+            sort_mode = None
+
+        rows = self._sort_tasks(source, sort_mode)
+        self._tab_total_counts[key] = len(rows)
+        if key == "suggested":
+            rows = rows[:12]
+        elif key in ("all", "done"):
+            rows = rows[:_TAB_PAGE_SIZE]
+        self._filtered_cache[key] = rows
+        return rows
+
     def _load_tab(self, key):
         """Render a single tab from cached data. Caps All/Done at 200 items."""
         tasks = self._filtered_cache.get(key)
         if tasks is None:
-            return
+            tasks = self._build_tab_rows(key)
         cap_msg = ""
-        if key in ("all", "done") and len(tasks) > _TAB_PAGE_SIZE:
-            cap_msg = f"── {len(tasks) - _TAB_PAGE_SIZE} more items... ──"
-            tasks = tasks[:_TAB_PAGE_SIZE]
+        total = self._tab_total_counts.get(key, len(tasks))
+        if key in ("all", "done") and total > len(tasks):
+            cap_msg = f"── {total - len(tasks)} more items... ──"
 
         # Entity results only shown in "suggested" tab during search
         entities = (
@@ -2191,6 +2275,11 @@ class TaskTrayApp(BridgeSyncMixin):
         self._db_refresh_debounce.setInterval(500)
         self._db_refresh_debounce.timeout.connect(self._refresh_all)
         self._bridge_refresh_requested.connect(self._db_refresh_debounce.start)
+        self._rss_restart_requested = False
+        self._rss_next_log_at = 0.0
+        self._rss_timer = QTimer(self.app)
+        self._rss_timer.timeout.connect(self._check_memory_budget)
+        self._rss_timer.start(_TRAY_RSS_CHECK_INTERVAL_MS)
         self._sync_run_active = False
         self._sync_cooldown_until = 0.0
         self._initial_auto_sync_pending = self._auto_sync_enabled
@@ -2412,8 +2501,62 @@ class TaskTrayApp(BridgeSyncMixin):
         self.db.update_task(task_id, reminder_at=None)
         _clear_reminder_delivery_state(self._reminder_delivery_state, task_id)
 
+    def _check_memory_budget(self):
+        """Log tray RSS growth and self-restart before the kernel OOM killer does."""
+        rss_mb = _current_rss_mb()
+        if rss_mb <= 0:
+            return
+        now = time.monotonic()
+        if _TRAY_RSS_LOG_MB and rss_mb >= _TRAY_RSS_LOG_MB and now >= getattr(
+            self, "_rss_next_log_at", 0.0
+        ):
+            logger.warning(
+                "tray_rss_watchdog rss_mb=%.1f log_threshold_mb=%s exit_threshold_mb=%s",
+                rss_mb,
+                _TRAY_RSS_LOG_MB,
+                _TRAY_RSS_EXIT_MB,
+            )
+            self._rss_next_log_at = now + 300.0
+        if _TRAY_RSS_EXIT_MB and rss_mb >= _TRAY_RSS_EXIT_MB:
+            self._restart_due_to_memory(rss_mb)
+
+    def _restart_due_to_memory(self, rss_mb: float):
+        if getattr(self, "_rss_restart_requested", False):
+            return
+        self._rss_restart_requested = True
+        logger.error(
+            "tray_rss_watchdog_restart rss_mb=%.1f exit_threshold_mb=%s",
+            rss_mb,
+            _TRAY_RSS_EXIT_MB,
+        )
+        try:
+            self._enrich_timer.stop()
+            self._rss_timer.stop()
+            if self._audit_timer is not None:
+                self._audit_timer.stop()
+            self._reminder_timer.stop()
+            self._purge_timer.stop()
+            self._periodic_pull_timer.stop()
+            self._auto_sync_timer.stop()
+            self._db_refresh_debounce.stop()
+            if self._instance_socket:
+                self._instance_socket.close()
+            self.db.search_engine.save()
+            self.db.close()
+        except Exception:
+            logger.exception("tray memory restart cleanup failed")
+        executable = sys.executable or "python3"
+        script = os.path.abspath(sys.argv[0])
+        argv = [executable, script, *sys.argv[1:]]
+        try:
+            os.execv(executable, argv)
+        except OSError:
+            logger.exception("tray memory restart exec failed")
+            self.app.quit()
+
     def _on_quit(self):
         self._enrich_timer.stop()
+        self._rss_timer.stop()
         if self._audit_timer is not None:
             self._audit_timer.stop()
         self._reminder_timer.stop()
