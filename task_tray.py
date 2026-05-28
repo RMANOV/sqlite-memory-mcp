@@ -357,6 +357,8 @@ class TaskDB:
         description=None,
         notes=None,
         type="task",
+        reminder_at=None,
+        recurring=None,
         attachments=None,
     ):
         """Insert new task, return its ID."""
@@ -376,6 +378,8 @@ class TaskDB:
                 project=project,
                 notes=notes,
                 type=type,
+                reminder_at=reminder_at,
+                recurring=recurring,
                 tool_name="task_tray.add_task",
             )
             for file_path in attachments or []:

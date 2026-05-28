@@ -102,3 +102,20 @@ def test_check_reminders_uses_backoff_and_stops_after_third_notification(
         "Stretch",
         "Stretch",
     ]
+
+
+def test_taskdb_add_task_accepts_reminder_at_and_recurring(tmp_path):
+    db_path = str(tmp_path / "add_task.db")
+    init_db(db_path)
+    db = task_tray.TaskDB(db_path)
+    task_id = db.add_task(
+        "Reminder bug repro",
+        reminder_at="2026-05-28T10:00:00+00:00",
+        recurring='{"freq":"daily"}',
+    )
+    row = db._conn.execute(
+        "SELECT reminder_at, recurring FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    assert row[0] == "2026-05-28T10:00:00+00:00"
+    assert row[1] == '{"freq":"daily"}'
