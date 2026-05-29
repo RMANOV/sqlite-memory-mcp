@@ -954,6 +954,64 @@ def _bridge_git_operation_blocker(repo_dir: str) -> str | None:
     return None
 
 
+# E1: sequence-marker auto-recovery. rebase-merge / rebase-apply / MERGE_HEAD are
+# left-behind half-operations that bridge_pull/push never create (ff-only by design);
+# they can be safely auto-aborted IFF the working tree carries no user-managed
+# changes. CHERRY_PICK_HEAD / REVERT_HEAD stay manual.
+_BRIDGE_AUTO_ABORTABLE_MARKERS = ("rebase-merge", "rebase-apply", "MERGE_HEAD")
+_BRIDGE_MANUAL_MARKERS = ("CHERRY_PICK_HEAD", "REVERT_HEAD")
+
+# Last auto-abort attempt record (Option A: contract-preserving — ensure_bridge_repo_ready
+# keeps its (bool, str|None) return; bridge_doctor reads this via the accessor below).
+_last_bridge_auto_abort: dict | None = None
+
+
+def get_last_bridge_auto_abort() -> dict | None:
+    """Read-only accessor for the last E1 auto-abort attempt (bridge_doctor surface)."""
+    return _last_bridge_auto_abort
+
+
+def _bridge_working_tree_safe_for_abort(repo_dir: str) -> tuple[bool, str | None]:
+    """True only if every porcelain entry is absent or an exclusively generated
+    bridge artifact. Any non-generated conflicted/dirty/staged/untracked path makes
+    auto-abort unsafe (we must not discard user-managed work)."""
+    status = git_run(repo_dir, "status", "--porcelain")
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout).strip()
+        return False, f"cannot inspect bridge status: {detail or 'unknown git error'}"
+    lines = [ln for ln in status.stdout.splitlines() if ln.strip()]
+    paths = [_bridge_status_path(ln) for ln in lines]
+    non_generated = [p for p in paths if not is_generated_bridge_path(p)]
+    if non_generated:
+        shown = ", ".join(non_generated[:3])
+        return False, f"non-generated working-tree changes present: {shown}"
+    return True, None
+
+
+def _bridge_auto_abort_recover(repo_dir: str, markers: list[str]) -> dict:
+    """Bounded auto-abort of left-behind sequence state. Each abort is git_run(timeout=5).
+    Returns a structured record with per-command success/failure (no exceptions escape)."""
+    cmds: list[tuple[str, str]] = []
+    if any(m in ("rebase-merge", "rebase-apply") for m in markers):
+        cmds.append(("rebase", "--abort"))
+    if "MERGE_HEAD" in markers:
+        cmds.append(("merge", "--abort"))
+    attempts: list[dict] = []
+    for cmd in cmds:
+        try:
+            r = git_run(repo_dir, *cmd, timeout=5)
+            attempts.append(
+                {
+                    "cmd": " ".join(cmd),
+                    "ok": r.returncode == 0,
+                    "detail": ((r.stderr or r.stdout).strip()[:200]),
+                }
+            )
+        except subprocess.TimeoutExpired:
+            attempts.append({"cmd": " ".join(cmd), "ok": False, "detail": "timeout(5s)"})
+    return {"markers_detected": list(markers), "aborts": attempts}
+
+
 def inspect_bridge_repo_blocker(repo_dir: str) -> str | None:
     """Return a fail-closed blocker message for unsafe bridge repo states.
 
@@ -993,7 +1051,42 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     """
     blocker = _bridge_git_operation_blocker(repo_dir)
     if blocker:
-        return False, blocker
+        global _last_bridge_auto_abort
+        abortable = [
+            m for m in _BRIDGE_AUTO_ABORTABLE_MARKERS if _bridge_git_path(repo_dir, m).exists()
+        ]
+        manual = [
+            m for m in _BRIDGE_MANUAL_MARKERS if _bridge_git_path(repo_dir, m).exists()
+        ]
+        # Auto-recover only when the blocker is EXCLUSIVELY from auto-abortable markers.
+        if not abortable or manual:
+            return False, blocker
+        # Pre-abort gate (conflict-gate per spec): never abort over user-managed work.
+        safe, unsafe_reason = _bridge_working_tree_safe_for_abort(repo_dir)
+        if not safe:
+            _last_bridge_auto_abort = {
+                "markers_detected": abortable,
+                "aborts": [],
+                "skipped": unsafe_reason,
+            }
+            return (
+                False,
+                f"{blocker}; auto-recovery skipped ({unsafe_reason}); "
+                "blocked_by_repo_state preserved",
+            )
+        record = _bridge_auto_abort_recover(repo_dir, abortable)
+        _last_bridge_auto_abort = record
+        recheck = _bridge_git_operation_blocker(repo_dir)
+        if recheck is not None:
+            summary = "; ".join(
+                f"{a['cmd']}={'ok' if a['ok'] else 'fail'}" for a in record["aborts"]
+            )
+            return (
+                False,
+                f"{blocker}; auto-recovery failed [{summary}]; "
+                "blocked_by_repo_state preserved",
+            )
+        # Sequence state cleared -> fall through to the normal readiness flow.
 
     branch = git_run(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
     if branch.returncode != 0:

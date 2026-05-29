@@ -56,6 +56,7 @@ from db_utils import (
     git_run as _git_run,
     ensure_bridge_git_identity as _ensure_bridge_git_identity,
     ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
+    get_last_bridge_auto_abort as _get_last_bridge_auto_abort,
     inspect_bridge_repo_blocker as _inspect_bridge_repo_blocker,
     source_hash as _source_hash,
     validate_github_username as _validate_github_user,
@@ -1787,6 +1788,7 @@ def bridge_doctor(write_manifest: bool = True) -> str:
             "runtime_warning": warning,
             "surface_contract": _build_surface_contract_report(),
             "updated_at_churn": updated_at_churn,
+            "auto_abort_attempts": _get_last_bridge_auto_abort(),
         }
     )
 

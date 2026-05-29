@@ -158,15 +158,20 @@ def test_bridge_repo_ready_blocks_user_managed_dirty_files(monkeypatch):
     ) not in calls
 
 
-def test_bridge_repo_ready_blocks_active_rebase_without_git_mutation(
+def test_bridge_repo_ready_blocks_rebase_with_user_managed_changes(
     tmp_path, monkeypatch
 ):
+    # E1: a left-behind rebase-merge is auto-abortable, BUT only when the working
+    # tree carries no user-managed work. With a non-generated dirty file present,
+    # auto-abort is SKIPPED (never discard user work) and the repo stays blocked.
     bridge_dir = tmp_path / "bridge"
     (bridge_dir / ".git" / "rebase-merge").mkdir(parents=True)
     calls = []
 
     def fake_git_run(repo_dir, *args, timeout=30):
         calls.append(args)
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout=" M user_module.py\n")
         raise AssertionError(f"Unexpected git call: {args}")
 
     monkeypatch.setattr(db_utils, "git_run", fake_git_run)
@@ -174,9 +179,10 @@ def test_bridge_repo_ready_blocks_active_rebase_without_git_mutation(
     ok, msg = db_utils.ensure_bridge_repo_ready(str(bridge_dir))
 
     assert ok is False
-    assert "active git operation" in msg
     assert "rebase-merge" in msg
-    assert calls == []
+    assert "blocked_by_repo_state preserved" in msg
+    # Never aborted over user-managed work:
+    assert ("rebase", "--abort") not in calls
 
 
 def test_bridge_repo_ready_blocks_generated_conflict_without_reset(monkeypatch):
