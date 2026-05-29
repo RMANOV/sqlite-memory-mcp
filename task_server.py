@@ -454,6 +454,86 @@ def update_task(
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 3: query_tasks
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Allowlist: maps a caller-supplied sort key to a hardcoded SQL expression.
+# Values are NEVER derived from caller input — this is the SQL-injection guard.
+# "priority" maps to the enum CASE (critical-first), not the raw TEXT column.
+_QUERY_TASKS_SORT_COLUMNS: dict[str, str] = {
+    "created_at": "t.created_at",
+    "updated_at": "t.updated_at",
+    "due_date": "t.due_date",
+    "priority": build_priority_order_sql("t."),
+    "status": "t.status",
+    "title": "t.title",
+    "project": "t.project",
+    "section": "t.section",
+    "type": "t.type",
+}
+
+# Per-field default direction when sort_order is omitted. Dates/recency and
+# priority lead with the most actionable rows; text fields are alphabetical.
+# For "priority" the CASE is critical=0..low=3, so "desc" (highest first)
+# means CASE ASC — handled explicitly in the builder below.
+_QUERY_TASKS_SORT_DEFAULT_DIR: dict[str, str] = {
+    "created_at": "desc",
+    "updated_at": "desc",
+    "due_date": "asc",
+    "priority": "desc",
+    "status": "asc",
+    "title": "asc",
+    "project": "asc",
+    "section": "asc",
+    "type": "asc",
+}
+
+# Default ORDER BY when sort_by is empty — byte-for-byte the historical
+# behavior (priority critical-first, due_date ASC NULLS LAST, created_at ASC).
+_QUERY_TASKS_DEFAULT_ORDER = (
+    f"{build_priority_order_sql('t.')}, t.due_date ASC NULLS LAST, t.created_at ASC"
+)
+
+
+def _build_query_tasks_order(
+    sort_by: str, sort_order: str
+) -> tuple[str, str | None]:
+    """Build a validated ORDER BY clause for query_tasks.
+
+    Returns (order_clause, error). When sort_by is empty, returns the
+    historical default and no error. On invalid sort_by/sort_order, returns
+    ("", error_message). The SQL column is taken only from the hardcoded
+    allowlist — caller input is never interpolated into SQL.
+    """
+    if not sort_by:
+        return _QUERY_TASKS_DEFAULT_ORDER, None
+
+    col = _QUERY_TASKS_SORT_COLUMNS.get(sort_by)
+    if col is None:
+        allowed = ", ".join(sorted(_QUERY_TASKS_SORT_COLUMNS))
+        return "", f"invalid_sort_by: {sort_by}; allowed: [{allowed}]"
+
+    if sort_order:
+        direction = sort_order.lower()
+        if direction not in ("asc", "desc"):
+            return "", f"invalid_sort_order: {sort_order}; allowed: [asc, desc]"
+    else:
+        direction = _QUERY_TASKS_SORT_DEFAULT_DIR[sort_by]
+
+    if sort_by == "priority":
+        # CASE is critical=0..low=3; highest-first ("desc") == CASE ASC.
+        sql_dir = "ASC" if direction == "desc" else "DESC"
+        primary = f"{col} {sql_dir}"
+    elif sort_by == "due_date":
+        # NULLS LAST so undated tasks never crowd the top of an ASC sort.
+        sql_dir = "ASC" if direction == "asc" else "DESC"
+        primary = f"{col} {sql_dir} NULLS LAST"
+    else:
+        sql_dir = "ASC" if direction == "asc" else "DESC"
+        primary = f"{col} {sql_dir}"
+
+    # Deterministic tie-breaker so equal keys never reorder between calls.
+    return f"{primary}, t.created_at DESC, t.id ASC", None
+
+
 @mcp.tool()
 def query_tasks(
     section: str = "",
@@ -467,6 +547,8 @@ def query_tasks(
     summary_only: bool = False,
     offset: int = 0,
     limit: int = 50,
+    sort_by: str = "",
+    sort_order: str = "",
 ) -> str:
     """Query tasks with optional filters. Returns markdown table.
 
@@ -474,7 +556,25 @@ def query_tasks(
     overdue_only=True shows only tasks past due_date.
     search: full-text search across title, description, notes.
     summary_only=True omits description/notes (faster).
+
+    sort_by: optional column to sort by. Empty ("") preserves the default
+        ordering (priority critical-first, then due_date ASC NULLS LAST,
+        then created_at ASC). Allowed: created_at, updated_at, due_date,
+        priority, status, title, project, section, type. Any other value
+        returns an error (no silent fallback).
+    sort_order: "asc" or "desc" (case-insensitive). Empty ("") uses a
+        sensible per-field default: due_date ASC (soonest first);
+        created_at/updated_at DESC (most recent first); priority DESC
+        (highest first); title/project/section/status/type ASC. Ignored
+        when sort_by is empty. Any other value returns an error.
+
+    Note: when ``search`` is set, results are re-ranked by the search engine,
+    so ``sort_by`` has little visible effect on that path.
     """
+    order_clause, sort_err = _build_query_tasks_order(sort_by, sort_order)
+    if sort_err is not None:
+        return json.dumps({"error": sort_err})
+
     conditions: list[str] = []
     params: list[Any] = []
 
@@ -507,9 +607,6 @@ def query_tasks(
         cols = "t.id, t.title, t.description, t.notes, t.status, t.priority, t.section, t.due_date, t.project, t.parent_id, t.created_at, t.updated_at"
 
     from_clause = "tasks t"
-    order_clause = (
-        f"{build_priority_order_sql('t.')}, t.due_date ASC NULLS LAST, t.created_at ASC"
-    )
 
     where = " AND ".join(conditions) if conditions else "1=1"
 
