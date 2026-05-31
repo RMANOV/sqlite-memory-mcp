@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# obsidian-publish — Governed one-way markdown publication (Obsidian Feature #1).
+#
+# Emits APPROVED sqlite-memory content to an Obsidian-readable vault as
+# deterministic markdown. READ-ONLY on memory: writes markdown OUT only, there
+# is NO vault->memory path. Default-deny allowlist (only promoted facts +
+# public entities/observations/relations + public notes/tasks are emitted).
+#
+# Usage:
+#   obsidian-publish [--db PATH] [--vault DIR] [--no-prune] [--quiet]
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PY="python3"
+command -v python3 >/dev/null 2>&1 || PY="python"
+
+exec "$PY" -m obsidian_publish "$@"
