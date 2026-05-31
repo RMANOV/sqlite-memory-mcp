@@ -251,19 +251,11 @@ class BridgeSyncMixin:
                     return
 
                 after_head = _bridge_head(self._BRIDGE_DIR)
-                if initiator == "bootstrap":
-                    self._log_sync_event(
-                        "result",
-                        initiator=initiator,
-                        mode="pull_only",
-                        pulled=True,
-                        changed=bool(
-                            before_head and after_head and before_head != after_head
-                        ),
-                        imported=0,
-                    )
-                    return
-
+                # Bootstrap follows the same import path as periodic pull: when
+                # HEAD advanced during pull, fall through to bridge_sync_worker
+                # so the local SQLite absorbs remote changes (tombstones, edits).
+                # Returning early here would leave local state stale after a
+                # HEAD change — only git-pulled, never imported.
                 if before_head and after_head and before_head == after_head:
                     self._log_sync_event(
                         "result",

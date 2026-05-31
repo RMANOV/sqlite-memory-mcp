@@ -41,6 +41,7 @@ from db_utils import (
     merge_import_tasks as _merge_import_tasks,
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
+    mark_tombstones_pushed as _mark_tombstones_pushed,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     export_entity_files as _export_entity_files,
     export_entities_index as _export_entities_index,
@@ -734,7 +735,13 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 merged_updated_fields,
             )
             task_export_since = None
-        _export_task_files(conn, BRIDGE_REPO, changed_since=task_export_since)
+        # Capture the exact id list written to this push payload. After a
+        # successful push we stamp the pushed tombstones from THIS list only, so a
+        # tombstone dropped by the incremental changed_since clause is never
+        # marked pushed (which would make it Tier-2 deletable without propagating).
+        exported_task_ids = _export_task_files(
+            conn, BRIDGE_REPO, changed_since=task_export_since
+        )
         _export_index_json(conn, BRIDGE_REPO)
         # v4: Export per-entity files + entities_index.json
         _, _entity_rows = _export_entity_files(conn, BRIDGE_REPO)
@@ -1084,6 +1091,8 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
                 (export_started_at,),
             )
+            # Push-aware retention: stamp tombstones actually in this payload.
+            _mark_tombstones_pushed(conn, exported_task_ids, export_started_at)
 
     return json.dumps(result)
 

@@ -2032,6 +2032,11 @@ _MIGRATIONS = [
         """,
         "Tier-A #5 typed predicate vocabulary provenance backfill",
     ),
+    (
+        "SELECT 1 FROM pragma_table_info('tasks') WHERE name='tombstone_pushed_at'",
+        "ALTER TABLE tasks ADD COLUMN tombstone_pushed_at TEXT DEFAULT NULL",
+        "tasks.tombstone_pushed_at column (push-aware tombstone retention)",
+    ),
 ]
 
 
