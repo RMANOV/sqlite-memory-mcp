@@ -46,6 +46,7 @@ from db_utils import (
     json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
     export_task_files,
     export_index_json,
+    mark_tombstones_pushed,
     load_remote_tasks_for_merge,
     content_length,
     has_meaningful_content,
@@ -1003,7 +1004,10 @@ def _main_locked(
         tasks_out = _export_tasks(conn)
 
         _progress(progress_callback, 45, "Exporting per-task files...")
-        export_task_files(conn, bridge_dir)
+        # Full export here (no changed_since): the returned id list contains every
+        # task written to the payload, including tombstones. We stamp the pushed
+        # tombstones from this exact list AFTER a successful push (see below).
+        exported_task_ids = export_task_files(conn, bridge_dir)
         export_index_json(conn, bridge_dir)
 
         _progress(progress_callback, 25, "Exporting per-entity files...")
@@ -1155,7 +1159,10 @@ def _main_locked(
                 delay,
             )
 
-    # Record last_push_at so incremental check can skip next time
+    # Record last_push_at so incremental check can skip next time, and stamp the
+    # tombstones that were just pushed (push-aware retention). Stamping uses the
+    # exact id list export_task_files returned for THIS push, so only tombstones
+    # actually in the payload become Tier-2 hard-delete eligible.
     if pushed:
         with get_conn(_db_path) as conn:
             conn.execute(
@@ -1163,6 +1170,7 @@ def _main_locked(
                 "VALUES('last_push_at', ?)",
                 (payload["pushed_at"],),
             )
+            mark_tombstones_pushed(conn, exported_task_ids, payload["pushed_at"])
 
     # Deploy to Cloudflare Pages (auto-update after push)
     deployed = False

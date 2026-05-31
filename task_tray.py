@@ -287,7 +287,12 @@ class TaskDB:
         )
 
     def purge_old_done(self, days=30):
-        """Delete done tasks older than `days` days. Returns count deleted."""
+        """Retire done tasks older than `days` days. Returns count retired.
+
+        Bridge-visible: tier-1 archives (tombstones) old done tasks so automated
+        incremental sync sees the change and cleans stale bridge files; tier-2
+        hard-purges tombstones that have aged past the export window.
+        """
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         return TaskDAO.purge_done(self._conn, cutoff)
 
