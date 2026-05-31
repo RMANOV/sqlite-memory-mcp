@@ -12,3 +12,6 @@ memory.db-*
 memory.db.bak-pre-optimization
 *.log
 docs/strategic/
+
+# Press/marketing drafts — never tracked (operator rule)
+docs/press/
