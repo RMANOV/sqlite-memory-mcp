@@ -37,7 +37,8 @@ def conn(tmp_path):
             visibility TEXT DEFAULT 'private',
             publish_requested_at TEXT,
             created_at TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            tombstone_pushed_at TEXT DEFAULT NULL
         );
 
         CREATE TABLE task_field_versions (

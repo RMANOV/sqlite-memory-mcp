@@ -44,7 +44,8 @@ CREATE TABLE tasks (
     visibility           TEXT DEFAULT 'private',
     publish_requested_at TEXT DEFAULT NULL,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    tombstone_pushed_at  TEXT DEFAULT NULL
 );
 """
 

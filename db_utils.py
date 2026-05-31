@@ -2497,14 +2497,78 @@ class TaskDAO:
         return [dict(r) for r in rows]
 
     @staticmethod
-    def purge_done(conn: sqlite3.Connection, cutoff_iso: str) -> int:
-        """Delete done tasks older than cutoff. Returns count deleted."""
-        cur = conn.execute(
-            "DELETE FROM tasks WHERE status = 'done' AND type = 'task' "
+    def purge_done(
+        conn: sqlite3.Connection,
+        cutoff_iso: str,
+        hard_delete_before_iso: str | None = None,
+    ) -> int:
+        """Retire old done tasks in a bridge-visible, two-tier way.
+
+        Tier 1 (tombstone): done tasks older than ``cutoff_iso`` are transitioned
+        to ``archived`` via ``apply_task_mutation`` rather than hard-deleted. This
+        bumps ``updated_at`` and writes a status field version, so the change is
+        visible to ``bridge_change_summary`` (incremental sync no longer skips it)
+        and the next full export emits a proper tombstone AND removes the stale
+        per-task bridge file. A bare ``DELETE`` was invisible to both, leaving
+        stale files behind on automated sync and resurrecting deletions on peers.
+
+        Tier 2 (hard purge): push-aware. Only ``archived`` rows whose tombstone
+        has been *successfully pushed* (``tombstone_pushed_at IS NOT NULL``) AND
+        whose push predates ``hard_delete_before_iso`` (default: now −
+        ``_TOMBSTONE_DAYS``) are hard-deleted. Retention is measured FROM the
+        push, not from ``updated_at``: a tombstone created offline and pushed only
+        weeks later still gets a full retention window after the push for every
+        peer to pull it before the row disappears locally.
+
+        Rows with ``tombstone_pushed_at IS NULL`` are NEVER hard-deleted — they
+        have not provably reached the bridge, so deleting them could let a peer
+        still holding the old ``done`` row resurrect the task (the 2026-05-08
+        "12 tasks resurrected" incident class). The export window
+        (``export_task_files`` / ``_export_index_json``) is the exact complement
+        of this gate, so an un-pushed tombstone stays exportable until a
+        successful push stamps it, and only then can it age out of either side.
+
+        Only ``archived`` is swept (Tier 1 and ``archive_done`` only ever produce
+        ``archived``); ``cancelled`` is the user soft-delete state and is
+        intentionally left untouched to avoid silently destroying user data.
+
+        Returns the count of done tasks retired (Tier 1) this cycle, preserving the
+        historical "rows purged from the active view" meaning of the return value.
+        """
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'done' AND type = 'task' "
             "AND updated_at < ?",
             (cutoff_iso,),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        retired = 0
+        if ids:
+            now = now_iso()
+            for task_id in ids:
+                result = apply_task_mutation(
+                    conn,
+                    task_id,
+                    {"status": "archived"},
+                    timestamp=now,
+                    tool_name="db_utils.TaskDAO.purge_done",
+                )
+                retired += int(result.get("updated", 0))
+
+        # Tier 2: hard-purge archived tombstones that have been pushed AND aged
+        # past the retention window measured from the push. Un-pushed tombstones
+        # (tombstone_pushed_at IS NULL) are retained indefinitely so a deletion is
+        # never destroyed before it provably reaches the bridge. 'cancelled' (user
+        # soft-delete) is deliberately excluded.
+        hard_cutoff = hard_delete_before_iso or (
+            datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)
+        ).isoformat()
+        conn.execute(
+            "DELETE FROM tasks WHERE type = 'task' "
+            "AND status = 'archived' "
+            "AND tombstone_pushed_at IS NOT NULL AND tombstone_pushed_at < ?",
+            (hard_cutoff,),
         )
-        return cur.rowcount
+        return retired
 
     @staticmethod
     def get_suggested(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
@@ -3149,6 +3213,16 @@ def apply_task_mutation(
     if touch_updated_at:
         effective_changes["updated_at"] = ts
 
+    # Push-aware tombstone retention: any status change invalidates a prior
+    # tombstone push stamp. A reactivated task (archived -> in_progress) and a
+    # later re-archive form a NEW tombstone that has not itself been pushed;
+    # carrying the old stamp forward would let the new tombstone age out of
+    # export / become Tier-2 deletable without propagating, resurrecting the row
+    # on a peer. Clearing on every status change makes each new state require its
+    # own push confirmation (re-tombstoning then starts NULL = protected).
+    if "status" in effective_changes:
+        effective_changes["tombstone_pushed_at"] = None
+
     set_clause = ", ".join(f"{field} = ?" for field in effective_changes)
     values = list(effective_changes.values()) + [task_id]
     cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
@@ -3776,14 +3850,33 @@ def export_task_files(
                     pass
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
+    # Push-aware tombstone window: a tombstone stays export-eligible until it has
+    # been successfully pushed AND aged past retention measured FROM the push.
+    # tombstone_pushed_at IS NULL  -> never pushed -> always export (never drop an
+    #                                 un-pushed deletion, even if updated_at is old).
+    # tombstone_pushed_at > cutoff -> pushed but still inside the retention window.
+    # This keeps export-eligibility the exact complement of Tier-2 hard-delete
+    # eligibility (see TaskDAO.purge_done), so no tombstone can age out of export
+    # before it has propagated.
     export_filter = (
         "WHERE (status NOT IN ('archived', 'cancelled') "
-        "OR (status IN ('archived', 'cancelled') AND updated_at > ?))"
+        "OR (status IN ('archived', 'cancelled') "
+        "AND (tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?)))"
     )
     if changed_since:
+        # Incremental export: normally only rows touched since the last push are
+        # re-emitted. But an UN-PUSHED tombstone must ride along regardless of
+        # updated_at, else the incremental AND-clause would silently drop an aged
+        # un-pushed deletion that the export window gate above just kept eligible
+        # (the archive-while-offline >30d resurrection class). Already-pushed
+        # in-window tombstones need no ride-along: their bridge file already
+        # exists (cleanup runs only on full export) so peers already have them.
         rows = conn.execute(
             f"SELECT {TASK_EXPORT_COLS} FROM tasks "
-            f"{export_filter} AND updated_at >= ? ORDER BY created_at",
+            f"{export_filter} AND (updated_at >= ? "
+            "OR (status IN ('archived', 'cancelled') "
+            "AND tombstone_pushed_at IS NULL)) "
+            "ORDER BY created_at",
             (cutoff, changed_since),
         ).fetchall()
     else:
@@ -3922,6 +4015,47 @@ def export_task_files(
     return exported
 
 
+def mark_tombstones_pushed(
+    conn: sqlite3.Connection,
+    exported_ids: list[str],
+    pushed_at: str,
+) -> int:
+    """Stamp ``tombstone_pushed_at`` on tombstones that were just pushed.
+
+    Call ONLY after a successful push, passing the exact id list returned by
+    ``export_task_files`` for that push. Correct-by-construction: it stamps only
+    rows that (a) were actually written into this push payload, (b) are currently
+    archived/cancelled tombstones, and (c) are not already stamped. This is the
+    push-success signal that makes a tombstone eligible to age out of the export
+    window and become Tier-2 hard-deletable (see ``TaskDAO.purge_done``).
+
+    Never re-derive the id set from a fresh ``WHERE`` here: a tombstone excluded
+    from the payload (e.g. dropped by an incremental ``changed_since`` clause)
+    must NOT be marked pushed, or it could be hard-deleted without ever having
+    propagated — resurrecting on a peer. Retention is measured from this
+    ``pushed_at``, so stamping a never-exported row is the one unsafe move.
+
+    Returns the number of tombstones newly stamped.
+    """
+    ids = [tid for tid in exported_ids if isinstance(tid, str) and tid]
+    if not ids:
+        return 0
+    stamped = 0
+    # Chunk to stay under SQLite's variable limit on very large payloads.
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        ph = ",".join("?" * len(chunk))
+        cur = conn.execute(
+            f"UPDATE tasks SET tombstone_pushed_at = ? "
+            f"WHERE id IN ({ph}) "
+            "AND status IN ('archived', 'cancelled') "
+            "AND tombstone_pushed_at IS NULL",
+            (pushed_at, *chunk),
+        )
+        stamped += cur.rowcount or 0
+    return stamped
+
+
 def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
     """Build index.json: metadata + field versions for all active tasks + tombstones.
 
@@ -3934,11 +4068,15 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
         "WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
     ).fetchall()
 
-    # Tombstones: recently archived/cancelled (30 days)
+    # Tombstones: archived/cancelled rows still inside the push-aware retention
+    # window. Keyed off tombstone_pushed_at so the index agrees with the per-task
+    # export (export_task_files): NULL (un-pushed) is always listed; a pushed
+    # tombstone is listed until retention elapses FROM the push.
     cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
     tombstone_rows = conn.execute(
         f"SELECT {meta_cols} FROM tasks "
-        "WHERE status IN ('archived', 'cancelled') AND updated_at > ? "
+        "WHERE status IN ('archived', 'cancelled') "
+        "AND (tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?) "
         "ORDER BY updated_at",
         (cutoff,),
     ).fetchall()
@@ -4294,8 +4432,13 @@ def merge_import_tasks(
                             or remote_ts
                             or fallback_ts
                         )
+                    # Absorbing a remote tombstone: this is a fresh local
+                    # tombstone state that THIS machine has not pushed, so clear
+                    # any prior push stamp. It stays export-eligible (and not
+                    # Tier-2 deletable) until this machine itself pushes it.
                     conn.execute(
-                        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                        "UPDATE tasks SET status = ?, updated_at = ?, "
+                        "tombstone_pushed_at = NULL WHERE id = ?",
                         (remote["status"], row_updated_at, tid),
                     )
                     _store_task_field_version(
@@ -4679,6 +4822,11 @@ def merge_import_tasks(
                     )
                     if semantic_updated_at:
                         safe_fields["updated_at"] = semantic_updated_at
+                    # A merged status change yields a new local tombstone state
+                    # that THIS machine has not pushed; clear the prior push stamp
+                    # so it must be re-pushed before aging out of export / Tier-2.
+                    if "status" in safe_fields:
+                        safe_fields["tombstone_pushed_at"] = None
                     set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
                     values = list(safe_fields.values()) + [local_id]
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)

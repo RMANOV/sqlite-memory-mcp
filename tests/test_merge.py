@@ -44,7 +44,7 @@ def conn(tmp_path):
             parent_id TEXT, notes TEXT, recurring TEXT, reminder_at TEXT,
             type TEXT NOT NULL DEFAULT 'task', assignee TEXT, shared_by TEXT,
             visibility TEXT DEFAULT 'private', publish_requested_at TEXT,
-            created_at TEXT, updated_at TEXT
+            created_at TEXT, updated_at TEXT, tombstone_pushed_at TEXT DEFAULT NULL
         );
         CREATE TABLE task_field_versions (
             task_id TEXT NOT NULL, field_name TEXT NOT NULL,

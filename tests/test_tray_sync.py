@@ -336,15 +336,67 @@ def test_periodic_pull_skips_heavy_import_when_git_head_unchanged(
     assert refreshes == []
 
 
-def test_bootstrap_pull_skips_heavy_import_even_when_git_head_changes(
+def test_bootstrap_pull_imports_remote_changes_when_git_head_changes(
     bridge_env, monkeypatch
 ):
+    """Regression: bootstrap auto-sync must IMPORT remote changes after a HEAD
+    advance, not early-return with imported=0 leaving local SQLite stale.
+
+    Bootstrap now follows the same path as periodic pull: when HEAD advanced,
+    it runs bridge_sync_worker.main(pull_only=True) so the local DB absorbs
+    remote tombstones/edits, then requests a UI refresh."""
+    captured = {}
+    refreshes = []
     bridge_sync_worker = SimpleNamespace(
-        main=lambda **kwargs: pytest.fail("bootstrap should not run heavy worker")
+        main=lambda **kwargs: (
+            captured.update(kwargs) or {"imported_new": 2, "imported_updated": 1}
+        )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
     heads = ["old-head", "new-head"]
     monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: heads.pop(0))
+    monkeypatch.setattr(
+        tray_sync,
+        "_bridge_git_pull",
+        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    window = _DummyWindow(bridge_env)
+    window.status = _CaptureStatus()
+    window._db_refresh_debounce = SimpleNamespace(
+        start=lambda: refreshes.append("timer")
+    )
+    window._bridge_refresh_requested = SimpleNamespace(
+        emit=lambda: refreshes.append("signal")
+    )
+    window._bridge_progress = SimpleNamespace(emit=lambda *args: None)
+    window._bridge_done = SimpleNamespace(emit=lambda *args: None)
+    monkeypatch.setattr(
+        window,
+        "_start_bridge_sync_thread",
+        lambda target, busy_message=None, **kwargs: (target(), True)[1],
+    )
+
+    window._periodic_pull(initiator="bootstrap")
+
+    # Heavy import worker ran in pull-only mode (not an imported=0 early-return).
+    assert captured["pull_only"] is True
+    # Imported updates trigger a UI refresh so the tray reflects remote state.
+    assert refreshes == ["signal"]
+
+
+def test_bootstrap_pull_skips_heavy_import_when_git_head_unchanged(
+    bridge_env, monkeypatch
+):
+    """Bootstrap still avoids the heavy import worker when nothing arrived
+    (HEAD unchanged) — the import only runs when the pull advanced HEAD."""
+    bridge_sync_worker = SimpleNamespace(
+        main=lambda **kwargs: pytest.fail(
+            "bootstrap must not import when HEAD is unchanged"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
+    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: "same-head")
     monkeypatch.setattr(
         tray_sync,
         "_bridge_git_pull",
