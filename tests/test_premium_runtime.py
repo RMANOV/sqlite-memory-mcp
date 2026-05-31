@@ -30,6 +30,8 @@ _PREMIUM_ENV_VARS = (
     "SQLITE_MEMORY_PREMIUM_ENTRYPOINT",
     "SQLITE_MEMORY_PREMIUM_INSTALLATION_SALT",
     "SQLITE_MEMORY_OWNER_APPROVAL",
+    "SQLITE_MEMORY_DEBATE_GATE_ENABLED",
+    "SQLITE_MEMORY_DEBATE_GATE_DISABLED",
 )
 
 
@@ -122,6 +124,220 @@ def test_evaluate_feature_gate_denies_without_entitlement_and_audits(tmp_path):
     assert audit["decision"] == "denied"
     assert audit["reason"] == "entitlement_missing"
     assert event["event_type"] == "premium_gate_denied"
+
+
+def test_debate_protocol_creation_gate_is_default_off(tmp_path):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_debate_protocol_creation_gate(
+            conn,
+            payload={"test_case": "default_off"},
+        )
+
+    assert verdict["allowed"] is True
+    assert verdict["decision"] == "skipped"
+    assert verdict["reason"] == "debate_protocol_gate_default_off"
+
+
+def test_debate_protocol_creation_gate_denies_clear_missing_entitlement(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "debate_protocol_gate_enabled": True,
+            "control_plane_required": False,
+        },
+    )
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_debate_protocol_creation_gate(
+            conn,
+            payload={"test_case": "missing_entitlement"},
+        )
+
+    assert verdict["allowed"] is False
+    assert verdict["reason"] == "entitlement_missing"
+
+
+def test_debate_protocol_creation_gate_disabled_env_overrides_enabled_config(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    monkeypatch.setenv("SQLITE_MEMORY_DEBATE_GATE_DISABLED", "1")
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "debate_protocol_gate_enabled": True,
+        },
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: pytest.fail("disabled debate gate should not load entitlement"),
+    )
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_debate_protocol_creation_gate(conn)
+
+    assert verdict["allowed"] is True
+    assert verdict["decision"] == "skipped"
+    assert verdict["reason"] == "debate_protocol_gate_disabled"
+
+
+def test_debate_protocol_creation_gate_fail_opens_entitlement_runtime_errors(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "debate_protocol_gate_enabled": True,
+            "control_plane_required": False,
+        },
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (_ for _ in ()).throw(RuntimeError("loader unavailable")),
+    )
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_debate_protocol_creation_gate(
+            conn,
+            payload={"test_case": "runtime_error"},
+        )
+
+    assert verdict["allowed"] is True
+    assert verdict["fail_open"] is True
+    assert verdict["reason"].startswith(
+        "debate_protocol_gate_fail_open:entitlement_load_failed:"
+    )
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT decision, reason FROM premium_gate_audit "
+            "WHERE feature_id = 'debate_protocol'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert any(
+        row["decision"] == "allowed"
+        and row["reason"].startswith("debate_protocol_gate_fail_open:")
+        for row in rows
+    )
+
+
+def test_debate_protocol_creation_gate_fail_opens_when_evaluator_raises(
+    tmp_path, monkeypatch
+):
+    # Distinct from the by-reason branch above: here evaluate_feature_gate itself
+    # raises, exercising the wrapper's anti-lockout except. The recorded reason
+    # carries only the exception class, with NO entitlement_load_failed infix.
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "debate_protocol_gate_enabled": True,
+            "control_plane_required": False,
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("evaluator exploded")
+
+    monkeypatch.setattr(premium_runtime, "evaluate_feature_gate", _boom)
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_debate_protocol_creation_gate(
+            conn,
+            payload={"test_case": "evaluator_raises"},
+        )
+
+    assert verdict["allowed"] is True
+    assert verdict["fail_open"] is True
+    assert verdict["reason"] == "debate_protocol_gate_fail_open:RuntimeError"
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT decision, reason FROM premium_gate_audit "
+            "WHERE feature_id = 'debate_protocol'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Distinct runtime-error audit row, and never confused with entitlement_valid.
+    assert any(
+        row["decision"] == "allowed"
+        and row["reason"] == "debate_protocol_gate_fail_open:RuntimeError"
+        for row in rows
+    )
+    assert not any(row["reason"] == "entitlement_valid" for row in rows)
+
+
+def test_debate_protocol_creation_gate_allows_with_valid_entitlement(
+    tmp_path, monkeypatch
+):
+    # (b) ENABLED + valid entitlement => allowed via the normal entitlement path,
+    # audited as entitlement_valid (NOT a fail-open row).
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    entitlement = {
+        "entitlement_id": "ent-debate-unit",
+        "customer_id": "cust-debate-unit",
+        "features": ["debate_protocol"],
+        "machine_ids": [premium_runtime.MACHINE_ID],
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "load_premium_config",
+        lambda: {
+            **premium_runtime._DEFAULT_CONFIG,
+            "debate_protocol_gate_enabled": True,
+            "control_plane_required": False,
+        },
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_entitlement",
+        lambda config: (entitlement, "test:inline"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_entitlement_signature",
+        lambda entitlement, public_key_value: (True, "signature_valid"),
+    )
+
+    with _conn_ctx(db_path) as conn:
+        verdict = premium_runtime.evaluate_debate_protocol_creation_gate(
+            conn,
+            payload={"test_case": "valid_entitlement"},
+        )
+
+    assert verdict["allowed"] is True
+    assert verdict["reason"] == "entitlement_valid"
+    assert not verdict.get("fail_open")
 
 
 def test_evaluate_feature_gate_honors_local_revocation(tmp_path, monkeypatch):

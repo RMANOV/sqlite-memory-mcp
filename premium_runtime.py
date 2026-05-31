@@ -71,6 +71,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "require_machine_binding": True,
     "installation_salt_env_var": "SQLITE_MEMORY_PREMIUM_INSTALLATION_SALT",
     "owner_approval_env_var": "SQLITE_MEMORY_OWNER_APPROVAL",
+    "debate_protocol_gate_enabled": False,
+    "debate_protocol_gate_enabled_env_var": "SQLITE_MEMORY_DEBATE_GATE_ENABLED",
+    "debate_protocol_gate_disabled_env_var": "SQLITE_MEMORY_DEBATE_GATE_DISABLED",
     "record_allowed_events": True,
     "record_denied_events": True,
 }
@@ -125,6 +128,11 @@ PREMIUM_FEATURES: dict[str, dict[str, Any]] = {
         "tier": "premium",
         "requires_owner_approval": False,
         "description": "Premium provenance pointers across mail, notes, facts, and action layers.",
+    },
+    "debate_protocol": {
+        "tier": "premium",
+        "requires_owner_approval": False,
+        "description": "Premium gate for creating new debate protocol topics.",
     },
     "query_templates": {
         "tier": "premium",
@@ -325,6 +333,15 @@ def load_premium_config() -> dict[str, Any]:
             "premium_security_config.json missing or invalid; using safe defaults"
         )
         return dict(_DEFAULT_CONFIG)
+
+
+def _truthy_env(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _config_env_flag(config: dict[str, Any], config_key: str) -> bool:
+    env_name = str(config.get(config_key) or "").strip()
+    return _truthy_env(os.environ.get(env_name)) if env_name else False
 
 
 def _normalize_string_items(raw: Any) -> list[str]:
@@ -1628,6 +1645,139 @@ def evaluate_feature_gate(
             actor_id=actor_id,
             payload=audit_payload,
         )
+    return verdict
+
+
+_DEBATE_PROTOCOL_GATE_FAIL_OPEN_PREFIXES = (
+    "entitlement_load_failed:",
+    "control_plane_load_failed:",
+    "artifact_manifest_load_failed:",
+)
+
+
+def evaluate_debate_protocol_creation_gate(
+    conn: sqlite3.Connection,
+    *,
+    server_name: str | None = "sqlite-intel",
+    tool_name: str | None = "sqlite-intel.debate_init",
+    actor_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate the optional premium gate for new debate topic creation.
+
+    The gate is default-off so deploying the code cannot lock out new topics.
+    When enabled, clear entitlement denials fail closed, while entitlement
+    runtime/evaluator failures fail open and write a distinct audit row.
+    """
+    config = load_premium_config()
+    feature_id = "debate_protocol"
+    audit_payload = {
+        "gate_scope": "debate_init_new_topic",
+        **dict(payload or {}),
+    }
+
+    if _config_env_flag(config, "debate_protocol_gate_disabled_env_var"):
+        return {
+            "allowed": True,
+            "decision": "skipped",
+            "reason": "debate_protocol_gate_disabled",
+            "feature_id": feature_id,
+        }
+
+    gate_enabled = bool(config.get("debate_protocol_gate_enabled")) or _config_env_flag(
+        config, "debate_protocol_gate_enabled_env_var"
+    )
+    if not gate_enabled:
+        return {
+            "allowed": True,
+            "decision": "skipped",
+            "reason": "debate_protocol_gate_default_off",
+            "feature_id": feature_id,
+        }
+
+    try:
+        verdict = evaluate_feature_gate(
+            conn,
+            feature_id=feature_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            actor_id=actor_id,
+            payload=audit_payload,
+        )
+    except Exception as exc:
+        reason = f"debate_protocol_gate_fail_open:{exc.__class__.__name__}"
+        logger.exception("debate_protocol gate evaluator failed open")
+        # STEP-4 safety: the audit write must NEVER be able to flip a fail-OPEN
+        # allow into a fail-CLOSED deny. If persisting the audit row itself
+        # fails, log and continue — the allow verdict below is still returned.
+        try:
+            _write_gate_audit(
+                conn,
+                feature_id=feature_id,
+                decision="allowed",
+                reason=reason,
+                server_name=server_name,
+                tool_name=tool_name,
+                actor_id=actor_id,
+                payload={
+                    **audit_payload,
+                    "fail_open": True,
+                    "failure_class": exc.__class__.__name__,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "debate_protocol fail-open audit write failed; "
+                "returning allow regardless",
+                exc_info=True,
+            )
+        return {
+            "allowed": True,
+            "decision": "allowed",
+            "reason": reason,
+            "feature_id": feature_id,
+            "fail_open": True,
+        }
+
+    reason = str(verdict.get("reason") or "")
+    if not verdict.get("allowed") and reason.startswith(
+        _DEBATE_PROTOCOL_GATE_FAIL_OPEN_PREFIXES
+    ):
+        fail_open_reason = f"debate_protocol_gate_fail_open:{reason}"
+        # STEP-4 safety: same anti-lockout guard as the evaluator-exception
+        # branch — a load-failure fail-OPEN must never become a deny because
+        # the audit row could not be written.
+        try:
+            _write_gate_audit(
+                conn,
+                feature_id=feature_id,
+                decision="allowed",
+                reason=fail_open_reason,
+                entitlement_id=verdict.get("entitlement_id"),
+                customer_id=verdict.get("customer_id"),
+                server_name=server_name,
+                tool_name=tool_name,
+                actor_id=actor_id,
+                payload={
+                    **audit_payload,
+                    "fail_open": True,
+                    "source_reason": reason,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "debate_protocol fail-open (by-reason) audit write failed; "
+                "returning allow regardless",
+                exc_info=True,
+            )
+        return {
+            **verdict,
+            "allowed": True,
+            "decision": "allowed",
+            "reason": fail_open_reason,
+            "fail_open": True,
+        }
+
     return verdict
 
 

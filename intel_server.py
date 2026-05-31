@@ -93,7 +93,10 @@ from debate import (
     transition_state as _debate_transition_dao,
     worker_no_action as _debate_worker_no_action_dao,
 )
-from premium_runtime import maybe_mount_premium_extensions
+from premium_runtime import (
+    evaluate_debate_protocol_creation_gate,
+    maybe_mount_premium_extensions,
+)
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -1188,6 +1191,25 @@ def _debate_error_response(exc: Exception) -> str:
     return json.dumps({"error": str(exc), "error_type": "internal_error"})
 
 
+def _debate_gate_denied_response(verdict: dict[str, object]) -> str:
+    reason = str(verdict.get("reason") or "premium_gate_denied")
+    return json.dumps(
+        {
+            "error": f"debate_protocol_gate_denied: {reason}",
+            "error_type": "premium_gate_denied",
+            "gate": verdict,
+        }
+    )
+
+
+def _debate_topic_exists(conn, topic_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM debates WHERE topic_id = ? LIMIT 1",
+        (topic_id,),
+    ).fetchone()
+    return row is not None
+
+
 # Tool 25: debate_init
 @mcp.tool()
 def debate_init(
@@ -1215,6 +1237,24 @@ def debate_init(
         roles = json.loads(roles_json) if roles_json else []
         metadata = json.loads(metadata_json) if metadata_json else None
         with _get_conn() as conn:
+            if not _debate_topic_exists(conn, topic_id):
+                gate_verdict = evaluate_debate_protocol_creation_gate(
+                    conn,
+                    server_name="sqlite-intel",
+                    tool_name="sqlite-intel.debate_init",
+                    actor_id=created_by_role,
+                    payload={
+                        "topic_id": topic_id,
+                        "created_by_role": created_by_role,
+                    },
+                )
+                if not gate_verdict.get("allowed"):
+                    logger.info(
+                        "debate_init premium gate denied: topic=%s reason=%s",
+                        topic_id,
+                        gate_verdict.get("reason"),
+                    )
+                    return _debate_gate_denied_response(gate_verdict)
             out = _debate_init_dao(
                 conn,
                 topic_id=topic_id,
