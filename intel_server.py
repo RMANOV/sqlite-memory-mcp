@@ -71,6 +71,7 @@ from tools.gbrain_bridge import (
 )
 from debate import (
     DebateError as _DebateError,
+    add_role_to_debate as _debate_add_role_dao,
     advance_watermark as _debate_advance_watermark_dao,
     bind_role_session as _debate_bind_role_session_dao,
     claim_worker_session as _debate_claim_worker_session_dao,
@@ -1678,6 +1679,53 @@ def debate_bind_role(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_bind_role failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 36b: debate_add_role (flexible roster — add a role after debate_init)
+@mcp.tool()
+def debate_add_role(
+    topic_id: str,
+    role: str,
+    session_id: str,
+    runtime: str = "",
+    reason: str = "",
+    bound_by_role: str = "",
+    bound_by_msg_id: str = "",
+    replace_active: bool = False,
+    conductor_override_msg_id: str = "",
+) -> str:
+    """Add a NEW role to an existing topic after debate_init (flexible roster).
+
+    Roles are no longer frozen at debate_init. This appends ``role`` to the
+    declared roster and installs an active primary binding in one transaction,
+    so messages can be addressed to the role immediately. Idempotent: if the
+    role is already declared and this session already owns it, returns the
+    existing binding with ``added_role=False``.
+
+    To swap a different active owner for this session, set ``replace_active``
+    (atomic). To preserve the new owner's read cursor on an exhausted-session
+    handoff, prefer ``debate_rotate_binding`` instead.
+    """
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_add_role_dao(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                session_id=session_id,
+                runtime=runtime,
+                reason=reason or "debate_add_role flexible roster",
+                bound_by_role=bound_by_role or None,
+                bound_by_msg_id=bound_by_msg_id or None,
+                replace_active=replace_active,
+                conductor_override_msg_id=conductor_override_msg_id or None,
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_add_role failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 
