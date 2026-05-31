@@ -2002,6 +2002,105 @@ def seed_initial_role_bindings(
     return seeded
 
 
+def add_role_to_debate(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    session_id: str,
+    runtime: str = "",
+    reason: str,
+    bound_by_role: str | None = None,
+    bound_by_msg_id: str | None = None,
+    replace_active: bool = False,
+    conductor_override_msg_id: str | None = None,
+) -> dict[str, Any]:
+    """Add a role to an EXISTING topic after debate_init froze ``roles_json``.
+
+    Roles were historically frozen at ``debate_init`` (re-init with a new role
+    raised ``topic_exists_with_different_roles``, and ``debate_bind_role`` on an
+    undeclared role raised ``recipient_unknown_role``). This is the
+    flexible-roster path: it appends ``role`` to the declared roster
+    (``debates.roles_json``) and installs an active primary binding in the SAME
+    transaction, so the role is both addressable (recipient validation consults
+    ``roles_json``) and wake-resolvable (binding is the runtime authority).
+
+    Idempotency / invariant contract:
+      * role NOT declared  -> append to roles_json + active binding for
+        ``session_id``.
+      * role declared, ``session_id`` already the active owner -> no-op:
+        returns the existing binding with ``added_role=False``.
+      * role declared, a DIFFERENT session is the active owner -> rejected as
+        ``binding_duplicate_active`` unless ``replace_active=True`` (atomic
+        swap; the old owner is retired in the same transaction). For an
+        exhausted-session handoff that must preserve the read cursor, prefer
+        ``rotate_role_binding`` / ``debate_rotate_binding`` instead.
+
+    Every mutation is audited by the binding row itself (generation, reason,
+    bound_by_role, bound_by_msg_id) — consistent with the rest of v3.10. The
+    declared-role no-active-primary case (e.g. a previously retired role) is a
+    plain reactivation handled by ``bind_role_session(state='active')``.
+    """
+    validate_topic_id(topic_id)
+    validate_role(role)
+    validate_session_id(session_id)
+    if not isinstance(reason, str) or not reason.strip():
+        raise DebateError("invalid_reason: must be non-empty string")
+
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+
+    already_declared = role_in_debate(debate["roles"], role)
+    if already_declared:
+        existing_active = _active_binding(conn, topic_id, role)
+        if (
+            existing_active is not None
+            and existing_active["session_id"] == session_id
+            and not replace_active
+        ):
+            # Fully idempotent: role declared and this session already owns it.
+            return {
+                "topic_id": topic_id,
+                "role": role,
+                "session_id": session_id,
+                "runtime": existing_active["runtime"],
+                "state": "active",
+                "generation": int(existing_active["generation"]),
+                "added_role": False,
+                "retired_sessions": [],
+                "retired_worker_claims": 0,
+            }
+    else:
+        # Append the role to the declared roster atomically with the binding.
+        new_roles = list(debate["roles"]) + [
+            {"role": role, "session_id": session_id}
+        ]
+        conn.execute(
+            "UPDATE debates SET roles_json = ? WHERE topic_id = ?",
+            (json_dumps(new_roles), topic_id),
+        )
+
+    binding = bind_role_session(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=session_id,
+        runtime=runtime,
+        state="active",
+        reason=reason,
+        bound_by_role=bound_by_role,
+        bound_by_msg_id=bound_by_msg_id,
+        replace_active=replace_active,
+        conductor_override_msg_id=conductor_override_msg_id,
+    )
+    binding["added_role"] = not already_declared
+    return binding
+
+
 def rotate_role_binding(
     conn: sqlite3.Connection,
     *,
