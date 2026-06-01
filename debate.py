@@ -136,6 +136,18 @@ VALID_KINDS = (
     "COMPACTION",
 )
 STANDING_SIGNAL_KINDS = ("DECISION", "STATE")
+# ── Vehicle tagging (v3.12, conductor-approved solution #5) ────────────
+# Classifies the work a message implies so the wake/pump router can decide
+# whether a bounded no-edit wake-worker may pick it up. Wake-spawned
+# ``-W<n>`` workers run no-edit, so an ``implementation``-tagged message
+# would silently bounce if dispatched to one. The router FAILS CLOSED on
+# ``implementation`` (see ``claim_worker_session`` + ``prepare_wake_dry_run``).
+# NULL / absent → DEFAULT_VEHICLE for backcompat with pre-v3.12 rows.
+VALID_VEHICLES = ("analysis", "review", "implementation")
+DEFAULT_VEHICLE = "analysis"
+# Vehicles a bounded wake-worker may execute. ``implementation`` is
+# intentionally excluded — it requires a conductor-approved impl vehicle.
+WAKE_WORKER_VEHICLES = ("analysis", "review")
 VALID_STATES = ("INIT", "ACTIVE", "RESOLVED", "ARCHIVED")
 VALID_BINDING_STATES = ("active", "retired", "diagnostic")
 VALID_CURSOR_MODES = ("head", "copy", "replay")
@@ -221,6 +233,36 @@ def validate_kind(kind: str) -> None:
         raise DebateError(
             f"invalid_kind: {kind!r} not in {VALID_KINDS}"
         )
+
+
+def validate_vehicle(vehicle: str) -> None:
+    """Validate a debate-message vehicle tag (v3.12).
+
+    Accepts only the three declared vehicles. ``None``/absent is handled by
+    the caller (defaults to ``DEFAULT_VEHICLE``) and never reaches here, so
+    a value that arrives here is an explicit caller choice and must be one
+    of the enum members. Raises a typed ``invalid_vehicle`` DebateError so
+    the MCP wrapper surfaces a clean error_type rather than a raw sqlite
+    CHECK IntegrityError (the column CHECK is only the backstop).
+    """
+    if vehicle not in VALID_VEHICLES:
+        raise DebateError(
+            f"invalid_vehicle: {vehicle!r} not in {VALID_VEHICLES}",
+            error_type="invalid_vehicle",
+        )
+
+
+def normalize_vehicle(vehicle: str | None) -> str:
+    """Resolve a possibly-absent vehicle to its effective value.
+
+    NULL/empty/absent → ``DEFAULT_VEHICLE`` (backcompat: pre-v3.12 rows and
+    untagged callers behave as ``analysis``). Any non-empty value is
+    validated against the enum.
+    """
+    if vehicle is None or vehicle == "":
+        return DEFAULT_VEHICLE
+    validate_vehicle(vehicle)
+    return vehicle
 
 
 def validate_state(state: str) -> None:
@@ -802,13 +844,39 @@ def claim_worker_session(
             error_type="worker_parent_binding_inactive",
         )
     trigger = conn.execute(
-        "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+        "SELECT topic_id, vehicle FROM debate_messages WHERE msg_id = ?",
         (trigger_msg_id,),
     ).fetchone()
     if trigger is None or trigger["topic_id"] != topic_id:
         raise DebateError(
             f"worker_trigger_unknown: {trigger_msg_id}",
             error_type="worker_trigger_unknown",
+        )
+    # ── FAIL-CLOSED VEHICLE ROUTER (v3.12, solution #5) ──────────────────
+    # This is the deepest shared chokepoint for spawning a bounded -W<n>
+    # wake-worker: the wake hook (debate_wake._claim_worker_target), the
+    # pump hook (debate_pump → debate_wake._maybe_dispatch), AND the direct
+    # debate_worker_claim MCP tool all funnel through here. Wake-workers run
+    # NO-EDIT, so an implementation-tagged trigger dispatched to one would
+    # silently bounce. Per the advocate, solution #5 must FAIL CLOSED — else
+    # it just renames the bounce. We REFUSE the claim with a typed error
+    # instead of allocating a worker that cannot do the work. analysis /
+    # review (and untagged → DEFAULT_VEHICLE) proceed unchanged.
+    #
+    # CONDUCTOR-APPROVED IMPL-VEHICLE SEAM (#3): when a future implementation
+    # vehicle lands (#2 claim-for-impl / #1 IMPL-worker), gate it here — e.g.
+    # accept implementation claims only when details carries an approved
+    # impl-vehicle token (details.get("impl_vehicle_approved")), or branch to
+    # an IMPL-worker allocator. Until then, implementation work is handled
+    # out-of-band by the conductor via Agent sub-agents and is refused here.
+    trigger_vehicle = normalize_vehicle(trigger["vehicle"])
+    if trigger_vehicle not in WAKE_WORKER_VEHICLES:
+        raise DebateError(
+            f"implementation_requires_impl_vehicle: trigger {trigger_msg_id} "
+            f"is vehicle={trigger_vehicle!r}; bounded wake-workers are "
+            f"no-edit and cannot execute implementation work. Route to a "
+            f"conductor-approved impl vehicle (Agent sub-agent).",
+            error_type="implementation_requires_impl_vehicle",
         )
     addressed = conn.execute(
         "SELECT 1 FROM debate_message_recipients "
@@ -1287,11 +1355,20 @@ def post_message(
     body: str,
     reply_to: str | None = None,
     standing: bool | None = None,
+    vehicle: str | None = None,
 ) -> dict[str, Any]:
     """Append a message to a debate. Validates topic state, role membership,
     enums, and all kind-specific semantics BEFORE the INSERT (atomicity
     fix per CONDUCTOR msg:bf45a126). On any DebateError no row is
     persisted.
+
+    ``vehicle`` (v3.12) tags the kind of work the message implies:
+    ``analysis`` | ``review`` | ``implementation``. NULL/absent persists as
+    NULL and reads back as the default ``analysis`` (backcompat). An
+    explicit bad value raises a typed ``invalid_vehicle`` DebateError
+    pre-INSERT. The value gates the wake/pump router downstream (see
+    ``claim_worker_session`` + ``prepare_wake_dry_run``): ``implementation``
+    fails closed instead of dispatching a no-edit wake-worker.
 
     Side-effects (post-INSERT, only when validations pass):
       kind=STATE: triggers transition via VALID_TRANSITIONS + UPDATE debates.
@@ -1301,6 +1378,11 @@ def post_message(
     validate_role(role)
     validate_priority(priority)
     validate_kind(kind)
+    # v3.12: reject an explicit bad vehicle pre-INSERT (typed error). NULL/
+    # absent is allowed through and stored as NULL (reads back as default).
+    if vehicle is not None and vehicle != "":
+        validate_vehicle(vehicle)
+    vehicle_db = vehicle if (vehicle is not None and vehicle != "") else None
     if not isinstance(body, str) or not body.strip():
         # v3.9.3 (msg:76e96a96 P2.5): reject whitespace-only bodies in
         # addition to fully empty ones. A body that strips to empty
@@ -1467,8 +1549,8 @@ def post_message(
 
     conn.execute(
         "INSERT INTO debate_messages (msg_id, topic_id, role, ts, priority, "
-        "kind, standing, reply_to, body, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "kind, standing, vehicle, reply_to, body, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             msg_id,
             topic_id,
@@ -1477,6 +1559,7 @@ def post_message(
             priority,
             kind,
             standing_db,
+            vehicle_db,
             reply_to,
             body,
             ts,
@@ -1515,7 +1598,12 @@ def post_message(
             (topic_id, role, wm_id, wm_ts, ts),
         )
 
-    return {"msg_id": msg_id, "ts": ts, "topic_state": new_state}
+    return {
+        "msg_id": msg_id,
+        "ts": ts,
+        "topic_state": new_state,
+        "vehicle": vehicle_db if vehicle_db is not None else DEFAULT_VEHICLE,
+    }
 
 
 def get_watermark(
@@ -2880,6 +2968,7 @@ def debate_post_with_recipients(
     conductor_override_msg_id: str | None = None,
     reply_to: str | None = None,
     standing: bool | None = None,
+    vehicle: str | None = None,
 ) -> dict[str, Any]:
     """Atomic insert: debate_messages row + per-recipient
     debate_message_recipients rows.
@@ -2985,6 +3074,7 @@ def debate_post_with_recipients(
         body=body,
         reply_to=reply_to,
         standing=standing,
+        vehicle=vehicle,
     )
     msg_id = post_result["msg_id"]
     for recipient in deduped:
@@ -3007,6 +3097,11 @@ def debate_post_with_recipients(
         "recipient_count": len(deduped) + len(diagnostic_deduped),
         "diagnostic_recipient_count": len(diagnostic_deduped),
         "topic_state": post_result["topic_state"],
+        # v3.12: effective vehicle (default 'analysis' when untagged). Carried
+        # for observability only — the router reads the authoritative value
+        # from the DB row, never from this response (which is unauthenticated
+        # at the hook boundary).
+        "vehicle": post_result["vehicle"],
         "schema_version": DEBATE_POST_RESPONSE_SCHEMA_VERSION,
     }
 
@@ -3589,7 +3684,7 @@ def prepare_wake_dry_run(
 
     validate_msg_id(msg_id)
     msg = conn.execute(
-        "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+        "SELECT topic_id, vehicle FROM debate_messages WHERE msg_id = ?",
         (msg_id,),
     ).fetchone()
     if msg is None:
@@ -3604,6 +3699,31 @@ def prepare_wake_dry_run(
         return {"targets": [], "logs": [log], "suppressed": 0}
 
     topic_id = msg["topic_id"]
+    # ── FAIL-CLOSED VEHICLE ROUTER (v3.12, solution #5) — resolution seam ──
+    # Refuse to resolve any wake targets for an implementation-tagged trigger.
+    # This is the signal-only counterpart to the hard guard in
+    # claim_worker_session: it fails closed *before* dispatch, emits a typed
+    # audit row (debate_wake_log.result is unconstrained TEXT), and returns
+    # zero targets so neither the dry-run path nor the real-spawn hook can
+    # proceed to allocate a no-edit worker. The authoritative vehicle is read
+    # from the DB row here, never from the (unauthenticated) tool_response.
+    #
+    # CONDUCTOR-APPROVED IMPL-VEHICLE SEAM (#3): a future impl vehicle plugs
+    # in here by branching this refusal into an impl-target resolution path
+    # (return impl-worker targets instead of []). Until then implementation
+    # work is conductor-handled out-of-band via Agent sub-agents.
+    trigger_vehicle = normalize_vehicle(msg["vehicle"])
+    if trigger_vehicle not in WAKE_WORKER_VEHICLES:
+        log = _insert_wake_log(
+            conn,
+            trigger_msg_id=msg_id,
+            topic_id=topic_id,
+            recipient="",
+            action=action,
+            result="implementation_requires_impl_vehicle",
+            details={"vehicle": trigger_vehicle},
+        )
+        return {"targets": [], "logs": [log], "suppressed": 0}
     recipients = conn.execute(
         "SELECT recipient, recipient_mode FROM debate_message_recipients "
         "WHERE msg_id = ? ORDER BY recipient",

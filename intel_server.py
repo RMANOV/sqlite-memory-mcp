@@ -1297,6 +1297,7 @@ def debate_post(
     body: str,
     reply_to: str = "",
     standing: bool | None = None,
+    vehicle: str = "",
 ) -> str:
     """Append a message to a debate. Validates kind-specific semantics
     BEFORE the INSERT (atomic — failed validation leaves no row).
@@ -1308,6 +1309,11 @@ def debate_post(
         kind: Q | A | STATUS | DECISION | PING | WATERMARK | STATE | COMPACTION.
         body: non-empty.
         reply_to: optional msg_id in same topic.
+        vehicle: optional work classification — analysis | review |
+            implementation. Empty/absent → analysis (backcompat). Gates the
+            wake/pump router: implementation-tagged work fails closed instead
+            of dispatching a no-edit wake-worker (routed to a
+            conductor-approved impl vehicle out-of-band).
     """
     try:
         with _get_conn_immediate() as conn:
@@ -1315,7 +1321,7 @@ def debate_post(
                 conn,
                 topic_id=topic_id, role=role, priority=priority,
                 kind=kind, body=body, reply_to=reply_to or None,
-                standing=standing,
+                standing=standing, vehicle=vehicle or None,
             )
             return json.dumps(out)
     except _DebateError as exc:
@@ -1504,9 +1510,16 @@ def debate_post_with_recipients(
     conductor_override_msg_id: str = "",
     reply_to: str = "",
     standing: bool | None = None,
+    vehicle: str = "",
 ) -> str:
     """Post an addressed message: debate_messages + debate_message_recipients
     in a single atomic transaction.
+
+    vehicle: optional work classification — analysis | review |
+    implementation. Empty/absent → analysis (backcompat). implementation-
+    tagged messages FAIL CLOSED at the wake/pump router (no bounded no-edit
+    wake-worker is spawned); they are routed to a conductor-approved impl
+    vehicle out-of-band.
 
     addressed_to_csv: comma-separated list of recipients. Each entry must
     be either a declared role of the topic OR a session_id with an
@@ -1536,6 +1549,7 @@ def debate_post_with_recipients(
                 conductor_override_msg_id=conductor_override_msg_id or None,
                 reply_to=reply_to or None,
                 standing=standing,
+                vehicle=vehicle or None,
             )
             return json.dumps(out)
     except _DebateError as exc:
