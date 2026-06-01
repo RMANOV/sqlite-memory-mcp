@@ -24,6 +24,7 @@ sqlite-memory-collab = "collab_server:main"
 sqlite-memory-entity = "entity_server:main"
 sqlite-memory-intel = "intel_server:main"
 sqlite-memory-unified = "unified_server:main"
+sqlite-memory-n8n = "n8n_server:main"
 sqlite-memory-doctor = "install_doctor:main"
 sqlite-memory-debate-ops = "debate_ops:main"
 sqlite-memory-demo = "demo_flow:main"
@@ -53,6 +54,7 @@ py-modules = [
     "intelligence_v2",
     "lazy_enrichment",
     "memory_audit",
+    "n8n_server",
     "overdue_bump",
     "premium_contract",
     "premium_runtime",
