@@ -1,16 +1,22 @@
 # SQLite Memory MCP Server
 
-## Technical deep-dives
+## Governed cross-agent memory for coding agents
+
+Claude and Codex can share one provenance-rich knowledge graph with approval-aware promotion workflows.
+
+- **Hybrid retrieval** — BM25/FTS5 keyword search fused with optional semantic (sqlite-vec) results via Reciprocal Rank Fusion, so recall does not depend on exact keywords.
+- **Provenance + reviewable promotion** — memory mutations carry provenance, and candidate claims move to canonical facts through an approval-aware promotion gate (`human_confirmed`, plus policy-gated multi-evidence) instead of silent rewrites.
+- **Cross-agent MCP memory with bridge sync** — one local SQLite knowledge graph any MCP client can read and write, with bridge tools that sync shared entities across machines.
+
+[![CI](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml)
+
+It is a production-quality, local-first MCP memory stack: a single SQLite file under WAL concurrency (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system-tray task manager. The core 9 knowledge-graph tools are drop-in compatible with `@modelcontextprotocol/server-memory`; companion FastMCP micro-servers add more tools for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence/multi-agent workflows. A PyQt6 desktop app and standalone automation scripts ship alongside. See the [Tool Reference](#tool-reference) for the exact per-server tool counts.
+
+### Technical deep-dives
 
 - **Medium:** [The Amnesiac That Learned to Remember](https://medium.com/@r.manov/the-amnesiac-that-learned-to-remember-4fe4342db89d)
 - **Dev.to:** [The Amnesiac That Learned to Remember — Building a Brain for Claude Code](https://dev.to/ruslan_manov/the-amnesiac-that-learned-to-remember-building-a-brain-for-claude-code-1ok6)
 - **Dev.to:** [How a SQLite WAL Fix Grew into a 54-Tool MCP Memory Stack](https://dev.to/ruslan_manov/how-a-sqlite-wal-fix-grew-into-a-54-tool-mcp-memory-stack-4nkl)
-
-[![CI](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml)
-
-A production-quality SQLite-backed MCP Memory stack with WAL concurrent safety (10+ sessions), FTS5 BM25 search, session tracking, task management, bridge sync, collaboration workflows, and a native system tray task manager.
-
-Drop-in compatible with `@modelcontextprotocol/server-memory` for the core 9 knowledge-graph tools, with 48 additional tools split across companion FastMCP micro-servers for sessions, tasks, bridge sync, collaboration, entity linking, and intelligence workflows (57 OSS tools total). Includes a PyQt6 desktop app for visual task management and standalone automation scripts.
 
 ## Why SQLite?
 
@@ -38,8 +44,8 @@ SQLite hits the sweet spot:
 - **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
 - **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
-- **Premium runtime boundary** -- The OSS core can gate-load a separate private premium repo via signed entitlement checks, signed artifact manifests, signed control-plane policy, explicit owner approval, audit logging, cached revocation-aware policy fallback, and local revocation
-- **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with 47 more tools available from companion servers
+- **Provenance + approval-aware promotion** -- Mutations carry provenance; candidate claims promote to canonical facts through a review gate (`human_confirmed` / policy-gated multi-evidence). See [Advanced & operator topics](#advanced--operator-topics)
+- **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with many more tools available from companion servers (see [Tool Reference](#tool-reference) for exact per-server counts)
 - **Zero required dependencies beyond stdlib** -- Only `fastmcp` is required for MCP protocol; `sqlite3` is Python stdlib. Optional `orjson`, `sqlite-vec`, and `sentence-transformers` add speed and semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
 - **JSONL migration** -- Optionally import existing `memory.json` knowledge graphs on first run
@@ -72,270 +78,34 @@ governance: how agents remember, revise, sync, debate, and promote durable
 context without turning the memory store into an unreviewable pile of
 contradictions.
 
-## Premium / Enterprise Boundary
+## Advanced & operator topics
 
-This repository now includes the **public-core boundary** for a separate premium runtime.
+The features above are the core. The capabilities below are deliberately kept out of the hero because they matter to operators, not first-time users. Each links to its canonical document.
 
-What is in this OSS repo:
+### Intelligence v2 — claims, governance, and provenance
 
-- entitlement-aware premium loader (`premium_runtime.py`)
-- premium audit + revoke tables in the shared schema
-- public contract for a separate private premium repo (`premium_contract.py`)
-- premium entitlement schema (`docs/premium/entitlement.schema.json`)
-- signed artifact manifest schema (`docs/premium/artifact_manifest.schema.json`)
-- signed control-plane policy schema (`docs/premium/control_plane_policy.schema.json`)
-- a public-safe bootstrap template for the separate private repo (`templates/private_premium_repo/`)
-- operator wiring guide (env vars, canonical signing payload, rotation) in [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md)
+The `sqlite_intel` server turns raw memory into reviewable knowledge. It extracts candidate claims, queues clarifications, records human answers, and promotes claims to canonical facts through an approval-aware gate (`promote_candidate`: `human_confirmed` always allowed; `multi_evidence` is policy-gated; sensitive scopes require explicit human confirmation). Every mutation can carry a provenance link, and `audit_memory` / `replay_memory` make the history inspectable. Consolidation runs through `reflect_audit` (Phase 0.5) — deterministic SQL with no LLM cost per run. See [`docs/REFLECT_AUDIT_DEMO.md`](docs/REFLECT_AUDIT_DEMO.md).
 
-What is **not** in this OSS repo:
+### Debate / multi-agent protocol
 
-- private premium business logic
-- private connectors and ingestion code
-- customer entitlements
-- signing keys
-- proprietary ranking / governance rules
+For workflows that coordinate multiple agents (conductor, executor, devil's advocate) across sessions, the `sqlite_intel` debate tools provide a single per-topic channel with role-aware watermarks, claim/reclaim, and escalation. This is an advanced coordination layer, not required for memory use. See [`docs/DEBATE_PROTOCOL.md`](docs/DEBATE_PROTOCOL.md) and [`docs/ops/DEBATE_OPERATIONS.md`](docs/ops/DEBATE_OPERATIONS.md).
 
-### Anti-corporate-fork protection model
+### Premium / enterprise boundary
 
-This project is open source, so the OSS core can be forked. That is intentional.
-The protection model is not "hide the code" or pretend a permissive public repo
-cannot be copied.
+This OSS repo ships the **public-core airlock** for a separate, private premium runtime — not the premium business logic itself. The airlock is an entitlement-aware loader (`premium_runtime.py`), a public contract (`premium_contract.py`), signed entitlement / artifact-manifest / control-plane-policy schemas, premium audit + revoke tables, and a bootstrap template. Private extensions are **not loaded by default**: they mount only when a configured private entrypoint, a valid (optionally machine-bound, non-revoked) entitlement, satisfied signed-manifest and control-policy checks, and explicit local owner approval are all present.
 
-The protected asset is the **premium operating boundary**:
+What is **not** in this OSS repo: private premium logic, connectors, customer entitlements, signing keys, and proprietary ranking/governance rules. The protected asset is the signed, revocable, auditable operating boundary — not code obfuscation. A fork of the public tree gets the airlock but not the keys, entitlements, private runtime, control-plane authority, or operator approval chain.
 
-- the private runtime lives outside this repo
-- premium features require signed, revocable entitlements
-- entitlements are machine-bound by default via `machine_ids`
-- private runtime loading requires a signed artifact manifest over the entrypoint
-- a signed control-plane policy can allow or deny manifests, features,
-  protection phases, and entitlement versions
-- protected runtime loading requires explicit owner approval
-- every premium gate decision is written to `premium_gate_audit`
-- local revocations are honored before a premium feature runs
-- remote issuer/control documents must be fetched over HTTPS with redirects
-  refused, then signature-verified before use
+For the full operator wiring (env vars, canonical signing payload, rotation, verification), the feature-pack breakdown, the premium tray/search surface, and the release-confidence checklist, see:
 
-Why this exists:
+- [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md) — operator wiring and verification
+- [`docs/ops/RELEASE_CONFIDENCE.md`](docs/ops/RELEASE_CONFIDENCE.md) — `v3.7.2` release-quality checklist
+- [`premium_contract.py`](premium_contract.py) — public contract for the private repo
+- [`docs/premium/entitlement.schema.json`](docs/premium/entitlement.schema.json) — entitlement schema
+- [`docs/premium/private_extension_contract.md`](docs/premium/private_extension_contract.md) — private extension contract
+- [`templates/private_premium_repo/`](templates/private_premium_repo/) — public-safe bootstrap template
 
-- a customer should be able to run the OSS memory core without trusting opaque
-  premium code
-- a legitimate premium deployment should have a clear audit trail for why a
-  feature was allowed or denied
-- a copied public repo should not be enough to execute paid private modules
-- stale or leaked premium documents should be revocable and bounded to machines,
-  manifests, owners, and policy versions
-- commercial value should sit in signed authority, operational policy, private
-  runtime distribution, and customer-specific governance rather than in fragile
-  code obfuscation
-
-What this does **not** claim:
-
-- it does not stop anyone from forking the OSS core
-- it does not make Python code impossible to modify
-- it does not replace legal licensing, private-key custody, customer contracts,
-  or deployment discipline
-- it does not defend against a company building its own unrelated private fork
-  and its own signing infrastructure
-
-The practical goal is narrower and more useful: a corporate fork of the public
-tree alone cannot honestly claim to be running the premium runtime through the
-same audited, signed, machine-bound control surface. They can copy the airlock;
-they do not get the signed keys, customer entitlements, private runtime,
-control-plane policy, revocation authority, or operator approval chain.
-
-See [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md) for the
-operator wiring and verification procedure.
-
-For the `v3.7.2` release-quality checklist and reproducible confidence checks,
-see [`docs/ops/RELEASE_CONFIDENCE.md`](docs/ops/RELEASE_CONFIDENCE.md).
-
-**Premium-only capabilities** are for paid, explicitly entitled users only. They are expected to live in a separate private repo and be loaded through the gated runtime only. Typical premium-only modules include:
-
-- password-protected premium views and protected operator scopes for especially sensitive memory surfaces
-- ACL / RBAC
-- multi-mailbox ingestion
-- action snapshots and client history overlays on top of the note/task layer
-- canonical facts, provenance digests, and human-approved note promotion
-- partner digests and management summaries
-- advanced ranking / orchestration
-- query templates and task-signal extraction
-- governance / audit workflows beyond the OSS baseline
-- premium tray/search surfaces for entitled operators, including a parameterized `Custom Design` tab
-
-### Premium-only runtime behavior
-
-Private premium extensions are **not loaded by default**.
-
-The public runtime will only attempt to mount them when all of the following are true:
-
-- a private premium entrypoint is configured
-- a valid entitlement is provided
-- the private artifact can satisfy the signed manifest / compatibility checks when enabled
-- the signed control-plane policy allows the current manifest, entitlement, and protection phase when configured
-- local owner approval is present for protected premium features
-- the entitlement is not locally revoked
-
-Without a valid entitlement and local approval path, the premium runtime stays off and private extensions are not mounted.
-
-The host runtime can now source all three signed premium documents from a remote issuer/control service as well:
-
-- entitlement via `SQLITE_MEMORY_PREMIUM_ENTITLEMENT_URL`
-- artifact manifest via `SQLITE_MEMORY_PREMIUM_ARTIFACT_MANIFEST_URL`
-- control policy via `SQLITE_MEMORY_PREMIUM_POLICY_URL`
-- optional runtime fetch headers via `SQLITE_MEMORY_PREMIUM_REMOTE_HEADERS_JSON`
-
-### Premium feature packs
-
-The premium layer is not meant to be a vague "enterprise edition". It is structured as a set of **gated operational packs** that sit on top of the OSS memory core.
-
-Entitlements can now be **modular**:
-
-- choose `packs`
-- choose explicit `features`
-- combine both in one entitlement
-- rely on dependency expansion so high-level premium surfaces pull in the lower-level capabilities they need
-
-That means a customer can license one pack, one feature, or a hybrid bundle without forcing the whole private runtime scope on every deployment.
-
-Commercially, numeric pricing is intentionally **not published** in this OSS README.
-Serious paid prospects receive a scoped questionnaire first, then a customized offer
-that is valid for **7 working days**.
-
-#### 1. `access_governance`
-
-- `acl_rbac`
-- `governance_audit`
-
-This is the control plane for customers that need scoped trust, explainable decisions, and audit-safe premium workflows.
-
-#### 2. `communication_context`
-
-- `multi_mailbox_ingestion`
-- `cross_mailbox_context`
-
-This pack turns memory into governed communication context instead of passive storage. It is where shared inboxes, thread memory, and client-scoped cross-mailbox views become first-class premium surfaces.
-
-#### 3. `client_memory_twin`
-
-- `client_memory_twin`
-- `human_approved_notes`
-
-Dependency expansion also brings in `memory_action_snapshots`, `client_history_notes`, `canonical_facts`, and provenance-aware context. The result is a live client twin built from trusted facts, approved notes, action checkpoints, and surrounding communication state.
-
-#### 4. `briefing_suite`
-
-- `instant_briefing`
-- `team_digest`
-- `chief_of_staff_queries`
-
-This is the fastest-to-sell premium layer because it removes cold starts before calls, emails, or meetings. It combines ranking, query templates, partner/team digests, and scoped memory retrieval into concise operator briefings.
-
-#### 5. `commitment_radar`
-
-- `commitment_radar`
-- `silence_drift_detection`
-
-This pack is about not dropping the ball. It detects commitments, blockers, deadlines, stale threads, and drift before they become visible operational failures.
-
-#### 6. `decision_ledger`
-
-- `decision_ledger`
-- `provenance_pointers`
-
-This pack makes premium memory defensible. Important conclusions can be traced back to governance decisions, human-approved promotion, and source-linked provenance instead of vague AI summaries.
-
-#### 7. `custom_design_surface`
-
-- `custom_design_tab`
-
-This is the premium operator UI layer. It lets an entitled user shape a live working view over premium rows, grouping, risk, mailbox/client focus, and custom search/sort surfaces without flattening everything back into the OSS task model.
-
-#### 8. `protected_operator_surface`
-
-- `password_protected_views`
-
-This pack adds local password-gated premium views on top of the Custom Design surface for the highest-sensitivity operator slices, so a premium view can require an explicit per-session unlock before it renders its real rows.
-
-#### Feature-level premium surfaces
-
-On top of the pack structure, the private runtime now exposes concrete premium-only features for the most valuable operator workflows:
-
-- `password_protected_views` for especially sensitive client, governance, or operator-specific surfaces inside the premium tray
-- `instant_briefing` for fast pre-call or pre-mail context
-- `commitment_radar` for open commitments, deadlines, blockers, and stale follow-ups
-- `client_memory_twin` for a scoped memory profile per client
-- `decision_ledger` for governance plus provenance-backed review trails
-- `chief_of_staff_queries` for questions like `what depends on me`, `what is blocked`, `what changed recently`, and `who is risky`
-- `team_digest` for internal handoff and management-style summaries
-- `silence_drift_detection` for unanswered threads and slow-moving risk
-- `cross_mailbox_context` for unified client context across multiple inboxes
-
-#### High-control deployment surface
-
-The commercial design still assumes that the local machine may be untrusted.
-
-- explicit entitlements
-- signed artifact manifests over the private runtime entrypoint
-- signed control-plane policy with cached offline fallback
-- remote issuer delivery for entitlements / manifests / policy over URL + runtime headers when desired
-- local revocation
-- owner approval for protected runtime loading
-- host/runtime compatibility checks plus minimum protection phase enforcement
-- installation fingerprinting for audit correlation
-- password-protected premium views for the highest-sensitivity operator surfaces
-- separate private runtime packaging
-- optional extra service boundaries for the most sensitive premium logic
-
-The point is not obfuscation theater. The point is to keep premium execution gated, auditable, and operationally controllable.
-
-### Current premium runtime scope
-
-The current private premium runtime is no longer limited to the first three pack families. The active bootstrap contract now supports and mounts concrete packs for:
-
-- `acl_rbac`
-- `governance_audit`
-- `multi_mailbox_ingestion`
-- `memory_action_snapshots`
-- `client_history_notes`
-- `canonical_facts`
-- `provenance_pointers`
-- `partner_digest`
-- `team_digest`
-- `advanced_ranking`
-- `query_templates`
-- `human_approved_notes`
-- `task_signal_extraction`
-- `instant_briefing`
-- `commitment_radar`
-- `client_memory_twin`
-- `decision_ledger`
-- `chief_of_staff_queries`
-- `silence_drift_detection`
-- `cross_mailbox_context`
-- `custom_design_tab`
-- `password_protected_views`
-
-That runtime is intentionally separate from the OSS repo. The public repo ships the airlock, contract, tray loader hooks, schema hooks, and bootstrap template. The premium logic itself stays outside the OSS tree.
-
-### Current premium tray/search surface
-
-The current premium-facing UI surface is built around a gated `custom_design_tab` capability plus pack-aware entitlement selection.
-
-- it activates only when the premium runtime is entitled and the private runtime exposes the tray extension builder
-- premium rows can enter the same tray search index as OSS tasks and notes when the premium runtime is active
-- premium-specific grouping and sorting modes can be injected into the tray at runtime without changing the OSS data model
-- the `Custom Design` tab behaves like an operator-defined working view rather than a fixed canned tab
-- protected premium views can be configured with a locally stored password hash and unlocked per session inside the premium tray
-- tray loading now carries the resolved entitlement selection into the private runtime, so a customer can activate `packs`, explicit `features`, or both without changing the public host code
-
-This remains premium-only functionality. The OSS repo contains the loader path and safe UI hooks, not the private business logic itself.
-
-See:
-
-- [`premium_contract.py`](premium_contract.py)
-- [`docs/premium/entitlement.schema.json`](docs/premium/entitlement.schema.json)
-- [`docs/premium/private_extension_contract.md`](docs/premium/private_extension_contract.md)
-- [`templates/private_premium_repo/`](templates/private_premium_repo/)
+Pricing is intentionally not published here; serious prospects receive a scoped questionnaire, then a customized offer.
 
 ## Competitor Comparison
 
@@ -350,6 +120,11 @@ See:
 | Drop-in compatible | 9/9 tools | baseline | no | partial | no | no | no | partial | no |
 | Setup effort | pip install | npx | API key + pip | pip | npx | Docker + pip | Docker + pip | pip | Docker + Neo4j |
 | Dependencies | sqlite3 (stdlib) | Node.js | Cloud API | sqlite3 | Node.js | ChromaDB | Qdrant | sqlite3 | Neo4j |
+
+### Where this sits in the ecosystem
+
+- **Beads.** sqlite-memory-mcp can sit beside [Beads](https://github.com/steveyegge/beads). Beads is an issue/work-tracking layer for agents; sqlite-memory-mcp is a governed memory layer. There is no shipped Beads adapter — the `ready_context` tool offers a `ready`/`prime` work surface that is the cross-project/cross-machine analog of `bd ready` / `bd prime`, so the two can coexist in the same workflow.
+- **Codex Memories.** OpenAI's Codex has its own memory feature, and the "agent memory" category is gaining mindshare fast. sqlite-memory-mcp is not pitched as a 1:1 replacement; it targets a different point in the design space — a local-first, multi-agent, provenance-governed knowledge graph that any MCP client can share, rather than a single-agent built-in. The category risk is real, which is precisely why the governance and cross-agent surface matter.
 
 ## Convergent evolution: sqlite-memory-mcp vs GBrain
 
@@ -369,7 +144,7 @@ The two projects ship **different bets** for different deployments. Public git h
 | Cross-machine sync | git remote of the brain repo | bridge JSON + per-field LWW-Register CRDT (proven 2000+ tasks across 3 machines) |
 | Source of truth | Markdown (human-readable) | SQLite + JSON bridge exports (machine-portable) |
 | Air-gapped / regulated deployment | blocked by OpenAI embedding requirement | **fully supported** (no external network in hot path) |
-| Companion stack | GStack (Garry's Claude Code setup) | MCP-native, works with any MCP client (Claude Code, Codex, Cursor) |
+| Companion stack | GStack (Garry's Claude Code setup) | MCP-native, works with any MCP client (Claude Code, Codex) |
 
 Where each one wins:
 
@@ -422,7 +197,7 @@ pip install -e .
 # Add the core drop-in server
 claude mcp add --scope user sqlite_memory -- python /path/to/server.py
 
-# Add companion servers for the full 57-tool OSS stack
+# Add companion servers for the full OSS tool stack
 claude mcp add --scope user sqlite_tasks -- python /path/to/task_server.py
 claude mcp add --scope user sqlite_session -- python /path/to/session_server.py
 claude mcp add --scope user sqlite_bridge -- python /path/to/bridge_server.py
@@ -485,7 +260,7 @@ If you need a manual fallback, add these server/file pairs to your
 | `sqlite_collab` | `collab_server.py` | Collaborator and public-knowledge workflows |
 | `sqlite_entity` | `entity_server.py` | Task-entity linking and merge helpers |
 | `sqlite_intel` | `intel_server.py` | Context assessment and enrichment tools |
-| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full 57-tool OSS stack |
+| `sqlite_unified` | `unified_server.py` | Optional all-in-one server that mounts the full OSS tool stack |
 
 Each server should share the same environment values:
 
@@ -503,7 +278,7 @@ The `SQLITE_MEMORY_DB` environment variable controls where the database is store
 The system is intentionally split into micro-servers because Claude Code exposes only a limited number of tools per MCP server.
 
 - `server.py` exposes the 9 drop-in knowledge-graph tools.
-- `task_server.py`, `session_server.py`, `bridge_server.py`, `collab_server.py`, `entity_server.py`, and `intel_server.py` expose the remaining 41 tools.
+- `task_server.py`, `session_server.py`, `bridge_server.py`, `collab_server.py`, `entity_server.py`, and `intel_server.py` expose the remaining tools; see the [Tool Reference](#tool-reference) for the exact per-server breakdown.
 - All MCP servers, the Task Tray GUI, and the automation scripts share the same `memory.db`.
 - `db_utils.py` and `schema.py` are the shared source of truth for connections, migrations, and common helpers.
 - SQLite WAL mode handles concurrency across all of these processes.
@@ -592,17 +367,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 
 ## Tool Reference
 
-The 57 OSS tools are grouped by MCP server:
+Tools are exposed as `@mcp.tool()` endpoints grouped by MCP server. The counts below are the exact number of tools registered in each server file (reproduce with `grep -c '@mcp.tool(' <server>.py`):
 
 | MCP server | Tool count | Tools |
 |---|---:|---|
 | `sqlite_memory` | 9 | `create_entities`, `add_observations`, `create_relations`, `delete_entities`, `delete_observations`, `delete_relations`, `read_graph`, `search_nodes`, `open_nodes` |
 | `sqlite_session` | 5 | `session_save`, `session_recall`, `search_by_project`, `knowledge_health`, `resume_context` |
-| `sqlite_tasks` | 8 | `create_task_or_note`, `upsert_note_by_title_project`, `update_task`, `query_tasks`, `find_by_title`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority` |
+| `sqlite_tasks` | 9 | `create_task_or_note`, `upsert_note_by_title_project`, `update_task`, `query_tasks`, `find_by_title`, `task_digest`, `archive_done_tasks`, `bump_overdue_priority`, `ready_context` |
 | `sqlite_bridge` | 7 | `bridge_push`, `bridge_pull`, `bridge_status`, `bridge_doctor`, `assign_task`, `review_shared_tasks`, `process_recurring_tasks` |
 | `sqlite_collab` | 9 | `manage_collaborators`, `share_knowledge`, `review_shared_knowledge`, `request_publish`, `cancel_publish`, `search_public_knowledge`, `rate_public_knowledge`, `get_knowledge_ratings`, `update_verification` |
 | `sqlite_entity` | 7 | `link_task_entity`, `unlink_task_entity`, `get_task_links`, `get_entity_tasks`, `suggest_task_links`, `find_entity_overlaps`, `merge_entities` |
-| `sqlite_intel` | 12 | `assess_context`, `queue_clarification`, `record_human_answer`, `extract_candidate_claims`, `promote_candidate`, `build_context_pack`, `explain_impact`, `audit_memory`, `replay_memory`, `govern_fact`, `list_memory_issues`, `enrich_context` |
+| `sqlite_intel` | 46 | **14 intelligence / governance:** `assess_context`, `queue_clarification`, `record_human_answer`, `extract_candidate_claims`, `promote_candidate`, `build_context_pack`, `explain_impact`, `audit_memory`, `replay_memory`, `govern_fact`, `list_memory_issues`, `enrich_context`, `export_to_gbrain`, `import_from_gbrain`. **+ 32 reflect / debate** multi-agent coordination tools (`reflect_*`, `debate_*`) — see [Advanced & operator topics](#advanced--operator-topics) |
+
+**Total: 92 tools** across the seven micro-servers (9 + 5 + 9 + 7 + 9 + 7 + 46). The optional `sqlite_unified` all-in-one server mounts the same set rather than adding new tools.
 
 ## Bridge Sync (Cross-Machine)
 
