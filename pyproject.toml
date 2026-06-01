@@ -55,6 +55,7 @@ py-modules = [
     "lazy_enrichment",
     "memory_audit",
     "n8n_server",
+    "obsidian_publish",
     "overdue_bump",
     "premium_contract",
     "premium_runtime",
