@@ -722,6 +722,9 @@ CREATE TABLE IF NOT EXISTS debate_messages (
                         'WATERMARK', 'STATE', 'COMPACTION')),
     standing   INTEGER DEFAULT NULL
         CHECK (standing IS NULL OR standing IN (0, 1)),
+    vehicle    TEXT DEFAULT NULL
+        CHECK (vehicle IS NULL
+               OR vehicle IN ('analysis', 'review', 'implementation')),
     reply_to   TEXT REFERENCES debate_messages(msg_id) ON DELETE SET NULL,
     body       TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -1795,6 +1798,15 @@ _MIGRATIONS = [
         "ADD COLUMN standing INTEGER DEFAULT NULL "
         "CHECK (standing IS NULL OR standing IN (0, 1))",
         "debate_messages.standing column (v3.11)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('debate_messages') "
+        "WHERE name='vehicle'",
+        "ALTER TABLE debate_messages "
+        "ADD COLUMN vehicle TEXT DEFAULT NULL "
+        "CHECK (vehicle IS NULL "
+        "OR vehicle IN ('analysis', 'review', 'implementation'))",
+        "debate_messages.vehicle column (v3.12 — vehicle-tagging router)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' "

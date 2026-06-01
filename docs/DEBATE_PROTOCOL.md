@@ -81,6 +81,55 @@ low-value cases. This records the claim/cursor outcome without adding another
 `debate_messages` row, preserving zero-touch operation while keeping the log
 readable.
 
+## Vehicle routing (fail-closed)
+
+Every message carries an optional `vehicle` tag classifying the kind of work
+it implies. It exists because bounded, wake-spawned `-W<n>` workers run
+**no-edit** — they can analyze and review, but they cannot apply changes.
+Dispatching implementation work to such a worker silently bounces.
+
+| `vehicle`        | Meaning                                  | Wake/pump routing |
+|------------------|------------------------------------------|-------------------|
+| `analysis`       | investigation / read-only reasoning      | → bounded wake-worker |
+| `review`         | critique / verification of existing work | → bounded wake-worker |
+| `implementation` | code edits, patches, applied changes     | **refused — fail closed** |
+
+The rule:
+
+- **`analysis` / `review`** (and untagged → default `analysis`) resolve to a
+  bounded wake-worker exactly as before. No behavior change.
+- **`implementation`** **fails closed**. The router REFUSES to allocate a
+  no-edit wake-worker with the typed error
+  `implementation_requires_impl_vehicle`, instead of spawning a worker that
+  would bounce. Implementation-tagged work is handled out-of-band by the
+  `CONDUCTOR` via Agent sub-agents (a real, edit-capable vehicle).
+
+This is enforced at two points, both reading the authoritative `vehicle` from
+the persisted message row (never from an unauthenticated hook payload):
+
+1. **`claim_worker_session` (hard guard, deepest shared chokepoint).** The
+   wake hook (`debate_wake`), the pump hook (`debate_pump`), and the direct
+   `debate_worker_claim` MCP tool all funnel through here. An
+   `implementation` trigger raises `implementation_requires_impl_vehicle` and
+   **no `debate_worker_claims` row is written** — nothing is spawned.
+2. **`prepare_wake_dry_run` (signal-only resolution seam).** Returns zero wake
+   targets and writes a typed `debate_wake_log` audit row
+   (`result=implementation_requires_impl_vehicle`) before any dispatch.
+
+> **Why fail closed?** A guard that merely re-routed `implementation` to a
+> wake-worker that then no-action-bounces would just *rename the bounce*. The
+> refusal must block the spawn so the work surfaces for a vehicle that can act.
+
+### Conductor-approved impl-vehicle seam
+
+Both enforcement points carry a documented seam for a future
+implementation vehicle (claim-for-impl / a dedicated edit-capable IMPL-worker).
+When that lands, gate it at these two functions — e.g. accept an
+`implementation` claim only when an approved impl-vehicle token is present, or
+branch `prepare_wake_dry_run` to resolve impl-worker targets instead of `[]`.
+Until then, `implementation` is refused-to-wake and conductor-handled
+out-of-band.
+
 ## Open-Work Priority
 
 The debate runtime has two different priority layers:
@@ -226,7 +275,7 @@ example:
 {"priority_lane":"P1","priority_reason":"active trading risk blocks live use"}
 ```
 
-### `debate_post(topic_id, role, priority, kind, body, reply_to="")`
+### `debate_post(topic_id, role, priority, kind, body, reply_to="", standing=None, vehicle="")`
 
 Append-only message insert. **Pre-INSERT validation** of kind-specific
 semantics: STATE body must be a legal transition target, WATERMARK body
@@ -239,6 +288,13 @@ leaves no row in `debate_messages`.
 
 State side-effects (`debates.state`, `debate_watermarks` upsert) only
 run after the INSERT lands.
+
+`vehicle` (v3.12, optional) classifies the work the message implies —
+`analysis` | `review` | `implementation`. Empty/absent stores `NULL` and
+reads back as `analysis` (back-compat). An explicit bad value raises a typed
+`invalid_vehicle` `DebateError` pre-INSERT (no row written). `vehicle` gates
+the wake/pump router — see **Vehicle routing (fail-closed)** below.
+`debate_post_with_recipients(..., vehicle="")` accepts the same parameter.
 
 ### `debate_read(topic_id, role, since_msg_id="", since_ts="", since_latest_compaction=False, kind_filter_csv="", priority_filter_csv="", limit=200)`
 
