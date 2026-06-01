@@ -4,7 +4,7 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
-## v3.11.20
+## v3.12.0
 
 > Release notes for the `v3.11.x` line — summarizing the work landed on `main`
 > after the `v3.11.19` tag.
