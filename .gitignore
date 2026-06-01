@@ -15,3 +15,6 @@ docs/strategic/
 
 # Press/marketing drafts — never tracked (operator rule)
 docs/press/
+
+# newly-created article not operator-reviewed (untrack from public repo)
+docs/articles/2026-05-09-convergent-evolution-vs-gbrain.md
