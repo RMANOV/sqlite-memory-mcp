@@ -434,10 +434,8 @@ def is_archived_duplicate_redirect_task(task: Any) -> bool:
     text = "\n".join(
         str(_value(field) or "") for field in ("title", "description", "notes")
     ).upper()
-    has_duplicate_marker = "ARCHIVED DUPLICATE" in text or "DUPLICATE" in text
-    has_redirect_marker = (
-        "DO NOT USE" in text or "SUPERSEDED" in text or "CANONICAL" in text
-    )
+    has_duplicate_marker = "ARCHIVED DUPLICATE" in text
+    has_redirect_marker = "DO NOT USE" in text or "SUPERSEDED" in text
     return has_duplicate_marker and has_redirect_marker
 
 

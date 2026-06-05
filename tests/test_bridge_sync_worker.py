@@ -196,6 +196,113 @@ def test_auto_heal_sync_safety_preserves_archived_duplicate_redirect(tmp_path):
         conn.close()
 
 
+def test_archived_deduplication_prose_is_not_duplicate_redirect():
+    task = {
+        "title": "Lesson: deduplication strategy",
+        "status": "archived",
+        "description": "Use canonical entity merge to deduplicate old notes.",
+        "notes": None,
+    }
+
+    assert db_utils.is_archived_duplicate_redirect_task(task) is False
+
+
+def test_archived_non_redirect_notes_keep_bridge_shrink_protection(tmp_path):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = str(tmp_path / "bridge")
+    os.makedirs(os.path.join(bridge_dir, "tasks"), exist_ok=True)
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        now = db_utils.now_iso()
+        bridge_body = "# Archived lesson\n" + ("Preserved bridge evidence. " * 250)
+        local_body = (
+            "Lesson: deduplication strategy. Use canonical entity merge to deduplicate."
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, status, section, priority, type, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-archived-lesson",
+                "Lesson: deduplication strategy",
+                local_body,
+                "archived",
+                "someday",
+                "medium",
+                "note",
+                now,
+                now,
+            ),
+        )
+        with open(
+            os.path.join(bridge_dir, "tasks", "task-archived-lesson.json"),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                {
+                    "id": "task-archived-lesson",
+                    "title": "Lesson: deduplication strategy",
+                    "description": bridge_body,
+                    "notes": None,
+                    "updated_at": now,
+                },
+                fh,
+            )
+
+        repairs = _auto_heal_sync_safety(conn, bridge_dir)
+        row = conn.execute(
+            "SELECT description FROM tasks WHERE id = 'task-archived-lesson'"
+        ).fetchone()
+        assert repairs["tasks_touched"] == 1
+        assert repairs["restored_descriptions"] == 1
+        assert row["description"] == bridge_body
+
+        local_export_body = "Archived note without redirect markers."
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, status, section, priority, type, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-archived-export",
+                "Archived ordinary note",
+                local_export_body,
+                "archived",
+                "someday",
+                "medium",
+                "note",
+                now,
+                now,
+            ),
+        )
+        with open(
+            os.path.join(bridge_dir, "tasks", "task-archived-export.json"),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                {
+                    "id": "task-archived-export",
+                    "title": "Archived ordinary note",
+                    "description": bridge_body,
+                    "notes": None,
+                    "updated_at": now,
+                },
+                fh,
+            )
+
+        db_utils.export_task_files(conn, bridge_dir)
+        with open(
+            os.path.join(bridge_dir, "tasks", "task-archived-export.json"),
+            encoding="utf-8",
+        ) as fh:
+            exported_task = json.load(fh)
+        assert exported_task["description"] == bridge_body
+    finally:
+        conn.close()
+
+
 def _cp(args, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
 

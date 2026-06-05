@@ -4,6 +4,15 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.12.2
+
+### Fixed
+
+- **Bridge sync duplicate-redirect marker precision.** Archived duplicate
+  redirects now require the explicit `ARCHIVED DUPLICATE` marker plus `DO NOT
+  USE` or `SUPERSEDED`, preventing ordinary archived notes about
+  deduplication/canonicalization from bypassing bridge shrink guards.
+
 ## v3.12.1
 
 ### Fixed
