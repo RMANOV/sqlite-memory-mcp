@@ -68,6 +68,7 @@ def noninteractive_git_env() -> dict[str, str]:
         env["SSH_ASKPASS"] = askpass
     return env
 
+
 try:
     import orjson
 
@@ -414,6 +415,30 @@ def is_suspicious_content_shrink(
     if old_len < min_chars:
         return False
     return content_length(new_value) < (old_len * ratio)
+
+
+def is_archived_duplicate_redirect_task(task: Any) -> bool:
+    """True when an archived task intentionally redirects to a canonical item."""
+
+    def _value(field: str) -> Any:
+        if isinstance(task, dict):
+            return task.get(field)
+        try:
+            return task[field]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    if _value("status") != "archived":
+        return False
+
+    text = "\n".join(
+        str(_value(field) or "") for field in ("title", "description", "notes")
+    ).upper()
+    has_duplicate_marker = "ARCHIVED DUPLICATE" in text or "DUPLICATE" in text
+    has_redirect_marker = (
+        "DO NOT USE" in text or "SUPERSEDED" in text or "CANONICAL" in text
+    )
+    return has_duplicate_marker and has_redirect_marker
 
 
 def assert_enrichment_safe(fields: dict[str, Any] | set[str] | list[str]) -> None:
@@ -944,7 +969,9 @@ def _bridge_git_operation_blocker(repo_dir: str) -> str | None:
         "REVERT_HEAD",
     )
     active = [
-        marker for marker in sequence_markers if _bridge_git_path(repo_dir, marker).exists()
+        marker
+        for marker in sequence_markers
+        if _bridge_git_path(repo_dir, marker).exists()
     ]
     if active:
         return (
@@ -1008,7 +1035,9 @@ def _bridge_auto_abort_recover(repo_dir: str, markers: list[str]) -> dict:
                 }
             )
         except subprocess.TimeoutExpired:
-            attempts.append({"cmd": " ".join(cmd), "ok": False, "detail": "timeout(5s)"})
+            attempts.append(
+                {"cmd": " ".join(cmd), "ok": False, "detail": "timeout(5s)"}
+            )
     return {"markers_detected": list(markers), "aborts": attempts}
 
 
@@ -1053,7 +1082,9 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     if blocker:
         global _last_bridge_auto_abort
         abortable = [
-            m for m in _BRIDGE_AUTO_ABORTABLE_MARKERS if _bridge_git_path(repo_dir, m).exists()
+            m
+            for m in _BRIDGE_AUTO_ABORTABLE_MARKERS
+            if _bridge_git_path(repo_dir, m).exists()
         ]
         manual = [
             m for m in _BRIDGE_MANUAL_MARKERS if _bridge_git_path(repo_dir, m).exists()
@@ -2559,9 +2590,12 @@ class TaskDAO:
         # (tombstone_pushed_at IS NULL) are retained indefinitely so a deletion is
         # never destroyed before it provably reaches the bridge. 'cancelled' (user
         # soft-delete) is deliberately excluded.
-        hard_cutoff = hard_delete_before_iso or (
-            datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)
-        ).isoformat()
+        hard_cutoff = (
+            hard_delete_before_iso
+            or (
+                datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)
+            ).isoformat()
+        )
         conn.execute(
             "DELETE FROM tasks WHERE type = 'task' "
             "AND status = 'archived' "
@@ -3991,15 +4025,18 @@ def export_task_files(
         if task_path.exists():
             try:
                 existing = json_loads(task_path.read_text(encoding="utf-8"))
-                for content_field in CONTENT_FIELDS:
-                    local_content = task.get(content_field)
-                    existing_content = existing.get(content_field)
-                    if not has_meaningful_content(
-                        local_content
-                    ) and has_meaningful_content(existing_content):
-                        task[content_field] = existing_content
-                    elif is_suspicious_content_shrink(existing_content, local_content):
-                        task[content_field] = existing_content
+                if not is_archived_duplicate_redirect_task(task):
+                    for content_field in CONTENT_FIELDS:
+                        local_content = task.get(content_field)
+                        existing_content = existing.get(content_field)
+                        if not has_meaningful_content(
+                            local_content
+                        ) and has_meaningful_content(existing_content):
+                            task[content_field] = existing_content
+                        elif is_suspicious_content_shrink(
+                            existing_content, local_content
+                        ):
+                            task[content_field] = existing_content
             except (ValueError, OSError):
                 pass
 
@@ -4289,9 +4326,7 @@ def merge_import_tasks(
             remote_status_order,
             remote_status_event_id,
         ) = _parse_field_ts(remote_fts, "status", fallback_ts)
-        remote_status_explicit_value = _field_ts_explicit_value(
-            remote_fts, "status"
-        )
+        remote_status_explicit_value = _field_ts_explicit_value(remote_fts, "status")
         status_has_legacy_value_authority = (
             isinstance(remote_fts, dict)
             and "status" in remote_fts

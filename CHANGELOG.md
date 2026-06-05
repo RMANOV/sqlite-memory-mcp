@@ -4,6 +4,15 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.12.1
+
+### Fixed
+
+- **Bridge sync archived-duplicate redirect preservation.** The bridge safety
+  and export paths now recognize archived duplicate redirect tasks as
+  intentional canonical pointers, so content-aware shrink guards do not restore
+  stale full task bodies over a short `DO NOT USE` redirect stub.
+
 ## v3.12.0
 
 > Release notes for the `v3.11.x` line — summarizing the work landed on `main`
