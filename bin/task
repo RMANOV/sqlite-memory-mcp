@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-export TASK_DB="$HOME/.claude/memory/memory.db"
+export TASK_DB="${TASK_DB:-$HOME/.claude/memory/memory.db}"
 REFRESH="$HOME/.claude/memory/.task_refresh"
 export TASK_REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -146,6 +146,208 @@ else:
         typ = 'N' if r['type']=='note' else 'T'
         print(f'  {typ} [{r[\"priority\"][0].upper()}] {r[\"section\"]:>7} | {r[\"title\"]}{due}{proj}')
     print(f'  --- {len(rows)} item(s)')
+	"
+    ;;
+
+dash-set)
+    export DASH_TASK="${1:?Usage: task dash-set <id8> <kind> <slot> <text> [--priority H|M|L] [--src-msg-id MSG] [--writer-session SESSION]}"
+    export DASH_KIND="${2:?Usage: task dash-set <id8> <kind> <slot> <text> [--priority H|M|L] [--src-msg-id MSG] [--writer-session SESSION]}"
+    export DASH_SLOT="${3:?Usage: task dash-set <id8> <kind> <slot> <text> [--priority H|M|L] [--src-msg-id MSG] [--writer-session SESSION]}"
+    shift 3
+    export DASH_PRIORITY="M"
+    export DASH_SRC_MSG_ID=""
+    export DASH_WRITER_SESSION="${SQLITE_MEMORY_DASH_WRITER_SESSION:-${DEBATE_SESSION_ID:-${SQLITE_MEMORY_SESSION_ID:-${CODEX_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}}}"
+    body_parts=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --priority)       export DASH_PRIORITY="$2"; shift 2;;
+            --src-msg-id)     export DASH_SRC_MSG_ID="$2"; shift 2;;
+            --writer-session) export DASH_WRITER_SESSION="$2"; shift 2;;
+            *) body_parts+=("$1"); shift;;
+        esac
+    done
+    export DASH_BODY="${body_parts[*]}"
+    $PY -c "
+import os, sys
+sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
+from db_utils import dash_upsert, get_conn_immediate
+
+def resolve_task_id(conn, token):
+    token = str(token or '').strip()
+    rows = conn.execute(
+        'SELECT id FROM tasks WHERE id LIKE ? ORDER BY updated_at DESC',
+        (token + '%',),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]['id']
+    if len(rows) > 1:
+        raise SystemExit(f'Ambiguous task id prefix: {token}')
+    return token
+
+if not os.environ.get('DASH_BODY'):
+    raise SystemExit('Usage: task dash-set <id8> <kind> <slot> <text> [--priority H|M|L]')
+with get_conn_immediate(os.environ['TASK_DB']) as conn:
+    task_id = resolve_task_id(conn, os.environ['DASH_TASK'])
+    out = dash_upsert(
+        conn,
+        task_id=task_id,
+        kind=os.environ['DASH_KIND'],
+        slot=os.environ['DASH_SLOT'],
+        body=os.environ['DASH_BODY'],
+        priority=os.environ['DASH_PRIORITY'],
+        src_msg_id=os.environ['DASH_SRC_MSG_ID'] or None,
+        writer_session=os.environ.get('DASH_WRITER_SESSION') or None,
+    )
+print(f'dashboard set: {out[\"task_id\"][:8]} {out[\"kind\"]}/{out[\"slot\"]} evicted={out[\"evicted\"]}')
+"
+    touch "$REFRESH"
+    ;;
+
+dash-rm)
+    export DASH_TASK="${1:?Usage: task dash-rm <id8> <kind> <slot> [--writer-session SESSION]}"
+    export DASH_KIND="${2:?Usage: task dash-rm <id8> <kind> <slot> [--writer-session SESSION]}"
+    export DASH_SLOT="${3:?Usage: task dash-rm <id8> <kind> <slot> [--writer-session SESSION]}"
+    shift 3
+    export DASH_WRITER_SESSION="${SQLITE_MEMORY_DASH_WRITER_SESSION:-${DEBATE_SESSION_ID:-${SQLITE_MEMORY_SESSION_ID:-${CODEX_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}}}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --writer-session) export DASH_WRITER_SESSION="$2"; shift 2;;
+            *) echo "Unknown flag: $1"; exit 1;;
+        esac
+    done
+    $PY -c "
+import os, sys
+sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
+from db_utils import dash_retract, get_conn_immediate
+
+def resolve_task_id(conn, token):
+    token = str(token or '').strip()
+    rows = conn.execute(
+        'SELECT id FROM tasks WHERE id LIKE ? ORDER BY updated_at DESC',
+        (token + '%',),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]['id']
+    if len(rows) > 1:
+        raise SystemExit(f'Ambiguous task id prefix: {token}')
+    return token
+
+with get_conn_immediate(os.environ['TASK_DB']) as conn:
+    task_id = resolve_task_id(conn, os.environ['DASH_TASK'])
+    removed = dash_retract(
+        conn,
+        task_id=task_id,
+        kind=os.environ['DASH_KIND'],
+        slot=os.environ['DASH_SLOT'],
+        writer_session=os.environ.get('DASH_WRITER_SESSION') or None,
+    )
+print(f'dashboard removed: {removed}')
+"
+    touch "$REFRESH"
+    ;;
+
+dash)
+    export DASH_DAY=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --day) export DASH_DAY="$2"; shift 2;;
+            *) echo "Unknown flag: $1"; exit 1;;
+        esac
+    done
+    $PY -c "
+import os, sys
+sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
+from db_utils import get_daily_dashboard
+import sqlite3
+
+KIND_TAG = {
+    'decision': 'D',
+    'difficulty': '!',
+    'misunderstanding': '?',
+    'advice': 'A',
+    'option': 'O',
+    'result': 'R',
+}
+conn = sqlite3.connect(os.environ['TASK_DB'], isolation_level=None, timeout=10)
+conn.row_factory = sqlite3.Row
+rows = get_daily_dashboard(conn, day=os.environ['DASH_DAY'] or None)
+conn.close()
+if not rows:
+    print('No dashboard items for today.')
+    raise SystemExit(0)
+current = None
+other_open = False
+for row in rows:
+    is_today = row.get('task_section') == 'today'
+    if is_today:
+        key = row.get('task_id')
+        if key != current:
+            current = key
+            title = row.get('task_title') or str(key)[:8]
+            print(f'-- {title} --')
+    else:
+        if not other_open:
+            print('-- Other / debate work-items --')
+            other_open = True
+    tag = KIND_TAG.get(row.get('kind'), '-')
+    prefix = '' if is_today else f'{str(row.get(\"task_id\") or \"\")[:8]}: '
+    pri = ' (H)' if row.get('priority') == 'H' else ''
+    print(f'  [{tag}] {prefix}{row.get(\"body\")}{pri}')
+"
+    ;;
+
+fb)
+    export FB_TASK="${1:?Usage: task fb <id8> <text>}"
+    shift
+    export FB_TEXT="$*"
+    $PY -c "
+import os, sys
+sys.path.insert(0, os.environ['TASK_REPO_ROOT'])
+from db_utils import dash_topic_id, get_conn_immediate
+from debate import add_role_to_debate, debate_post_with_recipients
+
+def active_session(conn, topic_id, role):
+    row = conn.execute(
+        'SELECT session_id FROM debate_role_bindings '
+        'WHERE topic_id = ? AND role = ? AND state = \\'active\\' '
+        'ORDER BY generation DESC LIMIT 1',
+        (topic_id, role),
+    ).fetchone()
+    return row['session_id'] if row else ''
+
+def ensure_active_role(conn, topic_id, role, default_session):
+    existing = active_session(conn, topic_id, role)
+    if existing:
+        return existing
+    add_role_to_debate(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=default_session,
+        reason='bin.task.fb self-heal role binding',
+        bound_by_role='HUMAN' if role != 'HUMAN' else None,
+    )
+    return default_session
+
+if not os.environ.get('FB_TEXT'):
+    raise SystemExit('Usage: task fb <id8> <text>')
+topic_id = dash_topic_id()
+human_session = os.environ.get('SQLITE_MEMORY_DASH_HUMAN_SESSION') or 'human-rmanov'
+conductor_default = os.environ.get('SQLITE_MEMORY_DASH_CONDUCTOR_SESSION') or 'cc-conductor'
+with get_conn_immediate(os.environ['TASK_DB']) as conn:
+    ensure_active_role(conn, topic_id, 'HUMAN', human_session)
+    ensure_active_role(conn, topic_id, 'CONDUCTOR', conductor_default)
+    result = debate_post_with_recipients(
+        conn,
+        topic_id=topic_id,
+        role='HUMAN',
+        priority='H',
+        kind='Q',
+        body=f'Human feedback for {os.environ[\"FB_TASK\"]}: {os.environ[\"FB_TEXT\"]}',
+        addressed_to=['CONDUCTOR'],
+        vehicle='analysis',
+    )
+print(f'sent to conductor: {result[\"msg_id\"]}')
 "
     ;;
 
@@ -156,6 +358,10 @@ help|*)
     echo "  task note \"title\" [--content \"...\"] [--priority high] [--project X]"
     echo "  task done \"title\""
     echo "  task ls [--section today] [--status done] [--project X]"
+    echo "  task dash-set <id8> <kind> <slot> <text> [--priority H|M|L] [--src-msg-id MSG]"
+    echo "  task dash-rm <id8> <kind> <slot>"
+    echo "  task dash [--day YYYY-MM-DD]"
+    echo "  task fb <id8> <text>"
     echo ""
     echo "Recurring formats: {\"every\":\"day\"} | {\"every\":\"week\",\"day\":\"monday\"} | {\"every\":\"month\",\"day\":15}"
     ;;
