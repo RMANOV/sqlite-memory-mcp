@@ -48,13 +48,18 @@ from pathlib import Path
 from typing import Any
 
 from db_utils import (
+    MACHINE_ID,
     MERGEABLE_FIELDS,
     TASK_HIDDEN_STATUSES,
+    _HLC_PACKED_MIN,
     _field_version_sort_key,
+    _iso_to_epoch_ms,
+    _pack_logical_clock,
     _parse_field_ts,
     git_run,
     json_dumps,
     json_loads,
+    now_iso,
 )
 
 # git config section/name for the driver. Registered programmatically because
@@ -136,6 +141,60 @@ def _task_recency_key(task: dict[str, Any]) -> tuple:
     return _field_key(task, "status")
 
 
+def _packed_order_of(task: dict[str, Any], field: str) -> int:
+    """Return a PACKED logical clock representing ``field``'s current order.
+
+    Legacy (unpacked, ``< _HLC_PACKED_MIN``) orders are projected onto the
+    packed space using the field's ``updated_at`` so they can be compared and
+    out-ranked on the same axis. This mirrors the legacy/packed bridging in
+    ``db_utils._field_version_sort_key`` (legacy < any packed clock).
+    """
+    fts = task.get("_field_ts") or {}
+    fallback_ts = task.get("updated_at", "") or ""
+    updated_at, _by, updated_order, _ev = _parse_field_ts(fts, field, fallback_ts)
+    order = int(updated_order or 0)
+    if order >= _HLC_PACKED_MIN:
+        return order
+    return _pack_logical_clock(_iso_to_epoch_ms(updated_at), 0)
+
+
+def _dominating_status_clock(
+    ours: dict[str, Any], theirs: dict[str, Any]
+) -> tuple[str, str, int]:
+    """A status field-version that STRICTLY out-ranks BOTH inputs' status clocks.
+
+    This is the invariant fix: "tombstone wins regardless of timestamp" cannot be
+    encoded by copying either side's status clock — a copied clock merely *ties*
+    the losing peer's clock, so on the next ``merge_import_tasks`` round-trip the
+    tombstone fails to win (equal sort key) and the deletion resurrects. The
+    merged tombstone must out-rank both sides so every downstream peer absorbs it.
+
+    Returns (updated_at, updated_by, updated_order) with a packed order >
+    max(both sides) and an updated_at >= max(both sides, now).
+    """
+    now = now_iso()
+    max_packed = max(
+        _packed_order_of(ours, "status"),
+        _packed_order_of(theirs, "status"),
+        _pack_logical_clock(_iso_to_epoch_ms(now), 0),
+    )
+    # +1 on a packed clock increments the counter (carrying into physical_ms on
+    # overflow): strictly greater as an integer, so it dominates on the packed
+    # axis where _field_version_sort_key places all packed clocks above legacy.
+    dominating_order = max_packed + 1
+    o_at = (ours.get("_field_ts", {}).get("status") or {})
+    t_at = (theirs.get("_field_ts", {}).get("status") or {})
+    candidate_ats = [
+        now,
+        ours.get("updated_at", "") or "",
+        theirs.get("updated_at", "") or "",
+        o_at.get("updated_at", "") if isinstance(o_at, dict) else "",
+        t_at.get("updated_at", "") if isinstance(t_at, dict) else "",
+    ]
+    updated_at = max(a for a in candidate_ats if a) if any(candidate_ats) else now
+    return updated_at, MACHINE_ID, dominating_order
+
+
 # ── core reconcile ──────────────────────────────────────────────────────────
 
 
@@ -170,8 +229,21 @@ def reconcile_task_pair(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[st
         if base.get("status") not in TASK_HIDDEN_STATUSES:
             # Explicit-flag tombstone with stale active status: canonicalize.
             base["status"] = "archived"
-        # Union field-version metadata, keeping the newer entry per field.
-        base["_field_ts"] = _union_field_ts(ours, theirs)
+        # Union field-version metadata for non-status fields, then OVERWRITE the
+        # status field-version with a clock that STRICTLY out-ranks both inputs.
+        # Copying either side's status clock would only tie the losing peer and
+        # let the deletion resurrect on the next DB-layer merge round-trip; the
+        # tombstone must dominate so every peer absorbs it. (Invariant fix.)
+        merged_fts = _union_field_ts(ours, theirs)
+        dom_at, dom_by, dom_order = _dominating_status_clock(ours, theirs)
+        merged_fts["status"] = {
+            "updated_at": dom_at,
+            "updated_by": dom_by,
+            "updated_order": dom_order,
+            "value": base["status"],
+        }
+        base["_field_ts"] = merged_fts
+        base["updated_at"] = max(base.get("updated_at", "") or "", dom_at)
         return base
 
     # Neither side is a tombstone: per-field LWW.
@@ -356,14 +428,16 @@ def register_bridge_merge_driver(repo_dir: str) -> bool:
         driver_cmd,
         timeout=10,
     )
-    # recursive=binary: for the inner merge of a recursive (criss-cross) merge,
-    # treat these files as binary rather than text-merging them, so the driver
-    # stays the only thing that ever reconciles them.
+    # recursive=bridge-reconcile (self): for the inner merge of a recursive
+    # (criss-cross) merge that builds a virtual ancestor, reuse THIS driver
+    # rather than git's text/binary fallback — so a tombstone can never be
+    # dropped in the virtual-ancestor step. ``binary``/``text`` would let the
+    # ancestor merge resolve without tombstone-union.
     recursive_set = git_run(
         repo_dir,
         "config",
         f"{MERGE_DRIVER_KEY_PREFIX}.recursive",
-        "binary",
+        MERGE_DRIVER_NAME,
         timeout=10,
     )
     return all(

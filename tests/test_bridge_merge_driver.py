@@ -30,7 +30,17 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import bridge_merge_driver as bmd  # noqa: E402
-from db_utils import TASK_HIDDEN_STATUSES, json_dumps, json_loads  # noqa: E402
+from db_utils import (  # noqa: E402
+    TASK_HIDDEN_STATUSES,
+    _iso_to_epoch_ms,
+    _pack_logical_clock,
+    _store_task_field_version,
+    get_conn,
+    json_dumps,
+    json_loads,
+    merge_import_tasks,
+)
+from schema import init_db  # noqa: E402
 
 
 # ── fixtures / helpers ───────────────────────────────────────────────────────
@@ -418,3 +428,95 @@ def test_single_task_path_routing():
     assert bmd._is_single_task_path("tasks/abc-123.json") is True
     assert bmd._is_single_task_path("index.json") is False
     assert bmd._is_single_task_path("shared.json") is False
+
+
+# ── round-trip: driver output must be ABSORBED by the DB-layer merge ──────────
+#
+# The deepest invariant: the tombstone the driver emits must survive a feedback
+# loop through merge_import_tasks on the LOSING peer (the one still holding the
+# task active). A merged tombstone that merely *ties* the active side's status
+# clock fails to win on import (equal sort key) -> the deletion resurrects ->
+# two-peer ping-pong (the 2026-05-08 incident class). The driver therefore stamps
+# a status clock that STRICTLY out-ranks both inputs.
+
+
+@pytest.fixture()
+def task_db(tmp_path):
+    db_path = str(tmp_path / "tasks.db")
+    init_db(db_path)
+    return db_path
+
+
+def _seed_active(db_path, tid, status, updated_at, updated_order, updated_by="win"):
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,type,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (tid, "T", status, "task", "2026-06-01T00:00:00+00:00", updated_at),
+        )
+        _store_task_field_version(
+            conn, tid, "status",
+            updated_at=updated_at, updated_by=updated_by, updated_order=updated_order,
+        )
+
+
+def _db_status(db_path, tid):
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+    return row["status"] if row else None
+
+
+def test_roundtrip_legacy_active_tombstone_absorbed(task_db):
+    # Losing peer holds t1 active with a NEWER legacy status order than the
+    # tombstone. The driver-merged tombstone must still be absorbed (archived).
+    _seed_active(task_db, "t1", "in_progress", "2026-06-09T00:00:00+00:00", 9)
+    active = _task("t1", status="in_progress",
+                   status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9))
+    tomb = _task("t1", status="archived", tombstone=True,
+                 status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    merged = bmd.reconcile_task_pair(active, tomb)
+    with get_conn(task_db) as conn:
+        merge_import_tasks(conn, [merged], import_content=True)
+    assert _db_status(task_db, "t1") in TASK_HIDDEN_STATUSES, (
+        "RESURRECTION on round-trip: losing peer did not absorb the tombstone"
+    )
+
+
+def test_roundtrip_packed_future_active_tombstone_absorbed(task_db):
+    # Losing peer holds t1 active with a high PACKED (clock-skewed future) order.
+    high = _pack_logical_clock(_iso_to_epoch_ms("2030-01-01T00:00:00+00:00"), 50)
+    _seed_active(task_db, "t1", "in_progress", "2030-01-01T00:00:00+00:00", high)
+    active = _task("t1", status="in_progress",
+                   status_fts=_fts("2030-01-01T00:00:00+00:00", "win", high))
+    tomb = _task("t1", status="archived", tombstone=True,
+                 status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    merged = bmd.reconcile_task_pair(active, tomb)
+    with get_conn(task_db) as conn:
+        merge_import_tasks(conn, [merged], import_content=True)
+    assert _db_status(task_db, "t1") in TASK_HIDDEN_STATUSES, (
+        "RESURRECTION: packed-future active clock defeated the merged tombstone"
+    )
+
+
+def test_roundtrip_idempotent_reimport_stays_dead(task_db):
+    # Importing the SAME merged tombstone twice keeps the task dead (no churn).
+    _seed_active(task_db, "t1", "in_progress", "2026-06-09T00:00:00+00:00", 9)
+    active = _task("t1", status="in_progress",
+                   status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9))
+    tomb = _task("t1", status="archived", tombstone=True,
+                 status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    merged = bmd.reconcile_task_pair(active, tomb)
+    with get_conn(task_db) as conn:
+        merge_import_tasks(conn, [merged], import_content=True)
+        merge_import_tasks(conn, [bmd.reconcile_task_pair(active, tomb)], import_content=True)
+    assert _db_status(task_db, "t1") in TASK_HIDDEN_STATUSES
+
+
+def test_dominating_status_clock_strictly_outranks_inputs():
+    ours = _task("t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9))
+    theirs = _task("t1", status="archived", tombstone=True,
+                   status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    _at, _by, order = bmd._dominating_status_clock(ours, theirs)
+    # Must strictly exceed BOTH inputs on the packed sort axis.
+    assert order > bmd._packed_order_of(ours, "status")
+    assert order > bmd._packed_order_of(theirs, "status")
