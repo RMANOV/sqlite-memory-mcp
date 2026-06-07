@@ -1105,6 +1105,24 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
                 f"bridge repo is detached and could not checkout main: {detail}",
             )
 
+    # Install the tombstone-safe merge driver + .gitattributes (idempotent).
+    # This wires the second line of defense so any FUTURE external git pull/merge
+    # of a tombstone-bearing bridge file reconciles instead of resurrecting. It
+    # is best-effort: the DB-layer merge (merge_import_tasks) remains the
+    # authoritative tombstone-union, so a config write failure must not block
+    # sync. Skipped when the bridge repo isn't initialized (no .git dir).
+    if (Path(repo_dir) / ".git").exists():
+        try:
+            from bridge_merge_driver import ensure_bridge_merge_protection
+
+            protection = ensure_bridge_merge_protection(repo_dir)
+            if not protection.get("ok"):
+                log.warning(
+                    "bridge merge protection install incomplete: %s", protection
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("bridge merge protection install failed: %s", exc)
+
     symlink_issues = _bridge_generated_symlink_issues(repo_dir)
     if symlink_issues:
         shown = ", ".join(symlink_issues[:3])
@@ -1132,11 +1150,55 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
                 False,
                 f"resolve bridge conflicts in user-managed files first: {shown}",
             )
-        shown = ", ".join(conflict_paths[:3])
-        return False, f"resolve bridge conflicts in generated files first: {shown}"
+        # Generated-only unmerged state with no active sequence operation
+        # (the "stuck UU without MERGE_HEAD" class): safe to auto-heal — these
+        # files are rebuilt from the DB on the next export. We resolve the
+        # conflict (prefer theirs so an incoming tombstone survives until the
+        # DB-layer merge rewrites it) rather than blocking sync indefinitely.
+        try:
+            from bridge_merge_driver import auto_heal_unmerged_generated
+
+            heal = auto_heal_unmerged_generated(repo_dir)
+        except Exception as exc:  # pragma: no cover - defensive
+            heal = {"healed": [], "skipped": f"auto-heal error: {exc}"}
+        if heal.get("healed"):
+            log.info(
+                "Auto-healed stuck unmerged generated bridge artifacts: %s",
+                ", ".join(heal["healed"][:5]),
+            )
+            status = git_run(repo_dir, "status", "--porcelain")
+            if status.returncode != 0:
+                detail = (status.stderr or status.stdout).strip()
+                return False, f"cannot inspect bridge status: {detail or 'unknown git error'}"
+            lines = [ln for ln in status.stdout.splitlines() if ln.strip()]
+            still_conflicted = [ln for ln in lines if ln[:2] in _BRIDGE_CONFLICT_STATES]
+            if still_conflicted:
+                shown = ", ".join(_bridge_status_path(ln) for ln in still_conflicted[:3])
+                return False, f"resolve bridge conflicts in generated files first: {shown}"
+            if not lines:
+                return True, None
+        else:
+            shown = ", ".join(conflict_paths[:3])
+            return False, f"resolve bridge conflicts in generated files first: {shown}"
+
+    # A dirty path is allowed through readiness when it is a regenerable
+    # generated artifact OR the merge-driver's own managed .gitattributes seed.
+    # The latter is content-verified (must carry our managed block) and was just
+    # staged by ensure_bridge_merge_protection above; it rides the worker's next
+    # commit. Without this, first-time runtime seeding of .gitattributes (not a
+    # generated path) would block sync with "commit or stash bridge repo edits".
+    def _path_allowed_dirty(path: str) -> bool:
+        if is_generated_bridge_path(path):
+            return True
+        try:
+            from bridge_merge_driver import is_managed_gitattributes
+
+            return is_managed_gitattributes(repo_dir, path)
+        except Exception:  # pragma: no cover - defensive
+            return False
 
     dirty_paths = [_bridge_status_path(ln) for ln in lines]
-    unsafe = [p for p in dirty_paths if not is_generated_bridge_path(p)]
+    unsafe = [p for p in dirty_paths if not _path_allowed_dirty(p)]
     if unsafe:
         shown = ", ".join(unsafe[:3])
         return False, f"commit or stash bridge repo edits before sync: {shown}"
@@ -1173,7 +1235,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     remaining = [
         _bridge_status_path(ln) for ln in status.stdout.splitlines() if ln.strip()
     ]
-    unsafe = [p for p in remaining if not is_generated_bridge_path(p)]
+    unsafe = [p for p in remaining if not _path_allowed_dirty(p)]
     if unsafe:
         shown = ", ".join(unsafe[:3])
         return False, f"bridge repo still has user-managed edits after cleanup: {shown}"
