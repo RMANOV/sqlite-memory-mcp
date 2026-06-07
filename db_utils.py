@@ -1350,7 +1350,16 @@ def assert_dashboard_conductor_writer(
     day: str | None = None,
     allow_test_override: bool = False,
 ) -> None:
-    """Fail closed unless writer_session owns the active CONDUCTOR binding."""
+    """Fail closed unless writer_session owns the active CONDUCTOR binding.
+
+    NOTE (ADVOCATE 2026-06-07): this is a COOPERATIVE session-binding guard,
+    NOT an identity proof or security boundary. ``writer_session`` is a
+    caller-supplied string (via ``--writer-session`` / env), so anything that
+    knows the active CONDUCTOR session_id can pass it. The real protection is
+    deployment shape — executors have no CLI/MCP path to this writer — plus the
+    author='conductor'/updated_at audit stamp on every row. Do not rely on this
+    as an authentication mechanism.
+    """
     day = day or dash_today()
     if _dashboard_test_override(allow_test_override):
         return
