@@ -50,6 +50,7 @@ from db_utils import (
     load_remote_tasks_for_merge,
     content_length,
     has_meaningful_content,
+    is_archived_duplicate_redirect_task,
     is_suspicious_content_shrink,
     merge_import_tasks,
     migrate_to_per_task_files,
@@ -124,7 +125,10 @@ def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
             for cp in (local, remote, base)
             if cp.returncode != 0
         ).strip()
-        return False, f"bridge git graph inspection failed: {detail or 'unknown git error'}"
+        return (
+            False,
+            f"bridge git graph inspection failed: {detail or 'unknown git error'}",
+        )
 
     local_sha = local.stdout.strip()
     remote_sha = remote.stdout.strip()
@@ -141,7 +145,10 @@ def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
         )
         if merge.returncode != 0:
             detail = (merge.stderr or merge.stdout).strip()
-            return False, f"bridge git fast-forward failed: {detail or 'unknown git error'}"
+            return (
+                False,
+                f"bridge git fast-forward failed: {detail or 'unknown git error'}",
+            )
         return True, None
 
     return (
@@ -288,11 +295,14 @@ def _check_sync_safety(
             continue
 
         local = conn.execute(
-            "SELECT description, notes FROM tasks WHERE id = ?", (tid,)
+            "SELECT title, status, description, notes FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
 
         if not local:
             stats["tasks_removed"] += 1
+            continue
+
+        if is_archived_duplicate_redirect_task(local):
             continue
 
         bridge_desc = bridge_task.get("description")
@@ -375,6 +385,9 @@ def _auto_heal_sync_safety(conn: sqlite3.Connection, bridge_dir: str) -> dict:
             (tid,),
         ).fetchone()
         if not local:
+            continue
+
+        if is_archived_duplicate_redirect_task(local):
             continue
 
         changes = {}
