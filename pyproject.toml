@@ -35,6 +35,7 @@ memory-digest = "daily_digest:main"
 py-modules = [
     "advanced_context",
     "auto_archive",
+    "bridge_merge_driver",
     "bridge_server",
     "bridge_sync_worker",
     "claim_graph",
