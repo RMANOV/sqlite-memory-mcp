@@ -92,11 +92,14 @@ from db_utils import (
     add_task_attachment,
     apply_task_mutation,
     create_task_with_ledger,
+    ensure_dashboard_schema,
     get_conn,
+    get_daily_dashboard,
     is_overdue,
     normalize_project_filter_values,
     now_iso,
     priority_sort_key,
+    purge_old_dashboard_days,
     remove_task_attachment,
     resolve_task_attachment_path,
 )
@@ -193,6 +196,7 @@ class TaskDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=10000")
+        ensure_dashboard_schema(self._conn)
         self._repair_fts_if_needed()
 
         self._last_promote_time: float = 0.0
@@ -321,6 +325,14 @@ class TaskDB:
             tasks = self.get_all_active()
         overdue = sum(1 for t in tasks if is_overdue(t["due_date"]))
         return {"total": len(tasks), "overdue": overdue}
+
+    def get_dashboard(self):
+        """Return today's local dashboard projection."""
+        return get_daily_dashboard(self._conn)
+
+    def purge_old_dashboard(self):
+        """Drop dashboard rows older than today's local dashboard day."""
+        return purge_old_dashboard_days(self._conn)
 
     def get_tasks(self, section=None):
         """Return tasks excluding archived/cancelled, optionally filtered by section."""
@@ -935,12 +947,36 @@ class _TrayStatusProxy:
 
 
 # Per-tab sort/filter constants
-_FIXED_VIEW_TABS = frozenset({"projects"})
+_FIXED_VIEW_TABS = frozenset({"dashboard", "projects"})
 _DEFAULT_TAB_VIEW = {
     "sort": "ready",
     "active": {"priority": set(), "due": set(), "project": set()},
     "excluded": {"priority": set(), "due": set(), "project": set()},
     "params": {},
+}
+_DASHBOARD_KIND_ORDER = {
+    "decision": 0,
+    "difficulty": 1,
+    "misunderstanding": 2,
+    "advice": 3,
+    "option": 4,
+    "result": 5,
+}
+_DASHBOARD_KIND_TAG = {
+    "decision": "D",
+    "difficulty": "!",
+    "misunderstanding": "?",
+    "advice": "A",
+    "option": "O",
+    "result": "R",
+}
+_DASHBOARD_KIND_COLOR = {
+    "decision": "#ffd166",
+    "difficulty": "#ff8a80",
+    "misunderstanding": "#80cbc4",
+    "advice": "#a5d6a7",
+    "option": "#90caf9",
+    "result": "#c5cae9",
 }
 
 
@@ -1034,8 +1070,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     self._SORT_MODES = (*self._SORT_MODES, mode)
                     self._SORT_LABELS[mode] = label
 
-        # Tab order: Suggested, Today, Inbox, Next, Notes, All, Done
+        # Tab order: Dashboard, Suggested, Today, Inbox, Next, Notes, All, Done
         self._tab_keys = [
+            "dashboard",
             "suggested",
             "today",
             "inbox",
@@ -1048,6 +1085,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if self._premium_tray_extension:
             self._tab_keys.insert(1, self._premium_tray_extension.tab_key)
         self._tab_labels = {
+            "dashboard": "Dashboard",
             "suggested": "Suggested",
             "today": "Today",
             "inbox": "Inbox",
@@ -1103,11 +1141,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             pass
 
-        # Set working state from the initial tab
-        self._saved_active_tab = int(self._settings.value("active_tab", 0))
-        initial_key = self._tab_keys[
-            min(self._saved_active_tab, len(self._tab_keys) - 1)
-        ]
+        # Dashboard is the default launch tab. Persist the active tab by key for
+        # future compatibility, but force Dashboard on startup per operator spec.
+        legacy_idx = int(self._settings.value("active_tab", 0))
+        saved_key = self._settings.value("active_tab_key", "")
+        if not isinstance(saved_key, str) or saved_key not in self._tab_keys:
+            saved_key = self._tab_keys[min(legacy_idx, len(self._tab_keys) - 1)]
+        initial_key = "dashboard" if "dashboard" in self._tab_keys else saved_key
+        self._saved_active_tab = self._tab_keys.index(initial_key)
         if initial_key in self._tab_views:
             v = self._tab_views[initial_key]
             self._sort_mode = v["sort"]
@@ -1340,6 +1381,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
+        self.db.purge_old_dashboard()
 
     def _process_recurring(self):
         created = _run_recurring_maintenance(self.db.db_path)
@@ -1477,6 +1519,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             }
         self._settings.setValue("tab_views", json.dumps(serializable))
         self._settings.setValue("active_tab", self.tabs.currentIndex())
+        idx = self.tabs.currentIndex()
+        if 0 <= idx < len(self._tab_keys):
+            self._settings.setValue("active_tab_key", self._tab_keys[idx])
 
     def _font_down(self):
         if _td._font_size > 10:
@@ -1861,6 +1906,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # 2 DB queries instead of 4: derive suggested & notes in Python
         all_active = self.db.get_all_active()
         done = self.db.get_done_tasks()
+        dashboard_rows = self.db.get_dashboard()
         premium_rows = []
         premium_key = (
             self._premium_tray_extension.tab_key if self._premium_tray_extension else ""
@@ -1892,6 +1938,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         ]
 
         raw = {
+            "dashboard": dashboard_rows,
             "suggested": suggested,
             "today": [t for t in all_active if t.get("section") == "today"],
             "inbox": [t for t in all_active if t.get("section") == "inbox"],
@@ -1917,7 +1964,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._entity_results = []
 
         # Update tab visibility (suggested, notes, projects always visible)
-        always_visible = ("suggested", "today", "notes", "projects")
+        always_visible = ("dashboard", "suggested", "today", "notes", "projects")
         if premium_key:
             always_visible = (*always_visible, premium_key)
         for i, key in enumerate(self._tab_keys):
@@ -2011,6 +2058,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def _build_tab_rows(self, key):
         """Filter/sort a single tab on demand and cache only that result."""
         source = list(self._raw_cache.get(key, []))
+        if key == "dashboard":
+            self._tab_total_counts[key] = len(source)
+            self._filtered_cache[key] = source
+            return source
 
         if self._search_text:
             search_results = self._search_engine.search(
@@ -2048,6 +2099,113 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._filtered_cache[key] = rows
         return rows
 
+    @staticmethod
+    def _dashboard_sort_key(row):
+        return (
+            _DASHBOARD_KIND_ORDER.get(row.get("kind"), 99),
+            str(row.get("updated_at") or ""),
+            str(row.get("slot") or ""),
+        )
+
+    def _add_dashboard_header(self, lw, text):
+        header = QListWidgetItem(text)
+        header.setFlags(Qt.ItemFlag.NoItemFlags)
+        header.setBackground(QColor("#1d2b36"))
+        header.setForeground(QColor("#d9e2ec"))
+        font = header.font()
+        font.setBold(True)
+        header.setFont(font)
+        lw.addItem(header)
+
+    def _add_dashboard_row(self, lw, row):
+        kind = str(row.get("kind") or "")
+        tag = _DASHBOARD_KIND_TAG.get(kind, kind[:1].upper() or "-")
+        text = f"  [{tag}] {row.get('body') or ''}"
+        if row.get("priority") == "H":
+            text = f"{text}  (H)"
+        item = QListWidgetItem(text)
+        item.setData(
+            Qt.ItemDataRole.UserRole,
+            f"dashboard:{row.get('day')}:{row.get('task_id')}:{kind}:{row.get('slot')}",
+        )
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        item.setForeground(QColor(_DASHBOARD_KIND_COLOR.get(kind, "#cbd5e1")))
+        tooltip_bits = [
+            f"task_id={row.get('task_id')}",
+            f"kind={kind}",
+            f"slot={row.get('slot')}",
+        ]
+        if row.get("src_msg_id"):
+            tooltip_bits.append(f"src_msg_id={row.get('src_msg_id')}")
+        item.setToolTip(" | ".join(tooltip_bits))
+        lw.addItem(item)
+
+    def _load_dashboard_tab(self, lw, rows):
+        fp = tuple(
+            (
+                r.get("day"),
+                r.get("task_id"),
+                r.get("kind"),
+                r.get("slot"),
+                r.get("body"),
+                r.get("priority"),
+                r.get("updated_at"),
+                r.get("task_title"),
+                r.get("task_section"),
+            )
+            for r in rows
+        )
+        if fp == lw._last_fp:
+            return
+        lw._last_fp = fp
+        lw._tasks = []
+        lw.blockSignals(True)
+        try:
+            lw.clear()
+            today_groups: dict[str, list[dict]] = {}
+            today_titles: dict[str, str] = {}
+            other_rows: list[dict] = []
+            for row in rows:
+                if row.get("task_section") == "today":
+                    task_id = str(row.get("task_id") or "")
+                    today_groups.setdefault(task_id, []).append(row)
+                    title = row.get("task_title") or task_id[:8]
+                    today_titles[task_id] = str(title)
+                else:
+                    other_rows.append(row)
+
+            if not rows:
+                footer = QListWidgetItem("No dashboard items for today.")
+                footer.setFlags(Qt.ItemFlag.NoItemFlags)
+                footer.setForeground(QColor("#888"))
+                lw.addItem(footer)
+                return
+
+            for task_id, task_rows in today_groups.items():
+                title = today_titles.get(task_id) or task_id[:8]
+                self._add_dashboard_header(lw, f"-- {title} ({len(task_rows)}) --")
+                for row in sorted(task_rows, key=self._dashboard_sort_key):
+                    self._add_dashboard_row(lw, row)
+
+            if other_rows:
+                self._add_dashboard_header(
+                    lw, f"-- Other / debate work-items ({len(other_rows)}) --"
+                )
+                for row in sorted(
+                    other_rows,
+                    key=lambda r: (
+                        str(r.get("task_title") or r.get("task_id") or ""),
+                        *self._dashboard_sort_key(r),
+                    ),
+                ):
+                    if not row.get("task_title"):
+                        label = str(row.get("task_id") or "")[:8]
+                        row = dict(row)
+                        row["body"] = f"{label}: {row.get('body') or ''}"
+                    self._add_dashboard_row(lw, row)
+        finally:
+            lw.blockSignals(False)
+
     def _load_tab(self, key):
         """Render a single tab from cached data. Caps All/Done at 200 items."""
         tasks = self._filtered_cache.get(key)
@@ -2064,7 +2222,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         )
 
         lw = self.tab_lists[key]
-        if key == "suggested":
+        if key == "dashboard":
+            self._load_dashboard_tab(lw, tasks)
+        elif key == "suggested":
             lw.load_smart_grouped(tasks, entities=entities)
         elif (
             self._premium_tray_extension and key == self._premium_tray_extension.tab_key
@@ -2341,6 +2501,7 @@ class TaskTrayApp(BridgeSyncMixin):
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
+        self.db.purge_old_dashboard()
 
     def _process_recurring(self):
         created = _run_recurring_maintenance(self.db.db_path)

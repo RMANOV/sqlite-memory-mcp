@@ -115,6 +115,44 @@ TASK_TYPES = ("task", "note")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
 TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
 
+DASHBOARD_KINDS = (
+    "result",
+    "option",
+    "decision",
+    "difficulty",
+    "misunderstanding",
+    "advice",
+)
+DASHBOARD_PRIORITIES = ("H", "M", "L")
+DASHBOARD_KIND_CAP = 8
+DASHBOARD_TASK_CAP = 40
+
+_DASHBOARD_KIND_ALIASES = {
+    "r": "result",
+    "result": "result",
+    "o": "option",
+    "option": "option",
+    "d": "decision",
+    "decision": "decision",
+    "!": "difficulty",
+    "difficulty": "difficulty",
+    "?": "misunderstanding",
+    "misunderstanding": "misunderstanding",
+    "a": "advice",
+    "advice": "advice",
+}
+_DASHBOARD_PRIORITY_ALIASES = {
+    "h": "H",
+    "high": "H",
+    "critical": "H",
+    "m": "M",
+    "medium": "M",
+    "l": "L",
+    "low": "L",
+}
+_DASHBOARD_TOPIC_RE = re.compile(r"^DAILY_(\d{8})$")
+_DASHBOARD_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 # v5: Extended memory keys — written to separate files during bridge export
 EXTENDED_MEMORY_KEYS = (
     "context_chunks",
@@ -1306,6 +1344,329 @@ def _sqlite_has_column(
     # row_factory=sqlite3.Row set or returns plain tuples (bin/task opens a
     # raw connection without row_factory).
     return any(r[1] == column_name for r in rows)
+
+
+def normalize_dashboard_kind(kind: str) -> str:
+    """Normalize dashboard kind aliases to the canonical six-kind enum."""
+    normalized = _DASHBOARD_KIND_ALIASES.get(str(kind or "").strip().lower())
+    if normalized is None:
+        raise ValueError(
+            "dashboard kind must be one of: " + ", ".join(DASHBOARD_KINDS)
+        )
+    return normalized
+
+
+def normalize_dashboard_priority(priority: str | None) -> str:
+    """Normalize H/M/L dashboard priority aliases."""
+    raw = str(priority or "M").strip()
+    normalized = _DASHBOARD_PRIORITY_ALIASES.get(raw.lower())
+    if normalized is None and raw.upper() in DASHBOARD_PRIORITIES:
+        normalized = raw.upper()
+    if normalized is None:
+        raise ValueError("dashboard priority must be H, M, or L")
+    return normalized
+
+
+def dash_topic_id(day: str | None = None) -> str:
+    """Return the DAILY_YYYYMMDD topic id for a dashboard day."""
+    day = day or dash_today()
+    if not _DASHBOARD_DAY_RE.fullmatch(day):
+        raise ValueError(f"dashboard day must be YYYY-MM-DD, got {day!r}")
+    return "DAILY_" + day.replace("-", "")
+
+
+def dash_today(topic_id: str | None = None) -> str:
+    """Return local dashboard day and validate it against DAILY_YYYYMMDD.
+
+    If ``topic_id`` or ``SQLITE_MEMORY_DASH_TOPIC_ID`` is supplied, it must match
+    today's local date. This keeps UTC/local rollover drift visible instead of
+    silently writing under the wrong daily topic.
+    """
+    day = date.today().isoformat()
+    candidate = topic_id or os.environ.get("SQLITE_MEMORY_DASH_TOPIC_ID") or ""
+    if candidate:
+        m = _DASHBOARD_TOPIC_RE.fullmatch(candidate)
+        if not m:
+            raise ValueError(f"dashboard topic must match DAILY_YYYYMMDD: {candidate!r}")
+        topic_day = f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:8]}"
+        if topic_day != day:
+            raise ValueError(
+                f"dashboard topic/day mismatch: topic={candidate} local_day={day}"
+            )
+    return day
+
+
+def ensure_dashboard_schema(conn: sqlite3.Connection) -> None:
+    """Create the machine-local daily dashboard projection table if needed."""
+    kind_check = ", ".join(f"'{k}'" for k in DASHBOARD_KINDS)
+    priority_check = ", ".join(f"'{p}'" for p in DASHBOARD_PRIORITIES)
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS daily_dashboard (
+            day        TEXT NOT NULL,
+            task_id    TEXT NOT NULL,
+            kind       TEXT NOT NULL CHECK(kind IN ({kind_check})),
+            slot       TEXT NOT NULL CHECK(length(trim(slot)) > 0),
+            body       TEXT NOT NULL CHECK(length(body) <= 240),
+            priority   TEXT NOT NULL DEFAULT 'M' CHECK(priority IN ({priority_check})),
+            src_msg_id TEXT DEFAULT NULL,
+            author     TEXT NOT NULL DEFAULT 'conductor',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(day, task_id, kind, slot)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_dashboard_day_task "
+        "ON daily_dashboard(day, task_id, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_dashboard_day_kind "
+        "ON daily_dashboard(day, kind, updated_at DESC)"
+    )
+
+
+def _dashboard_test_override(allow_test_override: bool = False) -> bool:
+    return allow_test_override or os.environ.get("SQLITE_MEMORY_DASH_TEST_OVERRIDE") in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def assert_dashboard_conductor_writer(
+    conn: sqlite3.Connection,
+    *,
+    writer_session: str | None,
+    day: str | None = None,
+    allow_test_override: bool = False,
+) -> None:
+    """Fail closed unless writer_session owns the active CONDUCTOR binding.
+
+    NOTE (ADVOCATE 2026-06-07): this is a COOPERATIVE session-binding guard,
+    NOT an identity proof or security boundary. ``writer_session`` is a
+    caller-supplied string (via ``--writer-session`` / env), so anything that
+    knows the active CONDUCTOR session_id can pass it. The real protection is
+    deployment shape — executors have no CLI/MCP path to this writer — plus the
+    author='conductor'/updated_at audit stamp on every row. Do not rely on this
+    as an authentication mechanism.
+    """
+    day = day or dash_today()
+    if _dashboard_test_override(allow_test_override):
+        return
+    topic_id = dash_topic_id(day)
+    writer = str(writer_session or "").strip()
+    if not writer:
+        raise PermissionError(
+            "dashboard write denied: writer_session required for hard CONDUCTOR guard"
+        )
+    row = conn.execute(
+        "SELECT session_id FROM debate_role_bindings "
+        "WHERE topic_id = ? AND role = 'CONDUCTOR' AND state = 'active' "
+        "ORDER BY generation DESC LIMIT 1",
+        (topic_id,),
+    ).fetchone()
+    if row is None:
+        raise PermissionError(
+            f"dashboard write denied: no active CONDUCTOR binding for {topic_id}"
+        )
+    active = row["session_id"] if isinstance(row, sqlite3.Row) else row[0]
+    if active != writer:
+        raise PermissionError(
+            "dashboard write denied: writer_session is not active CONDUCTOR "
+            f"for {topic_id}"
+        )
+
+
+def _priority_rank_sql() -> str:
+    return "CASE priority WHEN 'L' THEN 0 WHEN 'M' THEN 1 WHEN 'H' THEN 2 ELSE 0 END"
+
+
+def _prune_dashboard_rows(
+    conn: sqlite3.Connection,
+    *,
+    day: str,
+    task_id: str,
+    kind: str | None = None,
+    cap: int,
+) -> int:
+    where = "day = ? AND task_id = ?"
+    params: list[Any] = [day, task_id]
+    if kind is not None:
+        where += " AND kind = ?"
+        params.append(kind)
+    rows = conn.execute(
+        "SELECT day, task_id, kind, slot FROM daily_dashboard "
+        f"WHERE {where} "
+        "ORDER BY updated_at DESC, "
+        f"{_priority_rank_sql()} DESC, slot ASC",
+        params,
+    ).fetchall()
+    stale = rows[cap:]
+    for row in stale:
+        conn.execute(
+            "DELETE FROM daily_dashboard "
+            "WHERE day = ? AND task_id = ? AND kind = ? AND slot = ?",
+            (row["day"], row["task_id"], row["kind"], row["slot"]),
+        )
+    return len(stale)
+
+
+def _enforce_dashboard_caps(
+    conn: sqlite3.Connection, *, day: str, task_id: str, kind: str
+) -> int:
+    removed = _prune_dashboard_rows(
+        conn,
+        day=day,
+        task_id=task_id,
+        kind=kind,
+        cap=DASHBOARD_KIND_CAP,
+    )
+    removed += _prune_dashboard_rows(
+        conn,
+        day=day,
+        task_id=task_id,
+        cap=DASHBOARD_TASK_CAP,
+    )
+    return removed
+
+
+def dash_upsert(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    kind: str,
+    slot: str,
+    body: str,
+    priority: str | None = "M",
+    src_msg_id: str | None = None,
+    writer_session: str | None = None,
+    day: str | None = None,
+    updated_at: str | None = None,
+    allow_test_override: bool = False,
+) -> dict[str, Any]:
+    """Upsert one daily dashboard item after the hard CONDUCTOR write guard."""
+    ensure_dashboard_schema(conn)
+    day = day or dash_today()
+    if not _DASHBOARD_DAY_RE.fullmatch(day):
+        raise ValueError(f"dashboard day must be YYYY-MM-DD, got {day!r}")
+    assert_dashboard_conductor_writer(
+        conn,
+        writer_session=writer_session,
+        day=day,
+        allow_test_override=allow_test_override,
+    )
+    task_id = str(task_id or "").strip()
+    slot = str(slot or "").strip()
+    body = str(body or "").strip()
+    kind = normalize_dashboard_kind(kind)
+    priority = normalize_dashboard_priority(priority)
+    if not task_id:
+        raise ValueError("dashboard task_id required")
+    if not slot:
+        raise ValueError("dashboard slot required")
+    if not body:
+        raise ValueError("dashboard body required")
+    if len(body) > 240:
+        raise ValueError("dashboard body must be <= 240 characters")
+    ts = updated_at or now_iso()
+    conn.execute(
+        "INSERT INTO daily_dashboard "
+        "(day, task_id, kind, slot, body, priority, src_msg_id, author, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'conductor', ?) "
+        "ON CONFLICT(day, task_id, kind, slot) DO UPDATE SET "
+        "body = excluded.body, priority = excluded.priority, "
+        "src_msg_id = excluded.src_msg_id, author = 'conductor', "
+        "updated_at = excluded.updated_at",
+        (day, task_id, kind, slot, body, priority, src_msg_id, ts),
+    )
+    evicted = _enforce_dashboard_caps(conn, day=day, task_id=task_id, kind=kind)
+    return {
+        "day": day,
+        "task_id": task_id,
+        "kind": kind,
+        "slot": slot,
+        "priority": priority,
+        "updated_at": ts,
+        "evicted": evicted,
+    }
+
+
+def dash_retract(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    kind: str,
+    slot: str,
+    writer_session: str | None = None,
+    day: str | None = None,
+    allow_test_override: bool = False,
+) -> int:
+    """Remove one daily dashboard item after the hard CONDUCTOR write guard."""
+    ensure_dashboard_schema(conn)
+    day = day or dash_today()
+    if not _DASHBOARD_DAY_RE.fullmatch(day):
+        raise ValueError(f"dashboard day must be YYYY-MM-DD, got {day!r}")
+    assert_dashboard_conductor_writer(
+        conn,
+        writer_session=writer_session,
+        day=day,
+        allow_test_override=allow_test_override,
+    )
+    kind = normalize_dashboard_kind(kind)
+    task_id = str(task_id or "").strip()
+    slot = str(slot or "").strip()
+    if not task_id or not slot:
+        raise ValueError("dashboard task_id and slot required")
+    cur = conn.execute(
+        "DELETE FROM daily_dashboard "
+        "WHERE day = ? AND task_id = ? AND kind = ? AND slot = ?",
+        (day, task_id, kind, slot),
+    )
+    return cur.rowcount or 0
+
+
+def get_daily_dashboard(
+    conn: sqlite3.Connection,
+    *,
+    day: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return one local-day dashboard projection; does not create schema."""
+    day = day or dash_today()
+    if not _DASHBOARD_DAY_RE.fullmatch(day):
+        raise ValueError(f"dashboard day must be YYYY-MM-DD, got {day!r}")
+    if not _sqlite_table_exists(conn, "daily_dashboard"):
+        return []
+    rows = conn.execute(
+        "SELECT d.day, d.task_id, d.kind, d.slot, d.body, d.priority, "
+        "d.src_msg_id, d.author, d.updated_at, "
+        "t.title AS task_title, t.section AS task_section, "
+        "t.status AS task_status, t.project AS task_project "
+        "FROM daily_dashboard d "
+        "LEFT JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.day = ? "
+        "ORDER BY CASE WHEN t.section = 'today' THEN 0 ELSE 1 END, "
+        "LOWER(COALESCE(t.title, d.task_id)), "
+        "CASE d.kind WHEN 'decision' THEN 0 WHEN 'difficulty' THEN 1 "
+        "WHEN 'misunderstanding' THEN 2 WHEN 'advice' THEN 3 "
+        "WHEN 'option' THEN 4 WHEN 'result' THEN 5 ELSE 9 END, "
+        "d.updated_at DESC, d.slot ASC",
+        (day,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def purge_old_dashboard_days(
+    conn: sqlite3.Connection,
+    *,
+    today: str | None = None,
+) -> int:
+    """Delete dashboard rows older than today's local day."""
+    if not _sqlite_table_exists(conn, "daily_dashboard"):
+        return 0
+    today = today or dash_today()
+    cur = conn.execute("DELETE FROM daily_dashboard WHERE day < ?", (today,))
+    return cur.rowcount or 0
 
 
 def _new_event_id() -> str:
