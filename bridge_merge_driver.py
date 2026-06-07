@@ -455,6 +455,29 @@ def _render_managed_block() -> str:
     )
 
 
+def is_managed_gitattributes(repo_dir: str, rel_path: str) -> bool:
+    """True only for a ``.gitattributes`` that carries OUR managed block.
+
+    Content-verified and intentionally narrow: this lets the bridge readiness
+    gate allow the merge-driver's own ``.gitattributes`` seed through (so
+    first-time runtime install does not block sync), WITHOUT broadening the dirty
+    gate for arbitrary files. Any other path, or a ``.gitattributes`` lacking the
+    managed header/footer, returns False.
+    """
+    rel = (rel_path or "").replace("\\", "/").strip("/")
+    if rel != ".gitattributes":
+        return False
+    path = Path(repo_dir) / ".gitattributes"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return (
+        _GITATTRIBUTES_MANAGED_BLOCK_HEADER in text
+        and _GITATTRIBUTES_MANAGED_BLOCK_FOOTER in text
+    )
+
+
 def ensure_gitattributes(repo_dir: str) -> bool:
     """Write/refresh the managed .gitattributes block in the bridge repo.
 
@@ -512,13 +535,15 @@ def ensure_bridge_merge_protection(repo_dir: str) -> dict[str, Any]:
     staged = False
     if attrs_ok and (Path(repo_dir) / ".git").exists():
         # Stage .gitattributes so the next bridge commit propagates the managed
-        # block to peers (it is not in BRIDGE_GIT_STAGE_PATHS). Best-effort; the
-        # worker commits everything staged. Only stages when content changed.
-        diff = git_run(repo_dir, "diff", "--quiet", "--", ".gitattributes", timeout=10)
-        cached = git_run(
-            repo_dir, "diff", "--cached", "--quiet", "--", ".gitattributes", timeout=10
-        )
-        if diff.returncode != 0 or cached.returncode != 0:
+        # block to peers (it is not in BRIDGE_GIT_STAGE_PATHS). We do NOT commit
+        # here: committing inside the readiness preflight (which runs before the
+        # fast-forward step) would turn a normally fast-forwardable concurrent
+        # peer-push into a stuck divergence. Instead it rides the worker's next
+        # commit. ``git status --porcelain`` reports BOTH untracked (fresh repo)
+        # and modified (live repo already tracks .gitattributes) states — plain
+        # ``git diff`` misses the untracked case.
+        st = git_run(repo_dir, "status", "--porcelain", "--", ".gitattributes", timeout=10)
+        if st.returncode == 0 and st.stdout.strip():
             add = git_run(repo_dir, "add", "--", ".gitattributes", timeout=10)
             staged = add.returncode == 0
     return {

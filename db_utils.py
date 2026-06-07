@@ -1181,8 +1181,24 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
             shown = ", ".join(conflict_paths[:3])
             return False, f"resolve bridge conflicts in generated files first: {shown}"
 
+    # A dirty path is allowed through readiness when it is a regenerable
+    # generated artifact OR the merge-driver's own managed .gitattributes seed.
+    # The latter is content-verified (must carry our managed block) and was just
+    # staged by ensure_bridge_merge_protection above; it rides the worker's next
+    # commit. Without this, first-time runtime seeding of .gitattributes (not a
+    # generated path) would block sync with "commit or stash bridge repo edits".
+    def _path_allowed_dirty(path: str) -> bool:
+        if is_generated_bridge_path(path):
+            return True
+        try:
+            from bridge_merge_driver import is_managed_gitattributes
+
+            return is_managed_gitattributes(repo_dir, path)
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     dirty_paths = [_bridge_status_path(ln) for ln in lines]
-    unsafe = [p for p in dirty_paths if not is_generated_bridge_path(p)]
+    unsafe = [p for p in dirty_paths if not _path_allowed_dirty(p)]
     if unsafe:
         shown = ", ".join(unsafe[:3])
         return False, f"commit or stash bridge repo edits before sync: {shown}"
@@ -1219,7 +1235,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     remaining = [
         _bridge_status_path(ln) for ln in status.stdout.splitlines() if ln.strip()
     ]
-    unsafe = [p for p in remaining if not is_generated_bridge_path(p)]
+    unsafe = [p for p in remaining if not _path_allowed_dirty(p)]
     if unsafe:
         shown = ", ".join(unsafe[:3])
         return False, f"bridge repo still has user-managed edits after cleanup: {shown}"

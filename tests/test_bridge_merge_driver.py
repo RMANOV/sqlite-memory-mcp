@@ -396,6 +396,118 @@ def test_gitattributes_and_config_installed(git_bridge):
     assert bmd.is_merge_driver_registered(str(repo))
 
 
+# ── readiness-gate integration: runtime .gitattributes seeding must not block ─
+#
+# ADVOCATE blocking item 4: ensure_bridge_merge_protection writes/stages
+# .gitattributes (not a generated path, not accepted by is_generated_bridge_path),
+# then ensure_bridge_repo_ready status-scans and treats non-generated dirty paths
+# as unsafe -> first-time runtime seeding made readiness FAIL with "commit or
+# stash bridge repo edits before sync". The fix whitelists ONLY a content-verified
+# managed .gitattributes through the dirty gate (no preflight commit, no gate
+# broadening), letting it ride the worker's next commit.
+
+
+def _init_bare_bridge(tmp_path, *, with_existing_attrs=False):
+    """A committed bridge repo WITHOUT the merge driver installed yet."""
+    repo = tmp_path / "bridge"
+    repo.mkdir()
+
+    def git(*args, check=True):
+        cp = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+        if check and cp.returncode != 0:
+            raise AssertionError(f"git {args}: {cp.stderr or cp.stdout}")
+        return cp
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    _write(repo, "index.json", _collection())
+    to_add = ["index.json"]
+    if with_existing_attrs:
+        (repo / ".gitattributes").write_text(
+            "tasks/*.json diff=json\nindex.json diff=json\n", encoding="utf-8"
+        )
+        to_add.append(".gitattributes")
+    git("add", *to_add)
+    git("commit", "-qm", "base")
+    return repo, git
+
+
+def test_fresh_repo_no_committed_gitattributes_does_not_block(tmp_path):
+    """ADVOCATE's required regression: fresh bridge repo WITHOUT a committed
+    .gitattributes -> after ensure_bridge_merge_protection install,
+    ensure_bridge_repo_ready must NOT block."""
+    import db_utils
+
+    repo, git = _init_bare_bridge(tmp_path, with_existing_attrs=False)
+    head_before = git("rev-parse", "HEAD").stdout.strip()
+    rec = bmd.ensure_bridge_merge_protection(str(repo))
+    assert rec["ok"] is True
+    assert rec["gitattributes_staged"] is True  # untracked file actually staged
+    ok, msg = db_utils.ensure_bridge_repo_ready(str(repo))
+    assert ok is True, f"runtime .gitattributes seeding blocked readiness: {msg}"
+    # No preflight commit (a commit before fast-forward would risk divergence on
+    # concurrent peer push). The managed file rides the worker's next commit.
+    assert git("rev-parse", "HEAD").stdout.strip() == head_before
+
+
+def test_existing_minimal_gitattributes_does_not_block(tmp_path):
+    """Live-repo shape: a pre-existing minimal .gitattributes (diff=json) gets the
+    managed block merged in, and readiness still passes without blocking."""
+    import db_utils
+
+    repo, git = _init_bare_bridge(tmp_path, with_existing_attrs=True)
+    head_before = git("rev-parse", "HEAD").stdout.strip()
+    bmd.ensure_bridge_merge_protection(str(repo))
+    ok, msg = db_utils.ensure_bridge_repo_ready(str(repo))
+    assert ok is True, f"existing-attrs repo blocked readiness: {msg}"
+    assert git("rev-parse", "HEAD").stdout.strip() == head_before
+    # The managed block is present and the bare diff=json line was deduped.
+    attrs = (repo / ".gitattributes").read_text(encoding="utf-8")
+    assert "index.json merge=bridge-reconcile" in attrs
+
+
+def test_readiness_still_blocks_real_user_dirty_file(tmp_path):
+    """Gate not broadened: a genuine user-managed dirty file STILL blocks even
+    after the managed .gitattributes is present."""
+    import db_utils
+
+    repo, git = _init_bare_bridge(tmp_path, with_existing_attrs=False)
+    bmd.ensure_bridge_merge_protection(str(repo))
+    (repo / "README.md").write_text("user edit\n", encoding="utf-8")
+    ok, msg = db_utils.ensure_bridge_repo_ready(str(repo))
+    assert ok is False
+    assert "README.md" in (msg or "")
+
+
+def test_ensure_protection_makes_no_commit(tmp_path):
+    """Divergence-safety guard: ensure_bridge_merge_protection must never create a
+    commit (committing in the readiness preflight, before fast-forward, would turn
+    a fast-forwardable concurrent peer push into a stuck divergence)."""
+    repo, git = _init_bare_bridge(tmp_path, with_existing_attrs=False)
+    head_before = git("rev-parse", "HEAD").stdout.strip()
+    bmd.ensure_bridge_merge_protection(str(repo))
+    bmd.ensure_bridge_merge_protection(str(repo))  # idempotent re-run
+    assert git("rev-parse", "HEAD").stdout.strip() == head_before
+
+
+def test_is_managed_gitattributes_content_verified(tmp_path):
+    """The whitelist is content-verified and narrow."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    # No file -> not managed.
+    assert bmd.is_managed_gitattributes(str(repo), ".gitattributes") is False
+    # Unrelated content -> not managed.
+    (repo / ".gitattributes").write_text("tasks/*.json diff=json\n", encoding="utf-8")
+    assert bmd.is_managed_gitattributes(str(repo), ".gitattributes") is False
+    # Managed block present -> managed.
+    bmd.ensure_gitattributes(str(repo))
+    assert bmd.is_managed_gitattributes(str(repo), ".gitattributes") is True
+    # A different path is never managed, even with managed content on disk.
+    assert bmd.is_managed_gitattributes(str(repo), "README.md") is False
+
+
 def test_run_merge_driver_fail_closed_writes_nothing(tmp_path):
     base = tmp_path / "base.json"
     ours = tmp_path / "ours.json"
