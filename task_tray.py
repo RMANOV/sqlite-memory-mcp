@@ -106,6 +106,7 @@ from db_utils import (
 from schema import init_db
 from smart_retrieval import suggested_ready
 
+
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
@@ -858,9 +859,7 @@ _REMINDER_MAX_DELIVERIES = 3
 _REMINDER_REPEAT_DELAYS_SECONDS = (5 * 60, 15 * 60)
 
 
-def _reminder_delivery_key(
-    task_id: str, reminder_at: str | None
-) -> tuple[str, str]:
+def _reminder_delivery_key(task_id: str, reminder_at: str | None) -> tuple[str, str]:
     return (task_id, reminder_at or "")
 
 
@@ -1141,13 +1140,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             pass
 
-        # Dashboard is the default launch tab. Persist the active tab by key for
-        # future compatibility, but force Dashboard on startup per operator spec.
+        # Persist the active tab by key for future compatibility. Do not force
+        # Dashboard on startup: it is a curated projection and may be empty.
         legacy_idx = int(self._settings.value("active_tab", 0))
         saved_key = self._settings.value("active_tab_key", "")
         if not isinstance(saved_key, str) or saved_key not in self._tab_keys:
             saved_key = self._tab_keys[min(legacy_idx, len(self._tab_keys) - 1)]
-        initial_key = "dashboard" if "dashboard" in self._tab_keys else saved_key
+        # The daily working surface is Today. Dashboard is curated and may be
+        # empty, while the previously saved tab can be stale after restarts.
+        initial_key = "today" if "today" in self._tab_keys else saved_key
         self._saved_active_tab = self._tab_keys.index(initial_key)
         if initial_key in self._tab_views:
             v = self._tab_views[initial_key]
@@ -1963,8 +1964,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._cancel_entity_searches()
             self._entity_results = []
 
-        # Update tab visibility (suggested, notes, projects always visible)
-        always_visible = ("dashboard", "suggested", "today", "notes", "projects")
+        # Update tab visibility. Dashboard is visible only when curated rows
+        # exist; otherwise Today/Suggested remain the open daily TODO surface.
+        always_visible = ("suggested", "today", "notes", "projects")
         if premium_key:
             always_visible = (*always_visible, premium_key)
         for i, key in enumerate(self._tab_keys):
@@ -1973,6 +1975,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
         # Actual current index AFTER all tab visibility and search changes
         current_idx = self.tabs.currentIndex()
+        if not (0 <= current_idx < len(self._tab_keys)) or not self.tabs.isTabVisible(
+            current_idx
+        ):
+            for preferred in ("today", "suggested", "projects", "notes"):
+                idx = self._tab_keys.index(preferred)
+                if self.tabs.isTabVisible(idx):
+                    self.tabs.setCurrentIndex(idx)
+                    current_idx = idx
+                    break
 
         # Lazy rendering: only load the currently active tab
         if 0 <= current_idx < len(self._tab_keys):
@@ -2356,15 +2367,15 @@ class TaskTrayApp(BridgeSyncMixin):
         self._bridge_refresh_requested = self._bridge_signal_bus.refresh_requested
         self._bridge_done.connect(self._on_app_sync_done)
         self._background_db_write_lock = threading.Lock()
-        self._auto_sync_enabled = os.environ.get("SQLITE_MEMORY_TRAY_AUTO_SYNC", "1") != "0"
+        self._enrich_cache_thread_running = False
+        self._enrich_cache_thread_lock = threading.Lock()
+        self._auto_sync_enabled = (
+            os.environ.get("SQLITE_MEMORY_TRAY_AUTO_SYNC", "1") != "0"
+        )
 
         # Periodic entity enrichment cache refresh (60s safety net for external writes)
         self._enrich_timer = QTimer(self.app)
-        self._enrich_timer.timeout.connect(
-            lambda: threading.Thread(
-                target=self.db._refresh_enrich_cache, daemon=True
-            ).start()
-        )
+        self._enrich_timer.timeout.connect(self._schedule_enrich_cache_refresh)
         self._enrich_timer.start(60_000)
 
         self._audit_timer = None
@@ -2555,14 +2566,71 @@ class TaskTrayApp(BridgeSyncMixin):
                     **vals,
                 )
 
+    def _schedule_enrich_cache_refresh(self):
+        """Run at most one enrich-cache refresh worker at a time."""
+        with self._enrich_cache_thread_lock:
+            if self._enrich_cache_thread_running:
+                logger.debug("enrich cache refresh skipped: worker already running")
+                return
+            self._enrich_cache_thread_running = True
+
+        def _work():
+            try:
+                self.db._refresh_enrich_cache()
+            finally:
+                with self._enrich_cache_thread_lock:
+                    self._enrich_cache_thread_running = False
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def _open_full(self):
-        if self.popup:
-            self.popup.hide()
+        logger.info("open_full requested")
+        try:
+            if self.popup:
+                self.popup.hide()
+            if not self.full_window:
+                logger.info("open_full creating FullWindow")
+                self.full_window = FullWindow(self.db, sync_host=self)
+                logger.info("open_full FullWindow created")
+            self._force_full_window_visible()
+            QTimer.singleShot(250, self._force_full_window_visible)
+        except Exception:
+            logger.exception("open_full failed")
+            self.tray.showMessage(
+                "Task Tray",
+                "Full window failed to open; see task_tray.log",
+                QSystemTrayIcon.MessageIcon.Critical,
+                10_000,
+            )
+
+    def _force_full_window_visible(self):
         if not self.full_window:
-            self.full_window = FullWindow(self.db, sync_host=self)
+            return
+        self.full_window.setWindowState(
+            (self.full_window.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
+        self.full_window.showNormal()
         self.full_window.show()
         self.full_window.raise_()
         self.full_window.activateWindow()
+        hwnd = int(self.full_window.winId())
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                logger.exception("win32 force-visible failed")
+        logger.info(
+            "open_full force-visible qt_visible=%s qt_state=%s win_id=%s",
+            self.full_window.isVisible(),
+            str(self.full_window.windowState()),
+            hwnd,
+        )
 
     def _poll_instance_socket(self):
         """Check if another instance sent a SHOW command."""
@@ -2572,16 +2640,19 @@ class TaskTrayApp(BridgeSyncMixin):
             conn, _ = self._instance_socket.accept()
             data = conn.recv(64)
             conn.close()
+            logger.info("instance socket received %r", data)
             if data == b"SHOW":
                 self._open_full()
         except BlockingIOError:
             pass
         except OSError:
             pass
+        except Exception:
+            logger.exception("instance socket poll failed")
 
     def _refresh_all(self):
         """Update tray icon badge + tooltip after any change."""
-        threading.Thread(target=self.db._refresh_enrich_cache, daemon=True).start()
+        self._schedule_enrich_cache_refresh()
         summary = self.db.get_summary()
         self._update_icon(summary)
         self.tray.setToolTip(self._tooltip(summary))
@@ -2677,8 +2748,10 @@ class TaskTrayApp(BridgeSyncMixin):
         if rss_mb <= 0:
             return
         now = time.monotonic()
-        if _TRAY_RSS_LOG_MB and rss_mb >= _TRAY_RSS_LOG_MB and now >= getattr(
-            self, "_rss_next_log_at", 0.0
+        if (
+            _TRAY_RSS_LOG_MB
+            and rss_mb >= _TRAY_RSS_LOG_MB
+            and now >= getattr(self, "_rss_next_log_at", 0.0)
         ):
             logger.warning(
                 "tray_rss_watchdog rss_mb=%.1f log_threshold_mb=%s exit_threshold_mb=%s",

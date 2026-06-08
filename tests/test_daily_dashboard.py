@@ -58,7 +58,9 @@ def _insert_task(
     )
 
 
-def _seed_daily_topic(conn: sqlite3.Connection, *, session_id: str = "cc-conductor") -> str:
+def _seed_daily_topic(
+    conn: sqlite3.Connection, *, session_id: str = "cc-conductor"
+) -> str:
     topic_id = dash_topic_id()
     ts = now_iso()
     conn.execute(
@@ -434,3 +436,38 @@ def test_dashboard_qt_renderer_uses_no_item_flags_and_blocks_load_signals(qapp):
     assert "Other / debate work-items" in widget.item(2).text()
     for i in range(widget.count()):
         assert widget.item(i).flags() == Qt.ItemFlag.NoItemFlags
+
+
+def test_empty_dashboard_hidden_and_today_is_start_tab(qapp, tmp_path):
+    import task_tray
+    from PyQt6.QtCore import QSettings
+
+    settings = QSettings("TaskTray", "FullWindow")
+    old_active_tab = settings.value("active_tab")
+    old_active_tab_key = settings.value("active_tab_key")
+    settings.setValue("active_tab", 0)
+    settings.setValue("active_tab_key", "dashboard")
+
+    db = task_tray.TaskDB(str(tmp_path / "memory.db"))
+    db.add_task("Open daily task", section="today")
+    window = None
+    try:
+        window = task_tray.FullWindow(db)
+        window.refresh()
+
+        assert len(window._raw_cache.get("dashboard", [])) == 0
+        assert window.tabs.isTabVisible(window._tab_keys.index("dashboard")) is False
+        assert window._tab_keys[window.tabs.currentIndex()] == "today"
+        assert len(window._raw_cache.get("today", [])) == 1
+    finally:
+        if window is not None:
+            window.deleteLater()
+        db.close()
+        if old_active_tab is None:
+            settings.remove("active_tab")
+        else:
+            settings.setValue("active_tab", old_active_tab)
+        if old_active_tab_key is None:
+            settings.remove("active_tab_key")
+        else:
+            settings.setValue("active_tab_key", old_active_tab_key)

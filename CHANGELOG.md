@@ -4,6 +4,19 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.12.3
+
+### Fixed
+
+- **Task Tray full-window launch when Dashboard is empty.** The large Task
+  Manager window now starts on Today instead of forcing an empty curated
+  Dashboard tab, hides Dashboard when no curated rows exist, and restores the
+  window through an explicit Win32-visible path when another tray instance sends
+  `SHOW`.
+- **Task Tray enrich-cache worker pileup.** Periodic and manual refresh paths now
+  use a single-flight guard so long-running enrich-cache refreshes cannot spawn
+  overlapping background workers every 60 seconds.
+
 ## v3.12.2
 
 ### Fixed
