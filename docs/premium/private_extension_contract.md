@@ -1,5 +1,9 @@
 # Private Premium Extension Contract
 
+> Operator / private-runtime documentation — not part of the public
+> external-facing (DIANA) capability claim-set. See
+> [`../ops/CORE_VS_ADVANCED_PATH.md`](../ops/CORE_VS_ADVANCED_PATH.md).
+
 This file defines the minimal integration contract for a separate private repo.
 
 ## Goal

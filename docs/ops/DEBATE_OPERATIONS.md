@@ -7,6 +7,13 @@ is still client hooks, but `sqlite-memory-debate-pump.service` is the resident
 catch-all for Codex posts, missed hooks, stale claims, and backlogged addressed
 messages.
 
+This wake/pump path is deliberately **operator-supervised and
+resource-governed**: delivery is gated by the local machine's current condition,
+`no_action` is a normal zero-touch completion (not a failure), and the controls
+here describe existing service behavior — this document changes none of it. The
+bounded coordination claim built on top of these controls is mapped in
+[`CORE_VS_ADVANCED_PATH.md`](CORE_VS_ADVANCED_PATH.md).
+
 ## Fast commands
 
 ```bash

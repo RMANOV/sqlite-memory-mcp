@@ -10,6 +10,16 @@
 > `debate_escalate`, `debate_compact`, `debate_advance_watermark`. Three
 > tables: `debates`, `debate_messages`, `debate_watermarks`.
 
+## Claim boundary
+
+The debate protocol is **governed multi-agent OODA coordination**. For external
+/ diligence material it is claimable only when bounded to its actual controls:
+addressed messages, role-aware cursors / watermarks, `no_action` completion,
+and append-only audit logs. It does **not** carry an autonomous
+execution-safety claim beyond these controls. See
+[`ops/CORE_VS_ADVANCED_PATH.md`](ops/CORE_VS_ADVANCED_PATH.md) for the frozen
+claim-set.
+
 ## Mental model
 
 Multi-agent coordination tends to degrade in five ways: missed updates

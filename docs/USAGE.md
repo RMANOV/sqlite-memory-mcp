@@ -126,9 +126,13 @@ codex mcp add sqlite_unified -- sqlite-memory-unified
 
 Tools are grouped by MCP server. See the README Tool Reference for the
 per-server tool list. This section describes what each group is *for* and how
-mature it is.
+mature it is. For the canonical core-path vs advanced-path operator map and the
+frozen external-claim set, see
+[`docs/ops/CORE_VS_ADVANCED_PATH.md`](ops/CORE_VS_ADVANCED_PATH.md). The labels
+below describe posture and emphasis only; nothing here is removed, deprecated,
+or disabled.
 
-### Stable (start here)
+### Stable / core path (start here)
 
 | Server | What it does |
 |---|---|
@@ -140,14 +144,19 @@ These three cover the everyday memory loop — remember entities and facts,
 track tasks and notes, and recall context across sessions. They are the most
 exercised and the safest place to begin.
 
-### Advanced (opt in as needed)
+The `sqlite_bridge` server is a special case: while it lives in the advanced
+table below, it is a **core operational-resilience path** whenever you sync
+across more than one machine — health / conflict / recovery discipline rather
+than an optional extra.
+
+### Advanced / optional (opt in as needed)
 
 | Server | What it does | Notes |
 |---|---|---|
-| `sqlite_bridge` (`bridge_server.py`) | Cross-machine sync over a private git repo: push/pull, task assignment, shared-task review, bridge self-checks. | Requires `BRIDGE_REPO` and a one-time setup per machine. |
-| `sqlite_collab` (`collab_server.py`) | P2P knowledge sharing, public-knowledge search, ratings, verification, publish requests. | For multi-user / shared-knowledge scenarios. |
-| `sqlite_entity` (`entity_server.py`) | Task-entity linking, overlap detection, entity merging. | Useful once your graph is large enough to need de-duplication. |
-| `sqlite_intel` (`intel_server.py`) | Intelligence layer: context assessment/enrichment, claim extraction and promotion, fact governance, memory audit, reflect/consolidation, and the multi-agent **Debate Protocol**. | The largest and most advanced surface. The debate tools coordinate multiple agents; treat them as power-user features. See `docs/DEBATE_PROTOCOL.md` and `docs/ops/DEBATE_OPERATIONS.md`. |
+| `sqlite_bridge` (`bridge_server.py`) | Cross-machine sync over a private git repo: push/pull, task assignment, shared-task review, bridge self-checks. | **Core resilience spine when multi-machine** — conflict / recovery discipline against no-resurrect / no-data-loss failures (not an absolute no-data-loss guarantee). Requires `BRIDGE_REPO` and a one-time setup per machine. |
+| `sqlite_collab` (`collab_server.py`) | P2P knowledge sharing, public-knowledge search, ratings, verification, publish requests. | **Advanced / optional** shared-knowledge surface, for multi-user / shared-knowledge scenarios. |
+| `sqlite_entity` (`entity_server.py`) | Task-entity linking, overlap detection, entity merging. | Entity hygiene; useful once your graph is large enough to need de-duplication. |
+| `sqlite_intel` (`intel_server.py`) | Intelligence layer: context assessment/enrichment, claim extraction and promotion, fact governance, memory audit, reflect/consolidation, and the multi-agent **Debate Protocol**. | **Governance / audit plus power-user** surface, not required for baseline memory. The largest and most advanced surface; the debate tools coordinate multiple agents — treat them as power-user features. See `docs/DEBATE_PROTOCOL.md` and `docs/ops/DEBATE_OPERATIONS.md`. |
 
 ### Search
 
@@ -155,8 +164,10 @@ Search defaults to SQLite FTS5 BM25 ranking over entity names, types, and
 observations — available with the core install, no extra setup.
 
 If you install the `vector` extra, search additionally fuses sqlite-vec vector
-results with the BM25 ranking via Reciprocal Rank Fusion (RRF). Without the
-extra, search transparently falls back to pure FTS5; nothing breaks.
+results with the BM25 ranking via Reciprocal Rank Fusion (RRF). The vector
+backend is **optional, with FTS5 fallback**: without the extra, search
+transparently falls back to pure FTS5; nothing breaks. Vector search is not the
+product center or a required baseline.
 
 ```bash
 # FTS5 term / phrase / boolean queries work out of the box via search_nodes.
@@ -170,6 +181,8 @@ extra, search transparently falls back to pure FTS5; nothing breaks.
 
 - `README.md` — full feature overview, architecture, schema, and the canonical
   Tool Reference.
+- `docs/ops/CORE_VS_ADVANCED_PATH.md` — canonical core-path vs advanced-path
+  operator map and the frozen external-claim set.
 - `docs/DEBATE_PROTOCOL.md` — multi-agent debate protocol design.
 - `docs/ops/BRIDGE_OPERATIONS.md` — running cross-machine bridge sync.
 - `examples/basic_usage.md` — a worked end-to-end example.

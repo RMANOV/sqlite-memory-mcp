@@ -82,6 +82,28 @@ contradictions.
 
 The features above are the core. The capabilities below are deliberately kept out of the hero because they matter to operators, not first-time users. Each links to its canonical document.
 
+### Core path vs advanced path
+
+For a single canonical operator map of what is on the everyday **core path**
+versus the **advanced / optional path** — plus the frozen allowed / forbidden
+external-claim set and the D2 (code-change) triggers — see
+[`docs/ops/CORE_VS_ADVANCED_PATH.md`](docs/ops/CORE_VS_ADVANCED_PATH.md).
+
+- **Core path (load-bearing, start here):** `sqlite_memory`, `sqlite_tasks`,
+  `sqlite_session`; provenance / knowledge-links; bridge resilience; reflect /
+  audit discipline; addressed debate routing; entity hygiene.
+- **Advanced / optional path (opt in as needed):** `sqlite_collab` / P2P
+  (advanced / optional shared-knowledge surface); premium / airlock (an
+  operator / private-runtime boundary, excluded from external-facing feature
+  claims); the vector semantic backend (an optional backend with FTS5 fallback);
+  and the advanced `sqlite_intel` / debate operations.
+
+These labels describe posture and emphasis. Nothing here is removed, deprecated,
+disabled, or scheduled for removal; every server and tool below stays present
+and supported. The **7-microserver split is current MCP-visibility / ergonomics
+design, not a consolidation target** — the [Tool Reference](#tool-reference) and
+its server / tool counts are unchanged.
+
 ### Intelligence v2 — claims, governance, and provenance
 
 The `sqlite_intel` server turns raw memory into reviewable knowledge. It extracts candidate claims, queues clarifications, records human answers, and promotes claims to canonical facts through an approval-aware gate (`promote_candidate`: `human_confirmed` always allowed; `multi_evidence` is policy-gated; sensitive scopes require explicit human confirmation). Every mutation can carry a provenance link, and `audit_memory` / `replay_memory` make the history inspectable. Consolidation runs through `reflect_audit` (Phase 0.5) — deterministic SQL with no LLM cost per run. See [`docs/REFLECT_AUDIT_DEMO.md`](docs/REFLECT_AUDIT_DEMO.md).
@@ -106,6 +128,30 @@ For the full operator wiring (env vars, canonical signing payload, rotation, ver
 - [`templates/private_premium_repo/`](templates/private_premium_repo/) — public-safe bootstrap template
 
 Pricing is intentionally not published here; serious prospects receive a scoped questionnaire, then a customized offer.
+
+### External claim boundary (frozen claim-set)
+
+For external / diligence material, the project commits to a frozen claim-set,
+stated canonically in
+[`docs/ops/CORE_VS_ADVANCED_PATH.md`](docs/ops/CORE_VS_ADVANCED_PATH.md).
+
+**Allowed:** local-first governed cross-agent memory; provenance /
+knowledge-links and approval-aware promotion; the deterministic `reflect_audit`
+audit gate; addressed debate routing bounded to addressed messages, cursors,
+`no_action`, role watermarks, and audit logs; hybrid retrieval with an FTS5
+baseline and an optional vector backend (FTS5 fallback); entity hygiene / merge
+with an audit trail; and bridge cross-machine resilience as conflict / recovery
+discipline against no-resurrect / no-data-loss failures. Posture: application-
+enforced append-only governance, local-first, civilian-dogfooded,
+single-operator, test-backed.
+
+**Forbidden:** defence validation / accreditation / certification; "immutable" /
+WORM / tamper-evident or hash-chain claims (until shipped); shipped
+STRIX ↔ `sqlite_memory` integration; edge / on-hardware deployment; premium /
+airlock as a named external feature; an absolute no-data-loss guarantee; vector
+search as the product center or a required baseline; and unbounded "production"
+claims (only production-quality, single-operator, no external customers or
+deployment).
 
 ## Competitor Comparison
 

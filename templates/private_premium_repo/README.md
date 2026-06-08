@@ -1,5 +1,9 @@
 # sqlite-memory-mcp-premium-template
 
+> Extension-boundary documentation only — this public-safe template is not a
+> public external-facing (DIANA) feature claim. See the operator claim map in
+> the main repo's `docs/ops/CORE_VS_ADVANCED_PATH.md`.
+
 Public-safe bootstrap template for a **separate private premium repo**.
 
 This template mirrors the resilient bootstrap layout of the real private

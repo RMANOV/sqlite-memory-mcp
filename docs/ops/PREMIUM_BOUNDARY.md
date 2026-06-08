@@ -6,6 +6,11 @@ this repo. That separation is deliberate — it is Echelon 0 of the anti-fork
 strategy ("product boundary moat") and the reason a copy of this OSS tree alone
 cannot run premium features.
 
+Premium / airlock is an **optional operator / private-runtime boundary** on the
+advanced / optional path — not part of the core memory loop. See
+[`CORE_VS_ADVANCED_PATH.md`](CORE_VS_ADVANCED_PATH.md) for where it sits in the
+operator claim map.
+
 ## What the host enforces
 
 The public host runtime enforces, in `premium_runtime.evaluate_feature_gate`:
@@ -128,3 +133,13 @@ without the corresponding signed artifacts cannot execute premium features. It
 is not sufficient — alone — against an organization willing to run its own
 parallel signing infrastructure. That is why authority, policy, and update
 discipline are the real moats, not code obfuscation.
+
+## DIANA / public-material boundary
+
+Premium / airlock is **excluded as a named feature from external-facing (DIANA)
+material**. It is an internal operator / private-runtime boundary and is kept out
+of the main external claim-set. The only exception is when a diligence question
+specifically asks about extension governance — in which case it can be described
+as the optional, signed, revocable operator boundary it is, not as a headline
+capability. This boundary is recorded in the frozen claim-set in
+[`CORE_VS_ADVANCED_PATH.md`](CORE_VS_ADVANCED_PATH.md).
