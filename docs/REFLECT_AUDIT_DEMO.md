@@ -9,6 +9,12 @@
 
 ## What the audit does
 
+`reflect_audit` is **scheduled audit behavior in the provenance / audit spine**:
+a visible, deterministic audit loop, not a merge-away target. It stays on the
+core path as a standing audit gate. See
+[`ops/CORE_VS_ADVANCED_PATH.md`](ops/CORE_VS_ADVANCED_PATH.md) for how it fits
+the claim map.
+
 `reflect_audit` (Phase 0.5, Tool 13 on the `sqlite-intel` MCP server) detects
 six categories of consolidation candidates with pure SQL:
 
