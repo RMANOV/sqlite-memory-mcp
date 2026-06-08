@@ -142,8 +142,8 @@ audit gate; addressed debate routing bounded to addressed messages, cursors,
 baseline and an optional vector backend (FTS5 fallback); entity hygiene / merge
 with an audit trail; and bridge cross-machine resilience as conflict / recovery
 discipline against no-resurrect / no-data-loss failures. Posture: application-
-enforced append-only governance, civilian-dogfooded, single-operator,
-test-backed, simulator-first.
+enforced append-only governance, local-first, civilian-dogfooded,
+single-operator, test-backed.
 
 **Forbidden:** defence validation / accreditation / certification; "immutable" /
 WORM / tamper-evident or hash-chain claims (until shipped); shipped

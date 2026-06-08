@@ -13,8 +13,8 @@ emphasis*, not a product cut.
 
 ## Posture (one line)
 
-Local-first, single-operator, civilian-dogfooded, test-backed, simulator/replay
-evidence first. No external customers and no external deployment are claimed.
+Local-first, single-operator, civilian-dogfooded, test-backed; application-enforced
+append-only governance. No external customers and no external deployment are claimed.
 
 ## Core path (load-bearing, start here)
 
@@ -96,7 +96,7 @@ diligence material:
   guarantee).
 
 Framing for all of the above: **application-enforced append-only governance**,
-civilian-dogfooded, single-operator, test-backed, simulator-first.
+local-first, civilian-dogfooded, single-operator, test-backed.
 
 ## External-facing (DIANA) forbidden claims
 
