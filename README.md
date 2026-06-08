@@ -112,13 +112,11 @@ The `sqlite_intel` server turns raw memory into reviewable knowledge. It extract
 
 For workflows that coordinate multiple agents (conductor, executor, devil's advocate) across sessions, the `sqlite_intel` debate tools provide a single per-topic channel with role-aware watermarks, claim/reclaim, and escalation. This is an advanced coordination layer, not required for memory use. See [`docs/DEBATE_PROTOCOL.md`](docs/DEBATE_PROTOCOL.md) and [`docs/ops/DEBATE_OPERATIONS.md`](docs/ops/DEBATE_OPERATIONS.md).
 
-### Premium / enterprise boundary
+### Optional private-runtime boundary
 
-This OSS repo ships the **public-core airlock** for a separate, private premium runtime — not the premium business logic itself. The airlock is an entitlement-aware loader (`premium_runtime.py`), a public contract (`premium_contract.py`), signed entitlement / artifact-manifest / control-plane-policy schemas, premium audit + revoke tables, and a bootstrap template. Private extensions are **not loaded by default**: they mount only when a configured private entrypoint, a valid (optionally machine-bound, non-revoked) entitlement, satisfied signed-manifest and control-policy checks, and explicit local owner approval are all present.
+This OSS repo includes a public contract for separately configured private extensions. It defines entitlement, artifact-manifest, control-policy, audit, revoke, and bootstrap surfaces, but does not include private business logic, private entitlements, signing keys, proprietary connectors, or private ranking/governance rules. Private extensions are not loaded by default; they require an explicit configured entrypoint, local owner approval, and the relevant signed entitlement / manifest / policy checks.
 
-What is **not** in this OSS repo: private premium logic, connectors, customer entitlements, signing keys, and proprietary ranking/governance rules. The protected asset is the signed, revocable, auditable operating boundary — not code obfuscation. A fork of the public tree gets the airlock but not the keys, entitlements, private runtime, control-plane authority, or operator approval chain.
-
-For the full operator wiring (env vars, canonical signing payload, rotation, verification), the feature-pack breakdown, the premium tray/search surface, and the release-confidence checklist, see:
+Operator wiring and the public contract are documented in:
 
 - [`docs/ops/PREMIUM_BOUNDARY.md`](docs/ops/PREMIUM_BOUNDARY.md) — operator wiring and verification
 - [`docs/ops/RELEASE_CONFIDENCE.md`](docs/ops/RELEASE_CONFIDENCE.md) — `v3.7.2` release-quality checklist
@@ -187,7 +185,7 @@ The two projects ship **different bets** for different deployments. Public git h
 | Embeddings | OpenAI API (network call per page write) | sentence-transformers, fully local |
 | Memory consolidation | "dream cycle" (uses LLM) | `reflect_audit` Phase 0.5 — **deterministic SQL, no LLM cost** |
 | Per-candidate review | atomic store-level output | per-row accept / reject / defer with apply snapshots |
-| Cross-machine sync | git remote of the brain repo | bridge JSON + per-field LWW-Register CRDT (proven 2000+ tasks across 3 machines) |
+| Cross-machine sync | git remote of the brain repo | bridge JSON + per-field LWW-Register CRDT; conflict/recovery regressions and operational discipline address no-resurrect / no-data-loss failure modes without claiming an absolute data-loss guarantee |
 | Source of truth | Markdown (human-readable) | SQLite + JSON bridge exports (machine-portable) |
 | Air-gapped / regulated deployment | blocked by OpenAI embedding requirement | **fully supported** (no external network in hot path) |
 | Companion stack | GStack (Garry's Claude Code setup) | MCP-native, works with any MCP client (Claude Code, Codex) |
