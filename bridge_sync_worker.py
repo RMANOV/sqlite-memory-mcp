@@ -73,6 +73,7 @@ from db_utils import (
     export_memory_audit_state,
     import_remote_bridge_data,
     write_extended_memory_files,  # noqa: F401
+    write_kanban_payload,  # noqa: F401
     EXTENDED_MEMORY_KEYS,  # noqa: F401
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
@@ -1090,6 +1091,13 @@ def _main_locked(
     tmp_shared_path.write_text(payload_json, encoding="utf-8")
     os.replace(tmp_shared_path, shared_path)
     _write_shared_js(shared_path, payload_json)
+    # Render-only Kanban payload (preview); failure here must NOT block transport/push.
+    try:
+        write_kanban_payload(bridge_dir, payload)
+    except Exception as exc:  # noqa: BLE001 - render artifact is best-effort
+        log.warning(
+            "kanban_payload write failed (non-fatal, transport unaffected): %s", exc
+        )
 
     n_ent = len(entities_out)
     n_tasks = len(payload["tasks"])

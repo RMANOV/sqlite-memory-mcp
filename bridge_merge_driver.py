@@ -92,6 +92,7 @@ _GITATTRIBUTES_MANAGED_LINES = (
     "entities_index.json merge=union diff=json",
     "entities/*.json merge=union diff=json",
     "extended_memory/*.json merge=union diff=json",
+    "kanban_payload.json merge=union diff=json",
 )
 
 # Generated bridge artifacts that are safe to discard / rebuild from the DB if
@@ -102,6 +103,7 @@ _GENERATED_UNMERGED_HEALABLE = frozenset(
         "shared.js",
         "index.json",
         "entities_index.json",
+        "kanban_payload.json",
     }
 )
 _GENERATED_UNMERGED_HEALABLE_DIRS = ("tasks/", "entities/", "extended_memory/")
@@ -182,8 +184,8 @@ def _dominating_status_clock(
     # overflow): strictly greater as an integer, so it dominates on the packed
     # axis where _field_version_sort_key places all packed clocks above legacy.
     dominating_order = max_packed + 1
-    o_at = (ours.get("_field_ts", {}).get("status") or {})
-    t_at = (theirs.get("_field_ts", {}).get("status") or {})
+    o_at = ours.get("_field_ts", {}).get("status") or {}
+    t_at = theirs.get("_field_ts", {}).get("status") or {}
     candidate_ats = [
         now,
         ours.get("updated_at", "") or "",
@@ -267,9 +269,7 @@ def reconcile_task_pair(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[st
     return merged
 
 
-def _union_field_ts(
-    ours: dict[str, Any], theirs: dict[str, Any]
-) -> dict[str, Any]:
+def _union_field_ts(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
     """Per-field union of ``_field_ts`` metadata, keeping the newer entry."""
     o_fts = ours.get("_field_ts") or {}
     t_fts = theirs.get("_field_ts") or {}
@@ -302,8 +302,14 @@ def reconcile_task_collection(
     if not isinstance(ours, dict) or not isinstance(theirs, dict):
         raise ValueError("reconcile_task_collection requires dict payloads")
 
-    ours_tasks = {t["id"]: t for t in ours.get("tasks", []) if isinstance(t, dict) and t.get("id")}
-    theirs_tasks = {t["id"]: t for t in theirs.get("tasks", []) if isinstance(t, dict) and t.get("id")}
+    ours_tasks = {
+        t["id"]: t for t in ours.get("tasks", []) if isinstance(t, dict) and t.get("id")
+    }
+    theirs_tasks = {
+        t["id"]: t
+        for t in theirs.get("tasks", [])
+        if isinstance(t, dict) and t.get("id")
+    }
 
     merged_tasks: list[dict[str, Any]] = []
     for tid in sorted(set(ours_tasks) | set(theirs_tasks)):
@@ -369,7 +375,9 @@ def run_merge_driver(
     try:
         ours = _read_json_or_fail(ours_path, label="ours")
         theirs = _read_json_or_fail(theirs_path, label="theirs")
-        _ = _read_json_or_fail(base_path, label="base")  # parsed for fail-closed validation
+        _ = _read_json_or_fail(
+            base_path, label="base"
+        )  # parsed for fail-closed validation
         if single_task:
             merged = reconcile_task_pair(ours, theirs)
         else:
@@ -411,8 +419,7 @@ def register_bridge_merge_driver(repo_dir: str) -> bool:
     module_path = str(Path(__file__).resolve())
     # %O=base(ancestor) %A=ours(current/result) %B=theirs(other) %P=pathname.
     driver_cmd = (
-        f'"{python}" "{module_path}" merge '
-        f'--base %O --ours %A --theirs %B --path %P'
+        f'"{python}" "{module_path}" merge --base %O --ours %A --theirs %B --path %P'
     )
     name_set = git_run(
         repo_dir,
@@ -440,9 +447,7 @@ def register_bridge_merge_driver(repo_dir: str) -> bool:
         MERGE_DRIVER_NAME,
         timeout=10,
     )
-    return all(
-        r.returncode == 0 for r in (name_set, driver_set, recursive_set)
-    )
+    return all(r.returncode == 0 for r in (name_set, driver_set, recursive_set))
 
 
 def _render_managed_block() -> str:
@@ -507,8 +512,7 @@ def ensure_gitattributes(repo_dir: str) -> bool:
         kept = [
             ln
             for ln in prefix.splitlines()
-            if ln.strip()
-            not in {"tasks/*.json diff=json", "index.json diff=json"}
+            if ln.strip() not in {"tasks/*.json diff=json", "index.json diff=json"}
         ]
         prefix = "\n".join(kept)
         new_text = (prefix + "\n\n" if prefix.strip() else "") + managed
@@ -542,7 +546,9 @@ def ensure_bridge_merge_protection(repo_dir: str) -> dict[str, Any]:
         # commit. ``git status --porcelain`` reports BOTH untracked (fresh repo)
         # and modified (live repo already tracks .gitattributes) states — plain
         # ``git diff`` misses the untracked case.
-        st = git_run(repo_dir, "status", "--porcelain", "--", ".gitattributes", timeout=10)
+        st = git_run(
+            repo_dir, "status", "--porcelain", "--", ".gitattributes", timeout=10
+        )
         if st.returncode == 0 and st.stdout.strip():
             add = git_run(repo_dir, "add", "--", ".gitattributes", timeout=10)
             staged = add.returncode == 0
@@ -637,7 +643,9 @@ def auto_heal_unmerged_generated(repo_dir: str) -> dict[str, Any]:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Bridge tombstone-safe JSON merge driver")
+    parser = argparse.ArgumentParser(
+        description="Bridge tombstone-safe JSON merge driver"
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     m = sub.add_parser("merge", help="git merge driver entrypoint")

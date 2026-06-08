@@ -1236,12 +1236,20 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
             status = git_run(repo_dir, "status", "--porcelain")
             if status.returncode != 0:
                 detail = (status.stderr or status.stdout).strip()
-                return False, f"cannot inspect bridge status: {detail or 'unknown git error'}"
+                return (
+                    False,
+                    f"cannot inspect bridge status: {detail or 'unknown git error'}",
+                )
             lines = [ln for ln in status.stdout.splitlines() if ln.strip()]
             still_conflicted = [ln for ln in lines if ln[:2] in _BRIDGE_CONFLICT_STATES]
             if still_conflicted:
-                shown = ", ".join(_bridge_status_path(ln) for ln in still_conflicted[:3])
-                return False, f"resolve bridge conflicts in generated files first: {shown}"
+                shown = ", ".join(
+                    _bridge_status_path(ln) for ln in still_conflicted[:3]
+                )
+                return (
+                    False,
+                    f"resolve bridge conflicts in generated files first: {shown}",
+                )
             if not lines:
                 return True, None
         else:
@@ -1350,9 +1358,7 @@ def normalize_dashboard_kind(kind: str) -> str:
     """Normalize dashboard kind aliases to the canonical six-kind enum."""
     normalized = _DASHBOARD_KIND_ALIASES.get(str(kind or "").strip().lower())
     if normalized is None:
-        raise ValueError(
-            "dashboard kind must be one of: " + ", ".join(DASHBOARD_KINDS)
-        )
+        raise ValueError("dashboard kind must be one of: " + ", ".join(DASHBOARD_KINDS))
     return normalized
 
 
@@ -1387,7 +1393,9 @@ def dash_today(topic_id: str | None = None) -> str:
     if candidate:
         m = _DASHBOARD_TOPIC_RE.fullmatch(candidate)
         if not m:
-            raise ValueError(f"dashboard topic must match DAILY_YYYYMMDD: {candidate!r}")
+            raise ValueError(
+                f"dashboard topic must match DAILY_YYYYMMDD: {candidate!r}"
+            )
         topic_day = f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:8]}"
         if topic_day != day:
             raise ValueError(
@@ -1427,7 +1435,9 @@ def ensure_dashboard_schema(conn: sqlite3.Connection) -> None:
 
 
 def _dashboard_test_override(allow_test_override: bool = False) -> bool:
-    return allow_test_override or os.environ.get("SQLITE_MEMORY_DASH_TEST_OVERRIDE") in {
+    return allow_test_override or os.environ.get(
+        "SQLITE_MEMORY_DASH_TEST_OVERRIDE"
+    ) in {
         "1",
         "true",
         "yes",
@@ -6760,6 +6770,63 @@ def write_extended_memory_files(
         os.replace(tmp_path, file_path)
         written.append(f"extended_memory/{key}.json")
     return written
+
+
+# --- Kanban render payload (preview-only; NEVER a transport/import source) ---
+# Transport (shared.json/index.json/tasks/*.json) keeps FULL bodies; this is a
+# separate derived artifact the Kanban PWA reads, so a 540KB single note can no
+# longer choke the browser render. Surface contract sets pull=False -> import
+# never reads it. Full body always recoverable from memory.db / transport.
+KANBAN_BIG_THRESHOLD = 20000  # active note size that triggers truncation
+KANBAN_PREVIEW_MAX = 1000  # truncate cap for active big notes
+KANBAN_COLLAPSE_MAX = 500  # collapse cap for non-active (done/archived/someday)
+_KANBAN_NONACTIVE_STATUS = {"done", "archived"}
+_KANBAN_NONACTIVE_SECTION = {"someday", "archive"}
+
+
+def _kanban_preview_task(task: dict) -> dict:
+    """Render-safe COPY of a task for the Kanban payload (never mutates input).
+
+    Truncates only ``description``; non-active notes collapse broadly (the real
+    size lever), active >20KB truncate, small active pass through full. Truncated
+    copies carry _mirror_preview / _full_len / _full_hash so a preview can never
+    be mistaken for the authoritative body.
+    """
+    desc = task.get("description") or ""
+    status = str(task.get("status") or "")
+    section = str(task.get("section") or "")
+    if status in _KANBAN_NONACTIVE_STATUS or section in _KANBAN_NONACTIVE_SECTION:
+        cap = KANBAN_COLLAPSE_MAX
+    elif len(desc) > KANBAN_BIG_THRESHOLD:
+        cap = KANBAN_PREVIEW_MAX
+    else:
+        return dict(task)
+    out = dict(task)
+    out["description"] = desc[:cap]
+    out["_mirror_preview"] = True
+    out["_full_len"] = len(desc)
+    out["_full_hash"] = hashlib.sha256(desc.encode("utf-8")).hexdigest()
+    return out
+
+
+def write_kanban_payload(bridge_dir: str, payload: dict) -> str:
+    """Write kanban_payload.json -- render-only preview of the bridge payload.
+
+    Mirrors the shared.json shape but truncates task descriptions. Transport
+    artifacts are untouched. Atomic tmp+replace. Validates JSON before publish
+    (parse-or-regenerate guard: a corrupt union-merged file is rebuilt from the
+    DB on the next export, which calls this). Returns the relative path written.
+    """
+    kb = dict(payload)
+    kb["_render_only"] = True
+    kb["tasks"] = [_kanban_preview_task(t) for t in payload.get("tasks", [])]
+    text = json_dumps(kb)
+    json_loads(text)  # guard: never publish unparseable JSON
+    path = Path(bridge_dir) / "kanban_payload.json"
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+    return "kanban_payload.json"
 
 
 def load_extended_memory_files(

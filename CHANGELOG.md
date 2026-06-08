@@ -4,6 +4,36 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.12.4
+
+### Added
+
+- **Render-only `kanban_payload.json` bridge artifact.** The Kanban PWA was
+  loading the full `shared.json` (~18 MB, with single notes up to ~540 KB),
+  which hung the browser render. Exports now also emit a separate
+  `kanban_payload.json` that mirrors the payload but truncates task
+  descriptions: non-active notes (done/archived/someday) collapse broadly,
+  active notes over 20 KB truncate, small active notes pass through full. Each
+  truncated copy carries `_mirror_preview` / `_full_len` / `_full_hash`
+  (sha256). Generated on both export paths (`bridge_sync_worker` and
+  `bridge_server.bridge_push`) before git staging.
+
+### Guarantees
+
+- **Transport is never truncated.** `shared.json`, `index.json`, and
+  `tasks/*.json` keep full bodies, so a fresh pull / restore recovers the
+  complete description. The new artifact is `pull=False` in the surface contract
+  (never an import source) and `merge=union` + self-heal, so a corrupt
+  union-merged copy is rebuilt from the DB on the next export. Write failures are
+  non-fatal to push.
+
+### Notes
+
+- This closes the export/artifact-generation side only. The Kanban PWA consumer
+  repoint (reading `kanban_payload.json`) is deferred to a separate change
+  because `pwa/app.js` is read-write and a naive preview-read could write
+  truncated bodies back to `shared.json`.
+
 ## v3.12.3
 
 ### Fixed

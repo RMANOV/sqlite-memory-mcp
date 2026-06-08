@@ -310,6 +310,17 @@ BRIDGE_ARTIFACT_SURFACE_CONTRACT: dict[str, dict[str, Any]] = {
         "pages_publish": False,
         "legacy_fallback": False,
     },
+    # Render-only Kanban payload (preview of tasks). Tracked/synced so it opens
+    # immediately on peers, but pull=False -> NEVER imported back into the DB
+    # (full bodies live in shared.json/tasks/* transport, which stay untruncated).
+    "kanban_payload.json": {
+        "export": True,
+        "pull": False,
+        "bootstrap": False,
+        "git_stage": True,
+        "pages_publish": True,
+        "legacy_fallback": False,
+    },
 }
 
 BRIDGE_GIT_STAGE_PATHS = tuple(

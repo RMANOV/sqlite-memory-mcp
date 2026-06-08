@@ -155,8 +155,18 @@ def test_bridge_pull_does_not_resurrect_archived_task_from_remote_done(
                         "updated_at": new,
                         "_field_ts": {
                             "status": [new, "RManov", 116639670793142275, "evt-status"],
-                            "section": [new, "RManov", 116639670793142276, "evt-section"],
-                            "priority": [new, "RManov", 116639670793142277, "evt-priority"],
+                            "section": [
+                                new,
+                                "RManov",
+                                116639670793142276,
+                                "evt-section",
+                            ],
+                            "priority": [
+                                new,
+                                "RManov",
+                                116639670793142277,
+                                "evt-priority",
+                            ],
                             "due_date": [new, "RManov", 116639670793142278, "evt-due"],
                         },
                     }
@@ -254,7 +264,9 @@ def test_bridge_push_blocks_when_bridge_repo_is_not_safe(tmp_path, monkeypatch):
     assert git_calls == []
 
 
-def test_bridge_push_git_sync_failure_fails_closed_without_reset(bridge_env, monkeypatch):
+def test_bridge_push_git_sync_failure_fails_closed_without_reset(
+    bridge_env, monkeypatch
+):
     _db_path, _bridge_dir = bridge_env
     git_calls = []
 
@@ -450,7 +462,39 @@ def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
     assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
     assert any(args[:2] == ("add", "-f") for args in git_calls)
-    assert not any(args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls)
+    assert not any(
+        args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls
+    )
+
+
+def test_bridge_push_writes_kanban_payload_before_staging(bridge_env, monkeypatch):
+    """Regression: surface_contract git-stages kanban_payload.json, so bridge_push
+    MUST generate it before ``git add`` — otherwise staging fatals with
+    'pathspec kanban_payload.json did not match any files' and breaks the push."""
+    _, bridge_dir = bridge_env
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args == ("status", "--porcelain"):
+            return _cp(args, stdout="M shared.json\n")
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_server, "_git", fake_git)
+
+    result = json.loads(bridge_server.bridge_push.fn(force=True))
+
+    assert result["pushed_to_remote"] is True
+    kanban = bridge_dir / "kanban_payload.json"
+    assert kanban.exists()  # written before staging -> real `git add` won't fatal
+    data = json.loads(kanban.read_text(encoding="utf-8"))  # valid JSON
+    assert data.get("_render_only") is True
+    assert "tasks" in data
+    # staged alongside the other generated artifacts
+    assert any(args[0] == "add" and "kanban_payload.json" in args for args in git_calls)
 
 
 def test_bridge_push_git_add_failure_fails_closed_without_commit_or_push(
@@ -483,9 +527,7 @@ def test_bridge_push_git_add_failure_fails_closed_without_commit_or_push(
     assert not any(args[0] in {"commit", "push", "status"} for args in git_calls)
 
 
-def test_bridge_push_shared_js_generation_failure_fails_closed(
-    bridge_env, monkeypatch
-):
+def test_bridge_push_shared_js_generation_failure_fails_closed(bridge_env, monkeypatch):
     _db_path, _bridge_dir = bridge_env
     git_calls = []
 
@@ -1017,7 +1059,9 @@ def test_bridge_push_shared_payload_uses_canonical_task_export_columns(
 
     result = json.loads(bridge_server.bridge_push.fn(force=True))
     payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
-    task = next(item for item in payload["tasks"] if item["id"] == "task-canonical-cols")
+    task = next(
+        item for item in payload["tasks"] if item["id"] == "task-canonical-cols"
+    )
 
     assert result["pushed_to_remote"] is True
     assert task["reminder_at"] == reminder
@@ -1052,7 +1096,10 @@ def test_bridge_push_forces_full_task_export_when_index_would_reference_missing_
 
     def fake_git(*args):
         if args == ("status", "--porcelain"):
-            return _cp(args, stdout="M shared.json\nM index.json\nM tasks/task-missing-file.json\n")
+            return _cp(
+                args,
+                stdout="M shared.json\nM index.json\nM tasks/task-missing-file.json\n",
+            )
         return _cp(args)
 
     monkeypatch.setattr(

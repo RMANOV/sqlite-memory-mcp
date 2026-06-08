@@ -41,6 +41,7 @@ from db_utils import (
     merge_import_tasks as _merge_import_tasks,
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
+    write_kanban_payload as _write_kanban_payload,
     mark_tombstones_pushed as _mark_tombstones_pushed,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     export_entity_files as _export_entity_files,
@@ -178,7 +179,10 @@ def _sync_bridge_repo_fast_forward() -> tuple[bool, str | None]:
             for cp in (local, remote, base)
             if cp.returncode != 0
         ).strip()
-        return False, f"bridge git graph inspection failed: {detail or 'unknown git error'}"
+        return (
+            False,
+            f"bridge git graph inspection failed: {detail or 'unknown git error'}",
+        )
 
     local_sha = local.stdout.strip()
     remote_sha = remote.stdout.strip()
@@ -189,7 +193,10 @@ def _sync_bridge_repo_fast_forward() -> tuple[bool, str | None]:
         merge = _git("merge", "--ff-only", "origin/main")
         if merge.returncode != 0:
             detail = (merge.stderr or merge.stdout).strip()
-            return False, f"bridge git fast-forward failed: {detail or 'unknown git error'}"
+            return (
+                False,
+                f"bridge git fast-forward failed: {detail or 'unknown git error'}",
+            )
         return True, None
 
     return (
@@ -254,7 +261,9 @@ def _stage_generated_bridge_artifacts() -> subprocess.CompletedProcess:
     extended_memory/. Only shared.js is force-added because it is a small file://
     compatibility wrapper that is also intentionally ignored in local checkouts.
     """
-    normal_paths = tuple(path for path in _BRIDGE_GIT_STAGE_PATHS if path != "shared.js")
+    normal_paths = tuple(
+        path for path in _BRIDGE_GIT_STAGE_PATHS if path != "shared.js"
+    )
     add_result = _git("add", *normal_paths)
     if add_result.returncode != 0:
         return add_result
@@ -899,6 +908,14 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 "generated_file_failed": True,
             }
         )
+
+    # Render-only Kanban payload (preview) — MUST exist before staging since the
+    # surface contract git-stages kanban_payload.json. Failure here is non-fatal
+    # to transport/push, but we still write it so `git add` does not miss it.
+    try:
+        _write_kanban_payload(BRIDGE_REPO, payload)
+    except Exception as exc:  # noqa: BLE001 - render artifact is best-effort
+        logger.warning("bridge_push: kanban_payload write failed (non-fatal): %s", exc)
 
     # Cross-account push: send assigned tasks to other users' repos
     by_assignee: dict[str, list] = {}
