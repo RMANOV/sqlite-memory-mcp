@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import sys
+from datetime import UTC, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -304,13 +305,14 @@ class TestContradictions:
 
 class TestStaleEntities:
     def test_detect_stale(self, conn):
-        # Entity updated 120 days ago
-        _add_entity(conn, "OldEntity", updated_at="2025-11-01T00:00:00+00:00")
+        old_at = (datetime.now(UTC) - timedelta(days=120)).isoformat()
+        _add_entity(conn, "OldEntity", updated_at=old_at)
         stale = detect_stale_entities(conn, staleness_days=90)
         assert any(s["name"] == "OldEntity" for s in stale)
 
     def test_fresh_entity_not_stale(self, conn):
-        _add_entity(conn, "FreshEntity", updated_at="2026-03-10T00:00:00+00:00")
+        fresh_at = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        _add_entity(conn, "FreshEntity", updated_at=fresh_at)
         stale = detect_stale_entities(conn, staleness_days=90)
         assert not any(s["name"] == "FreshEntity" for s in stale)
 
