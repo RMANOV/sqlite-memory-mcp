@@ -61,6 +61,97 @@ addresses each by enforcing structure at the storage layer.
   digests (regex-validated body). Future readers bootstrap from the
   latest compaction + incremental tail instead of full history.
 
+## Task Tray operator dashboard
+
+The Task Tray full window is **not** a raw debate viewer. It is the
+human / `CONDUCTOR` control surface over debate projections. Raw
+`debate_messages` remain the immutable ledger; the tray should present
+bounded projections that preserve drill-back references into the raw log.
+
+This distinction is required for scale. Multi-agent coordination fails when
+each role repeatedly reads the whole topic history: read cost becomes
+`O(everything × agents)`, burns agent context windows, and increases
+lost-in-the-middle risk. The operator surface should reduce that to
+`O(changes × interested actor)` by routing each actor to the smallest
+actionable view.
+
+When an operator says "check the debate", `CONDUCTOR` should not default to a
+full `debate_read` replay. It should read these projections first:
+
+1. `conductor_inbox`: messages addressed to `CONDUCTOR` / operator,
+   blocked lanes, decision-needed rows, stale claims, and sync anomalies.
+2. `human_brief`: at most 7-10 bullets covering what changed, what closed,
+   what is waiting, what needs an operator decision, what is risky, the
+   recommended next move, and what does **not** need reading.
+3. `lane_state`: current owner, status, last addressed event, next action,
+   stop condition, and risk class per lane.
+4. Raw event / payload drill-back only for rows that need a decision, carry
+   risk, contradict another projection, or require exact evidence.
+
+The required tray projections are:
+
+- `HUMAN_BRIEF` — bounded operator brief, not a transcript.
+- `CONDUCTOR_INBOX` — addressed work, blocked lanes, decision-needed items,
+  stale claims, and sync anomalies.
+- `LANE_STATE` — owner, status, last addressed event, next action, stop
+  condition, and risk class.
+- `ADVOCATE_QUEUE` — artifacts that truly require `PASS` / `AMEND` /
+  `BLOCK` because of security, compliance, reputation, or diff risk.
+- `EXECUTOR_QUEUE` — dispatches addressed to each executor, without foreign
+  lane noise.
+- `STALE_OR_OVERCOORDINATION` — repeated `STATUS`, stale `CLAIM`, duplicate
+  review, and `STOP_COST` candidates.
+- `SYNC_HEALTH` — bridge health as an operator signal, never as a reason to
+  stop bridge sync.
+
+Every projection row must carry enough provenance for drill-back:
+`raw_event_ids`, `payload_ref`, and/or `artifact_ref`. Aggressive summary
+without drill-back is forbidden because it creates projection drift: the
+summary layer becomes a new stale-read source instead of fixing stale reads.
+The governed-memory pattern is therefore:
+
+- immutable raw log = ledger;
+- mutable projections = active working graph;
+- payload / artifact refs = provenance boundary;
+- drill-back = audit and correction path.
+
+Backpressure applies only to low-value coordination noise: repeated standby,
+duplicate FYI `STATUS`, and non-decision progress pings. It must never
+coalesce or buffer:
+
+- `severity >= high`;
+- messages addressed to operator or `CONDUCTOR`;
+- `decision_needed=true`;
+- `sync_health=failing`;
+- security, legal, or reputation critical flags;
+- user override or user correction.
+
+`CONDUCTOR` stop reasons are also part of the operator surface:
+
+- `STOP_PASS` — enough verification; more review has low value.
+- `STOP_STANDBY` — no addressed work.
+- `STOP_HANDOFF` — another actor owns the lane.
+- `STOP_BLOCKED` — missing external input.
+- `STOP_COST` — coordination overhead exceeds remaining value.
+- `STOP_USER_DECISION` — business, political, or personal decision required.
+- `STOP_SYNC_PROTECTION` is **not** a valid blocker: bridge sync must never be
+  stopped because a generated or render-only artifact is dirty. Those issues
+  must be handled as generated paths, previews, or non-fatal side artifacts.
+
+Operationally, `CONDUCTOR` should:
+
+- respect `CLAIM-before-work`, but treat stale claims as expiring signals, not
+  indefinite lane locks;
+- avoid taking a lane as "idle" from a stale read; read to the current
+  projection watermark first;
+- avoid asking `ADVOCATE` to review low-risk verified drafts with no outbound
+  unless legal, security, reputation, or diff risk changed;
+- send operator-facing decision briefs instead of long `STATUS` dumps;
+- treat explicit operator policies, such as "never block bridge sync", as
+  higher-order policy checked before any `BLOCK` / `STOP`;
+- fall back to save-to-file plus compact extraction only when a raw read is too
+  large and no projection is available yet.
+
 ## Message Economy
 
 Every autonomous role must treat a debate post as a scarce coordination event.
