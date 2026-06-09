@@ -4,6 +4,23 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.12.5
+
+### Fixed
+
+- **Bridge sync no longer blocks on the `kanban_payload.json` artifact.** v3.12.4
+  wired `kanban_payload.json` into `surface_contract` and the merge driver but
+  missed `db_utils.is_generated_bridge_path()` / the `generated_paths` restore
+  list. Because the export regenerates the file each run and leaves it
+  uncommitted, the pre-sync readiness check (`_path_allowed_dirty`) treated it as
+  a user-managed edit and failed closed with *"commit or stash bridge repo edits
+  before sync: kanban_payload.json"* — silently freezing the mirror (and any
+  downstream restore that relies on it). The file is now recognized as a
+  regenerable generated artifact: allowed-dirty through the readiness gate and
+  restorable from DB state alongside `shared.json`/`index.json`. This restores
+  the v3.12.4 "sync stays ON" guarantee. Regression test added
+  (`test_kanban_payload_is_recognized_as_generated_bridge_path`).
+
 ## v3.12.4
 
 ### Added

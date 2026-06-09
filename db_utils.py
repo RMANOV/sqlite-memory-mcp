@@ -802,6 +802,7 @@ BRIDGE_GENERATED_FILES = frozenset(
         "shared.js",
         "index.json",
         "entities_index.json",
+        "kanban_payload.json",  # render-only derived mirror (v3.12.4); regenerated each export
         ".bridge_sync.lock",  # legacy in-repo lock path; safe to discard
     }
 )
@@ -1284,6 +1285,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         "shared.js",
         "index.json",
         "entities_index.json",
+        "kanban_payload.json",
         ".bridge_sync.lock",
         "shared.tmp",
         "shared.json.tmp",

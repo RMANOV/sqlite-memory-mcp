@@ -22,10 +22,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from db_utils import (  # noqa: E402
+    BRIDGE_GENERATED_FILES,
     KANBAN_BIG_THRESHOLD,
     KANBAN_COLLAPSE_MAX,
     KANBAN_PREVIEW_MAX,
     _kanban_preview_task,
+    is_generated_bridge_path,
     write_kanban_payload,
 )
 from surface_contract import BRIDGE_ARTIFACT_SURFACE_CONTRACT  # noqa: E402
@@ -137,3 +139,16 @@ def test_surface_contract_render_only_and_tracked():
     assert spec["pull"] is False  # (c) NEVER imported back into the DB
     assert spec["git_stage"] is True  # tracked/synced -> opens immediately on peers
     assert spec["export"] is True
+
+
+def test_kanban_payload_is_recognized_as_generated_bridge_path():
+    """v3.12.5 regression: the pre-sync clean-check allows a dirty path only when
+    is_generated_bridge_path() returns True. v3.12.4 wired kanban_payload.json into
+    surface_contract + the merge-driver but NOT this set, so each export left it
+    uncommitted and the readiness gate blocked sync with 'commit or stash bridge repo
+    edits before sync: kanban_payload.json'. It is a regenerable derived mirror, so it
+    MUST be treated as a generated artifact (allowed-dirty + restored from DB state)."""
+    assert "kanban_payload.json" in BRIDGE_GENERATED_FILES
+    assert is_generated_bridge_path("kanban_payload.json") is True
+    # the readiness check normalizes leading separators before matching
+    assert is_generated_bridge_path("/kanban_payload.json") is True
