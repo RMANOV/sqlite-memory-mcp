@@ -1,5 +1,6 @@
 """Regression tests for core server module imports."""
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -201,6 +202,24 @@ def test_task_server_instructions_make_description_the_default_body_field():
         unified_server.mcp.instructions
     )
     assert "confidence gating" in unified_server.mcp.instructions
+
+
+def test_task_tool_schemas_are_openai_client_compatible():
+    tools = asyncio.run(task_server.mcp.list_tools())
+    forbidden_top_level_keys = {"oneOf", "anyOf", "allOf", "enum", "not"}
+
+    for tool in tools:
+        schema = tool.parameters
+        assert schema.get("type") == "object", tool.name
+        assert not (forbidden_top_level_keys & set(schema)), tool.name
+
+        properties = schema.get("properties", {})
+        assert isinstance(properties, dict), tool.name
+        for required_name in schema.get("required", []):
+            assert required_name in properties, (tool.name, required_name, schema)
+
+    create_schema = next(t.parameters for t in tools if t.name == "create_task_or_note")
+    assert create_schema["properties"]["title"]["type"] == "string"
 
 
 def test_setup_logger_falls_back_when_primary_log_path_is_unwritable(monkeypatch):

@@ -52,6 +52,58 @@ def _find_registered_tool(owner: Any, fn: Any) -> Any | None:
     return None
 
 
+def _schema_for_parameter(param: inspect.Parameter) -> dict[str, Any]:
+    """Return a conservative JSON-schema fragment for a Python parameter."""
+    annotation = param.annotation
+    if isinstance(annotation, str):
+        annotation_name = annotation
+    else:
+        annotation_name = getattr(annotation, "__name__", "")
+
+    if annotation in (bool,) or annotation_name == "bool":
+        schema: dict[str, Any] = {"type": "boolean"}
+    elif annotation in (int,) or annotation_name == "int":
+        schema = {"type": "integer"}
+    elif annotation in (float,) or annotation_name == "float":
+        schema = {"type": "number"}
+    elif annotation in (dict,) or annotation_name == "dict":
+        schema = {"type": "object"}
+    elif annotation in (list,) or annotation_name == "list":
+        schema = {"type": "array"}
+    else:
+        schema = {"type": "string"}
+
+    if param.default is not inspect.Parameter.empty:
+        schema["default"] = param.default
+    return schema
+
+
+def _patch_missing_parameter_properties(tool_obj: Any, fn: Any) -> None:
+    """Keep FastMCP tool schemas internally consistent.
+
+    FastMCP versions around 2.1 can drop a function parameter named ``title``
+    from ``parameters.properties`` while still keeping it in ``required``.
+    Downstream OpenAI-compatible clients then reject the whole tool list before
+    the model can run. Patch only missing properties from the raw signature and
+    leave FastMCP-generated schemas untouched otherwise.
+    """
+    parameters = getattr(tool_obj, "parameters", None)
+    if not isinstance(parameters, dict):
+        return
+    properties = parameters.setdefault("properties", {})
+    if not isinstance(properties, dict):
+        return
+
+    for name, param in inspect.signature(fn).parameters.items():
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if name not in properties:
+            properties[name] = _schema_for_parameter(param)
+
+
 def _wrap_callable_tool(fn: Any, registered_tool: Any | None) -> Any:
     @wraps(fn)
     def legacy_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -81,6 +133,11 @@ def _wrap_callable_tool(fn: Any, registered_tool: Any | None) -> Any:
 
 def _attach_fn_alias(owner: Any, tool_obj: Any, fn: Any) -> Any:
     registered_tool = _find_registered_tool(owner, fn)
+    raw_fn = getattr(fn, "__wrapped__", fn)
+
+    for candidate in (tool_obj, registered_tool):
+        if candidate is not None:
+            _patch_missing_parameter_properties(candidate, raw_fn)
 
     if isinstance(tool_obj, _CompatFunctionTool):
         if tool_obj._legacy_raw_fn is None:
