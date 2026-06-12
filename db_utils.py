@@ -6831,6 +6831,63 @@ def write_kanban_payload(bridge_dir: str, payload: dict) -> str:
     return "kanban_payload.json"
 
 
+def ensure_kanban_payload_parseable(
+    bridge_dir: str,
+    payload: dict | None = None,
+    logger: logging.Logger | None = None,
+) -> str:
+    """Load-side parse-or-regenerate guard for kanban_payload.json.
+
+    The render artifact merges with ``merge=union``, which can splice two JSON
+    documents into an unparseable file after a pull. A corrupt preview must
+    NEVER be served (Pages/PWA reads it) and must NEVER block sync: if the file
+    exists but fails to parse, regenerate it from the freshly loaded transport
+    ``payload`` (shared.json shape). A missing file is left alone -- the next
+    export creates it. Best-effort by design: never raises.
+
+    Returns a status string: ``ok`` (valid, untouched), ``missing`` (no file,
+    no-op), ``regenerated`` (corrupt -> rebuilt from transport payload),
+    ``skipped`` (corrupt but no transport payload to rebuild from), or
+    ``failed`` (regeneration attempt itself failed; logged, non-fatal).
+    """
+    path = Path(bridge_dir) / "kanban_payload.json"
+    try:
+        if not path.exists():
+            return "missing"
+        json_loads(path.read_text(encoding="utf-8"))
+        return "ok"
+    except (ValueError, OSError, TypeError) as exc:
+        if logger:
+            logger.warning(
+                "kanban_payload.json failed to parse (%s) -- "
+                "parse-or-regenerate guard engaged",
+                exc,
+            )
+    if not isinstance(payload, dict) or not payload:
+        if logger:
+            logger.warning(
+                "kanban_payload.json corrupt but no transport payload "
+                "available; leaving for the next export to regenerate"
+            )
+        return "skipped"
+    try:
+        write_kanban_payload(bridge_dir, payload)
+        if logger:
+            logger.info(
+                "kanban_payload.json regenerated from transport payload "
+                "after corrupt merge artifact"
+            )
+        return "regenerated"
+    except Exception as exc:  # noqa: BLE001 - render artifact is best-effort
+        if logger:
+            logger.warning(
+                "kanban_payload regeneration failed (non-fatal, transport "
+                "unaffected): %s",
+                exc,
+            )
+        return "failed"
+
+
 def load_extended_memory_files(
     bridge_dir: str,
     logger: logging.Logger | None = None,

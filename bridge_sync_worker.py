@@ -74,6 +74,7 @@ from db_utils import (
     import_remote_bridge_data,
     write_extended_memory_files,  # noqa: F401
     write_kanban_payload,  # noqa: F401
+    ensure_kanban_payload_parseable,
     EXTENDED_MEMORY_KEYS,  # noqa: F401
     migrate_entities_to_per_files,
     ensure_bridge_repo_ready,
@@ -892,6 +893,10 @@ def _main_locked(
         }
 
     if pull_only:
+        # No export follows in pull-only mode, so a union-merge-corrupted
+        # kanban_payload.json would otherwise linger until the next full sync.
+        # Parse-or-regenerate from the transport payload; never blocks the pull.
+        ensure_kanban_payload_parseable(bridge_dir, remote_payload, log)
         _progress(progress_callback, 100, "Pull complete")
         return {
             "entities": 0,

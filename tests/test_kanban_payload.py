@@ -12,24 +12,40 @@ Hard guards under test:
   - kanban_payload.json is valid JSON and materially smaller (giant cards capped)
   - idempotent (same task-preview fields across two writes)
   - surface contract: pull=False (NEVER imported) + git_stage=True (tracked/synced)
+  - parse-or-regenerate guard (load side): a union-merge-corrupted preview is
+    rebuilt from the transport payload and NEVER blocks pull/sync
+  - acceptance (b): fresh DB pull/restore from the transport recovers the FULL
+    description even when a preview kanban_payload.json sits in the bridge dir
 """
 
 import hashlib
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import bridge_server  # noqa: E402
+import bridge_sync_worker  # noqa: E402
+import db_utils  # noqa: E402
 from db_utils import (  # noqa: E402
     BRIDGE_GENERATED_FILES,
     KANBAN_BIG_THRESHOLD,
     KANBAN_COLLAPSE_MAX,
     KANBAN_PREVIEW_MAX,
     _kanban_preview_task,
+    ensure_kanban_payload_parseable,
+    export_index_json,
+    export_task_files,
     is_generated_bridge_path,
+    load_remote_tasks_for_merge,
+    merge_import_tasks,
+    now_iso,
     write_kanban_payload,
 )
+from schema import init_db  # noqa: E402
 from surface_contract import BRIDGE_ARTIFACT_SURFACE_CONTRACT  # noqa: E402
 
 
@@ -152,3 +168,288 @@ def test_kanban_payload_is_recognized_as_generated_bridge_path():
     assert is_generated_bridge_path("kanban_payload.json") is True
     # the readiness check normalizes leading separators before matching
     assert is_generated_bridge_path("/kanban_payload.json") is True
+
+
+# ── parse-or-regenerate guard (load side; SPEC e401c69d fold #2) ──────────
+
+
+def test_parse_guard_regenerates_corrupt_payload(tmp_path):
+    (tmp_path / "kanban_payload.json").write_text(
+        '{"tasks": [}{ UNION MERGE GARBAGE', encoding="utf-8"
+    )
+    payload = _payload(
+        [{"id": "big", "status": "done", "section": "someday", "description": "B" * 90000}]
+    )
+
+    status = ensure_kanban_payload_parseable(str(tmp_path), payload)
+
+    assert status == "regenerated"
+    data = json.loads((tmp_path / "kanban_payload.json").read_text(encoding="utf-8"))
+    assert data["_render_only"] is True
+    assert len(data["tasks"][0]["description"]) <= KANBAN_COLLAPSE_MAX
+
+
+def test_parse_guard_leaves_valid_payload_untouched(tmp_path):
+    write_kanban_payload(str(tmp_path), _payload([{"id": "keep", "description": "ok"}]))
+    before = (tmp_path / "kanban_payload.json").read_bytes()
+
+    # Even when handed a DIFFERENT transport payload, a valid file is not rewritten.
+    status = ensure_kanban_payload_parseable(
+        str(tmp_path), _payload([{"id": "other", "description": "changed"}])
+    )
+
+    assert status == "ok"
+    assert (tmp_path / "kanban_payload.json").read_bytes() == before
+
+
+def test_parse_guard_missing_file_is_noop(tmp_path):
+    status = ensure_kanban_payload_parseable(str(tmp_path), _payload([]))
+    assert status == "missing"
+    assert not (tmp_path / "kanban_payload.json").exists()
+
+
+def test_parse_guard_corrupt_without_transport_payload_never_raises(tmp_path):
+    (tmp_path / "kanban_payload.json").write_text("not json", encoding="utf-8")
+    assert ensure_kanban_payload_parseable(str(tmp_path), {}) == "skipped"
+    assert ensure_kanban_payload_parseable(str(tmp_path), None) == "skipped"
+    # left for the next export to regenerate -- guard never deletes
+    assert (tmp_path / "kanban_payload.json").read_text(encoding="utf-8") == "not json"
+
+
+def test_parse_guard_never_raises_when_regeneration_fails(tmp_path, monkeypatch):
+    (tmp_path / "kanban_payload.json").write_text("{corrupt", encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(db_utils, "write_kanban_payload", boom)
+    status = ensure_kanban_payload_parseable(str(tmp_path), _payload([]))
+    assert status == "failed"  # logged, non-fatal -- sync must never block
+
+
+# ── acceptance (b): fresh DB pull/restore keeps FULL descriptions ─────────
+
+
+def test_fresh_db_pull_restores_full_description_not_preview(tmp_path):
+    """SPEC e401c69d main P0 guard: the transport round-trip must recover the
+    FULL body on a fresh machine even though a preview kanban_payload.json is
+    present in the bridge dir (it is render-only and ignored by import)."""
+    full_body = "D" * 540408  # mirrors the d539f5ab ground-truth giant note
+    source_db_path = str(tmp_path / "source.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(source_db_path)
+    created = now_iso()
+    source = sqlite3.connect(source_db_path, isolation_level=None)
+    source.row_factory = sqlite3.Row
+    try:
+        source.execute(
+            "INSERT INTO tasks (id, title, description, status, section, priority, "
+            "type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "d539-full",
+                "Giant note",
+                full_body,
+                "not_started",
+                "inbox",
+                "medium",
+                "task",
+                created,
+                created,
+            ),
+        )
+        export_task_files(source, str(bridge_dir))
+        export_index_json(source, str(bridge_dir))
+    finally:
+        source.close()
+
+    # The render preview sits alongside the transport, as it does after export.
+    write_kanban_payload(
+        str(bridge_dir),
+        {"tasks": [{"id": "d539-full", "status": "not_started",
+                    "section": "inbox", "description": full_body}]},
+    )
+    preview = json.loads(
+        (bridge_dir / "kanban_payload.json").read_text(encoding="utf-8")
+    )
+    assert preview["tasks"][0]["_mirror_preview"] is True  # preview IS truncated
+
+    # Fresh machine: pull/restore from the transport only.
+    remote_tasks, loaded_from_index = load_remote_tasks_for_merge(str(bridge_dir), {})
+    restored_db_path = str(tmp_path / "restored.db")
+    init_db(restored_db_path)
+    restored = sqlite3.connect(restored_db_path, isolation_level=None)
+    restored.row_factory = sqlite3.Row
+    try:
+        new_count, _updated = merge_import_tasks(
+            restored, remote_tasks, import_content=True
+        )
+        row = restored.execute(
+            "SELECT description FROM tasks WHERE id='d539-full'"
+        ).fetchone()
+    finally:
+        restored.close()
+
+    assert loaded_from_index is True
+    assert new_count == 1
+    assert len(row["description"]) == 540408
+    assert row["description"] == full_body  # FULL body, NOT the preview
+    # and nothing imported carries preview markers
+    assert all("_mirror_preview" not in t for t in remote_tasks)
+
+
+# ── wiring: pull paths engage the guard (never block, never serve corrupt) ─
+
+
+def _git_cp(args, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
+
+
+def test_bridge_pull_regenerates_corrupt_kanban_payload(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    big = "G" * (KANBAN_BIG_THRESHOLD + 4000)
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(_payload(
+            [{"id": "g1", "title": "Giant", "type": "task", "status": "not_started",
+              "section": "inbox", "priority": "medium", "description": big,
+              "created_at": "2026-06-08T00:00:00+00:00",
+              "updated_at": "2026-06-08T00:00:00+00:00"}]
+        )),
+        encoding="utf-8",
+    )
+    (bridge_dir / "kanban_payload.json").write_text(
+        "<<<<<<< union merge wreckage", encoding="utf-8"
+    )
+
+    def _conn_factory():
+        conn = sqlite3.connect(db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(bridge_server, "BRIDGE_REPO", str(bridge_dir))
+    monkeypatch.setattr(bridge_server, "_get_conn", _conn_factory)
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_server, "_git", lambda *args: _git_cp(args))
+
+    result = json.loads(bridge_server.bridge_pull.fn())
+    assert "error" not in result  # guard must never block the pull
+
+    data = json.loads(
+        (bridge_dir / "kanban_payload.json").read_text(encoding="utf-8")
+    )
+    assert data["_render_only"] is True
+    by_id = {t["id"]: t for t in data["tasks"]}
+    assert by_id["g1"]["_mirror_preview"] is True
+    assert len(by_id["g1"]["description"]) == KANBAN_PREVIEW_MAX
+
+    # transport import still delivered the FULL body to the DB
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT description FROM tasks WHERE id='g1'").fetchone()
+    conn.close()
+    assert row["description"] == big
+
+
+def test_sync_worker_pull_only_regenerates_corrupt_kanban_payload(
+    tmp_path, monkeypatch
+):
+    """pull_only skips export, so the guard is the ONLY thing standing between a
+    union-merge-corrupted preview and the next Pages/PWA load."""
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    (bridge_dir / "shared.json").write_text(
+        json.dumps(_payload(
+            [{"id": "w1", "title": "Done giant", "type": "task", "status": "done",
+              "section": "someday", "priority": "medium",
+              "description": "H" * 80000,
+              "created_at": "2026-06-08T00:00:00+00:00",
+              "updated_at": "2026-06-08T00:00:00+00:00"}]
+        )),
+        encoding="utf-8",
+    )
+    (bridge_dir / "kanban_payload.json").write_text("} corrupt {", encoding="utf-8")
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        if args[:3] == ("fetch", "origin", "main"):
+            return _git_cp(args)
+        if args[0] in ("rev-parse", "merge-base"):
+            return _git_cp(args, stdout="same-sha\n")
+        raise AssertionError(f"Unexpected git_retry call: {args}")
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "import_remote_bridge_data",
+        lambda *a, **k: {"entities": 0, "relations": 0, "ratings": 0},
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker, "sync_task_attachments_from_remote", lambda *a, **k: (0, 0)
+    )
+
+    result = bridge_sync_worker.main(
+        db_path=db_path,
+        bridge_repo=str(bridge_dir),
+        pull_only=True,
+    )
+
+    assert result["pull_only"] is True
+    assert result["pushed"] is False
+    data = json.loads(
+        (bridge_dir / "kanban_payload.json").read_text(encoding="utf-8")
+    )
+    assert data["_render_only"] is True
+    assert len(data["tasks"][0]["description"]) <= KANBAN_COLLAPSE_MAX
+
+
+def test_parse_guard_failure_does_not_block_pull_only(tmp_path, monkeypatch):
+    """Even if the guard itself blows up, pull_only must complete (never block)."""
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+    (bridge_dir / "kanban_payload.json").write_text("{nope", encoding="utf-8")
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        if args[:3] == ("fetch", "origin", "main"):
+            return _git_cp(args)
+        if args[0] in ("rev-parse", "merge-base"):
+            return _git_cp(args, stdout="same-sha\n")
+        raise AssertionError(f"Unexpected git_retry call: {args}")
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "import_remote_bridge_data",
+        lambda *a, **k: {"entities": 0, "relations": 0, "ratings": 0},
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker, "load_remote_tasks_for_merge", lambda *a, **k: ([], True)
+    )
+    # write_kanban_payload exploding inside the guard must stay non-fatal
+    def boom(*args, **kwargs):
+        raise RuntimeError("regeneration blew up")
+
+    monkeypatch.setattr(db_utils, "write_kanban_payload", boom)
+
+    result = bridge_sync_worker.main(
+        db_path=db_path,
+        bridge_repo=str(bridge_dir),
+        pull_only=True,
+    )
+    assert result["pull_only"] is True
