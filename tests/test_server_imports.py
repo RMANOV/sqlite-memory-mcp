@@ -204,20 +204,55 @@ def test_task_server_instructions_make_description_the_default_body_field():
     assert "confidence gating" in unified_server.mcp.instructions
 
 
-def test_task_tool_schemas_are_openai_client_compatible():
-    tools = asyncio.run(task_server.mcp.list_tools())
+@pytest.mark.parametrize(
+    "module",
+    [
+        server,
+        session_server,
+        task_server,
+        bridge_server,
+        collab_server,
+        entity_server,
+        intel_server,
+        unified_server,
+    ],
+    ids=lambda module: module.__name__,
+)
+def test_tool_schemas_are_openai_client_compatible(module):
+    """Every public server's tool schemas must satisfy OpenAI-client invariants.
+
+    OpenAI-compatible clients reject tool definitions whose top-level input
+    schema is not a plain object or that lean on top-level combinators, and
+    they require every ``required`` name to be a declared property.
+    """
+    tools = asyncio.run(module.mcp.list_tools())
+    if not tools:
+        pytest.skip(f"{module.__name__} intentionally exposes no MCP tools")
+
     forbidden_top_level_keys = {"oneOf", "anyOf", "allOf", "enum", "not"}
 
     for tool in tools:
         schema = tool.parameters
-        assert schema.get("type") == "object", tool.name
-        assert not (forbidden_top_level_keys & set(schema)), tool.name
+        assert schema.get("type") == "object", (module.__name__, tool.name)
+        assert not (forbidden_top_level_keys & set(schema)), (
+            module.__name__,
+            tool.name,
+            sorted(forbidden_top_level_keys & set(schema)),
+        )
 
         properties = schema.get("properties", {})
-        assert isinstance(properties, dict), tool.name
+        assert isinstance(properties, dict), (module.__name__, tool.name)
         for required_name in schema.get("required", []):
-            assert required_name in properties, (tool.name, required_name, schema)
+            assert required_name in properties, (
+                module.__name__,
+                tool.name,
+                required_name,
+                schema,
+            )
 
+
+def test_task_create_schema_keeps_typed_title_property():
+    tools = asyncio.run(task_server.mcp.list_tools())
     create_schema = next(t.parameters for t in tools if t.name == "create_task_or_note")
     assert create_schema["properties"]["title"]["type"] == "string"
 

@@ -42,6 +42,7 @@ from db_utils import (
     export_task_files as _export_task_files,
     export_index_json as _export_index_json,
     write_kanban_payload as _write_kanban_payload,
+    ensure_kanban_payload_parseable as _ensure_kanban_payload_parseable,
     mark_tombstones_pushed as _mark_tombstones_pushed,
     migrate_to_per_task_files as _migrate_to_per_task_files,
     export_entity_files as _export_entity_files,
@@ -1167,6 +1168,11 @@ def bridge_pull() -> str:
             if not _has_index:
                 return _error(f"Failed to read shared.json: {exc}")
             logger.warning("bridge_pull: shared.json parse failed: %s", exc)
+
+    # Render-payload parse-or-regenerate guard: a union merge during pull can
+    # corrupt kanban_payload.json; rebuild it from the transport payload so a
+    # corrupt preview is never served. Best-effort -- never blocks the pull.
+    _ensure_kanban_payload_parseable(BRIDGE_REPO, payload, logger)
 
     entities = _load_remote_entities_for_import(BRIDGE_REPO, payload, logger)
     relations = payload.get("relations", [])
