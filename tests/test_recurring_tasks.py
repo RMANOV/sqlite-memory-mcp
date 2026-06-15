@@ -67,12 +67,13 @@ def _insert_task(
     project=None,
     parent_id=None,
     task_type="task",
+    section="today",
 ):
     conn.execute(
         "INSERT INTO tasks (id, title, status, section, priority, recurring, project, "
         "parent_id, type, visibility, created_at, updated_at) "
-        "VALUES (?, ?, ?, 'today', 'medium', ?, ?, ?, ?, 'private', datetime('now'), datetime('now'))",
-        (task_id, title, status, recurring, project, parent_id, task_type),
+        "VALUES (?, ?, ?, ?, 'medium', ?, ?, ?, ?, 'private', datetime('now'), datetime('now'))",
+        (task_id, title, status, section, recurring, project, parent_id, task_type),
     )
 
 
@@ -103,6 +104,59 @@ def test_process_recurring_scopes_duplicates_to_same_project(conn):
     assert created_row["title"] == "Weekly Review"
     assert created_row["project"] == "client-b"
     assert created_row["status"] == "not_started"
+
+
+def test_process_recurring_spawns_visible_task_from_done_section_source(conn):
+    _insert_task(
+        conn,
+        "source-done",
+        title="Monthly KPI Update",
+        status="done",
+        section="done",
+        recurring='{"every":"day"}',
+        project="work",
+    )
+
+    created = process_recurring(conn, dry_run=False)
+
+    assert len(created) == 1
+    created_row = conn.execute(
+        "SELECT status, section FROM tasks WHERE id = ?", (created[0]["id"],)
+    ).fetchone()
+    assert created_row["status"] == "not_started"
+    assert created_row["section"] == "next"
+
+
+def test_process_recurring_creates_one_child_for_duplicate_done_series(conn):
+    _insert_task(
+        conn,
+        "source-done-a",
+        title="Monthly KPI Update",
+        status="done",
+        section="done",
+        recurring='{"every":"day"}',
+        project="work",
+    )
+    _insert_task(
+        conn,
+        "source-done-b",
+        title="Monthly KPI Update",
+        status="done",
+        section="someday",
+        recurring='{"every":"day"}',
+        project="work",
+    )
+
+    created = process_recurring(conn, dry_run=False)
+
+    assert len(created) == 1
+    active_count = conn.execute(
+        "SELECT COUNT(*) FROM tasks "
+        "WHERE title = 'Monthly KPI Update' "
+        "AND project = 'work' "
+        "AND status IN ('not_started', 'in_progress')"
+    ).fetchone()[0]
+    assert active_count == 1
 
 
 def test_process_recurring_uses_shared_timestamp_for_new_task_versions(conn):

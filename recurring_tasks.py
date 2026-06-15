@@ -170,14 +170,18 @@ def get_recurring_done_tasks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def build_new_task(source: sqlite3.Row, due: str, timestamp: str) -> dict:
+def active_section_for_due(due: str, today: date) -> str:
+    return "today" if due == today.isoformat() else "next"
+
+
+def build_new_task(source: sqlite3.Row, due: str, timestamp: str, today: date) -> dict:
     return {
         "id": uuid.uuid4().hex[:16],
         "title": source["title"],
         "description": source["description"],
         "status": "not_started",
         "priority": source["priority"],
-        "section": source["section"],
+        "section": active_section_for_due(due, today),
         "due_date": due,
         "project": source["project"],
         "parent_id": source["parent_id"],
@@ -227,7 +231,7 @@ def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
             continue
 
         due = next_due_date(config, today)
-        new_task = build_new_task(task, due, timestamp)
+        new_task = build_new_task(task, due, timestamp, today)
 
         if dry_run:
             print(
