@@ -228,7 +228,10 @@ def rerank_entities(
 
 # ── Ready context surfaces ────────────────────────────────────────────────
 
-READY_CONTEXT_CONTRACT_VERSION = "ready_context.v0"
+# v0 -> v1 (Wave-2 B3): ADDITIVE response fields only — today_used,
+# reason_primary, sort_position; prime mode emits mandate when empty. No field
+# was removed or renamed, so v1 readers stay backward compatible with v0 data.
+READY_CONTEXT_CONTRACT_VERSION = "ready_context.v1"
 
 READY_STATES = (
     "ready_now",
@@ -267,6 +270,45 @@ _READY_STATE_RANK = {
     "excluded": 5,
 }
 _READY_URGENCY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# Deterministic precedence for reason_primary (B3, contract v1). The winning
+# reason is the highest-precedence code present in a record's reason_codes; if
+# none of these match (defensive), fall back to the first emitted code. This is
+# a pure, total ordering over REASON_CODES so reason_primary is reproducible.
+_REASON_PRIMARY_ORDER = (
+    "explicit_user_correction",
+    "reopen_requested_by_user",
+    "done_but_recently_confused",
+    "blocked_by_open_item",
+    "due_or_overdue",
+    "external_commitment_risk",
+    "active_delivery_pressure",
+    "critical_priority",
+    "machine_anomaly_open",
+    "waiting_followup_date",
+    "bridge_sync_caution",
+    "cleanup_candidate",
+    "reading_surface",
+    "stale_but_unresolved",
+)
+_REASON_PRIMARY_RANK = {code: i for i, code in enumerate(_REASON_PRIMARY_ORDER)}
+
+
+def _ready_reason_primary(reason_codes: list[str]) -> str:
+    """Deterministically pick the winning reason from reason_codes.
+
+    Highest-precedence code in ``_REASON_PRIMARY_ORDER`` wins; on a tie/miss the
+    first emitted code is used so the result is total and reproducible for a
+    fixed reason_codes list. Empty input yields the contract sentinel.
+    """
+    if not reason_codes:
+        return "stale_but_unresolved"
+    return min(
+        reason_codes,
+        key=lambda code: (_REASON_PRIMARY_RANK.get(code, len(_REASON_PRIMARY_ORDER)),),
+    )
+
+
 _BLOCKER_TERMS = (
     ("needs_user_decision", ("under-specified", "underspecified", "acceptance rule")),
     ("missing_input", ("missing input", "needs input", "permission", "awaiting")),
@@ -521,6 +563,8 @@ def build_ready_record(
     if ready_state in {"cleanup_candidate", "excluded"}:
         confidence = "low"
 
+    effective_reason_codes = reason_codes or ["stale_but_unresolved"]
+
     return {
         "id": task.get("id"),
         "type": task.get("type") or "task",
@@ -534,7 +578,12 @@ def build_ready_record(
         "blockers": blockers,
         "urgency": urgency,
         "urgency_reason": urgency_reason,
-        "reason_codes": reason_codes or ["stale_but_unresolved"],
+        "reason_codes": effective_reason_codes,
+        # B3 (v1, additive): the deterministic winning reason and the exact
+        # wall-clock date the rules were evaluated against, so date.today()
+        # dependence is auditable in the emitted record itself.
+        "reason_primary": _ready_reason_primary(effective_reason_codes),
+        "today_used": today.isoformat(),
         "provenance": {
             "source_kind": "task",
             "source_id": task.get("id"),
@@ -567,7 +616,12 @@ def ready_context(
     ]
     if not include_excluded:
         records = [r for r in records if r["ready_state"] != "excluded"]
-    return sorted(records, key=_ready_sort_key)
+    ordered = sorted(records, key=_ready_sort_key)
+    # B3 (v1, additive): stamp the final 0-based rank after the deterministic
+    # sort so callers can cite an item's position without re-deriving the order.
+    for position, record in enumerate(ordered):
+        record["sort_position"] = position
+    return ordered
 
 
 def attach_ready_metadata(record: dict[str, Any]) -> dict[str, Any]:
@@ -581,6 +635,11 @@ def attach_ready_metadata(record: dict[str, Any]) -> dict[str, Any]:
     task["_ready_stale_warning"] = record["stale_warning"]
     task["_ready_confidence"] = record["confidence"]
     task["_ready_provenance"] = dict(record["provenance"])
+    # B3 (v1, additive): mirror the new auditable fields onto tray rows.
+    task["_ready_reason_primary"] = record.get("reason_primary")
+    task["_ready_today_used"] = record.get("today_used")
+    if "sort_position" in record:
+        task["_ready_sort_position"] = record["sort_position"]
     return task
 
 
@@ -614,12 +673,35 @@ def prime_context(
     limit: int = 12,
     today: date | None = None,
 ) -> dict[str, Any]:
-    """Build a compact boot pack from the same ready-context records."""
-    records = ready_context(tasks, include_readings=include_readings, today=today)
+    """Build a compact boot pack from the same ready-context records.
+
+    The mandate and guidance are static and therefore present even when the
+    boot pack is empty (no tasks / nothing ready). Every item list is derived
+    strictly from the supplied tasks, so an empty input yields empty lists and
+    never fabricates work — only the mandate/guidance survive.
+    """
+    # Resolve the wall-clock date once so the pack records the exact day its
+    # rules ran against (B3, v1 — auditable date.today() dependence).
+    effective_today = today or date.today()
+    records = ready_context(
+        tasks, include_readings=include_readings, today=effective_today
+    )
     top = records[:limit]
+    mandate = "Use deterministic ready_context records before broad memory search."
     return {
         "contract_version": READY_CONTEXT_CONTRACT_VERSION,
-        "current_mandate": "Use deterministic ready_context records before broad memory search.",
+        "current_mandate": mandate,
+        # B3 (v1, additive): explicit mandate/guidance always present, even on
+        # an empty pack; today_used + items_empty make the empty case auditable.
+        "mandate": mandate,
+        "guidance": (
+            "Start from top_ready_items; resolve blocked_or_waiting next; treat "
+            "cleanup_candidates and explicit_exclusions as review-only. When the "
+            "pack is empty, honor the mandate and do NOT invent tasks — query or "
+            "wait for real ones."
+        ),
+        "today_used": effective_today.isoformat(),
+        "items_empty": not records,
         "top_ready_items": top,
         "blocked_or_waiting": [
             r for r in records if r["ready_state"] in {"blocked", "waiting"}
@@ -628,7 +710,7 @@ def prime_context(
             r for r in records if r["ready_state"] == "cleanup_candidate"
         ][:limit],
         "explicit_exclusions": [
-            build_ready_record(t, include_readings=include_readings, today=today)
+            build_ready_record(t, include_readings=include_readings, today=effective_today)
             for t in tasks
             if (t.get("status") in TASK_ACTIVE_EXCLUSIONS)
         ][:limit],

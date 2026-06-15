@@ -234,3 +234,132 @@ def test_prime_context_uses_same_ready_records():
     assert {record["id"] for record in pack["top_ready_items"]}.issubset(ready_ids)
     assert pack["blocked_or_waiting"][0]["id"] == "blocked"
     assert pack["explicit_exclusions"][0]["id"] == "closed"
+
+
+# ── B3 (contract v1) additive-field + cold-start coverage ──────────────────
+
+
+def test_contract_version_is_v1():
+    # Change 5: explicit, backcompat-safe v0 -> v1 bump is pinned by the suite.
+    assert READY_CONTEXT_CONTRACT_VERSION == "ready_context.v1"
+
+
+def test_ready_record_carries_additive_audit_fields():
+    # Change 1 + 2: today_used echoes the injected date; reason_primary is the
+    # deterministic winner derived from the existing reason_codes order.
+    fixed = date(2026, 5, 24)
+    record = build_ready_record(
+        _task(
+            "mapping",
+            "Mapping Studio installer delivery",
+            priority="critical",
+            section="today",
+            due_date="2026-05-24",
+            project="mapping-studio",
+        ),
+        today=fixed,
+    )
+
+    assert record["today_used"] == "2026-05-24"
+    assert record["reason_primary"] in record["reason_codes"]
+    # section=today => explicit_user_correction is the highest-precedence code.
+    assert record["reason_primary"] == "explicit_user_correction"
+    assert record["provenance"]["rule_version"] == "ready_context.v1"
+
+
+def test_reason_primary_is_deterministic_across_calls():
+    # Determinism proof: identical input -> identical winning reason every time.
+    # The bridge/sync text triggers both machine_anomaly_open (rank 8) and
+    # bridge_sync_caution (rank 10); the higher-precedence code wins, every run.
+    row = _task(
+        "bridge",
+        "Bridge sync status repair",
+        priority="high",
+        notes="bridge sync updated_at churn after import wave",
+    )
+    record = build_ready_record(row, today=date(2026, 5, 24))
+    assert "machine_anomaly_open" in record["reason_codes"]
+    assert "bridge_sync_caution" in record["reason_codes"]
+    primaries = {
+        build_ready_record(row, today=date(2026, 5, 24))["reason_primary"]
+        for _ in range(5)
+    }
+    assert primaries == {"machine_anomaly_open"}
+
+
+def test_reason_primary_prefers_blocker_over_lower_precedence_codes():
+    # A critical+blocked task surfaces the blocker as the primary reason, not
+    # the lower-precedence critical_priority code.
+    record = build_ready_record(
+        _task(
+            "smart-tab",
+            "Smart-tab threshold task",
+            priority="critical",
+            description="acceptance rule is under-specified",
+        ),
+        today=date(2026, 5, 24),
+    )
+
+    assert "blocked_by_open_item" in record["reason_codes"]
+    assert "critical_priority" in record["reason_codes"]
+    assert record["reason_primary"] == "blocked_by_open_item"
+
+
+def test_sort_position_is_assigned_after_final_sort():
+    # Change 2: sort_position is a 0-based rank stamped after the sort, and it
+    # matches the deterministic order of the returned records.
+    rows = [
+        _task("blocked", "Blocked work", notes="blocked by user decision"),
+        _task("ready", "Ready work", priority="critical", section="today"),
+    ]
+
+    records = ready_context(rows, today=date(2026, 5, 24))
+
+    assert [r["sort_position"] for r in records] == list(range(len(records)))
+    # ready_now sorts ahead of blocked, so 'ready' gets position 0.
+    assert records[0]["id"] == "ready"
+    assert records[0]["sort_position"] == 0
+
+
+def test_cold_start_ready_context_is_empty_shape():
+    # Change 4: ready_context([]) returns a {count:0, items:[]}-shaped result.
+    records = ready_context([], today=date(2026, 5, 24))
+
+    assert records == []
+    assert len(records) == 0
+
+
+def test_cold_start_prime_returns_mandate_with_empty_items():
+    # Change 3 + 4: prime-on-empty yields the mandate/guidance with empty item
+    # lists and fabricates nothing. today is injected for determinism.
+    pack = prime_context([], today=date(2026, 5, 24))
+
+    assert pack["contract_version"] == "ready_context.v1"
+    assert pack["mandate"]
+    assert pack["guidance"]
+    assert pack["current_mandate"] == pack["mandate"]
+    assert pack["today_used"] == "2026-05-24"
+    assert pack["items_empty"] is True
+    for key in (
+        "top_ready_items",
+        "blocked_or_waiting",
+        "cleanup_candidates",
+        "explicit_exclusions",
+        "risk_or_escalation_items",
+        "evidence_refs",
+    ):
+        assert pack[key] == []
+
+
+def test_suggested_ready_exposes_additive_fields():
+    # The suggested-tab projection mirrors the new audit fields under the
+    # established _ready_ prefix without dropping prior metadata.
+    rows = [_task("work", "Concrete work", priority="high")]
+
+    suggested = suggested_ready(rows, today=date(2026, 5, 24))
+
+    assert suggested[0]["_ready_today_used"] == "2026-05-24"
+    assert suggested[0]["_ready_reason_primary"]
+    assert suggested[0]["_ready_sort_position"] == 0
+    # Backcompat: prior projected fields remain intact.
+    assert suggested[0]["_ready_provenance"]["rule_version"] == "ready_context.v1"
