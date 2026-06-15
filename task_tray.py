@@ -812,8 +812,16 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QDialog,
     QProgressBar,
+    QAbstractItemView,
 )
-from PyQt6.QtGui import QIcon, QAction, QActionGroup, QColor
+from PyQt6.QtGui import (
+    QIcon,
+    QAction,
+    QActionGroup,
+    QColor,
+    QKeySequence,
+    QShortcut,
+)
 from PyQt6.QtCore import (
     QFileSystemWatcher,
     QObject,
@@ -1105,6 +1113,24 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             lw.itemChanged.connect(lambda item, k=key: self._on_item_changed(item))
             self.tab_lists[key] = lw
             self.tabs.addTab(lw, self._tab_labels[key])
+
+        # B1a: dashboard rows are a read-only projection. Allow multi-row
+        # mouse/keyboard selection and a Ctrl+C that copies the selection (or
+        # the whole tab if nothing is selected) with readable line breaks. The
+        # shortcut only reads item text → clipboard; it performs no DB write,
+        # navigation, snooze, archive, or done toggle.
+        dash_lw = self.tab_lists.get("dashboard")
+        if dash_lw is not None:
+            dash_lw.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+            dash_copy = QShortcut(
+                QKeySequence(QKeySequence.StandardKey.Copy), dash_lw
+            )
+            dash_copy.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            dash_copy.activated.connect(
+                lambda lw=dash_lw: self._copy_dashboard(lw)
+            )
 
         # B1: Per-tab view state dict (sort + filters per tab)
         self._tab_views = {
@@ -2120,7 +2146,11 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _add_dashboard_header(self, lw, text):
         header = QListWidgetItem(text)
-        header.setFlags(Qt.ItemFlag.NoItemFlags)
+        # B1a: selectable (for mouse/keyboard select + Ctrl+C) but NOT
+        # checkable/editable — so selecting/copying cannot mutate task state.
+        header.setFlags(
+            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        )
         header.setBackground(QColor("#1d2b36"))
         header.setForeground(QColor("#d9e2ec"))
         font = header.font()
@@ -2139,7 +2169,13 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             Qt.ItemDataRole.UserRole,
             f"dashboard:{row.get('day')}:{row.get('task_id')}:{kind}:{row.get('slot')}",
         )
-        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        # B1a: selectable (for mouse/keyboard select + Ctrl+C copy) but NOT
+        # checkable/editable. Double-click/context-menu are guarded against the
+        # `dashboard:` UserRole prefix in TaskListWidget, so selecting/copying a
+        # row cannot navigate, snooze, archive, delete, or mutate any task.
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        )
         item.setForeground(QColor(_DASHBOARD_KIND_COLOR.get(kind, "#cbd5e1")))
         tooltip_bits = [
             f"task_id={row.get('task_id')}",
@@ -2217,6 +2253,25 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         finally:
             lw.blockSignals(False)
 
+    def _copy_dashboard(self, lw):
+        """Copy dashboard text to the clipboard. Read-only: reads QListWidget
+        item text (headings/counts + [tag] body/status/priority lines) and
+        writes it to the clipboard. Copies the current selection, or the whole
+        tab when nothing is selected. Performs NO DB write, navigation, snooze,
+        archive, or done toggle — it cannot change any task state."""
+        selected = lw.selectedItems()
+        if selected:
+            # Preserve visual (top-to-bottom) order regardless of click order.
+            order = {lw.item(i): i for i in range(lw.count())}
+            items = sorted(selected, key=lambda it: order.get(it, 0))
+        else:
+            items = [lw.item(i) for i in range(lw.count())]
+        lines = [(it.text() or "").rstrip() for it in items if it is not None]
+        text = "\n".join(line for line in lines if line)
+        if text:
+            _td._clipboard_write(text)
+            self.status.showMessage("Dashboard copied to clipboard.", 3000)
+
     def _load_tab(self, key):
         """Render a single tab from cached data. Caps All/Done at 200 items."""
         tasks = self._filtered_cache.get(key)
@@ -2273,9 +2328,13 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         task_id = item.data(Qt.ItemDataRole.UserRole)
         if not task_id:
             return
-        # Skip entity items (no checkbox behavior)
+        # Skip entity items (no checkbox behavior). B1a: dashboard projection
+        # rows are selectable/copyable only — never checkable — so a select/copy
+        # can never reach mark_done/update_task here.
         if isinstance(task_id, str) and (
-            task_id.startswith("entity:") or task_id.startswith("premium:")
+            task_id.startswith("entity:")
+            or task_id.startswith("premium:")
+            or task_id.startswith("dashboard:")
         ):
             return
         checked = item.checkState() == Qt.CheckState.Checked

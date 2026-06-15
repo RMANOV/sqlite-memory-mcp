@@ -56,7 +56,15 @@ from PyQt6.QtWidgets import (
     QDateTimeEdit,
     QFileDialog,
 )
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPixmap
+from PyQt6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtCore import (
     QDate,
     QDateTime,
@@ -2170,6 +2178,11 @@ class TaskReaderDialog(QDialog):
         self._title_label = QLabel()
         self._title_label.setObjectName("reader-title")
         self._title_label.setWordWrap(True)
+        # B1c: title selectable/copyable before Edit (read-only, no mutation).
+        self._title_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
         title_row.addWidget(self._title_label, 1)
 
         header_layout.addLayout(title_row)
@@ -2188,8 +2201,11 @@ class TaskReaderDialog(QDialog):
         self._body_label = QLabel()
         self._body_label.setObjectName("reader-body")
         self._body_label.setWordWrap(True)
+        # B1c: full description selectable by mouse AND keyboard so Ctrl+A /
+        # Ctrl+C copy the exact selection (read-only, no mutation).
         self._body_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         self._body_label.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
@@ -2284,6 +2300,12 @@ class TaskReaderDialog(QDialog):
             if item.widget():
                 item.widget().deleteLater()
 
+        # B1c: header meta (priority/status/section/due/project) selectable too.
+        _meta_flags = (
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+
         # Priority badge
         priority = (self.task.get("priority") or "medium").upper()
         plbl = QLabel(priority)
@@ -2293,6 +2315,7 @@ class TaskReaderDialog(QDialog):
             f"color: #ffffff; background: {color}; font-size: {_font_size - 2}px; "
             f"font-weight: bold; padding: 2px 8px; border-radius: 3px;"
         )
+        plbl.setTextInteractionFlags(_meta_flags)
         self._meta_layout.addWidget(plbl)
 
         # Optional meta items
@@ -2305,12 +2328,14 @@ class TaskReaderDialog(QDialog):
             if val:
                 mlbl = QLabel(f"{label}: {val}")
                 mlbl.setObjectName("reader-meta")
+                mlbl.setTextInteractionFlags(_meta_flags)
                 self._meta_layout.addWidget(mlbl)
 
         rl = _recurring_label(self.task.get("recurring"))
         if rl:
             rlbl = QLabel(f"\U0001f504 {rl}")
             rlbl.setObjectName("reader-meta")
+            rlbl.setTextInteractionFlags(_meta_flags)
             self._meta_layout.addWidget(rlbl)
 
         self._meta_layout.addStretch()
@@ -3010,6 +3035,12 @@ class ReminderPopupDialog(QDialog):
         self.setStyleSheet(_build_dialog_style())
         layout = QVBoxLayout(self)
 
+        # B1b: all reminder text selectable by mouse + keyboard (read-only).
+        _sel_flags = (
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+
         # Priority badge
         color = PRIORITY_COLORS.get(priority, _DEFAULT_PRIORITY_COLOR)
         badge = QLabel(priority.upper())
@@ -3017,22 +3048,40 @@ class ReminderPopupDialog(QDialog):
             f"background: {color}; color: white; padding: 2px 8px; "
             f"border-radius: 3px; font-weight: bold; font-size: 11px;"
         )
+        badge.setTextInteractionFlags(_sel_flags)
         layout.addWidget(badge)
 
         # Title
         title_lbl = QLabel(title)
         title_lbl.setStyleSheet("font-size: 15px; font-weight: bold; padding: 4px 0;")
         title_lbl.setWordWrap(True)
+        title_lbl.setTextInteractionFlags(_sel_flags)
         layout.addWidget(title_lbl)
 
         # Description preview
+        desc_text = ""
         if description:
-            desc_lbl = QLabel(
-                description[:200] + ("..." if len(description) > 200 else "")
-            )
+            desc_text = description[:200] + ("..." if len(description) > 200 else "")
+            desc_lbl = QLabel(desc_text)
             desc_lbl.setWordWrap(True)
             desc_lbl.setStyleSheet("color: #666; padding: 4px 0;")
+            desc_lbl.setTextInteractionFlags(_sel_flags)
             layout.addWidget(desc_lbl)
+
+        # B1b: full reminder payload for Ctrl+A → Ctrl+C copy. Read-only: this
+        # string is assembled from the display text only and written to the
+        # clipboard — it touches no DB/snooze/dismiss path.
+        payload_lines = [priority.upper(), title]
+        if desc_text:
+            payload_lines.append(desc_text)
+        self._copy_payload = "\n".join(payload_lines)
+        # Ctrl+A selects all (here: arms full-payload copy); Ctrl+C copies it.
+        sc_copy = QShortcut(QKeySequence(QKeySequence.StandardKey.Copy), self)
+        sc_copy.activated.connect(self._copy_full_payload)
+        sc_select_all = QShortcut(
+            QKeySequence(QKeySequence.StandardKey.SelectAll), self
+        )
+        sc_select_all.activated.connect(self._copy_full_payload)
 
         # Snooze buttons
         snooze_layout = QHBoxLayout()
@@ -3051,6 +3100,12 @@ class ReminderPopupDialog(QDialog):
         dismiss_btn = QPushButton("Dismiss")
         dismiss_btn.clicked.connect(self._dismiss)
         layout.addWidget(dismiss_btn)
+
+    def _copy_full_payload(self):
+        """Copy the full reminder payload to the clipboard. Read-only: writes
+        the pre-built display string to the clipboard and emits no signal, so
+        it cannot snooze, dismiss, or mutate any task state."""
+        _clipboard_write(self._copy_payload)
 
     def _snooze(self, minutes):
         self.snoozed.emit(self.task_id, minutes)
@@ -3343,6 +3398,11 @@ class TaskListWidget(QListWidget):
         data = item.data(Qt.ItemDataRole.UserRole)
         if not data:
             return
+        # B1a: dashboard projection rows are selectable/copyable only — never
+        # navigable. `dashboard:` is not a real task id (those are UUIDs), so
+        # this guard cannot suppress any genuine task open.
+        if isinstance(data, str) and data.startswith("dashboard:"):
+            return
         if isinstance(data, str) and data.startswith("entity:"):
             entity_id = int(data.split(":", 1)[1])
             self._open_entity_detail(entity_id)
@@ -3362,6 +3422,12 @@ class TaskListWidget(QListWidget):
             return
         data = item.data(Qt.ItemDataRole.UserRole)
         if not data:
+            return
+        # B1a: dashboard projection rows expose no mutating context menu. The
+        # `dashboard:<...>` payload is not a real task id (those are UUIDs), so
+        # this guard prevents the (mutation-capable) task menu — including
+        # Delete — from ever acting on a projection row.
+        if isinstance(data, str) and data.startswith("dashboard:"):
             return
         # Entity items get a simplified context menu
         if isinstance(data, str) and data.startswith("entity:"):
