@@ -383,7 +383,7 @@ def test_bin_task_fb_self_heals_roles_and_posts_to_conductor(tmp_path):
     assert "operator says adjust" in msg["body"]
 
 
-def test_dashboard_qt_renderer_uses_no_item_flags_and_blocks_load_signals(qapp):
+def test_dashboard_qt_renderer_rows_non_mutable_and_blocks_load_signals(qapp):
     import task_tray
     from PyQt6.QtCore import Qt
     from tray_dialogs import TaskListWidget
@@ -435,7 +435,12 @@ def test_dashboard_qt_renderer_uses_no_item_flags_and_blocks_load_signals(qapp):
     assert widget.count() == 4
     assert "Other / debate work-items" in widget.item(2).text()
     for i in range(widget.count()):
-        assert widget.item(i).flags() == Qt.ItemFlag.NoItemFlags
+        flags = widget.item(i).flags()
+        # B1 (selectable/copyable) made dashboard rows ItemIsEnabled|ItemIsSelectable;
+        # they must stay NON-mutable (no checkbox, no inline edit) so select/copy
+        # cannot change task state — the no-mutation invariant B1 was gated on.
+        assert not (flags & Qt.ItemFlag.ItemIsUserCheckable)
+        assert not (flags & Qt.ItemFlag.ItemIsEditable)
 
 
 def test_empty_dashboard_hidden_and_today_is_start_tab(qapp, tmp_path):
