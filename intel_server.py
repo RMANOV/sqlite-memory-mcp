@@ -80,6 +80,7 @@ from debate import (
     debate_signal_advance as _debate_signal_advance_dao,
     debate_signal_check as _debate_signal_check_dao,
     escalate as _debate_escalate_dao,
+    get_debate as _debate_get_debate,
     init_debate as _debate_init_dao,
     list_open_debate_work as _debate_list_open_work_dao,
     list_role_bindings as _debate_list_role_bindings_dao,
@@ -92,6 +93,7 @@ from debate import (
     seed_initial_role_bindings as _debate_seed_initial_role_bindings_dao,
     set_topic_priority as _debate_set_topic_priority_dao,
     transition_state as _debate_transition_dao,
+    validate_topic_id as _debate_validate_topic_id,
     worker_no_action as _debate_worker_no_action_dao,
 )
 from premium_runtime import (
@@ -1383,6 +1385,70 @@ def debate_read(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_read failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 27b: debate_search (B5 — read-only LIKE-over-body, Option A)
+@mcp.tool()
+def debate_search(topic_id: str, query: str, limit: int = 50) -> str:
+    """Search a debate topic's messages by substring of ``body``.
+
+    Read-only, parameterized ``LIKE`` over the message body, scoped to a
+    single ``topic_id``. The ``query`` is matched LITERALLY: its SQL LIKE
+    wildcards (``%``, ``_``) and the escape char (``\\``) are escaped before
+    being wrapped as ``%<query>%``, so user input can never inject wildcard
+    or pattern semantics. Returns the same per-message column shape as
+    ``debate_read`` (msg_id, topic_id, role, ts, priority, kind, reply_to,
+    standing, body, created_at), newest first.
+
+    Args:
+        topic_id: existing debate topic to search within.
+        query: literal substring to find in message bodies. An empty
+            string matches every message in the topic.
+        limit: max rows to return; clamped to 1..500 (non-int/<=0 → 1).
+
+    Returns:
+        JSON dict ``{"topic_id", "query", "count", "limit", "messages"}``.
+    """
+    try:
+        # Clamp limit defensively to 1..500 (treat <=0 / non-int as 1).
+        if not isinstance(limit, int) or limit < 1:
+            effective_limit = 1
+        else:
+            effective_limit = min(limit, 500)
+
+        # Escape LIKE wildcards so the query is matched literally. Order
+        # matters: escape the escape char FIRST, then the wildcards.
+        escaped = (
+            query.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+
+        _debate_validate_topic_id(topic_id)
+        with _get_conn() as conn:
+            if _debate_get_debate(conn, topic_id) is None:
+                raise _DebateError(f"unknown_topic: {topic_id}")
+            rows = conn.execute(
+                "SELECT msg_id, topic_id, role, ts, priority, kind, "
+                "reply_to, standing, body, created_at FROM debate_messages "
+                "WHERE topic_id = ? AND body LIKE ? ESCAPE '\\' "
+                "ORDER BY ts DESC, msg_id DESC LIMIT ?",
+                (topic_id, pattern, effective_limit),
+            ).fetchall()
+            messages = [dict(r) for r in rows]
+            return json.dumps({
+                "topic_id": topic_id,
+                "query": query,
+                "count": len(messages),
+                "limit": effective_limit,
+                "messages": messages,
+            })
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_search failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 
