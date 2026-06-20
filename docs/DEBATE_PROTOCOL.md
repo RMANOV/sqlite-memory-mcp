@@ -182,6 +182,59 @@ low-value cases. This records the claim/cursor outcome without adding another
 `debate_messages` row, preserving zero-touch operation while keeping the log
 readable.
 
+## Role cadence, control loop, and operator briefing
+
+These are standing role duties (operator mandate, 2026-06-20), part of the
+canonical protocol — not optional courtesies. They define *who watches the
+channel, how often, who answers whom, and who translates for the human.*
+
+### All roles — check in, then follow at adaptive intervals
+
+Every role (`CONDUCTOR`, `ADVOCATE`, and every `EXECUTOR`) must **announce itself
+in the debate on entry** — a one-line role/binding `STATUS` so the channel knows
+who is live — and then **follow the topic at adaptive polling intervals**. No role
+goes dark while a topic is open. *Adaptive* means the cadence tracks the work, not
+a fixed timer:
+
+- **Tighten** (short interval) when there is open `H`/`Q` work, a pending gate, a
+  blocked lane, `decision_needed=true`, or active executor work in flight.
+- **Loosen** (long interval) when the topic is quiet, all lanes are `STOP_*`, or
+  work is parked on an external dependency. Loosening past a few minutes is
+  cheaper than tight idle polling — match the interval to how fast the watched
+  state can actually change.
+- A role with genuinely nothing to add completes its wake with
+  `debate_worker_no_action` rather than posting noise — but it keeps watching at
+  the loosened cadence.
+
+### CONDUCTOR + ADVOCATE — poll, answer, control, and log everything
+
+`CONDUCTOR` and `ADVOCATE` are the supervisory loop. Beyond the all-roles duty
+they must:
+
+- **Poll** the debate at adaptive intervals (per above).
+- **Answer the executors** — every executor `Q` / report addressed to them gets a
+  reply: a gate verdict, an in-bounds ruling, next-step direction, or an explicit
+  `[DEFERRED:...]`. No executor is left hanging.
+- **Control the executors** — dispatch, gate, re-scope, hold, or stop lanes; keep
+  each lane's owner / status / next-action / stop-condition current.
+- **Describe everything in the debate** — every supervisory action (dispatch,
+  in-bounds verification, gate `PASS`/`AMEND`/`BLOCK`, merge-go relay, completion)
+  is written to the channel as the durable record. The debate is the source of
+  truth; any off-channel action that changes a lane's state must be mirrored back
+  into it.
+
+### ADVOCATE — explain human-decision problems to the operator in plain language
+
+In addition to the supervisory duty, `ADVOCATE` owns the **operator briefing for
+human decisions**. Whenever an item genuinely requires the operator's choice
+(business / legal / financial / irreversible / strategy fork — anything in a
+"decisions awaiting the operator" set, i.e. the `STOP_USER_DECISION` class),
+`ADVOCATE` produces a **short, plain-human explanation**: what the decision is, the
+options, the single decisive factor, and the recommendation — so the operator can
+decide by reading only that, not the full ledger. This is the human-language layer
+over the `HUMAN_BRIEF` projection and the `STOP_USER_DECISION` stop reason. Keep it
+short and informative; no transcript dumps.
+
 ## Vehicle routing (fail-closed)
 
 Every message carries an optional `vehicle` tag classifying the kind of work
