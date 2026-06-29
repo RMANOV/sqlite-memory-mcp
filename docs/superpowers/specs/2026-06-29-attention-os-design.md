@@ -926,7 +926,76 @@ This architecture keeps the system economically and operationally viable:
 the expensive semantic layer runs only when it can add value, while the
 attention loop remains local, testable, replayable, and bounded.
 
-## 15. Strategic Conclusion
+## 15. Runtime Profiles
+
+The specification must be profile-aware. A STRIX-grade runtime profile is not
+automatically the better desktop profile; it optimizes a different bottleneck.
+The common architecture is shared, but the delivery constraints and acceptable
+latencies are not.
+
+Core shared by all profiles:
+
+- Append-only ledgers.
+- Evidence refs.
+- Typed memory units.
+- Actor state.
+- Context packets.
+- Ack/supersede lifecycle.
+- Replayability.
+
+`desktop-human-agent` profile:
+
+- Optimizes human cognition, absorption, and correction.
+- Uses rich SQLite persistence as the durable local source of truth.
+- Allows async LLM compiler passes for semantic compression, decision units,
+  traps, policy candidates, and long-form summaries.
+- Accepts Markdown/JSON packets and seconds/minutes latency.
+- Prioritizes dashboard drill-back, email/source refs, human-readable
+  descriptions, and agent-ready context packs.
+- Treats STRIX constraints as discipline, not as the whole product.
+
+`strix-observer` profile:
+
+- Optimizes non-interference with a high-frequency runtime.
+- Is observer-only in the hot path.
+- Uses fixed structs, ring buffers, monotonic event ids, and bounded top-K
+  attention queues.
+- Allows no DB, no LLM, no JSON-heavy packet building, and no blocking I/O in
+  the runtime loop.
+- Performs batch ingest after runs: trace -> evidence -> memory units ->
+  packets.
+- Has millisecond latency and deterministic safety constraints.
+
+The STRIX profile is therefore a stricter runtime safety profile, not a
+replacement for the desktop product. If used as the primary desktop design, it
+would be fast but too narrow: it would throw away the semantic richness,
+human-correction loop, durable descriptions, dashboard affordances, and source
+drill-back that make the desktop system useful.
+
+The desktop profile should still import STRIX discipline:
+
+- Bounded packets.
+- Backpressure.
+- Top-K attention.
+- No spam.
+- No LLM in a synchronous hot path.
+- Replayable ledgers.
+- Clear profile gates.
+
+Canonical product line:
+
+```text
+Desktop sqlite_memory optimizes cognition.
+STRIX sqlite_memory profile optimizes non-interference.
+Shared core, different runtime profiles.
+```
+
+Design comment: any future implementation plan must name its runtime profile
+before choosing storage, packet format, latency budget, compiler behavior, and
+router data structures. A design that is "optimal" without a profile is
+underspecified.
+
+## 16. Strategic Conclusion
 
 The defensible product is not "sqlite_memory remembers things". Mem0,
 Supermemory, Cognee, Letta, and Zep already fight that battle.
