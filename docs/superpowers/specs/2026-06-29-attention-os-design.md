@@ -619,7 +619,136 @@ Contract:
 11. Packet ack prevents repeated delivery.
 12. Legacy enrichment cannot auto-promote canonical truth.
 
-## 12. Strategic Conclusion
+## 12. Semantic Load Gate
+
+The existing acceptance tests prove architectural safety, but they do not prove
+semantic adequacy under real operator load. Before any runtime implementation
+of the attention router is accepted, the project must pass a dedicated semantic
+load gate.
+
+Required fixture:
+
+- At least 5 actors: `HUMAN`, `CONDUCTOR`, `CODEX`, `CLAUDE`, `ADVOCATE`, plus
+  optional executor roles.
+- 5 to 7 simulated days of dialogue.
+- 500 to 1500 messages.
+- Many-to-many conversation flow, not a clean single-thread transcript.
+- Mixed message types: decisions, reversals, corrections, blockers, low-value
+  status spam, stale waiting items, due dates, social nuance, implied
+  commitments, and contradicting statements.
+- At least 20 externally verifiable evidence refs.
+- At least 10 human corrections or supersessions.
+- At least 5 decisions that should become durable dashboard rows.
+- At least 5 urgent temporal deltas that should reach terminal.
+- At least 10 low-value deltas that must be suppressed or coalesced.
+
+Golden outputs:
+
+- `attention_next_terminal_delta` output for HUMAN at several checkpoints.
+- `attention_dashboard_state` durable rows after each simulated day.
+- `agent_context_pack` for CODEX, CLAUDE, ADVOCATE, and CONDUCTOR for the same
+  topic.
+- `memory_review_candidates` queue after compiler passes.
+- Drill-back evidence for every promoted decision, policy, blocker, and
+  receipt.
+
+Passing criteria:
+
+- Missed critical terminal items: zero.
+- Repeated acknowledged packets: zero.
+- Durable decision rows without evidence: zero.
+- Context packs exceeding budget: zero.
+- False urgent terminal items: <= 10%.
+- Low-value status messages coalesced or suppressed: >= 90%.
+- Human corrections supersede old units without deleting history: 100%.
+- Actor-specific packs differ materially by role while sharing the same raw
+  evidence base.
+- HUMAN terminal feed stays bounded: default max 7 bullets and no raw transcript
+  dumps.
+
+The gate fails closed. If the deterministic router passes structural tests but
+the semantic load gate fails, implementation must not proceed to dashboard or
+agent-context rollout. The next action is compiler/router redesign, not tuning
+the UI.
+
+## 13. Optimal Orchestration Architecture
+
+The attention system must not depend on a frontier LLM API in the real-time hot
+path. Real-time LLM orchestration would be expensive, latency-sensitive,
+non-deterministic, hard to replay, and fragile under offline/local-first
+constraints.
+
+The optimal split is:
+
+```text
+Hot path, deterministic:
+  append ledgers
+  update watermarks
+  route addressed H/Q
+  maintain actor_surface_state
+  enforce TTL/priority/backpressure
+  deliver already-compiled packets
+
+Warm path, cheap/incremental:
+  FTS/BM25 retrieval
+  vector lookup if available
+  entity and thread linking
+  topic segmentation
+  novelty/staleness/risk scoring
+  packet coalescing
+
+Cold path, semantic compiler:
+  LLM extracts candidate units
+  LLM labels ambiguous topic clusters
+  LLM summarizes messy many-to-many dialogue
+  LLM proposes decision/policy/trap/receipt units
+  human or policy gate promotes candidates
+```
+
+The LLM is therefore a compiler, not the orchestrator. It converts messy
+language into typed candidate memory units. The deterministic router decides
+who sees what, when, at which resolution, and through which surface.
+
+Algorithms that belong in the deterministic/warm layers:
+
+- Event sourcing over append-only ledgers.
+- Logical clocks and actor watermarks.
+- Incremental materialized views.
+- FTS5/BM25 for exact retrieval.
+- Optional vector search for semantic recall.
+- Temporal graph edges for depends-on, blocks, supersedes, supports, and
+  contradicts.
+- Priority queue with backpressure and TTL.
+- Novelty scoring against actor seen/ack state.
+- Staleness scoring for waiting/blocker/deadline items.
+- Coalescing by scope, actor, topic, and evidence hash.
+- Role-specific context packing with token budgets.
+- Confidence calibration from evidence count, correction history, and source
+  reliability.
+
+Algorithms that should not be trusted alone:
+
+- Pure graph clustering for semantic decisions.
+- Embeddings-only similarity for importance.
+- PageRank/centrality as a proxy for operator attention.
+- Recency-only or frequency-only ranking.
+- Regex extraction as semantic authority.
+
+LLM use should be gated by value and uncertainty:
+
+- No LLM call for simple addressed H/Q routing.
+- No LLM call for ack, TTL, deadline, and stale-waiting mechanics.
+- Small/local model or cached compiler output for routine summarization.
+- Frontier model only for high-ambiguity, high-impact, or high-compression
+  compiler passes.
+- Every LLM output enters as `candidate`, not canonical truth.
+- Every promoted unit must have evidence refs and replay path.
+
+This architecture keeps the system economically and operationally viable:
+the expensive semantic layer runs only when it can add value, while the
+attention loop remains local, testable, replayable, and bounded.
+
+## 14. Strategic Conclusion
 
 The defensible product is not "sqlite_memory remembers things". Mem0,
 Supermemory, Cognee, Letta, and Zep already fight that battle.
