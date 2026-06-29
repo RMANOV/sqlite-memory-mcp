@@ -138,7 +138,8 @@ Ledger invariants:
 4. Every context packet can be traced back to memory units and raw events.
 5. Supersede never deletes history.
 6. Compiler output is rebuildable from ledgers.
-7. Router output is rebuildable from `memory_units` plus `actor_surface_state`.
+7. Router output is rebuildable from `memory_units`, `actor_surface_state`, and
+   materialized `actor_outbox` rows.
 8. No LLM call is required in the hot path.
 9. Projections are read-only with respect to raw ledgers.
 10. Wrong memory is corrected by supersession, not deletion.
@@ -339,6 +340,41 @@ Fields:
 - `notification_threshold`.
 - `updated_at`.
 
+### `actor_outbox`
+
+Incremental queue of attention-worthy delivery items per actor/surface. This is
+the speed boundary between routing and rendering: terminal/dashboard calls read
+from the outbox instead of scanning `memory_units`.
+
+Fields:
+
+- `actor_id`.
+- `surface`.
+- `outbox_seq`.
+- `scope_kind`, `scope_id`.
+- `coalesce_key`.
+- `item_kind`: `temporal_delta`, `decision_required`, `blocker`,
+  `risk_changed`, `policy_warning`, `receipt`, `agent_context_seed`.
+- `priority`.
+- `severity`.
+- `summary_l1`.
+- `body_l2`.
+- `unit_id`.
+- `evidence_id`.
+- `event_ref`.
+- `status`: `queued`, `delivered`, `read`, `ack`, `acted`, `expired`,
+  `dismissed`, `coalesced`.
+- `ttl_until`.
+- `created_at`.
+
+Rules:
+
+- Router writes `actor_outbox` incrementally.
+- Terminal reads only queued outbox rows, bounded by actor/surface policy.
+- `context_packets` bundle outbox items; they are not the only delivery queue.
+- Repeated low-value items are coalesced at the outbox layer, not by dropping
+  raw human input.
+
 ### `context_packets`
 
 The atomic delivery object for human/agent surfaces.
@@ -487,6 +523,10 @@ Input:
 
 Builds one packet for one actor/surface.
 
+Packet build must select from materialized `actor_outbox` rows and attach
+referenced units/evidence. It must not scan all `memory_units` on the request
+path.
+
 Input:
 
 ```json
@@ -508,6 +548,7 @@ Returns the next bounded terminal feed item.
 
 Rules:
 
+- Reads queued `actor_outbox` items for the HUMAN terminal surface.
 - Only current temporal deltas.
 - No raw transcript.
 - Default max 3 items per burst.
@@ -788,8 +829,9 @@ dashboard rows, and different role-specific agent packets.
     one correction produce at most three terminal items; `STATUS` is coalesced
     or hidden.
 14. Same topic produces materially different HUMAN, CODEX, and ADVOCATE packets.
-15. Deleting derived `memory_units` and `context_packets` while keeping raw
-    ledgers allows compiler/router replay with preserved evidence refs.
+15. Deleting derived `memory_units`, `actor_outbox`, and `context_packets`
+    while keeping raw ledgers allows compiler/router replay with preserved
+    evidence refs.
 16. Human correction "LightRAG first; Graphiti later" supersedes any prior
     "Graphiti in V1" unit and changes future Codex packets.
 17. A delivered+seen but unacknowledged decision can be reminded later as a
@@ -928,59 +970,458 @@ attention loop remains local, testable, replayable, and bounded.
 
 ## 15. Runtime Profiles
 
-The specification must be profile-aware. A STRIX-grade runtime profile is not
-automatically the better desktop profile; it optimizes a different bottleneck.
-The common architecture is shared, but the delivery constraints and acceptable
-latencies are not.
+The specification must be profile-aware. "Optimal" is relative to the
+bottleneck. STRIX and desktop human-agent workflows share the same kernel, but
+they do not optimize the same resources.
 
-Core shared by all profiles:
+```text
+STRIX = high-volume / low-latency / structured trace events.
+Desktop = lower-volume / high-semantic-density / messy human context.
+```
 
-- Append-only ledgers.
-- Evidence refs.
-- Typed memory units.
-- Actor state.
-- Context packets.
-- Ack/supersede lifecycle.
-- Replayability.
+The correct product structure is:
 
-`desktop-human-agent` profile:
+```text
+sqlite_memory_core
+  + desktop_human_agents profile
+  + strix_trace profile
+```
 
-- Optimizes human cognition, absorption, and correction.
-- Uses rich SQLite persistence as the durable local source of truth.
-- Allows async LLM compiler passes for semantic compression, decision units,
-  traps, policy candidates, and long-form summaries.
-- Accepts Markdown/JSON packets and seconds/minutes latency.
-- Prioritizes dashboard drill-back, email/source refs, human-readable
-  descriptions, and agent-ready context packs.
-- Treats STRIX constraints as discipline, not as the whole product.
+Same kernel, different optimization policy.
 
-`strix-observer` profile:
+### Common Kernel
 
-- Optimizes non-interference with a high-frequency runtime.
-- Is observer-only in the hot path.
-- Uses fixed structs, ring buffers, monotonic event ids, and bounded top-K
-  attention queues.
-- Allows no DB, no LLM, no JSON-heavy packet building, and no blocking I/O in
-  the runtime loop.
-- Performs batch ingest after runs: trace -> evidence -> memory units ->
-  packets.
-- Has millisecond latency and deterministic safety constraints.
+These are non-negotiable across profiles:
 
-The STRIX profile is therefore a stricter runtime safety profile, not a
-replacement for the desktop product. If used as the primary desktop design, it
-would be fast but too narrow: it would throw away the semantic richness,
-human-correction loop, durable descriptions, dashboard affordances, and source
-drill-back that make the desktop system useful.
+- Raw append-only ledgers.
+- Derived memory units only with evidence refs.
+- Compiler separated from router.
+- `actor_surface_state`.
+- `actor_outbox`.
+- `context_packets`.
+- `ack_log` / `ack_events`.
+- Supersede semantics instead of silent overwrite.
+- Drill-back to raw evidence.
+- Replayable compiler/router rebuild.
+- Terminal as temporal delta only.
+- Dashboard as durable control surface.
+- Agent gets context packet, not memory dump.
+- `seen`, `read`, `ack`, and `acted` remain separate states.
 
-The desktop profile should still import STRIX discipline:
+### Desktop Human-Agent Profile
 
-- Bounded packets.
-- Backpressure.
-- Top-K attention.
-- No spam.
-- No LLM in a synchronous hot path.
-- Replayable ledgers.
-- Clear profile gates.
+The desktop profile optimizes human cognition, semantic richness, low capture
+friction, layered output, and correct context for Claude/Codex/ADVOCATE.
+
+Allowed:
+
+- Rich SQLite persistence.
+- Markdown and JSON payloads.
+- Voice transcripts, chat imports, email/file/web captures.
+- SQLite FTS and later sqlite-vec/embedding search.
+- Async LLM compiler passes.
+- User-triggered synchronous LLM work when the human explicitly asks for it.
+- Rich `memory_units` with L1/L2/L3/L4 resolution.
+- Ad-hoc semantic search and exploratory recall.
+- Human review queue for policy/decision/trap promotion.
+
+Forbidden:
+
+- Raw transcript spam.
+- AI-derived canonical truth without evidence and promotion rule.
+- Treating `seen` as `ack`.
+- Unbounded terminal bursts.
+- Unbounded agent context dumps.
+- Dropping raw human input as a storage policy.
+
+The desktop loss rule is:
+
+```text
+Never lose memory; reduce attention.
+Coalesce delivery, not raw human input.
+```
+
+### STRIX Trace Profile
+
+The STRIX profile is not runtime memory. It is a bounded, deterministic,
+append-only, replayable attention sidecar over STRIX traces.
+
+The STRIX path must be:
+
+```text
+HOT PATH
+Rust tick emits tiny typed events. No SQLite. No JSON. No LLM. No MCP.
+No graph retrieval. No blocking.
+
+WARM PATH
+Async writer batches events into WAL/control ledgers and projections.
+
+COLD PATH
+Compiler, summaries, GraphRAG/embeddings, human digest, and agent context packs.
+```
+
+Do not integrate as:
+
+```text
+STRIX tick -> sqlite_memory write -> compiler -> router -> packet
+```
+
+Integrate as:
+
+```text
+STRIX tick/replay/scenario
+  -> bounded event sink
+  -> ring buffer or trace file
+  -> async batch writer
+  -> SQLite control ledger
+  -> projections
+  -> attention router
+  -> terminal/dashboard/agent packets
+```
+
+STRIX emits trace events, not memory. Memory is derived later.
+
+Example trace event:
+
+```text
+event_kind = SAFETY_CLAMP_APPLIED
+tick = 142
+severity = medium
+source = strix-swarm
+payload_ref = ...
+```
+
+The compiler/router may later derive:
+
+- `temporal_delta`.
+- `evidence_memory`.
+- `trap_memory`.
+- dashboard row.
+- post-run Codex/Claude context packet.
+
+### STRIX Hot/Warm/Cold Gates
+
+Hot path forbidden operations:
+
+- SQLite.
+- fsync.
+- JSON serialization.
+- LLM.
+- MCP.
+- Network client.
+- Blocking I/O.
+- Unbounded queue.
+- Router scan.
+- Graph/embedding retrieval.
+
+Warm path responsibilities:
+
+- Async writer.
+- Batched inserts.
+- WAL mode.
+- Prepared statements.
+- Incremental projections.
+- Coalescing.
+- `actor_outbox` materialization.
+
+Cold path responsibilities:
+
+- Semantic compiler.
+- LLM summaries.
+- GraphRAG/embeddings.
+- Cross-run failure-pattern search.
+- Human digest.
+- Agent context packs.
+
+### STRIX Storage Split
+
+SQLite is the control ledger, not the telemetry warehouse.
+
+SQLite stores:
+
+- run metadata;
+- event index;
+- decision trace refs;
+- packet queues;
+- ack state;
+- memory units;
+- evidence refs;
+- actor/surface watermarks;
+- projection state.
+
+SQLite must not store bulk per-agent/per-tick telemetry as ordinary rows.
+Bulk scenario telemetry belongs in Parquet/Arrow/compressed trace blobs, with
+SQLite storing hash, offset, tick span, event kind, severity, scenario/run id,
+summary, and drill-back refs.
+
+### STRIX Data Shapes
+
+STRIX-mode events should use a small typed envelope:
+
+```rust
+pub struct AttentionEvent {
+    pub run_id: u128,
+    pub seq: u64,
+    pub tick: u64,
+    pub sim_time_us: u64,
+    pub kind: EventKind,
+    pub source: EventSource,
+    pub actor_id: u32,
+    pub severity: Severity,
+    pub priority: u8,
+    pub flags: u32,
+    pub payload_ref: Option<u64>,
+    pub hash: [u8; 32],
+}
+```
+
+Principle:
+
+```text
+small, typed, bounded envelope
+large payload as blob/ref
+semantic interpretation later
+```
+
+V1 STRIX event taxonomy should stay small:
+
+- `RUN_STARTED`
+- `RUN_ENDED`
+- `SCENARIO_LOADED`
+- `TICK_SUMMARY`
+- `REGIME_CHANGED`
+- `STATE_ESTIMATE_DEGRADED`
+- `ANOMALY_DETECTED`
+- `ASSIGNMENT_CHANGED`
+- `TASK_BLOCKED`
+- `TASK_COMPLETED`
+- `SAFETY_CLAMP_APPLIED`
+- `POLICY_DENY`
+- `CONSTRAINT_VIOLATION_PREVENTED`
+- `MESH_PARTITION_DETECTED`
+- `MESH_REJOINED`
+- `COMMS_DEGRADED`
+- `TRACE_CREATED`
+- `BATTLE_REPORT_CREATED`
+- `HUMAN_DECISION_REQUIRED`
+- `HUMAN_CORRECTION`
+- `SINK_DEGRADED`
+
+Do not capture everything as semantic memory. Capture decision-relevant trace
+events, tick summaries, exception events, periodic snapshots, and drill-back
+refs.
+
+### STRIX Write Amplification Rule
+
+Unacceptable:
+
+```text
+1 tick
+  -> 500 agent events
+  -> 500 source events
+  -> 500 memory units
+  -> 500 evidence rows
+  -> 500 outbox rows
+```
+
+Acceptable:
+
+```text
+1 tick
+  -> 1 tick summary
+  -> 0..N exception events
+  -> projections updated
+  -> outbox only if attention-worthy
+```
+
+The router must route only attention-worthy events:
+
+- state change;
+- risk change;
+- decision required;
+- blocker;
+- human correction;
+- policy deny/violation;
+- trace close;
+- summary close.
+
+Not every event becomes attention.
+
+### STRIX Backpressure Policy
+
+Hot path emit result must be explicit:
+
+```rust
+pub enum EmitResult {
+    Accepted,
+    Coalesced,
+    DroppedNonCritical,
+    SinkDegraded,
+}
+```
+
+Never drop:
+
+- `RUN_STARTED`
+- `RUN_ENDED`
+- `SAFETY_CLAMP_APPLIED`
+- `POLICY_DENY`
+- `HUMAN_DECISION_REQUIRED`
+- `TRACE_CREATED`
+- `BATTLE_REPORT_CREATED`
+
+May coalesce:
+
+- low-value status;
+- repeated `COMMS_DEGRADED`;
+- repeated mesh heartbeat;
+- repeated unchanged tick summaries.
+
+May sample:
+
+- per-agent state snapshots;
+- high-frequency telemetry.
+
+Queue full behavior:
+
+1. Coalesce low-value status.
+2. Drop non-critical telemetry.
+3. Keep counters.
+4. Emit `SINK_DEGRADED` once.
+5. Never block the tick.
+
+### STRIX Budget Gates
+
+These are benchmark targets, not public performance claims:
+
+| Operation | Target |
+| --- | ---: |
+| `NoopAttentionSink.emit()` | p99 < 1 us |
+| `RingBufferAttentionSink.emit()` | p99 < 5 us |
+| Hot path allocations | 0 |
+| Blocking calls | 0 |
+| LLM/MCP calls in tick | 0 |
+| SQLite calls in tick | 0 |
+| Terminal packet read | O(k), k <= 3 |
+| Agent pack build excluding LLM | < 100 ms target |
+| Full replay rebuild | deterministic and benchmarked |
+
+Any README/public benchmark or external capability claim must be refreshed from
+the exact commit before publication. The spec may use such numbers as
+benchmark targets only, not as current truth.
+
+### STRIX Integration Modes
+
+Rollout order:
+
+1. Offline replay post-processor:
+   `replay trace -> sqlite_memory ingest -> run_event_index -> dashboard`.
+   Zero runtime overhead and no STRIX code changes.
+2. Passive simulation sidecar:
+   `AttentionSink -> async writer -> live terminal/dashboard`.
+   If the sink fails, simulation continues.
+3. Agent development packs:
+   failing scenario/range -> Codex/Claude packet with trace refs, affected
+   surfaces, capability boundary, and stop conditions.
+4. Human review dashboard:
+   post-run OODA summary, decision rows, evidence refs, caveats.
+5. Live autonomy authority:
+   explicitly out of V1 scope.
+
+Capability-boundary guard:
+
+- Do not claim field/on-hardware deployment from software replay alone.
+- Do not claim delivered external memory integration until it is shipped.
+- Do not claim edge-LLM autonomous decision authority as core autonomy.
+- Do not infer sensor/RF/field readiness from software-only scenarios.
+- Public wording that crosses those boundaries requires human review.
+
+### Profile Config Sketch
+
+`desktop_human_agents.toml`:
+
+```toml
+[profile]
+name = "desktop_human_agents"
+primary_bottleneck = "human_attention"
+
+[capture]
+never_drop_raw_human_input = true
+allow_markdown = true
+allow_json_payloads = true
+allow_voice_transcripts = true
+allow_chat_imports = true
+
+[compiler]
+llm_allowed_async = true
+llm_allowed_user_triggered_sync = true
+durable_units_require_evidence = true
+policy_memory_requires_human_confirm = true
+decision_memory_requires_human_confirm = true
+
+[router]
+use_actor_outbox = true
+terminal_max_items = 3
+terminal_default_resolution = "L1"
+dashboard_default_resolution = "L2"
+coalesce_delivery_only = true
+
+[loss_policy]
+drop_raw_human_input = false
+drop_low_value_delivery_items = true
+```
+
+`strix_trace.toml`:
+
+```toml
+[profile]
+name = "strix_trace"
+primary_bottleneck = "runtime_determinism"
+
+[hot_path]
+sqlite_allowed = false
+llm_allowed = false
+mcp_allowed = false
+blocking_io_allowed = false
+unbounded_queue_allowed = false
+
+[capture]
+typed_event_envelope = true
+batch_writer = true
+ring_buffer = true
+payload_blobs = true
+
+[router]
+projection_first = true
+actor_outbox = true
+terminal_max_items = 3
+route_only_attention_worthy_events = true
+
+[loss_policy]
+drop_raw_human_input = false
+drop_noncritical_telemetry = true
+coalesce_status = true
+never_drop_safety_events = true
+```
+
+### STRIX Profile Acceptance Tests
+
+The STRIX profile is not accepted until these pass:
+
+1. Same scenario with sink disabled, `NoopAttentionSink`, and
+   `RingBufferAttentionSink` has unchanged deterministic replay result.
+2. Tick path has no imports or calls to SQLite, MCP, LLM, network clients, or
+   blocking I/O.
+3. 1000 low-value status events plus safety/decision events produce at most
+   three terminal items and no raw telemetry dump.
+4. Deleting projections/outbox/packets while keeping event index and payload
+   blobs allows replay rebuild with same evidence refs and packet hashes, or an
+   explainable version difference.
+5. Human correction supersedes future agent packets while preserving old
+   history.
+6. Public-claim boundary guard blocks field-ready, hardware-validated,
+   external-memory-shipped, or edge-LLM-authority claims unless explicitly
+   confirmed.
 
 Canonical product line:
 
@@ -990,9 +1431,9 @@ STRIX sqlite_memory profile optimizes non-interference.
 Shared core, different runtime profiles.
 ```
 
-Design comment: any future implementation plan must name its runtime profile
-before choosing storage, packet format, latency budget, compiler behavior, and
-router data structures. A design that is "optimal" without a profile is
+Design comment: any implementation plan must name its runtime profile before
+choosing storage, packet format, latency budget, compiler behavior, router data
+structures, and loss policy. A design that is "optimal" without a profile is
 underspecified.
 
 ## 16. Strategic Conclusion
