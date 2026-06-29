@@ -10,6 +10,17 @@ Target review date: 2026-07-04
 `sqlite_memory` should stop treating enrichment as "make text smarter" and
 become an attention operating system over provable ledgers.
 
+Operational definition:
+
+```text
+sqlite_memory is provable coordination memory.
+It turns raw events into actor-specific attention packets.
+```
+
+It is not a memory database. It is append-only ledgers plus a compiler plus an
+attention router plus delivery surfaces. The core shift is from memory storage
+to memory dispatch.
+
 The product problem is not only that agents need memory. The deeper problem is
 that a human operator and a team of agents have different bandwidth, different
 roles, different surfaces, and different tolerance for repetition. The memory
@@ -40,6 +51,18 @@ Delivery
 The debate protocol remains a deterministic append-only coordination ledger.
 The compiler and router are asynchronous projections over ledgers. They must be
 rebuildable from raw history and must never become the source of truth.
+
+Strict component boundary:
+
+- Compiler: extract, normalize, and propose typed candidate units from raw
+  ledgers.
+- Router: route, surface, packetize, throttle, and coalesce units into
+  actor/surface-specific packets.
+- Governance: accept, reject, supersede, or confirm candidate units and packet
+  actions.
+
+The compiler does not decide delivery. The router does not mutate raw ledgers.
+Governance does not erase history.
 
 ## 2. Market Research Summary
 
@@ -105,7 +128,41 @@ Research sources checked:
 - Do not ship a generic memory platform claim before the attention-routing
   distinction is working.
 
-## 4. Existing Assets To Preserve
+## 4. Core Invariants
+
+Ledger invariants:
+
+1. Raw ledgers are append-only.
+2. Raw ledgers are never overwritten by compiler or router output.
+3. Every derived memory unit has evidence refs.
+4. Every context packet can be traced back to memory units and raw events.
+5. Supersede never deletes history.
+6. Compiler output is rebuildable from ledgers.
+7. Router output is rebuildable from `memory_units` plus `actor_surface_state`.
+8. No LLM call is required in the hot path.
+9. Projections are read-only with respect to raw ledgers.
+10. Wrong memory is corrected by supersession, not deletion.
+
+Delivery invariants:
+
+1. Terminal shows temporal deltas only.
+2. Dashboard shows durable state.
+3. Agents receive context packets, not raw memory dumps.
+4. HUMAN receives decision prompts only when action is needed.
+5. `seen`, `read`, `understood`, `accepted`, and `acted` are separate states.
+6. The same memory unit can route differently to different actors.
+7. Raw transcript appears only through explicit drill-back.
+
+Governance invariants:
+
+1. LLM-derived durable units start as `proposed` or `provisional`.
+2. `policy_memory` and `decision_memory` require human confirmation unless
+   sourced from an explicit human command.
+3. `trap_memory` requires evidence.
+4. Standing instructions are versioned.
+5. Human correction supersedes affected future packets.
+
+## 5. Existing Assets To Preserve
 
 - `debate_messages`, `debate_watermarks`, debate lifecycle, compactions, and
   role-aware cursors.
@@ -120,7 +177,7 @@ Research sources checked:
 Legacy `lazy_enrichment` should be demoted to lint/fallback. It should not be
 the semantic authority.
 
-## 5. Memory Unit Model
+## 6. Memory Unit Model
 
 The compiler emits typed memory units. A unit is a projection, not raw truth.
 Each unit must carry evidence and rebuild lineage.
@@ -140,7 +197,37 @@ Required unit types:
 - `open_question`: unresolved question needing an actor.
 - `receipt`: verifiable delegation/action record.
 
-## 6. Proposed Tables
+V1 required types:
+
+- `temporal_delta`;
+- `working_state`;
+- `decision_memory`;
+- `policy_memory`;
+- `evidence_memory`;
+- `prospective_memory`;
+- `trap_memory`.
+
+V1.5/V2 types:
+
+- `semantic_memory`;
+- `episodic_memory`;
+- `procedural_memory`.
+
+The V1 boundary is intentional. Semantic, episodic, and procedural extraction
+can become a hallucination factory if it lands before governance, evidence, and
+ack/supersede semantics are stable.
+
+Promotion rules:
+
+- `temporal_delta`, `working_state`, `evidence_memory`, and explicit-task
+  `prospective_memory` may become active automatically when evidence is strong.
+- `semantic_memory`, `episodic_memory`, `procedural_memory`, and `trap_memory`
+  are provisional by default.
+- `policy_memory`, `decision_memory`, standing instructions, high-risk
+  `trap_memory`, people facts, and legal/financial/reputation claims require
+  explicit human confirmation unless sourced from an explicit human command.
+
+## 7. Proposed Tables
 
 ### `source_events`
 
@@ -276,6 +363,9 @@ Fields:
 - `ack_state`: `pending`, `seen`, `read`, `ack`, `acted`, `dismissed`,
   `expired`.
 
+`ack_state` is the coarse packet state. Detailed acknowledgements live in the
+append-only `ack_events` ledger.
+
 ### `context_packet_items`
 
 Maps packets back to units/evidence.
@@ -298,10 +388,21 @@ Fields:
 - `ack_id` primary key.
 - `packet_id`.
 - `actor_id`.
-- `ack_type`: `seen`, `read`, `ack`, `acted`, `dismissed`, `correction`,
+- `ack_type`: `seen`, `read`, `understood`, `accepted`, `disagree`,
+  `needs_later`, `corrected`, `delegated`, `acted`, `dismissed`, `snoozed`,
+  `included_in_context`, `used_in_output`, `relied_upon`, `contradicted`,
   `supersede_request`.
 - `ack_payload_json`.
 - `created_at`.
+
+Rules:
+
+- `seen` is not `read`.
+- `read` is not `understood`.
+- `understood` is not `accepted`.
+- `accepted` is not `acted`.
+- Mechanical acknowledgement must not promote a policy, decision, or high-risk
+  memory unit without evidence and the applicable promotion rule.
 
 ### `attention_rules`
 
@@ -321,7 +422,7 @@ Fields:
 - `coalesce_key_template`.
 - `created_at`, `updated_at`.
 
-## 7. Tool Contracts
+## 8. Tool Contracts
 
 ### `memory_capture_event`
 
@@ -409,7 +510,8 @@ Rules:
 
 - Only current temporal deltas.
 - No raw transcript.
-- Default max 7 bullets.
+- Default max 3 items per burst.
+- Default line length cap: 120 characters per item summary.
 - Must include `what_changed`, `why_it_matters`, `next_action`,
   `drillback_refs`.
 
@@ -488,7 +590,20 @@ Input: old unit id, replacement content, evidence/correction reason.
 
 Output: old status `superseded`, new unit id, edge `supersedes`.
 
-## 8. Routing Rules
+V1 public tool priority:
+
+1. `attention_next_terminal_delta` / `build_human_terminal_delta`;
+2. `attention_dashboard_state` / `build_task_tray_dashboard_delta`;
+3. `agent_context_pack` / `build_agent_context_pack`;
+4. `attention_ack_packet` / `ack_context_packet`;
+5. `memory_explain_unit` / `drill_back`;
+6. `memory_supersede_unit` / `supersede_memory_unit`.
+
+Names may be normalized during implementation, but the contracts must preserve
+these six capabilities before graph, embedding, or semantic-clustering work
+enters the critical path.
+
+## 9. Routing Rules
 
 Default triggers:
 
@@ -518,7 +633,36 @@ Default triggers:
   - decision or OODA memory unit;
   - receipt.
 
-## 9. Surface Contracts
+V1 attention score:
+
+```text
+attention_score =
+    novelty
+  + urgency
+  + risk
+  + actor_relevance
+  + decision_required
+  + blocker_weight
+  - already_seen_penalty
+  - already_ack_penalty
+  - surface_noise_penalty
+  - stale_penalty
+```
+
+Signal meaning:
+
+- `novelty`: new relative to actor/surface state.
+- `urgency`: deadline or active-today pressure.
+- `risk`: safety, legal, reputation, financial, or operational risk.
+- `actor_relevance`: the actor owns, blocks, reviews, or must decide.
+- `decision_required`: human or role choice required.
+- `blocker_weight`: active blocker for a task/debate.
+- `already_seen_penalty`: shown before.
+- `already_ack_penalty`: accepted/acted before.
+- `surface_noise_penalty`: useful elsewhere but wrong for this surface.
+- `stale_penalty`: TTL value already decayed.
+
+## 10. Surface Contracts
 
 ### Terminal
 
@@ -527,11 +671,15 @@ Purpose: immediate temporal orientation.
 Contract:
 
 - L1/L2 only by default.
-- Max 7 bullets.
+- Default L1.
+- Max 3 items per burst.
+- Default line length cap: 120 characters per item summary.
 - TTL required.
 - Must not store durable truth.
 - Must not show transcript dumps.
 - Must show action/decision state first.
+- If an item has no action, risk, blocker, decision, TTL, or temporal delta, it
+  does not enter the terminal feed.
 
 ### Task Tray Dashboard
 
@@ -560,7 +708,7 @@ Contract:
 - Include stop conditions and policies.
 - Include evidence refs when decisions or outbound actions are involved.
 
-## 10. Rollout Plan
+## 11. Rollout Plan
 
 ### Phase 0: Freeze the boundary
 
@@ -568,43 +716,61 @@ Contract:
 - Mark `lazy_enrichment` as legacy/fallback.
 - Add no schema changes yet.
 
-### Phase 1: Add read-only schema and dry-run compiler
+### Phase 1: Split enrichment into compiler and router
+
+- Replace "enrichment" as the primary design word with compiler/router/packet
+  language.
+- Compiler reads ledger tails and proposes memory units.
+- Router reads memory units and actor/surface state, then builds packets.
+- Governance promotes, rejects, or supersedes candidates.
+
+### Phase 2: Add read-only schema and dry-run compiler
 
 - Add tables above behind feature flag.
 - Compiler reads existing ledgers and emits candidate units.
 - No delivery yet.
 - Compare compiler output against current enrichment output.
 
-### Phase 2: Human terminal delta
+### Phase 3: Human terminal delta
 
 - Implement `attention_next_terminal_delta`.
 - Source only active tasks/debates and recent memory units.
 - Add ack state.
 - Acceptance: no repeated giant summaries after ack.
 
-### Phase 3: Task Tray dashboard tab
+### Phase 4: Task Tray dashboard tab
 
 - Add durable tabs and dashboard projections.
 - Show drill-back refs.
 - Acceptance: terminal remains quiet while dashboard keeps durable state.
 
-### Phase 4: Agent context packs
+### Phase 5: Agent context packs
 
 - Implement `agent_context_pack` for CODEX, CLAUDE, ADVOCATE, CONDUCTOR.
 - Acceptance: same task yields different role packs.
 
-### Phase 5: Supersession and correction
+### Phase 6: Supersession and correction
 
 - Add correction flow and `memory_supersede_unit`.
 - Acceptance: human correction propagates to future packs.
 
-### Phase 6: Retire legacy enrichment authority
+### Phase 7: Retire legacy enrichment authority
 
 - Keep regex extraction as diagnostic/lint only.
 - Stop auto-promoting heuristic claims.
 - Make compiler/review queue the only semantic promotion path.
 
-## 11. Acceptance Tests
+### Phase 8: Optional retrieval expansion
+
+- Add embedding search, GraphRAG, LightRAG, Graphiti, community detection, or
+  semantic entity graph only after packet routing, ack, supersede, and surface
+  contracts pass.
+
+V1 must not begin with embeddings or GraphRAG. The first product proof is that
+30 messy debate messages can become 1 to 3 useful human terminal items, durable
+dashboard rows, and different role-specific agent packets.
+
+## 12. Acceptance Tests
 
 1. HUMAN receives only temporal deltas in terminal, not raw debate history.
 2. Durable conclusions appear in Task Tray dashboard and survive restart.
@@ -618,8 +784,20 @@ Contract:
 10. Every dashboard row has drill-back evidence.
 11. Packet ack prevents repeated delivery.
 12. Legacy enrichment cannot auto-promote canonical truth.
+13. Twenty low-value `STATUS` messages plus two `Q` messages, one blocker, and
+    one correction produce at most three terminal items; `STATUS` is coalesced
+    or hidden.
+14. Same topic produces materially different HUMAN, CODEX, and ADVOCATE packets.
+15. Deleting derived `memory_units` and `context_packets` while keeping raw
+    ledgers allows compiler/router replay with preserved evidence refs.
+16. Human correction "LightRAG first; Graphiti later" supersedes any prior
+    "Graphiti in V1" unit and changes future Codex packets.
+17. A delivered+seen but unacknowledged decision can be reminded later as a
+    delta, not repeated as full context.
+18. Raw transcript is available only through `memory_explain_unit` / drill-back,
+    not in terminal or dashboard bodies.
 
-## 12. Semantic Load Gate
+## 13. Semantic Load Gate
 
 The existing acceptance tests prove architectural safety, but they do not prove
 semantic adequacy under real operator load. Before any runtime implementation
@@ -663,7 +841,7 @@ Passing criteria:
 - Human corrections supersede old units without deleting history: 100%.
 - Actor-specific packs differ materially by role while sharing the same raw
   evidence base.
-- HUMAN terminal feed stays bounded: default max 7 bullets and no raw transcript
+- HUMAN terminal feed stays bounded: default max 3 items and no raw transcript
   dumps.
 
 The gate fails closed. If the deterministic router passes structural tests but
@@ -671,7 +849,7 @@ the semantic load gate fails, implementation must not proceed to dashboard or
 agent-context rollout. The next action is compiler/router redesign, not tuning
 the UI.
 
-## 13. Optimal Orchestration Architecture
+## 14. Optimal Orchestration Architecture
 
 The attention system must not depend on a frontier LLM API in the real-time hot
 path. Real-time LLM orchestration would be expensive, latency-sensitive,
@@ -748,7 +926,7 @@ This architecture keeps the system economically and operationally viable:
 the expensive semantic layer runs only when it can add value, while the
 attention loop remains local, testable, replayable, and bounded.
 
-## 14. Strategic Conclusion
+## 15. Strategic Conclusion
 
 The defensible product is not "sqlite_memory remembers things". Mem0,
 Supermemory, Cognee, Letta, and Zep already fight that battle.
@@ -758,6 +936,20 @@ The defensible product is:
 ```text
 Local, reviewable attention OS for human-agent teams:
 proof ledgers + typed memory + per-actor delta + delivery routing.
+```
+
+More operationally:
+
+```text
+sqlite_memory = provable coordination memory
+that turns raw events into actor-specific attention packets.
+```
+
+Shortest product line:
+
+```text
+Not memory storage.
+Memory dispatch.
 ```
 
 The next implementation plan should build the smallest useful vertical slice:
