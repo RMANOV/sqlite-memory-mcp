@@ -68,6 +68,11 @@ baseline memory loop and are not part of the first-time-user hero:
   exists because some agent clients expose only a limited number of tools per
   MCP server. It is **not** a consolidation target under this documentation
   wave; no Tool Reference rows, server counts, or tool counts change here.
+- **Memora-style retrieval handles are a future representation contract, not a
+  current shipped external claim.** The project may describe the architecture as
+  compatible with primary abstractions, cue anchors, and retrieval traces, but
+  must not imply that this layer is already implemented or benchmarked until it
+  ships and is verified.
 
 ## Bounded claim — bridge resilience
 
@@ -96,7 +101,10 @@ diligence material:
   guarantee).
 
 Framing for all of the above: **application-enforced append-only governance**,
-local-first, civilian-dogfooded, single-operator, test-backed.
+local-first, civilian-dogfooded, single-operator, test-backed. Do not frame the
+project as a generic long-horizon memory retriever competing with Microsoft
+Memora; frame it as governed attention, evidence, provenance, and context
+routing over local ledgers.
 
 ## External-facing (DIANA) forbidden claims
 
@@ -110,6 +118,10 @@ The following must never appear in external-facing material:
 - No premium / airlock as a named external (DIANA) feature.
 - No absolute no-data-loss guarantee (bridge resilience is bounded as above).
 - No vector search as the product center or a required baseline.
+- No generic "better AI memory than Memora/Mem0/Zep" claim.
+- No shipped primary-abstraction / cue-anchor / retrieval-trace layer claim
+  until the corresponding schema, tools, tests, and documentation are actually
+  implemented.
 - No unbounded "production" claim — only production-quality, single-operator,
   with no external customers or deployment.
 

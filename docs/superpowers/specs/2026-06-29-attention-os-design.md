@@ -39,6 +39,9 @@ Raw Ledgers
 Memory Compiler
   typed units, evidence, contradictions, resolutions
         ↓
+Retrieval Representation
+  primary abstractions, cue anchors, retrieval traces
+        ↓
 Attention Router
   actor delta + surface delta + timing decision
         ↓
@@ -64,10 +67,20 @@ Strict component boundary:
 The compiler does not decide delivery. The router does not mutate raw ledgers.
 Governance does not erase history.
 
+Memora amendment, 2026-06-30: the compiler/router split needs a formal
+retrieval representation layer between typed units and delivery routing. This
+layer decouples rich stored memory value from lightweight retrieval handles.
+It is a derived projection layer, not a new source of truth.
+
 ## 2. Market Research Summary
 
 The market already has strong adjacent products:
 
+- Microsoft Research Memora: harmonic memory representation that separates
+  rich memory values from lightweight primary abstractions and cue anchors,
+  with policy-guided retrieval. It validates the abstraction-specificity
+  bottleneck and makes generic long-horizon memory retrieval a major-player
+  research/product front.
 - Mem0: universal memory layer for agents and apps, active open-source repo,
   Claude/Codex plugin surfaces, memory compression, read/write audit claims.
 - Supermemory: context cloud, memory router, personal app, connectors, user
@@ -88,6 +101,8 @@ Conclusion: the broad "agent memory" category is already crowded. The sharper
 unclaimed wedge is not another memory store. It is local, reviewable,
 ledger-backed attention routing for a human-agent team: debate/work coordination
 plus durable memory plus actor-specific deltas plus human delivery surfaces.
+Memora sharpens this conclusion: do not compete as a generic memory retriever.
+Use Memora-like retrieval handles under a verifiable attention/evidence OS.
 
 Positioning:
 
@@ -99,6 +114,10 @@ Best: verifiable delegation and context routing over local ledgers.
 
 Research sources checked:
 
+- Microsoft Research Memora:
+  `https://www.microsoft.com/en-us/research/blog/memora-a-harmonic-memory-representation-balancing-abstraction-and-specificity/`,
+  `https://arxiv.org/abs/2602.03315`, and
+  `https://github.com/microsoft/Memora`.
 - Mem0: `https://mem0.ai/` and `https://github.com/mem0ai/mem0`.
 - Supermemory: `https://supermemory.ai/` and
   `https://github.com/supermemoryai/supermemory`.
@@ -125,6 +144,8 @@ Research sources checked:
 - Do not make dashboard summaries authoritative without drill-back.
 - Do not replace existing task, event, and debate ledgers.
 - Do not start with GraphRAG or clustering as the core value.
+- Do not treat Memora-like retrieval handles as canonical truth or as a
+  substitute for evidence, promotion, and ack/supersede governance.
 - Do not ship a generic memory platform claim before the attention-routing
   distinction is working.
 
@@ -143,6 +164,9 @@ Ledger invariants:
 8. No LLM call is required in the hot path.
 9. Projections are read-only with respect to raw ledgers.
 10. Wrong memory is corrected by supersession, not deletion.
+11. Retrieval handles are derived projections, not canonical truth.
+12. Memory value is preserved separately from retrieval abstraction.
+13. Cue anchors help recall but never replace evidence refs.
 
 Delivery invariants:
 
@@ -162,6 +186,7 @@ Governance invariants:
 3. `trap_memory` requires evidence.
 4. Standing instructions are versioned.
 5. Human correction supersedes affected future packets.
+6. Retrieval relevance is not attention priority and is not permission to act.
 
 ## 5. Existing Assets To Preserve
 
@@ -228,6 +253,37 @@ Promotion rules:
   `trap_memory`, people facts, and legal/financial/reputation claims require
   explicit human confirmation unless sourced from an explicit human command.
 
+### Retrieval representation layer
+
+Memora-style retrieval is a representation layer over memory units, not a
+replacement for evidence or routing.
+
+Definitions:
+
+- `primary_abstraction`: compact canonical retrieval handle, typically 6 to 12
+  words, describing what the unit is fundamentally about.
+- `memory_value`: the rich stored content of the unit. In this spec it is the
+  existing L1/L2/L3/L4 body and raw reference structure. It must not be
+  collapsed into the retrieval handle.
+- `cue_anchor`: alternate access path to the same unit, generated from the
+  memory value and evidence. Anchors are useful for multi-hop recall and
+  non-local context, but they are not facts.
+- `retrieval_trace`: audit/debug record explaining which abstractions and
+  anchors were followed, which units were selected, which were rejected, and
+  why retrieval stopped.
+
+Hard boundary:
+
+```text
+body_l1/body_l2/body_l3/body_l4_ref = value and display resolution.
+primary_abstraction + cue_anchors = retrieval representation.
+actor_outbox + context_packets = attention delivery.
+```
+
+Retrieval handles may be LLM-generated, model-generated, or deterministic, but
+they always enter as derived/provisional projection data. They can be reviewed,
+superseded, rejected, and rebuilt from the raw ledgers plus compiler version.
+
 ## 7. Proposed Tables
 
 ### `source_events`
@@ -278,6 +334,15 @@ Fields:
 - `body_l2`: short paragraph.
 - `body_l3`: detailed summary.
 - `body_l4_ref`: raw/long body ref when too large for row.
+- `primary_abstraction`: compact canonical retrieval handle.
+- `abstraction_status`: `candidate`, `active`, `superseded`, `rejected`.
+- `abstraction_version`: compiler/model/prompt version that generated the
+  handle.
+- `abstraction_embedding_ref`: optional external/vector row reference for the
+  primary abstraction. The rich memory value is not the default embedding
+  target.
+- `retrieval_value_policy`: `handle_only`, `handle_plus_anchors`,
+  `value_allowed_for_explicit_search`, or `no_embedding`.
 - `project`.
 - `scope_kind`, `scope_id`.
 - `valid_from`, `valid_to`.
@@ -304,6 +369,62 @@ Fields:
 - `evidence_role`: `source`, `support`, `contradiction`, `supersession`,
   `approval`, `rejection`.
 - `created_at`.
+
+### `memory_unit_cue_anchors`
+
+Alternate retrieval handles for a memory unit. Cue anchors are derived,
+reviewable, and supersedable. They are not canonical facts and never replace
+evidence refs.
+
+Fields:
+
+- `anchor_id` primary key.
+- `unit_id`.
+- `anchor_text`.
+- `anchor_kind`: `person`, `project`, `topic`, `decision`, `deadline`,
+  `source`, `risk`, `procedure`, `other`.
+- `anchor_status`: `candidate`, `active`, `superseded`, `rejected`.
+- `confidence`: 0-1.
+- `source_evidence_id`.
+- `created_by_run_id`.
+- `supersedes_anchor_id`.
+- `created_at`.
+
+Rules:
+
+- A unit may have many active anchors.
+- Anchors can be added, rejected, or superseded without changing the memory
+  value.
+- Anchor text must be short enough for retrieval and display diagnostics.
+- Anchor-derived recall still returns the memory unit plus evidence refs, not
+  anchor text alone.
+
+### `memory_retrieval_traces`
+
+Replayable trace of a retrieval pass. This table is for audit, debugging,
+evaluation, and explaining why a context packet saw a unit.
+
+Fields:
+
+- `trace_id` primary key.
+- `query_text`.
+- `actor_id`.
+- `surface`.
+- `scope_kind`, `scope_id`.
+- `initial_hits_json`.
+- `cue_expansions_json`.
+- `selected_units_json`.
+- `rejected_units_json`.
+- `stop_reason`: `budget_exhausted`, `enough_evidence`, `low_confidence`,
+  `no_more_anchors`, `permission_filter`, `manual_stop`, `other`.
+- `created_at`.
+
+Rules:
+
+- Retrieval traces are not source of truth.
+- Traces must include selected and rejected unit ids when available.
+- A packet built from retrieval-expanded context should preserve the
+  `trace_id` in `payload_json` or `context_packet_items`.
 
 ### `memory_edges`
 
@@ -519,6 +640,60 @@ Input:
 }
 ```
 
+### `memory_generate_retrieval_handles`
+
+Compiler-facing tool/DAO contract that proposes primary abstractions and cue
+anchors for existing memory units. This is not a promotion path.
+
+Input:
+
+```json
+{
+  "scope_kind": "global|task|debate|project|actor",
+  "scope_id": "",
+  "unit_ids": [],
+  "dry_run": true,
+  "limit": 100
+}
+```
+
+Output: run id, proposed primary abstractions, proposed cue anchors, evidence
+refs, and confidence.
+
+Rules:
+
+- Generated handles start as `candidate` unless the unit was explicitly created
+  from a human command and the handle is deterministic.
+- Handle generation must not change packet delivery directly.
+- Handle generation must not promote `semantic_memory`, `policy_memory`,
+  `decision_memory`, or `trap_memory`.
+
+### `memory_review_anchors`
+
+Returns cue anchors and primary abstractions requiring review.
+
+Input: scope, anchor status, unit types, limit.
+
+Output: candidate anchors with unit preview, evidence, confidence, and proposed
+action.
+
+### `memory_retrieval_trace`
+
+Returns the trace behind a retrieval-expanded context packet or an exploratory
+query.
+
+Input:
+
+```json
+{
+  "trace_id": "...",
+  "resolution": "L1|L2|L3"
+}
+```
+
+Output: query, initial abstraction hits, cue-anchor expansions, selected units,
+rejected units, stop reason, and drill-back refs.
+
 ### `attention_build_packet`
 
 Builds one packet for one actor/surface.
@@ -644,6 +819,12 @@ Names may be normalized during implementation, but the contracts must preserve
 these six capabilities before graph, embedding, or semantic-clustering work
 enters the critical path.
 
+Retrieval-handle contracts (`memory_generate_retrieval_handles`,
+`memory_review_anchors`, and `memory_retrieval_trace`) are compiler/evaluation
+contracts before they are public tools. They may be implemented earlier than
+Phase 8 because they are part of the memory representation contract, not a
+GraphRAG/vector expansion.
+
 ## 9. Routing Rules
 
 Default triggers:
@@ -673,6 +854,28 @@ Default triggers:
 - Closed debate/topic:
   - decision or OODA memory unit;
   - receipt.
+
+Memora-inspired retrieval pipeline:
+
+```text
+1. Determine actor/surface/task intent.
+2. Search primary_abstraction handles for candidate units.
+3. Expand through active cue_anchors for related non-local context.
+4. Filter by unit status, validity, actor permissions, sensitivity, evidence
+   confidence, and actor ack state.
+5. Score novelty, urgency, risk, decision_required, and blocker relevance.
+6. Build a context_packet at the requested L1/L2/L3/L4 resolution.
+7. Preserve retrieval trace and evidence refs.
+```
+
+Hard rule:
+
+```text
+retrieval relevance != attention priority != permission to act
+```
+
+Retrieval finds candidates. The router decides delivery. Governance decides
+promotion, correction, and permission to treat a unit as durable truth.
 
 V1 attention score:
 
@@ -772,6 +975,16 @@ Contract:
 - No delivery yet.
 - Compare compiler output against current enrichment output.
 
+### Phase 2.5: Retrieval representation handles
+
+- Add `primary_abstraction` fields to `memory_units`.
+- Add `memory_unit_cue_anchors`.
+- Add `memory_retrieval_traces`.
+- Compiler emits retrieval handles as candidate/provisional projection data.
+- Anchors are reviewable and supersedable independently from memory value.
+- Acceptance: a rich unit can be reached through multiple cue anchors while
+  preserving the original evidence and full value.
+
 ### Phase 3: Human terminal delta
 
 - Implement `attention_next_terminal_delta`.
@@ -803,9 +1016,9 @@ Contract:
 
 ### Phase 8: Optional retrieval expansion
 
-- Add embedding search, GraphRAG, LightRAG, Graphiti, community detection, or
-  semantic entity graph only after packet routing, ack, supersede, and surface
-  contracts pass.
+- Add full embedding search, GraphRAG, LightRAG, Graphiti, community detection,
+  or semantic entity graph only after packet routing, ack, supersede, surface
+  contracts, and retrieval-handle gates pass.
 
 V1 must not begin with embeddings or GraphRAG. The first product proof is that
 30 messy debate messages can become 1 to 3 useful human terminal items, durable
@@ -838,6 +1051,15 @@ dashboard rows, and different role-specific agent packets.
     delta, not repeated as full context.
 18. Raw transcript is available only through `memory_explain_unit` / drill-back,
     not in terminal or dashboard bodies.
+19. A memory unit preserves rich L2/L3/L4 value while retrieval uses
+    `primary_abstraction` and cue anchors.
+20. Cue-anchor retrieval returns units with evidence refs, not anchor text as
+    standalone truth.
+21. Superseded anchors stop influencing future packet builds.
+22. Two distinct decisions with similar wording are not falsely merged under one
+    abstraction.
+23. `memory_retrieval_trace` explains selected and rejected units for an
+    agent-context packet.
 
 ## 13. Semantic Load Gate
 
@@ -869,6 +1091,9 @@ Golden outputs:
 - `agent_context_pack` for CODEX, CLAUDE, ADVOCATE, and CONDUCTOR for the same
   topic.
 - `memory_review_candidates` queue after compiler passes.
+- `memory_review_anchors` queue for generated primary abstractions and cue
+  anchors.
+- `memory_retrieval_trace` for packets that used cue-anchor expansion.
 - Drill-back evidence for every promoted decision, policy, blocker, and
   receipt.
 
@@ -885,11 +1110,34 @@ Passing criteria:
   evidence base.
 - HUMAN terminal feed stays bounded: default max 3 items and no raw transcript
   dumps.
+- Rich detail is preserved in memory value while retrieval uses compact
+  abstractions and cue anchors.
+- Same source can be reached through multiple cue anchors without duplicating
+  the underlying unit.
+- False merge of distinct decisions under one abstraction: zero for the golden
+  decision fixtures.
+- Retrieval traces exist for every cue-expanded context packet.
 
 The gate fails closed. If the deterministic router passes structural tests but
 the semantic load gate fails, implementation must not proceed to dashboard or
 agent-context rollout. The next action is compiler/router redesign, not tuning
 the UI.
+
+### Abstraction-specificity gate
+
+Memora makes this an explicit sub-gate. The system must prove that it can keep
+specific details while retrieving through compact handles.
+
+The gate passes only when:
+
+- rich details remain in `body_l2`, `body_l3`, or `body_l4_ref`;
+- primary abstractions are short retrieval handles, not lossy replacements for
+  value;
+- cue anchors improve recall without creating canonical facts;
+- contradicted or superseded anchors stop affecting future packets;
+- every retrieved unit has drill-back evidence;
+- retrieval traces make selected/rejected unit choices inspectable;
+- actor-specific packet differences remain after retrieval filtering.
 
 ## 14. Optimal Orchestration Architecture
 
@@ -911,6 +1159,8 @@ Hot path, deterministic:
 
 Warm path, cheap/incremental:
   FTS/BM25 retrieval
+  primary_abstraction lookup
+  cue_anchor expansion
   vector lookup if available
   entity and thread linking
   topic segmentation
@@ -919,6 +1169,7 @@ Warm path, cheap/incremental:
 
 Cold path, semantic compiler:
   LLM extracts candidate units
+  LLM proposes primary abstractions and cue anchors
   LLM labels ambiguous topic clusters
   LLM summarizes messy many-to-many dialogue
   LLM proposes decision/policy/trap/receipt units
@@ -935,6 +1186,8 @@ Algorithms that belong in the deterministic/warm layers:
 - Logical clocks and actor watermarks.
 - Incremental materialized views.
 - FTS5/BM25 for exact retrieval.
+- Primary abstraction lookup for compact recall.
+- Cue-anchor expansion for related-but-not-similar context.
 - Optional vector search for semantic recall.
 - Temporal graph edges for depends-on, blocks, supersedes, supports, and
   contradicts.
@@ -950,6 +1203,7 @@ Algorithms that should not be trusted alone:
 
 - Pure graph clustering for semantic decisions.
 - Embeddings-only similarity for importance.
+- Cue-anchor match as a proxy for truth or delivery urgency.
 - PageRank/centrality as a proxy for operator attention.
 - Recency-only or frequency-only ranking.
 - Regex extraction as semantic authority.
@@ -962,6 +1216,8 @@ LLM use should be gated by value and uncertainty:
 - Frontier model only for high-ambiguity, high-impact, or high-compression
   compiler passes.
 - Every LLM output enters as `candidate`, not canonical truth.
+- Every LLM-generated retrieval handle enters as candidate/provisional
+  projection data until reviewed or safely auto-accepted by policy.
 - Every promoted unit must have evidence refs and replay path.
 
 This architecture keeps the system economically and operationally viable:
@@ -995,6 +1251,8 @@ These are non-negotiable across profiles:
 
 - Raw append-only ledgers.
 - Derived memory units only with evidence refs.
+- Retrieval handles separated from rich memory value.
+- Cue anchors are reviewable/supersedable projection data.
 - Compiler separated from router.
 - `actor_surface_state`.
 - `actor_outbox`.
@@ -1019,6 +1277,9 @@ Allowed:
 - Markdown and JSON payloads.
 - Voice transcripts, chat imports, email/file/web captures.
 - SQLite FTS and later sqlite-vec/embedding search.
+- Primary abstractions and cue anchors for retrieval without dumping raw
+  memory values into context.
+- User-triggered retrieval trace inspection.
 - Async LLM compiler passes.
 - User-triggered synchronous LLM work when the human explicitly asks for it.
 - Rich `memory_units` with L1/L2/L3/L4 resolution.
@@ -1029,6 +1290,7 @@ Forbidden:
 
 - Raw transcript spam.
 - AI-derived canonical truth without evidence and promotion rule.
+- Treating cue anchors as facts or permissions.
 - Treating `seen` as `ack`.
 - Unbounded terminal bursts.
 - Unbounded agent context dumps.
@@ -1057,7 +1319,8 @@ WARM PATH
 Async writer batches events into WAL/control ledgers and projections.
 
 COLD PATH
-Compiler, summaries, GraphRAG/embeddings, human digest, and agent context packs.
+Compiler, summaries, primary abstractions, cue anchors, GraphRAG/embeddings,
+human digest, and agent context packs.
 ```
 
 Do not integrate as:
@@ -1096,8 +1359,14 @@ The compiler/router may later derive:
 - `temporal_delta`.
 - `evidence_memory`.
 - `trap_memory`.
+- primary abstractions and cue anchors for post-run recall.
 - dashboard row.
 - post-run Codex/Claude context packet.
+
+Memora-like retrieval handles are allowed only after trace capture, indexing,
+and projection. They are for post-run/cold-path analysis: scenario summaries,
+failure-pattern recall, human review dashboards, and agent development packs.
+They are never part of STRIX tick authority.
 
 ### STRIX Hot/Warm/Cold Gates
 
@@ -1113,6 +1382,7 @@ Hot path forbidden operations:
 - Unbounded queue.
 - Router scan.
 - Graph/embedding retrieval.
+- Primary-abstraction or cue-anchor retrieval.
 
 Warm path responsibilities:
 
@@ -1129,6 +1399,8 @@ Cold path responsibilities:
 - Semantic compiler.
 - LLM summaries.
 - GraphRAG/embeddings.
+- Primary-abstraction generation.
+- Cue-anchor generation and expansion.
 - Cross-run failure-pattern search.
 - Human digest.
 - Agent context packs.
@@ -1358,6 +1630,9 @@ llm_allowed_user_triggered_sync = true
 durable_units_require_evidence = true
 policy_memory_requires_human_confirm = true
 decision_memory_requires_human_confirm = true
+retrieval_handles_enabled = true
+cue_anchors_enabled = true
+retrieval_traces_enabled = true
 
 [router]
 use_actor_outbox = true
@@ -1365,6 +1640,7 @@ terminal_max_items = 3
 terminal_default_resolution = "L1"
 dashboard_default_resolution = "L2"
 coalesce_delivery_only = true
+retrieval_relevance_is_not_priority = true
 
 [loss_policy]
 drop_raw_human_input = false
@@ -1396,6 +1672,7 @@ projection_first = true
 actor_outbox = true
 terminal_max_items = 3
 route_only_attention_worthy_events = true
+cold_path_retrieval_handles_only = true
 
 [loss_policy]
 drop_raw_human_input = false
@@ -1438,14 +1715,22 @@ underspecified.
 
 ## 16. Strategic Conclusion
 
-The defensible product is not "sqlite_memory remembers things". Mem0,
-Supermemory, Cognee, Letta, and Zep already fight that battle.
+The defensible product is not "sqlite_memory remembers things". Microsoft
+Memora, Mem0, Supermemory, Cognee, Letta, and Zep already fight the generic
+agent-memory battle.
+
+Memora changes the claim boundary. The project should not claim to beat
+Microsoft-scale long-horizon memory retrieval. It should use Memora-like
+retrieval handles where useful, while owning the layer Memora does not fully
+define here: proof ledgers, provenance, actor-specific attention, human gates,
+ack/supersede, and replayable workpapers.
 
 The defensible product is:
 
 ```text
 Local, reviewable attention OS for human-agent teams:
-proof ledgers + typed memory + per-actor delta + delivery routing.
+proof ledgers + typed memory + retrieval handles + per-actor delta +
+delivery routing.
 ```
 
 More operationally:
@@ -1459,7 +1744,8 @@ Shortest product line:
 
 ```text
 Not memory storage.
-Memory dispatch.
+Not generic memory retrieval.
+Memory dispatch with proof.
 ```
 
 The next implementation plan should build the smallest useful vertical slice:
@@ -1467,11 +1753,14 @@ The next implementation plan should build the smallest useful vertical slice:
 ```text
 debate/task/memory ledgers
 → dry-run compiler
+→ primary abstractions and cue anchors
 → actor_surface_state
 → terminal delta
 → ack
 → dashboard durable row
 ```
 
-Only after that works should graph clustering, embeddings, or external memory
-benchmarks enter the critical path.
+Only after that works should full graph clustering, GraphRAG, embeddings, or
+external memory benchmarks enter the critical path. Primary abstractions and
+cue anchors are no longer optional extras after Memora; they are part of the
+minimum retrieval representation contract.
