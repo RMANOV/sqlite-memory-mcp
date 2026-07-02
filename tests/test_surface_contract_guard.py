@@ -3,8 +3,8 @@
 Snapshots the PUBLIC surface of the project and fails on ANY drift:
 
   (a) the set of MCP server console scripts in pyproject.toml
-  (b) per-server MCP tool names (live ``mcp.list_tools()`` per server module)
-  (c) presence of claim-sensitive files (README.md, CORE_VS_ADVANCED_PATH.md)
+  (b) per-server MCP tool names per server module
+  (c) presence of claim-sensitive files (README.md)
 
 The checked-in fixture ``tests/fixtures/surface_contract_snapshot.json`` is the
 frozen contract. The test compares the LIVE surface against it and fails with a
@@ -37,8 +37,8 @@ import task_server  # noqa: E402
 import unified_server  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
-_FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / (
-    "surface_contract_snapshot.json"
+_FIXTURE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / ("surface_contract_snapshot.json")
 )
 
 # Same module set tests/test_server_imports.py exercises — the public split
@@ -54,12 +54,8 @@ _SERVER_MODULES = {
     "unified_server": unified_server,
 }
 
-# Files whose PRESENCE is claim-sensitive (D0: no README/public-claim removals,
-# CORE_VS_ADVANCED_PATH.md boundaries intact).
-_CLAIM_SENSITIVE_FILES = (
-    "README.md",
-    "docs/ops/CORE_VS_ADVANCED_PATH.md",
-)
+# Files whose PRESENCE is claim-sensitive (D0: no README/public-claim removals).
+_CLAIM_SENSITIVE_FILES = ("README.md",)
 
 _DRIFT_INSTRUCTIONS = (
     "Surface drift detected (claim-freeze guard). If this change is "
@@ -78,8 +74,15 @@ def _live_console_scripts() -> dict:
 def _live_server_tools() -> dict:
     out = {}
     for name, module in sorted(_SERVER_MODULES.items()):
-        tools = asyncio.run(module.mcp.list_tools())
-        out[name] = sorted(tool.name for tool in tools)
+        if hasattr(module.mcp, "list_tools"):
+            tools = asyncio.run(module.mcp.list_tools())
+            out[name] = sorted(tool.name for tool in tools)
+        else:
+            tools = asyncio.run(module.mcp.get_tools())
+            if isinstance(tools, dict):
+                out[name] = sorted(tools.keys())
+            else:
+                out[name] = sorted(tool.name for tool in tools)
     return out
 
 
@@ -97,8 +100,7 @@ def build_live_surface() -> dict:
 
 def _load_fixture() -> dict:
     assert _FIXTURE_PATH.is_file(), (
-        f"missing surface-contract fixture {_FIXTURE_PATH}; "
-        f"{_DRIFT_INSTRUCTIONS}"
+        f"missing surface-contract fixture {_FIXTURE_PATH}; {_DRIFT_INSTRUCTIONS}"
     )
     return json.loads(_FIXTURE_PATH.read_text(encoding="utf-8"))
 

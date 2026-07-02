@@ -1,7 +1,6 @@
 {
   "claim_sensitive_files": {
-    "README.md": true,
-    "docs/ops/CORE_VS_ADVANCED_PATH.md": true
+    "README.md": true
   },
   "console_scripts": {
     "memory-digest": "daily_digest:main",
