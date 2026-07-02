@@ -17,8 +17,8 @@ The debate protocol is **governed multi-agent OODA coordination**. For external
 addressed messages, role-aware cursors / watermarks, `no_action` completion,
 and append-only audit logs. It does **not** carry an autonomous
 execution-safety claim beyond these controls. See
-[`ops/CORE_VS_ADVANCED_PATH.md`](ops/CORE_VS_ADVANCED_PATH.md) for the frozen
-claim-set.
+the [`README` external claim boundary](../README.md#external-claim-boundary-frozen-claim-set)
+for the frozen claim-set.
 
 ## Mental model
 

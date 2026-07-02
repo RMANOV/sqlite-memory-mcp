@@ -126,11 +126,11 @@ codex mcp add sqlite_unified -- sqlite-memory-unified
 
 Tools are grouped by MCP server. See the README Tool Reference for the
 per-server tool list. This section describes what each group is *for* and how
-mature it is. For the canonical core-path vs advanced-path operator map and the
-frozen external-claim set, see
-[`docs/ops/CORE_VS_ADVANCED_PATH.md`](ops/CORE_VS_ADVANCED_PATH.md). The labels
-below describe posture and emphasis only; nothing here is removed, deprecated,
-or disabled.
+mature it is. For the public core-path vs advanced-path posture and external
+claim boundary, see the
+[`README` advanced/operator section](../README.md#advanced--operator-topics).
+The labels below describe posture and emphasis only; nothing here is removed,
+deprecated, or disabled.
 
 ### Stable / core path (start here)
 
@@ -181,8 +181,8 @@ product center or a required baseline.
 
 - `README.md` — full feature overview, architecture, schema, and the canonical
   Tool Reference.
-- `docs/ops/CORE_VS_ADVANCED_PATH.md` — canonical core-path vs advanced-path
-  operator map and the frozen external-claim set.
+- `README.md` § Advanced & operator topics — public core-path vs advanced-path
+  posture and external claim boundary.
 - `docs/DEBATE_PROTOCOL.md` — multi-agent debate protocol design.
 - `docs/ops/BRIDGE_OPERATIONS.md` — running cross-machine bridge sync.
 - `examples/basic_usage.md` — a worked end-to-end example.

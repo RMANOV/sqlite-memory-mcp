@@ -84,10 +84,9 @@ The features above are the core. The capabilities below are deliberately kept ou
 
 ### Core path vs advanced path
 
-For a single canonical operator map of what is on the everyday **core path**
-versus the **advanced / optional path** — plus the frozen allowed / forbidden
-external-claim set and the D2 (code-change) triggers — see
-[`docs/ops/CORE_VS_ADVANCED_PATH.md`](docs/ops/CORE_VS_ADVANCED_PATH.md).
+This section is the public summary of what is on the everyday **core path**
+versus the **advanced / optional path**, plus the allowed / forbidden
+external-claim set and the D2 (code-change) triggers.
 
 - **Core path (load-bearing, start here):** `sqlite_memory`, `sqlite_tasks`,
   `sqlite_session`; provenance / knowledge-links; bridge resilience; reflect /
@@ -129,9 +128,8 @@ Pricing is intentionally not published here; serious prospects receive a scoped 
 
 ### External claim boundary (frozen claim-set)
 
-For external / diligence material, the project commits to a frozen claim-set,
-stated canonically in
-[`docs/ops/CORE_VS_ADVANCED_PATH.md`](docs/ops/CORE_VS_ADVANCED_PATH.md).
+For external / diligence material, the project commits to the bounded
+claim-set summarized here.
 
 **Allowed:** local-first governed cross-agent memory; provenance /
 knowledge-links and approval-aware promotion; the deterministic `reflect_audit`

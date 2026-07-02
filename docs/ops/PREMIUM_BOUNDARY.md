@@ -8,8 +8,8 @@ cannot run premium features.
 
 Premium / airlock is an **optional operator / private-runtime boundary** on the
 advanced / optional path — not part of the core memory loop. See
-[`CORE_VS_ADVANCED_PATH.md`](CORE_VS_ADVANCED_PATH.md) for where it sits in the
-operator claim map.
+the [`README` operator section](../../README.md#optional-private-runtime-boundary)
+for where it sits in the public operator map.
 
 ## What the host enforces
 
@@ -142,4 +142,4 @@ of the main external claim-set. The only exception is when a diligence question
 specifically asks about extension governance — in which case it can be described
 as the optional, signed, revocable operator boundary it is, not as a headline
 capability. This boundary is recorded in the frozen claim-set in
-[`CORE_VS_ADVANCED_PATH.md`](CORE_VS_ADVANCED_PATH.md).
+the [`README` external claim boundary](../../README.md#external-claim-boundary-frozen-claim-set).

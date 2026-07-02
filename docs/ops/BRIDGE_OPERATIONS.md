@@ -4,7 +4,7 @@
 
 Keep bridge health, tray-side sync behavior, and recovery confidence visible without relying only on ad-hoc memory.
 
-Bridge sync is the **governance / resilience spine** of the cross-machine path. The claim it backs is bounded: **health / conflict / recovery discipline against no-resurrect / no-data-loss failures**, plus operator recovery drills — *not* an absolute, impossible-to-lose-data guarantee. See [`CORE_VS_ADVANCED_PATH.md`](CORE_VS_ADVANCED_PATH.md) for how this fits the core-path claim map.
+Bridge sync is the **governance / resilience spine** of the cross-machine path. The claim it backs is bounded: **health / conflict / recovery discipline against no-resurrect / no-data-loss failures**, plus operator recovery drills — *not* an absolute, impossible-to-lose-data guarantee. See the [`README` external claim boundary](../../README.md#external-claim-boundary-frozen-claim-set) for how this fits the public claim map.
 
 ## Fast commands
 
