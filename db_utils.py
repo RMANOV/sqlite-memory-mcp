@@ -3032,7 +3032,10 @@ class TaskDAO:
         conn.execute(
             "DELETE FROM tasks WHERE type = 'task' "
             "AND status = 'archived' "
-            "AND tombstone_pushed_at IS NOT NULL AND tombstone_pushed_at < ?",
+            "AND tombstone_pushed_at IS NOT NULL AND tombstone_pushed_at < ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM tasks child WHERE child.parent_id = tasks.id"
+            ")",
             (hard_cutoff,),
         )
         return retired
