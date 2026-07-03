@@ -56,12 +56,51 @@ def _bridge_head(repo_dir: str) -> str | None:
 def _bridge_git_pull(repo_dir: str):
     from db_utils import git_retry
 
-    return git_retry(
+    fetch = git_retry(
         repo_dir,
-        "pull",
-        "--rebase",
-        "--autostash",
+        "fetch",
+        "origin",
+        "main",
         timeout=_GIT_PULL_TIMEOUT,
+    )
+    if fetch.returncode != 0:
+        return fetch
+
+    local = git_retry(repo_dir, "rev-parse", "HEAD", timeout=10)
+    remote = git_retry(repo_dir, "rev-parse", "origin/main", timeout=10)
+    base = git_retry(repo_dir, "merge-base", "HEAD", "origin/main", timeout=10)
+    if local.returncode != 0 or remote.returncode != 0 or base.returncode != 0:
+        detail = " ".join(
+            (result.stderr or result.stdout).strip()
+            for result in (local, remote, base)
+            if result.returncode != 0
+        ).strip()
+        return subprocess.CompletedProcess(
+            ["git", "graph-inspect"],
+            1,
+            "",
+            detail or "bridge git graph inspection failed",
+        )
+
+    local_sha = local.stdout.strip()
+    remote_sha = remote.stdout.strip()
+    base_sha = base.stdout.strip()
+    if local_sha == remote_sha or base_sha == remote_sha:
+        return fetch
+    if base_sha == local_sha:
+        return git_retry(
+            repo_dir,
+            "merge",
+            "--ff-only",
+            "origin/main",
+            timeout=_GIT_PULL_TIMEOUT,
+        )
+
+    return subprocess.CompletedProcess(
+        ["git", "merge", "--ff-only", "origin/main"],
+        1,
+        "",
+        "bridge repo local and origin/main diverged; explicit recovery required",
     )
 
 

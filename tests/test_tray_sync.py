@@ -261,6 +261,42 @@ def test_sync_bridge_skips_when_thread_already_running(bridge_env):
     assert window.status.messages[-1][0] == "Sync already running"
 
 
+def test_bridge_git_pull_uses_fetch_and_ff_only_without_autostash(monkeypatch):
+    calls = []
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        calls.append(args)
+        if args == ("fetch", "origin", "main"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout="local\n", stderr="")
+        if args == ("rev-parse", "origin/main"):
+            return SimpleNamespace(returncode=0, stdout="remote\n", stderr="")
+        if args == ("merge-base", "HEAD", "origin/main"):
+            return SimpleNamespace(returncode=0, stdout="local\n", stderr="")
+        if args == ("merge", "--ff-only", "origin/main"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(
+        sys.modules["db_utils"],
+        "git_retry",
+        fake_git_retry,
+    )
+
+    result = tray_sync._bridge_git_pull("bridge")
+
+    assert result.returncode == 0
+    assert ("pull", "--rebase", "--autostash") not in calls
+    assert calls == [
+        ("fetch", "origin", "main"),
+        ("rev-parse", "HEAD"),
+        ("rev-parse", "origin/main"),
+        ("merge-base", "HEAD", "origin/main"),
+        ("merge", "--ff-only", "origin/main"),
+    ]
+
+
 def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     captured = {}
     refreshes = []
