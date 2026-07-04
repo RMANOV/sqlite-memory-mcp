@@ -48,3 +48,26 @@ jobs:
 
       - name: Pytest
         run: pytest -q
+
+  registry-smoke:
+    # Independent guard for MCP registry builders (Glama): a fresh
+    # core-only install (no extras) must still speak MCP over stdio.
+    # Mirrors the Dockerfile CMD path; runs in well under 3 minutes and
+    # does not touch the lint-and-test job.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Core-only install (no extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: MCP stdio smoke (initialize + tools/list)
+        run: python scripts/registry_smoke.py
