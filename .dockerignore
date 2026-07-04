@@ -1,0 +1,16 @@
+# Keep the build context small and deterministic, and never bake local
+# state (the private SQLite memory DB, git history, logs) into the image.
+.git
+.github
+__pycache__
+*.pyc
+*.egg-info
+*.db
+*.db-*
+*.log
+.pytest_cache
+.ruff_cache
+.venv
+venv
+build-target
+.claude
