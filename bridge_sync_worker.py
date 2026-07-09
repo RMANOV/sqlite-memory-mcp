@@ -70,6 +70,7 @@ from db_utils import (
     export_memory_audit_issues,
     export_memory_artifacts,
     export_memory_conflicts,
+    prune_memory_conflicts,
     export_memory_audit_state,
     import_remote_bridge_data,
     write_extended_memory_files,  # noqa: F401
@@ -1011,6 +1012,18 @@ def _main_locked(
                         }
         except (sqlite3.OperationalError, AttributeError) as e:
             log.warning("Sync skip-check error: %s", e)
+
+    # Phase 3a3: keep the conflict ledger bounded — auto-decided conflicts are
+    # marked resolved, then resolved rows older than the retention window are
+    # dropped. Own short write transaction so Phase 3b below stays read-only.
+    with get_conn(_db_path) as conn:
+        _cf_backfilled, _cf_pruned = prune_memory_conflicts(conn)
+    if _cf_backfilled or _cf_pruned:
+        log.info(
+            "conflict ledger maintenance: resolved %d, pruned %d",
+            _cf_backfilled,
+            _cf_pruned,
+        )
 
     # Phase 3b: Export (read-only, separate short transaction)
     extended_memory: dict[str, list] = {}

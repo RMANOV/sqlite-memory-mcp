@@ -2161,6 +2161,12 @@ def record_memory_conflict(
     if not _sqlite_table_exists(conn, "memory_conflicts"):
         return None
     now = created_at or now_iso()
+    # A winner means the conflict is auto-decided (terminal), not pending human
+    # review — record it resolved so the ledger self-limits and the audit's
+    # status='open' query surfaces only genuinely undecided conflicts.
+    _decided = bool(winner and str(winner).strip())
+    conflict_status = "resolved" if _decided else "open"
+    conflict_resolved_at = now if _decided else None
     key_payload = {
         "aggregate_kind": aggregate_kind,
         "aggregate_id": aggregate_id,
@@ -2190,7 +2196,7 @@ def record_memory_conflict(
             "local_value, remote_value, local_updated_at, remote_updated_at, "
             "local_updated_order, remote_updated_order, local_source_event_id, "
             "remote_source_event_id, winner, status, rationale, created_at, updated_at, resolved_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 conflict_id,
                 conflict_key,
@@ -2206,9 +2212,11 @@ def record_memory_conflict(
                 local_source_event_id,
                 remote_source_event_id,
                 winner,
+                conflict_status,
                 rationale,
                 now,
                 now,
+                conflict_resolved_at,
             ),
         )
     else:
@@ -2217,7 +2225,7 @@ def record_memory_conflict(
             "UPDATE memory_conflicts SET local_value = ?, remote_value = ?, "
             "local_updated_at = ?, remote_updated_at = ?, local_updated_order = ?, "
             "remote_updated_order = ?, local_source_event_id = ?, remote_source_event_id = ?, "
-            "winner = ?, status = 'open', rationale = ?, updated_at = ?, resolved_at = NULL "
+            "winner = ?, status = ?, rationale = ?, updated_at = ?, resolved_at = ? "
             "WHERE conflict_id = ?",
             (
                 local_text,
@@ -2229,12 +2237,43 @@ def record_memory_conflict(
                 local_source_event_id,
                 remote_source_event_id,
                 winner,
+                conflict_status,
                 rationale,
                 now,
+                conflict_resolved_at,
                 conflict_id,
             ),
         )
     return conflict_id
+
+
+CONFLICT_LEDGER_RETENTION_DAYS = 30
+
+
+def prune_memory_conflicts(
+    conn: sqlite3.Connection, *, retention_days: int = CONFLICT_LEDGER_RETENTION_DAYS
+) -> tuple[int, int]:
+    """Keep the conflict ledger bounded so bridge sync never bloats.
+
+    Backfill: a conflict with a winner is auto-decided (terminal), not pending
+    review, so mark any lingering 'open' such rows resolved. Prune: drop
+    resolved rows older than the retention window. Date-only comparison avoids
+    the ISO 'T'/timezone-suffix mismatch that breaks a raw datetime() compare.
+    Returns (backfilled, pruned). Caller owns the transaction/commit.
+    """
+    if not _sqlite_table_exists(conn, "memory_conflicts"):
+        return (0, 0)
+    backfilled = conn.execute(
+        "UPDATE memory_conflicts SET status = 'resolved', "
+        "resolved_at = COALESCE(resolved_at, updated_at) "
+        "WHERE status = 'open' AND winner IS NOT NULL AND TRIM(winner) <> ''"
+    ).rowcount
+    pruned = conn.execute(
+        "DELETE FROM memory_conflicts WHERE status = 'resolved' "
+        "AND substr(updated_at, 1, 10) < date('now', ?)",
+        (f"-{int(retention_days)} days",),
+    ).rowcount
+    return (backfilled, pruned)
 
 
 def promote_pending_public_entities(
