@@ -584,7 +584,9 @@ def test_stale_remote_status_does_not_win_with_newer_task_updated_at(conn):
     remote_status_ts = "2026-05-18T20:19:22.198077+00:00"
     metadata_ts = "2026-05-22T05:34:57.560101+00:00"
 
-    _insert_task(conn, tid, title="Migrated note", status="done", updated_at=local_status_ts)
+    _insert_task(
+        conn, tid, title="Migrated note", status="done", updated_at=local_status_ts
+    )
     upsert_field_versions(
         conn,
         tid,
@@ -620,7 +622,9 @@ def test_legacy_same_field_ts_source_machine_repairs_status_and_section_once(con
     field_ts = "2026-05-22T05:34:57.560101+00:00"
     stale_ts = "2026-05-22T05:00:00.000000+00:00"
 
-    _insert_task(conn, tid, title="Source authority", status="not_started", updated_at=stale_ts)
+    _insert_task(
+        conn, tid, title="Source authority", status="not_started", updated_at=stale_ts
+    )
     upsert_field_versions(
         conn,
         tid,
@@ -687,7 +691,9 @@ def test_status_event_authority_repairs_then_peer_payload_cannot_revert(conn):
     except sqlite3.OperationalError:
         pass
 
-    _insert_task(conn, tid, title="Event authority", status="not_started", updated_at=field_ts)
+    _insert_task(
+        conn, tid, title="Event authority", status="not_started", updated_at=field_ts
+    )
     upsert_field_versions(
         conn,
         tid,
@@ -781,7 +787,12 @@ def test_legacy_terminal_row_promotes_then_active_peer_cannot_revert(conn):
         "status": "archived",
         "updated_at": promoted_row_ts,
         "_field_ts": {
-            "status": [stale_field_ts, "fedora", stale_clock, "event-fedora-not-started"]
+            "status": [
+                stale_field_ts,
+                "fedora",
+                stale_clock,
+                "event-fedora-not-started",
+            ]
         },
     }
 
@@ -830,12 +841,19 @@ def test_legacy_active_row_never_promotes_via_fresh_updated_at(conn):
     stale_clock = _pack_logical_clock(1770000000000, 1)
 
     _ensure_field_event_columns(conn)
-    _insert_task(conn, tid, title="Active row", status="not_started", updated_at=local_ts)
+    _insert_task(
+        conn, tid, title="Active row", status="not_started", updated_at=local_ts
+    )
     conn.execute(
         "INSERT OR REPLACE INTO task_field_versions "
         "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
         "VALUES (?, 'status', ?, 'RManov', ?, ?, 'not_started')",
-        (tid, local_ts, _pack_logical_clock(1770000100000, 1), "event-local-not-started"),
+        (
+            tid,
+            local_ts,
+            _pack_logical_clock(1770000100000, 1),
+            "event-local-not-started",
+        ),
     )
 
     active_remote = {
@@ -863,7 +881,9 @@ def test_legacy_terminal_row_does_not_flip_existing_terminal_status(conn):
     stale_clock = _pack_logical_clock(1770000000000, 1)
 
     _ensure_field_event_columns(conn)
-    _insert_task(conn, tid, title="Terminal row", status="archived", updated_at=local_ts)
+    _insert_task(
+        conn, tid, title="Terminal row", status="archived", updated_at=local_ts
+    )
     conn.execute(
         "INSERT OR REPLACE INTO task_field_versions "
         "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
@@ -896,12 +916,19 @@ def test_explicit_status_value_blocks_legacy_terminal_row_promotion(conn):
     stale_clock = _pack_logical_clock(1770000000000, 1)
 
     _ensure_field_event_columns(conn)
-    _insert_task(conn, tid, title="Explicit status", status="not_started", updated_at=local_ts)
+    _insert_task(
+        conn, tid, title="Explicit status", status="not_started", updated_at=local_ts
+    )
     conn.execute(
         "INSERT OR REPLACE INTO task_field_versions "
         "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id, new_value) "
         "VALUES (?, 'status', ?, 'RManov', ?, ?, 'not_started')",
-        (tid, local_ts, _pack_logical_clock(1770000100000, 1), "event-local-not-started"),
+        (
+            tid,
+            local_ts,
+            _pack_logical_clock(1770000100000, 1),
+            "event-local-not-started",
+        ),
     )
 
     explicit_stale_remote = {
@@ -947,7 +974,13 @@ def test_source_legacy_status_payload_can_outrank_stale_event_head(conn):
     except sqlite3.OperationalError:
         pass
 
-    _insert_task(conn, tid, title="Legacy source status", status="in_progress", updated_at=source_ts)
+    _insert_task(
+        conn,
+        tid,
+        title="Legacy source status",
+        status="in_progress",
+        updated_at=source_ts,
+    )
     conn.execute(
         "INSERT OR REPLACE INTO task_field_versions "
         "(task_id, field_name, updated_at, updated_by, updated_order, source_event_id) "
@@ -1552,10 +1585,14 @@ def test_merge_records_conflict_objects(conn):
     )
 
     row = conn.execute(
-        "SELECT field_name, winner, status FROM memory_conflicts WHERE aggregate_id = ?",
+        "SELECT field_name, winner, status, resolved_at FROM memory_conflicts "
+        "WHERE aggregate_id = ?",
         (tid,),
     ).fetchone()
 
     assert row["field_name"] == "title"
     assert row["winner"] == "remote"
-    assert row["status"] == "open"
+    # A winner means the conflict is auto-decided (terminal), not pending human
+    # review, so it is recorded resolved with a resolution timestamp.
+    assert row["status"] == "resolved"
+    assert row["resolved_at"] is not None
