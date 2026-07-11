@@ -150,10 +150,17 @@ def _estimate_worker_demand(msg_id: str, suppressed_roles: set[str]) -> int:
     con.row_factory = sqlite3.Row
     try:
         msg = con.execute(
-            "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+            "SELECT topic_id, vehicle FROM debate_messages WHERE msg_id = ?",
             (msg_id,),
         ).fetchone()
         if msg is None:
+            return 0
+        # ``implementation`` is deliberately refused by the bounded wake
+        # router: it requires a conductor-approved edit-capable vehicle.  It
+        # therefore creates no per-session wake result/worker claim.  Treat it
+        # as zero bounded-worker demand here so the resident pump can advance
+        # past the typed refusal instead of retrying the same message forever.
+        if str(msg["vehicle"] or "analysis") == "implementation":
             return 0
         rows = con.execute(
             "SELECT recipient, recipient_mode FROM debate_message_recipients "

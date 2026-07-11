@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
@@ -383,6 +384,77 @@ def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tm
 
     assert module.main() == 0
     assert seen_budget == ["3"]
+
+
+def test_debate_pump_treats_implementation_as_zero_bounded_worker_demand(
+    monkeypatch, tmp_path
+):
+    module = _load_hook_module(
+        "debate_pump_implementation_demand_test", "hooks/debate_pump.py"
+    )
+    module.DB_PATH = tmp_path / "memory.db"
+    monkeypatch.setenv("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
+
+    con = sqlite3.connect(module.DB_PATH)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE debate_messages (
+                msg_id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL,
+                vehicle TEXT
+            );
+            CREATE TABLE debate_message_recipients (
+                msg_id TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                recipient_mode TEXT NOT NULL
+            );
+            CREATE TABLE debate_role_bindings (
+                topic_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                generation INTEGER NOT NULL
+            );
+            CREATE TABLE debate_wake_log (
+                trigger_msg_id TEXT NOT NULL,
+                target_session_id TEXT,
+                action TEXT NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        con.execute(
+            "INSERT INTO debate_messages VALUES (?, ?, ?)",
+            ("impl-q", "T", "implementation"),
+        )
+        con.execute(
+            "INSERT INTO debate_message_recipients VALUES (?, ?, ?)",
+            ("impl-q", "EXECUTOR", "normal"),
+        )
+        con.execute(
+            "INSERT INTO debate_role_bindings VALUES (?, ?, ?, ?, ?)",
+            ("T", "EXECUTOR", "codex-executor", "active", 1),
+        )
+        # The fail-closed resolver writes a message-level refusal with no
+        # target_session_id.  The pump must still regard the message as
+        # terminal for bounded-worker demand.
+        con.execute(
+            "INSERT INTO debate_wake_log VALUES (?, ?, ?, ?, ?)",
+            (
+                "impl-q",
+                None,
+                "post_tool_use_wake",
+                "implementation_requires_impl_vehicle",
+                "2026-07-11T00:00:00Z",
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert module._estimate_worker_demand("impl-q", set()) == 0
 
 
 def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(monkeypatch, tmp_path):
