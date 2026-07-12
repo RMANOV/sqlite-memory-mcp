@@ -15,7 +15,7 @@ Environment=DEBATE_PUMP_MAX_CONCURRENT_WORKERS=1
 Environment=DEBATE_MESSAGE_CLAIM_RECLAIM_SECONDS=900
 Environment=DEBATE_MESSAGE_CLAIM_RECLAIM_INTERVAL=60
 Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 %h/sqlite-memory-mcp/hooks/debate_pump.py --interval 10 --limit 5 --action-kind Q,DECISION
+ExecStart=/usr/bin/python3 %h/sqlite-memory-mcp/hooks/debate_pump.py --interval 10 --limit 5 --action-kind Q,DECISION,PING
 Nice=10
 CPUWeight=10
 MemoryHigh=3G

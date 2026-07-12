@@ -3767,6 +3767,11 @@ def prepare_wake_dry_run(
                 continue
             recipient = rec["recipient"]
             if SESSION_ID_RE.fullmatch(recipient):
+                # KNOWN LIMITATION (ADVOCATE 3fd85c9584e3 minor 1): a trigger
+                # addressed ONLY to session-ids resolves zero notify targets
+                # and skips silently — notify needs a binding lookup by
+                # session, not by role. Revive if impl hand-offs ever address
+                # sessions directly.
                 continue
             binding = _active_binding(conn, topic_id, recipient)
             if binding is None:
