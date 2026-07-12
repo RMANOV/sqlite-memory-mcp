@@ -168,6 +168,135 @@ def test_edit_task_dialog_roundtrips_notes(qapp):
     dlg.close()
 
 
+def test_task_reader_title_and_body_copy_exact_mixed_text_without_mutation(qapp):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+
+    title = "Дълго BG заглавие / mixed ASCII-Cyr 123 — exact"
+    description = "Първи ред на български.\nSecond ASCII line: []{} / exact."
+    task = {
+        "id": "task-copy-demo",
+        "title": title,
+        "description": description,
+        "notes": None,
+        "status": "not_started",
+        "priority": "critical",
+        "section": "today",
+    }
+    before = task.copy()
+    dlg = tray_dialogs.TaskReaderDialog(task, _FakeTaskDb())
+    dlg.show()
+    qapp.processEvents()
+
+    required = (
+        Qt.TextInteractionFlag.TextSelectableByMouse
+        | Qt.TextInteractionFlag.TextSelectableByKeyboard
+    )
+    assert dlg._title_label.textInteractionFlags() & required == required
+    assert dlg._body_label.textInteractionFlags() & required == required
+
+    dlg._title_label.setFocus()
+    QTest.keyClick(
+        dlg._title_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
+    )
+    QTest.keyClick(
+        dlg._title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
+    )
+    qapp.processEvents()
+    assert qapp.clipboard().text() == title
+
+    dlg._body_label.setFocus()
+    QTest.keyClick(
+        dlg._body_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
+    )
+    QTest.keyClick(
+        dlg._body_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
+    )
+    qapp.processEvents()
+    assert qapp.clipboard().text() == description
+    assert task == before
+    dlg.close()
+
+
+def test_reminder_copy_shortcuts_are_read_only_and_buttons_still_work(qapp):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QLabel, QPushButton
+
+    dlg = tray_dialogs.ReminderPopupDialog(
+        "task-reminder",
+        "Напомняне mixed 42",
+        "critical",
+        "Описание BG / ASCII",
+    )
+    snoozed = []
+    dismissed = []
+    dlg.snoozed.connect(lambda task_id, minutes: snoozed.append((task_id, minutes)))
+    dlg.dismissed.connect(dismissed.append)
+
+    required = (
+        Qt.TextInteractionFlag.TextSelectableByMouse
+        | Qt.TextInteractionFlag.TextSelectableByKeyboard
+    )
+    labels = dlg.findChildren(QLabel)
+    assert len(labels) == 3
+    assert all(label.textInteractionFlags() & required == required for label in labels)
+
+    dlg.show()
+    dlg.activateWindow()
+    qapp.processEvents()
+    title_label = next(label for label in labels if label.text() == "Напомняне mixed 42")
+    title_label.setSelection(0, len("Напомняне"))
+    title_label.setFocus()
+    QTest.keyClick(
+        title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
+    )
+    qapp.processEvents()
+    assert qapp.clipboard().text() == "Напомняне"
+
+    qapp.clipboard().setText("unchanged until copy")
+    QTest.keyClick(
+        title_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
+    )
+    qapp.processEvents()
+    assert qapp.clipboard().text() == "unchanged until copy"
+    assert all(label.selectedText() == label.text() for label in labels)
+    QTest.keyClick(
+        title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
+    )
+    qapp.processEvents()
+    assert qapp.clipboard().text() == dlg._copy_payload
+    assert snoozed == []
+    assert dismissed == []
+    dlg.close()
+
+    snooze_dlg = tray_dialogs.ReminderPopupDialog(
+        "task-snooze", "Snooze", "high", "body"
+    )
+    snooze_seen = []
+    snooze_dlg.snoozed.connect(
+        lambda task_id, minutes: snooze_seen.append((task_id, minutes))
+    )
+    snooze_buttons = {
+        button.text(): button for button in snooze_dlg.findChildren(QPushButton)
+    }
+    snooze_buttons["Snooze 5 min"].click()
+    qapp.processEvents()
+    assert snooze_seen == [("task-snooze", 5)]
+
+    dismiss_dlg = tray_dialogs.ReminderPopupDialog(
+        "task-dismiss", "Dismiss", "medium", "body"
+    )
+    dismiss_seen = []
+    dismiss_dlg.dismissed.connect(dismiss_seen.append)
+    dismiss_buttons = {
+        button.text(): button for button in dismiss_dlg.findChildren(QPushButton)
+    }
+    dismiss_buttons["Dismiss"].click()
+    qapp.processEvents()
+    assert dismiss_seen == ["task-dismiss"]
+
+
 def test_edit_task_dialog_roundtrips_reminder_and_recurring(qapp):
     recurring = '{"every":"week","day":"monday"}'
     dlg = tray_dialogs.EditTaskDialog(

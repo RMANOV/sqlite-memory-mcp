@@ -3050,6 +3050,7 @@ class ReminderPopupDialog(QDialog):
         )
         badge.setTextInteractionFlags(_sel_flags)
         layout.addWidget(badge)
+        self._copy_labels = [badge]
 
         # Title
         title_lbl = QLabel(title)
@@ -3057,6 +3058,7 @@ class ReminderPopupDialog(QDialog):
         title_lbl.setWordWrap(True)
         title_lbl.setTextInteractionFlags(_sel_flags)
         layout.addWidget(title_lbl)
+        self._copy_labels.append(title_lbl)
 
         # Description preview
         desc_text = ""
@@ -3067,6 +3069,7 @@ class ReminderPopupDialog(QDialog):
             desc_lbl.setStyleSheet("color: #666; padding: 4px 0;")
             desc_lbl.setTextInteractionFlags(_sel_flags)
             layout.addWidget(desc_lbl)
+            self._copy_labels.append(desc_lbl)
 
         # B1b: full reminder payload for Ctrl+A → Ctrl+C copy. Read-only: this
         # string is assembled from the display text only and written to the
@@ -3075,13 +3078,22 @@ class ReminderPopupDialog(QDialog):
         if desc_text:
             payload_lines.append(desc_text)
         self._copy_payload = "\n".join(payload_lines)
-        # Ctrl+A selects all (here: arms full-payload copy); Ctrl+C copies it.
+        # Ctrl+A selects every visible text label; Ctrl+C copies the exact
+        # current selection, or the full payload when nothing is selected.
         sc_copy = QShortcut(QKeySequence(QKeySequence.StandardKey.Copy), self)
-        sc_copy.activated.connect(self._copy_full_payload)
+        sc_copy.activated.connect(self._copy_selected_payload)
         sc_select_all = QShortcut(
             QKeySequence(QKeySequence.StandardKey.SelectAll), self
         )
-        sc_select_all.activated.connect(self._copy_full_payload)
+        sc_select_all.activated.connect(self._select_all_payload)
+
+        # A focused QLabel with TextSelectableByKeyboard consumes Ctrl+A / Ctrl+C
+        # with its own per-label handling, so the WindowShortcut versions above
+        # never fire and only that one label is selected/copied.  Route those two
+        # shortcuts, when they land on a copy label, to the dialog-level handlers
+        # so select-all / copy always span every label.
+        for _copy_label in self._copy_labels:
+            _copy_label.installEventFilter(self)
 
         # Snooze buttons
         snooze_layout = QHBoxLayout()
@@ -3101,11 +3113,42 @@ class ReminderPopupDialog(QDialog):
         dismiss_btn.clicked.connect(self._dismiss)
         layout.addWidget(dismiss_btn)
 
-    def _copy_full_payload(self):
-        """Copy the full reminder payload to the clipboard. Read-only: writes
-        the pre-built display string to the clipboard and emits no signal, so
-        it cannot snooze, dismiss, or mutate any task state."""
-        _clipboard_write(self._copy_payload)
+    def eventFilter(self, obj, event):
+        """Make Ctrl+A / Ctrl+C span every copy label, not just the focused one.
+
+        A QLabel with TextSelectableByKeyboard handles these shortcuts itself and
+        accepts the event, so the dialog-level QShortcuts never fire.  Intercept
+        the key press on the copy labels and delegate to the dialog handlers so
+        select-all covers all labels and copy yields the full payload; a partial
+        selection + Ctrl+C still copies exactly that selection.
+        """
+        if event.type() == QEvent.Type.KeyPress and obj in self._copy_labels:
+            if event.matches(QKeySequence.StandardKey.SelectAll):
+                self._select_all_payload()
+                return True
+            if event.matches(QKeySequence.StandardKey.Copy):
+                self._copy_selected_payload()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _select_all_payload(self):
+        """Select all visible reminder text without changing task state."""
+        for label in self._copy_labels:
+            label.setSelection(0, len(label.text()))
+
+    def _copy_selected_payload(self):
+        """Copy the exact visible selection, falling back to the full payload.
+
+        The dialog-level shortcut must respect mouse selections inside its
+        separate labels instead of always overwriting them with the full text.
+        This writes only to the clipboard and emits no snooze/dismiss signal.
+        """
+        selected = [
+            label.selectedText()
+            for label in self._copy_labels
+            if label.hasSelectedText()
+        ]
+        _clipboard_write("\n".join(selected) if selected else self._copy_payload)
 
     def _snooze(self, minutes):
         self.snoozed.emit(self.task_id, minutes)

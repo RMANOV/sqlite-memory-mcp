@@ -2199,6 +2199,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 r.get("updated_at"),
                 r.get("task_title"),
                 r.get("task_section"),
+                r.get("task_status"),
             )
             for r in rows
         )
@@ -2230,7 +2231,20 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
             for task_id, task_rows in today_groups.items():
                 title = today_titles.get(task_id) or task_id[:8]
-                self._add_dashboard_header(lw, f"-- {title} ({len(task_rows)}) --")
+                status = next(
+                    (
+                        str(row.get("task_status") or "").strip()
+                        for row in task_rows
+                        if row.get("task_status")
+                    ),
+                    "",
+                )
+                status_suffix = (
+                    f" [{status.replace('_', ' ').upper()}]" if status else ""
+                )
+                self._add_dashboard_header(
+                    lw, f"-- {title}{status_suffix} ({len(task_rows)}) --"
+                )
                 for row in sorted(task_rows, key=self._dashboard_sort_key):
                     self._add_dashboard_row(lw, row)
 
@@ -2262,8 +2276,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         selected = lw.selectedItems()
         if selected:
             # Preserve visual (top-to-bottom) order regardless of click order.
-            order = {lw.item(i): i for i in range(lw.count())}
-            items = sorted(selected, key=lambda it: order.get(it, 0))
+            # QListWidgetItem is unhashable in PyQt6, so deriving a dict keyed
+            # by the item crashes exactly when a multi-row selection is copied.
+            items = sorted(selected, key=lw.row)
         else:
             items = [lw.item(i) for i in range(lw.count())]
         lines = [(it.text() or "").rstrip() for it in items if it is not None]

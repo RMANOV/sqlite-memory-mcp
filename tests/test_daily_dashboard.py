@@ -443,6 +443,84 @@ def test_dashboard_qt_renderer_rows_non_mutable_and_blocks_load_signals(qapp):
         assert not (flags & Qt.ItemFlag.ItemIsEditable)
 
 
+def test_dashboard_selected_copy_preserves_lines_and_cannot_navigate(qapp):
+    import task_tray
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QAbstractItemView
+    from tray_dialogs import TaskListWidget
+
+    class _Db:
+        db_path = ":memory:"
+
+    class _Status:
+        def __init__(self):
+            self.messages = []
+
+        def showMessage(self, *args):
+            self.messages.append(args)
+
+    widget = TaskListWidget(_Db())
+    widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+    window = task_tray.FullWindow.__new__(task_tray.FullWindow)
+    window.status = _Status()
+    task_tray.FullWindow._load_dashboard_tab(
+        window,
+        widget,
+        [
+            {
+                "day": dash_today(),
+                "task_id": "linked-task",
+                "kind": "advice",
+                "slot": "main",
+                "body": "Първи linked preview BG",
+                "priority": "M",
+                "updated_at": now_iso(),
+                "task_title": "Linked item",
+                "task_section": "today",
+                "task_status": "in_progress",
+            },
+            {
+                "day": dash_today(),
+                "task_id": "linked-task",
+                "kind": "result",
+                "slot": "main",
+                "body": "Second preview ASCII",
+                "priority": "H",
+                "updated_at": now_iso(),
+                "task_title": "Linked item",
+                "task_section": "today",
+                "task_status": "in_progress",
+            },
+        ],
+    )
+
+    widget.item(1).setSelected(True)
+    widget.item(2).setSelected(True)
+    task_tray.FullWindow._copy_dashboard(window, widget)
+    assert qapp.clipboard().text() == (
+        "  [A] Първи linked preview BG\n"
+        "  [R] Second preview ASCII  (H)"
+    )
+
+    opened = []
+    widget._open_reader = opened.append
+    widget._on_double_click(widget.item(1))
+    assert opened == []
+    for index in (1, 2):
+        flags = widget.item(index).flags()
+        assert flags & Qt.ItemFlag.ItemIsSelectable
+        assert not (flags & Qt.ItemFlag.ItemIsEditable)
+        assert not (flags & Qt.ItemFlag.ItemIsUserCheckable)
+
+    widget.clearSelection()
+    task_tray.FullWindow._copy_dashboard(window, widget)
+    assert qapp.clipboard().text() == (
+        "-- Linked item [IN PROGRESS] (2) --\n"
+        "  [A] Първи linked preview BG\n"
+        "  [R] Second preview ASCII  (H)"
+    )
+
+
 def test_empty_dashboard_hidden_and_today_is_start_tab(qapp, tmp_path):
     import task_tray
     from PyQt6.QtCore import QSettings
