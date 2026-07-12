@@ -546,6 +546,11 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
         trigger_msg_id = str(tool_response.get("msg_id") or "")
         notified_targets = []
         for target in notify_targets:
+            # KNOWN LIMITATION (ADVOCATE 3fd85c9584e3 minor 2): _notify is a
+            # no-op without DISPLAY, yet the impl_notified row below still
+            # writes, permanently deduping (trigger, session, action) — on a
+            # headless host the desktop signal is lost. Acceptable while the
+            # debate runs on a desktop; revisit before any headless deploy.
             _notify(target, trigger_msg_id)
             notified_targets.append(target)
             try:
