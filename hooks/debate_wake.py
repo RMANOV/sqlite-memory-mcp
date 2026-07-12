@@ -532,6 +532,55 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
         mode=mode,
     )
 
+    # v3.13 impl-notify: implementation-tagged triggers resolve NOTIFY-ONLY
+    # targets (never worker spawns — `targets` stays empty for them).  Send
+    # the desktop signal and write the per-target audit row so hook+pump
+    # rescans dedupe on result='impl_notified'.  Honors the kill-switch file;
+    # a resource-budget downgrade does NOT suppress it (notify-send is free).
+    notify_targets = out.get("notify_targets", []) if isinstance(out, dict) else []
+    if (
+        notify_targets
+        and os.environ.get("DEBATE_WAKE_ACTION", "dry_run") in {"agent", "notify"}
+        and not disable_file.exists()
+    ):
+        trigger_msg_id = str(tool_response.get("msg_id") or "")
+        notified_targets = []
+        for target in notify_targets:
+            _notify(target, trigger_msg_id)
+            notified_targets.append(target)
+            try:
+                sys.path.insert(0, str(REPO))
+                from db_utils import get_conn_immediate
+                from debate import _insert_wake_log
+
+                with get_conn_immediate() as conn:
+                    _insert_wake_log(
+                        conn,
+                        trigger_msg_id=trigger_msg_id,
+                        topic_id=str(tool_response.get("topic_id") or ""),
+                        recipient=str(target.get("recipient") or ""),
+                        action=os.environ.get(
+                            "DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake"
+                        ),
+                        result="impl_notified",
+                        target_role=target.get("target_role"),
+                        target_session_id=target.get("target_session_id"),
+                        target_runtime=target.get("target_runtime"),
+                        details={"channel": "notify-send"},
+                    )
+            except Exception as exc:  # noqa: BLE001 — audit must not kill the hook
+                _log(
+                    "impl_notify_audit_failed",
+                    msg_id=trigger_msg_id,
+                    error=repr(exc),
+                )
+        _log(
+            "impl_notify_only",
+            msg_id=trigger_msg_id,
+            notified=len(notified_targets),
+            targets=notified_targets,
+        )
+
     if mode == "notify":
         notified = 0
         for target in targets:

@@ -1575,6 +1575,30 @@ def post_message(
         now=ts,
     )
 
+    # v3.13 (2026-07-12): PING is the explicit wake kind, yet plain-post
+    # PINGs carried their target only as free text ("target=ROLE"), so the
+    # wake resolver — which reads debate_message_recipients — never saw
+    # them and ESCALATE:WAKE pings woke nobody.  Derive recipient rows
+    # deterministically from `target=ROLE` tokens, accepting only roles
+    # declared in this topic's roster (no free-form fan-out).
+    if kind == "PING":
+        declared_roles = {
+            str(r.get("role", "")).upper()
+            for r in debate["roles"]
+            if isinstance(r, dict) and r.get("role")
+        }
+        derived = {
+            token.upper()
+            for token in re.findall(r"target=([A-Za-z0-9_]+)", body)
+            if token.upper() in declared_roles
+        }
+        for recipient in sorted(derived):
+            conn.execute(
+                "INSERT OR IGNORE INTO debate_message_recipients "
+                "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'normal')",
+                (msg_id, recipient),
+            )
+
     new_state = debate["state"]
     if kind == "STATE" and new_state_target is not None:
         new_state = new_state_target
@@ -3712,6 +3736,15 @@ def prepare_wake_dry_run(
     # in here by branching this refusal into an impl-target resolution path
     # (return impl-worker targets instead of []). Until then implementation
     # work is conductor-handled out-of-band via Agent sub-agents.
+    #
+    # v3.13 IMPL-NOTIFY branch (2026-07-12 operator "дебатът е счупен" fix):
+    # the refusal used to swallow the wake signal ENTIRELY, so addressed
+    # standing impl-vehicle sessions were never signalled and the operator
+    # had to nudge every hand-off manually (140/200 recent wake attempts
+    # died here).  The worker guard stays intact — `targets` remains [] so
+    # no dispatch path can allocate a no-edit wake worker — but the
+    # addressed ACTIVE bindings are now resolved as NOTIFY-ONLY targets
+    # under the separate `notify_targets` key (desktop signal, no spawn).
     trigger_vehicle = normalize_vehicle(msg["vehicle"])
     if trigger_vehicle not in WAKE_WORKER_VEHICLES:
         log = _insert_wake_log(
@@ -3723,7 +3756,46 @@ def prepare_wake_dry_run(
             result="implementation_requires_impl_vehicle",
             details={"vehicle": trigger_vehicle},
         )
-        return {"targets": [], "logs": [log], "suppressed": 0}
+        notify_targets: list[dict[str, Any]] = []
+        impl_recipients = conn.execute(
+            "SELECT recipient, recipient_mode FROM debate_message_recipients "
+            "WHERE msg_id = ? ORDER BY recipient",
+            (msg_id,),
+        ).fetchall()
+        for rec in impl_recipients:
+            if rec["recipient_mode"] != "normal":
+                continue
+            recipient = rec["recipient"]
+            if SESSION_ID_RE.fullmatch(recipient):
+                continue
+            binding = _active_binding(conn, topic_id, recipient)
+            if binding is None:
+                continue
+            # Dedupe across the hook fast path and the pump rescans: one
+            # notification per (message, session, action).
+            latest_result = _latest_wake_result(
+                conn,
+                trigger_msg_id=msg_id,
+                target_session_id=binding["session_id"],
+                action=action,
+            )
+            if latest_result == "impl_notified":
+                continue
+            notify_targets.append(
+                {
+                    "recipient": recipient,
+                    "target_role": binding["role"],
+                    "target_session_id": binding["session_id"],
+                    "target_runtime": binding["runtime"],
+                    "result": "impl_notify_only",
+                }
+            )
+        return {
+            "targets": [],
+            "logs": [log],
+            "suppressed": 0,
+            "notify_targets": notify_targets,
+        }
     recipients = conn.execute(
         "SELECT recipient, recipient_mode FROM debate_message_recipients "
         "WHERE msg_id = ? ORDER BY recipient",
