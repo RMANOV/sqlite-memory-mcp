@@ -110,7 +110,24 @@ prod is refused too (realpath check).
 
 Harness injects `as_of=2026-07-18T18:42:27Z` (no live `datetime.now`). `pytest -q`
 → **18 passed** (new suite, incl. the FullWindow visibility regression);
-**106 passed** across the touched tray/dialog suites, **0 regressions**.
+**107 passed** across the full touched 9-file tray/dialog set, **0 regressions**.
+
+Reproducible collection command (the exact 9 files that this change touches or
+integrates with):
+
+```
+QT_QPA_PLATFORM=offscreen python3 -m pytest \
+  tests/test_tray_readonly_debate.py \
+  tests/test_tray_sync.py \
+  tests/test_tray_purge_bridge_visible.py \
+  tests/test_tray_filters.py \
+  tests/test_tray_dialogs.py \
+  tests/test_task_tray_reminders.py \
+  tests/test_task_tray_memory_guard.py \
+  tests/test_premium_task_tray.py \
+  tests/test_task_db.py -q
+  → 107 passed
+```
 
 | Gate | Fixture | Result |
 |---|---|---|
