@@ -410,6 +410,66 @@ def test_tasklistwidget_debate_guard_context_menu(qapp, monkeypatch):
     assert not db.delete_task.called
 
 
+def test_BLOCKER1_fullwindow_debate_tabs_visible_and_load(qapp, tmp_path, monkeypatch):
+    """Integration regression (audit 370313098246 BLOCKER 1): the three debate
+    tabs must stay VISIBLE through FullWindow.__init__ → refresh() and actually
+    load, not be hidden by the empty-`raw`-bucket visibility check."""
+    import shutil
+    import task_tray
+    from PyQt6.QtCore import QSettings
+    from debate_list_widget import DebateListWidget
+
+    # Isolate QSettings to a temp ini (never touch the operator's real config).
+    ini = str(tmp_path / "tray.ini")
+    monkeypatch.setattr(
+        task_tray, "QSettings",
+        lambda *a, **k: QSettings(ini, QSettings.Format.IniFormat),
+    )
+    # No bridge/network side effects during construction.
+    monkeypatch.setattr(task_tray.FullWindow, "_restore_profile_from_bridge",
+                        lambda self: None, raising=False)
+
+    # Throwaway READ-WRITE copy of FX-B — the frozen fixture is never opened rw.
+    before = _sha256(FX_B)
+    dbcopy = str(tmp_path / "fxb_copy.db")
+    shutil.copyfile(FX_B, dbcopy)
+    db = task_tray.TaskDB(dbcopy)
+    fw = task_tray.FullWindow(db, sync_host=None)
+    try:
+        # __init__ already ran refresh(); all three debate tabs must be visible.
+        for key in ("recent", "waiting", "topics"):
+            idx = fw._tab_keys.index(key)
+            assert fw.tabs.isTabVisible(idx), f"{key} tab hidden after refresh (BLOCKER 1)"
+        # Simulate a periodic refresh — they must STILL be visible.
+        fw.refresh()
+        for key in ("recent", "waiting", "topics"):
+            idx = fw._tab_keys.index(key)
+            assert fw.tabs.isTabVisible(idx), f"{key} tab hidden after periodic refresh"
+        # Real load through the integration layer (DebateListWidget + DAO).
+        for key in ("recent", "waiting", "topics"):
+            fw._load_tab(key)
+            assert isinstance(fw.tab_lists[key], DebateListWidget)
+        # Seeded content reaches the widget (waiting Q's ≤21d + 10 topics fire
+        # even under the live clock; recent 1h may be empty but is still shown).
+        assert fw.tab_lists["waiting"].count() > 0
+        assert fw.tab_lists["topics"].count() > 0
+    finally:
+        if getattr(fw, "_debate_dao", None) is not None:
+            fw._debate_dao.close()
+        fw.close()
+        db._conn.close()
+    assert _sha256(FX_B) == before, "FX-B frozen fixture must be untouched"
+
+
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def test_on_item_changed_debate_guard(qapp, monkeypatch):
     """FullWindow._on_item_changed early-returns for debate: rows (no scheduled
     mutation)."""

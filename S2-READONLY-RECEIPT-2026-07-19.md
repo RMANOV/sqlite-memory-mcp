@@ -20,16 +20,39 @@ guards in the three task-side handlers.
 
 ## Files (new / modified)
 
-| File | Change | sha256 (post-build) |
-|---|---|---|
-| `debate_read_dao.py` | NEW — read-only DAO, injected clock, prod fence | `a2a92d7bb48be7ccdec2d05ceef483bbad7414ae5ab9fd55ea760e097e064009` |
-| `debate_list_widget.py` | NEW — read-only widget (holds no db) | `b59b33c17f94004800ed72ab1fcad2cc4ed972d5fcc7f5e5bb07520aa7a8fe3a` |
-| `task_tray.py` | MOD — tab registration + debate branches + guard | `355fb43ff445437db5e0dcf6c081daa23fca4512bba206e0179dc6e83b81f64e` |
-| `tray_dialogs.py` | MOD — `debate:` guards in double-click + context-menu | `c33fb1caa3c91d6b70232c0be16d1d95bd8da8598a4a81ca7c993ffa6d345804` |
-| `tests/test_tray_readonly_debate.py` | NEW — acceptance + negative tests (17) | `39043148420d4603a5c015d9b2bc84278223a93019d55cb1f9fec8d15a870ced` |
+Exact per-file diff vs `c236d24` (this table is the single source of truth;
+`git diff --numstat` — the receipt `.md` itself is documentation and is
+deliberately **excluded** so its own churn can never make these numbers stale):
 
-> **ADVOCATE pre-registered acceptance (dcd888d8c576).** Every falsifiable point
-> S2a–S2e is mapped explicitly below; a break in any is a NO-GO.
+| File | Change | +add / −del | sha256 (post-build) |
+|---|---|---|---|
+| `debate_read_dao.py` | NEW — read-only DAO, injected clock, prod fence | +501 / −0 | `a2a92d7bb48be7ccdec2d05ceef483bbad7414ae5ab9fd55ea760e097e064009` |
+| `debate_list_widget.py` | NEW — read-only widget (holds no db) | +114 / −0 | `b59b33c17f94004800ed72ab1fcad2cc4ed972d5fcc7f5e5bb07520aa7a8fe3a` |
+| `task_tray.py` | MOD — tab registration + debate branches + guard + **BLOCKER-1 visibility fix** | +186 / −4 | `a143365324e227607305528e79764b590fdf83da141ae13e9ab2a6e3cf2ddbd7` |
+| `tray_dialogs.py` | MOD — `debate:` guards in double-click + context-menu | +9 / −0 | `c33fb1caa3c91d6b70232c0be16d1d95bd8da8598a4a81ca7c993ffa6d345804` |
+| `tests/test_tray_readonly_debate.py` | NEW — acceptance + negative + integration tests (18) | +499 / −0 | `20fe8300eadf401baef21428653b4b2cbc1f1dc6558031299b0169fab1fa613e` |
+| **Total (code + test artifacts)** | | **+1309 / −4** | |
+
+> **ADVOCATE pre-registered acceptance (dcd888d8c576) + re-audit (370313098246).**
+> Every falsifiable point S2a–S2e is mapped explicitly below; a break in any is a
+> NO-GO. This revision closes the two re-audit blockers: **BLOCKER 1** (debate tabs
+> were hidden at startup/refresh) and **BLOCKER 2** (stale S2d diff count).
+
+## BLOCKER-1 fix — debate tabs stay visible (functional)
+
+Root cause: `FullWindow.__init__` calls `refresh()` (`task_tray.py:1397`), whose
+tab-visibility check (`task_tray.py:2024–2033`) hides any tab whose `raw` bucket
+is empty unless it is in `always_visible`. Debate tabs load from the read-only
+DAO (not from `raw`), so their bucket is always empty → all three were hidden at
+startup and on every periodic refresh, making the registered load paths
+unreachable in the real window. **Fix:** add `*self._DEBATE_TABS` to
+`always_visible` so `recent`/`waiting`/`topics` are always shown; their content
+still loads lazily via `_load_debate_tab`. **Regression test**
+`test_BLOCKER1_fullwindow_debate_tabs_visible_and_load` instantiates the **real
+`FullWindow`** against a throwaway read-write copy of FX-B (frozen fixture
+untouched; isolated QSettings; bridge restore stubbed) and asserts all three tabs
+are `isTabVisible` after `__init__` **and** after a second `refresh()`, that each
+renders through `DebateListWidget`, and that `waiting`/`topics` load seeded rows.
 
 ## S2a — Fail-closed refusal DEMONSTRATED, before any DB open
 
@@ -86,8 +109,8 @@ prod is refused too (realpath check).
 ## S2d — Frozen-clock reproduction of ALL manifest targets + hashes + clean worktree
 
 Harness injects `as_of=2026-07-18T18:42:27Z` (no live `datetime.now`). `pytest -q`
-→ **17 passed** (new suite); **105 passed** across the touched tray/dialog suites,
-**0 regressions**.
+→ **18 passed** (new suite, incl. the FullWindow visibility regression);
+**106 passed** across the touched tray/dialog suites, **0 regressions**.
 
 | Gate | Fixture | Result |
 |---|---|---|
@@ -111,10 +134,22 @@ first screen in <16 ms, so it cannot be the bottleneck.)*
 
 - **Post-build artifact hashes:** the five `sha256` in the file table above
   (recompute with `sha256sum …`).
-- **Worktree receipt, artifact-scoped clean:** built from `c236d24`; `git diff
-  --stat c236d24` touches **exactly** the 6 artifacts (2 modified + 4 new),
-  1382 insertions / 3 deletions, nothing else. Fixture bytes unchanged across all
-  runs (frozen `50e4f458…` / `06a72ee5…` verified before and after).
+- **Worktree receipt, artifact-scoped clean:** built from `c236d24`. The exact
+  per-file `git diff --numstat c236d24` for the code + test artifacts is in the
+  file table — **+1309 / −4** total across the 5 files, nothing else. **BLOCKER-2
+  fix:** the earlier "1382 / 3" (and a `task_tray +182/−3` figure) were a stale
+  total that folded in the receipt `.md`'s own churn; this receipt now reports
+  **per-file numstat excluding the receipt document**, so its own edits can never
+  desync the numbers. Fixture bytes unchanged across all runs (frozen
+  `50e4f458…` / `06a72ee5…` verified before and after).
+- **Production wiring is deliberately unfenced (adoption-gate pre-registered).**
+  The live tray opens the DAO at `task_tray.py:1126` as
+  `DebateReadDAO(self.db.db_path)` **without** `forbid_path` — correct: in
+  production the tray legitimately reads its own DB, and the read-only guarantee
+  there is **structural** (`mode=ro` + `PRAGMA query_only=ON`), not the harness
+  fence. `forbid_path` is a **harness-only** fence so tests are structurally
+  unable to touch prod. This split is intentional and recorded here for the
+  adoption gate.
 
 ## S2e — Static S3-fence proof: no close/write/CAS capability
 

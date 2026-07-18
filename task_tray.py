@@ -2021,7 +2021,13 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
         # Update tab visibility. Dashboard is visible only when curated rows
         # exist; otherwise Today/Suggested remain the open daily TODO surface.
-        always_visible = ("suggested", "today", "notes", "projects")
+        # Debate tabs load from the read-only DAO, not from `raw`; they must stay
+        # visible through the initial + every periodic refresh (their `raw` bucket
+        # is always empty, so they would otherwise be hidden by the count check).
+        always_visible = (
+            "suggested", "today", "notes", "projects",
+            *getattr(self, "_DEBATE_TABS", ()),
+        )
         if premium_key:
             always_visible = (*always_visible, premium_key)
         for i, key in enumerate(self._tab_keys):
