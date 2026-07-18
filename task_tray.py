@@ -858,6 +858,8 @@ from tray_dialogs import (
     TaskListWidget,
     create_tray_icon_pixmap,
 )
+from debate_read_dao import DebateReadDAO
+from debate_list_widget import DebateListWidget
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
 _PERIODIC_PULL_INTERVAL_MS = 15 * 60_000
@@ -1088,7 +1090,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "notes",
             "all",
             "done",
+            # Read-only debate tabs (BUILD STEP 1, spec §2/§3). Appended so the
+            # existing tab indices are unchanged.
+            "recent",
+            "waiting",
+            "topics",
         ]
+        # Debate tabs render through DebateListWidget (read-only), never
+        # TaskListWidget — no itemChanged/mutation wiring (spec §2.0, B3).
+        self._DEBATE_TABS = ("recent", "waiting", "topics")
         if self._premium_tray_extension:
             self._tab_keys.insert(1, self._premium_tray_extension.tab_key)
         self._tab_labels = {
@@ -1101,16 +1111,35 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "notes": "Notes",
             "all": "All",
             "done": "Done",
+            "recent": "Какво реши X",
+            "waiting": "Какво чака мен",
+            "topics": "Дебат по тема",
         }
         if self._premium_tray_extension:
             self._tab_labels[self._premium_tray_extension.tab_key] = (
                 self._premium_tray_extension.tab_label
             )
+        # Read-only debate DAO (own mode=ro + query_only connection to the same
+        # DB file; NO write path). Fail-open: if unavailable the debate tabs
+        # render empty and the rest of the tray is unaffected.
+        try:
+            self._debate_dao = DebateReadDAO(self.db.db_path)
+        except Exception:
+            logging.getLogger("task_tray").warning(
+                "DebateReadDAO unavailable; debate tabs will be empty", exc_info=True
+            )
+            self._debate_dao = None
+        self._topics_open_topic = None  # None → digest; else show that thread
+
         self.tab_lists = {}
         for key in self._tab_keys:
-            lw = TaskListWidget(self.db)
-            lw._search_engine = self._search_engine
-            lw.itemChanged.connect(lambda item, k=key: self._on_item_changed(item))
+            if key in self._DEBATE_TABS:
+                lw = DebateListWidget()
+                lw.navigate_requested.connect(self._on_debate_navigate)
+            else:
+                lw = TaskListWidget(self.db)
+                lw._search_engine = self._search_engine
+                lw.itemChanged.connect(lambda item, k=key: self._on_item_changed(item))
             self.tab_lists[key] = lw
             self.tabs.addTab(lw, self._tab_labels[key])
 
@@ -1992,7 +2021,13 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
         # Update tab visibility. Dashboard is visible only when curated rows
         # exist; otherwise Today/Suggested remain the open daily TODO surface.
-        always_visible = ("suggested", "today", "notes", "projects")
+        # Debate tabs load from the read-only DAO, not from `raw`; they must stay
+        # visible through the initial + every periodic refresh (their `raw` bucket
+        # is always empty, so they would otherwise be hidden by the count check).
+        always_visible = (
+            "suggested", "today", "notes", "projects",
+            *getattr(self, "_DEBATE_TABS", ()),
+        )
         if premium_key:
             always_visible = (*always_visible, premium_key)
         for i, key in enumerate(self._tab_keys):
@@ -2092,8 +2127,148 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if idx < len(self._tab_keys):
             self._load_tab(self._tab_keys[idx])
 
+    # ---- Read-only debate tabs (BUILD STEP 1, spec §2/§3) ------------------
+    def _debate_recent_params(self):
+        params = self._tab_views.get("recent", {}).get("params", {}) or {}
+        hours = params.get("hours", 1)
+        kinds = params.get("kinds") or ["DECISION", "STATE", "STATUS"]
+        role = params.get("role") or None
+        return hours, kinds, role
+
+    def _build_debate_rows(self, key):
+        """Return the raw read-only structure for a debate tab (never the task path)."""
+        dao = self._debate_dao
+        if dao is None:
+            return {}
+        try:
+            # Toolbar search spans debate + tasks + knowledge via the dedicated
+            # per-source BM25 path (spec §2d/§4, M4 verbatim board order). This
+            # bypasses TaskSearchEngine/SmartKey entirely and never re-sorts.
+            if self._search_text:
+                return {"search": dao.board_search(self._search_text)}
+            if key == "recent":
+                hours, kinds, role = self._debate_recent_params()
+                return dao.recent(hours, role, kinds)
+            if key == "waiting":
+                items, cand = dao.waiting_section_a()
+                return {"section_a": items, "section_a_before": cand}
+            if key == "topics":
+                if self._topics_open_topic:
+                    return {"thread": dao.topic_thread(self._topics_open_topic)}
+                return {"digest": dao.topics()}
+        except sqlite3.Error:
+            logging.getLogger("task_tray").warning(
+                "debate read failed for tab %s", key, exc_info=True
+            )
+        return {}
+
+    def _load_debate_tab(self, key, rows):
+        lw = self.tab_lists[key]
+        lw.clear_rows()
+        if not rows:
+            lw.add_header("—")
+            return
+        if "search" in rows:
+            self._load_debate_search(lw, rows["search"])
+            return
+        if key == "recent":
+            items = rows.get("items", [])
+            lw.add_header(f"Скорошни решения ({len(items)})")
+            for it in items:
+                mid = it["msg_id"]
+                text = (f"[{it.get('kind','')}] {it.get('role','')} · "
+                        f"{it.get('age','')} · {mid[:8]} — {it.get('line','')}")
+                copy_block = (f"{it.get('role','')} · {it.get('kind','')} · "
+                              f"{it.get('age','')} · {mid} · {it.get('body','')}")
+                lw.add_debate_row(mid, text, topic_id=it.get("topic_id"),
+                                  copy_payload=copy_block)
+        elif key == "waiting":
+            items = rows.get("section_a", [])
+            lw.add_header(
+                f"Какво чака мен ({len(items)} от {rows.get('section_a_before', 0)})"
+            )
+            for it in items:
+                mid = it["msg_id"]
+                stale = " ⏳" if it.get("stale") else ""
+                text = (f"[{it.get('kind','')}] {it.get('role','')} · "
+                        f"{it.get('age','')}{stale} · {mid[:8]} — {it.get('line','')}")
+                copy_block = (f"{it.get('role','')} · {it.get('kind','')} · "
+                              f"{it.get('age','')} · {mid} · {it.get('body','')}")
+                lw.add_debate_row(mid, text, topic_id=None, copy_payload=copy_block)
+        elif key == "topics":
+            if "thread" in rows:
+                th = rows["thread"]
+                lw.add_header(
+                    f"◀ {th.get('title','')} [{th.get('state','')}] ({th.get('count',0)})"
+                )
+                for m in th.get("messages", []):
+                    mid = m["msg_id"]
+                    indent = "    " if m.get("reply_to") else ""
+                    text = (f"{indent}[{m.get('kind','')}] {m.get('role','')} · "
+                            f"{m.get('age','')} · {mid[:8]} — {m.get('line','')}")
+                    copy_block = (f"{m.get('role','')} · {m.get('kind','')} · "
+                                  f"{m.get('age','')} · {mid} · {m.get('body','')}")
+                    lw.add_debate_row(mid, text, topic_id=th.get("topic_id"),
+                                      copy_payload=copy_block)
+            else:
+                topics = rows.get("digest", {}).get("topics", [])
+                lw.add_header(f"Теми ({len(topics)}) — двоен клик отваря нишката")
+                for t in topics:
+                    tid = t["topic_id"]
+                    text = (f"[{t.get('state','')}] {t.get('title','')} · "
+                            f"{t.get('count',0)} съобщ. · {t.get('age','')}")
+                    lw.add_debate_row(tid, text, topic_id=tid, copy_payload=tid)
+
+    def _load_debate_search(self, lw, result):
+        """Render grouped per-source BM25 search results, read-only.
+
+        Verbatim board order per source (no cross-source merge, no recency
+        band — M4). In this read-only stage all three groups render inert in the
+        DebateListWidget; the later write stage splits the tasks group into a
+        TaskListWidget with the gated close.
+        """
+        debate = result.get("debate", [])
+        tasks = result.get("tasks", [])
+        knowledge = result.get("knowledge", [])
+        lw.add_header(f"Дебат ({len(debate)})")
+        for r in debate:
+            mid = r["msg_id"]
+            text = (f"[{r.get('kind','')}] {r.get('role','')} · {mid[:8]} — "
+                    f"{r.get('snippet','') or r.get('body','')}")
+            lw.add_debate_row(mid, text, topic_id=r.get("topic_id"),
+                              copy_payload=f"{mid} · {r.get('body','')}")
+        lw.add_header(f"Задачи/бележки ({len(tasks)})")
+        for r in tasks:
+            tid = r.get("id", "")
+            text = f"[{r.get('type','')}/{r.get('status','')}] {r.get('title','')}"
+            lw.add_debate_row(f"task-{tid}", text, topic_id=None,
+                              copy_payload=str(r.get("title", "")))
+        lw.add_header(f"Знание ({len(knowledge)})")
+        for r in knowledge:
+            eid = r.get("id", "")
+            text = f"[{r.get('type','')}] {r.get('name','')}"
+            lw.add_debate_row(f"entity-{eid}", text, topic_id=None,
+                              copy_payload=str(r.get("name", "")))
+
+    def _on_debate_navigate(self, target):
+        """In-app navigation from a debate row: open the topics tab on a topic.
+
+        Read-only: switches tab + loads a read-only thread. No DB write.
+        """
+        if not target:
+            return
+        self._topics_open_topic = str(target)
+        if "topics" in self._tab_keys:
+            self._filtered_cache.pop("topics", None)
+            self.tabs.setCurrentIndex(self._tab_keys.index("topics"))
+            self._load_tab("topics")
+
     def _build_tab_rows(self, key):
         """Filter/sort a single tab on demand and cache only that result."""
+        if key in getattr(self, "_DEBATE_TABS", ()):
+            rows = self._build_debate_rows(key)
+            self._filtered_cache[key] = rows
+            return rows
         source = list(self._raw_cache.get(key, []))
         if key == "dashboard":
             self._tab_total_counts[key] = len(source)
@@ -2289,6 +2464,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _load_tab(self, key):
         """Render a single tab from cached data. Caps All/Done at 200 items."""
+        if key in getattr(self, "_DEBATE_TABS", ()):
+            rows = self._filtered_cache.get(key)
+            if rows is None:
+                rows = self._build_tab_rows(key)
+            self._load_debate_tab(key, rows)
+            return
         tasks = self._filtered_cache.get(key)
         if tasks is None:
             tasks = self._build_tab_rows(key)
@@ -2350,6 +2531,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             task_id.startswith("entity:")
             or task_id.startswith("premium:")
             or task_id.startswith("dashboard:")
+            or task_id.startswith("debate:")  # B3 defense-in-depth: read-only debate rows
         ):
             return
         checked = item.checkState() == Qt.CheckState.Checked

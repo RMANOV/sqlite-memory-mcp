@@ -1,0 +1,501 @@
+"""Read-only debate access for the native tray (BUILD STEP 1, read-only stages).
+
+Faithful port of the proven, no-LLM logic in
+``operator_board/board.py`` (recent / _section_a / topics / topic_thread /
+search), per BOARD-TO-NATIVE-TRAY-SPEC-2026-07-18.md (§2, §4). This module is
+**read-only by construction**:
+
+* every connection is opened ``mode=ro`` **and** ``PRAGMA query_only=ON``;
+* it exposes **no** mutation / close / CAS entry point, and never shells out;
+* an optional ``forbid_path`` fail-closed guard refuses to open a DB whose
+  realpath matches a forbidden path (the harness passes the prod DB so tests
+  are structurally unable to touch prod — spec §6 B5 lab/prod fence).
+
+Determinism (spec M3): the "now" used by ``recent`` / ``waiting_section_a`` is
+supplied by an injected ``clock`` callable. The acceptance harness injects the
+frozen ``as_of``; there is **no** live ``datetime.now`` on the harness path.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+from datetime import datetime, timezone
+
+# ── Section-A predicate regexes — verbatim from board.py:243-273 ──────────────
+_A_REF = re.compile(
+    r"(записан|получен|дошъл|даде|даден|дадено|взето|заключен|landed|recorded|"
+    r"gave|given|granted|verbatim|давай|\bACK\b|per\s+operator|"
+    r"по\s+операторск\w*\s+директив|availability\s+override|поеми|разпоред|"
+    r"standing=|DECISION\s+brief|→\s*ADVOCATE)",
+    re.I,
+)
+_A_TAKEN = re.compile(
+    r"(операторск\w*\s+(?:GO|решени\w+)\s+(?:записан|получен|даден|взето)|"
+    r"оператор\w*\s+(?:даде|потвърди|реши|одобри|нареди|разпореди)|"
+    r"operator\s+(?:gave|approved|confirmed|decided)|давай|verbatim\s+GO|ЗАПИСАН)",
+    re.I,
+)
+_A_OP_AWAIT = re.compile(
+    r"(чака\w*\s+оператор|очаква\w*\s+оператор|awaiting\s+operator|pending\s+operator|"
+    r"operator\s+GO\s+(?:needed|required|pending|awaited)|"
+    r"operator\s+(?:decision|sign-?off|input|approval)\s+"
+    r"(?:needed|required|awaited|pending|requested)|"
+    r"нужен\s+операторск|нужн\w*\s+операторск|изисква\w*\s+операторск|"
+    r"за\s+операторско\s+реш|моля\s+оператор|"
+    r"needs?\s+operator\s+(?:decision|go|sign|input|approval))",
+    re.I,
+)
+_A_IS_OPERATOR_ROLE = re.compile(r"^\s*(human|operator|оператор)", re.I)
+
+
+# ── clock-free helpers (verbatim board.py:166-224) ───────────────────────────
+def parse_ts(ts):
+    if not ts:
+        return None
+    s = ts.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def one_line(body, n=140):
+    if not body:
+        return ""
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line:
+            return line[:n] + ("…" if len(line) > n else "")
+    return body.strip()[:n]
+
+
+def fts_expr(query, mode="and"):
+    toks = [t for t in re.findall(r"\w+", query or "", re.UNICODE) if t]
+    if not toks:
+        return ""
+    parts = [f'"{t}"*' for t in toks]
+    joiner = " OR " if mode == "or" else " "
+    return joiner.join(parts)
+
+
+class DebateReadDAO:
+    """Read-only debate/knowledge reads for the tray's three new tabs + search.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite DB. Opened ``mode=ro`` + ``PRAGMA query_only=ON``.
+    clock : callable | None
+        Returns an aware UTC ``datetime`` for "now". Defaults to live UTC.
+        The acceptance harness injects the frozen ``as_of``.
+    forbid_path : str | None
+        If set and ``realpath(db_path) == realpath(forbid_path)``, construction
+        raises ``PermissionError`` (fail-closed prod fence for the harness).
+    """
+
+    def __init__(self, db_path, *, clock=None, forbid_path=None):
+        self.db_path = db_path
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        if forbid_path is not None:
+            if os.path.realpath(db_path) == os.path.realpath(forbid_path):
+                raise PermissionError(
+                    f"DebateReadDAO refused forbidden DB path: {db_path!r} "
+                    f"resolves to the fenced path {forbid_path!r}"
+                )
+        self._conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA query_only=ON")  # structural write-block
+        self._caps = self._introspect()
+        self._debate_mem = None  # lazy in-memory FTS mirror for search
+
+    # ---- introspection (board.py:66-92) ------------------------------------
+    def _introspect(self):
+        names = {
+            r[0]
+            for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+            ).fetchall()
+        }
+
+        def cols(t):
+            if t not in names:
+                return set()
+            return {r[1] for r in self._conn.execute(f"PRAGMA table_info({t})")}
+
+        return {
+            "tasks": cols("tasks"),
+            "has_recipients": "debate_message_recipients" in names,
+            "has_tasks_fts": "tasks_fts" in names,
+            "has_memory_fts": "memory_fts" in names,
+            "has_debate": "debate_messages" in names,
+            "has_tasks": "tasks" in names,
+            "has_debates_tbl": "debates" in names,
+        }
+
+    def _now(self):
+        return self._clock()
+
+    def _rel(self, ts):
+        dt = parse_ts(ts)
+        if dt is None:
+            return "—"
+        sec = int((self._now() - dt).total_seconds())
+        if sec < 0:
+            return "сега"
+        if sec < 60:
+            return f"преди {sec} сек"
+        m = sec // 60
+        if m < 60:
+            return f"преди {m} мин"
+        h = m // 60
+        if h < 24:
+            return f"преди {h} ч"
+        d = h // 24
+        if d < 30:
+            return f"преди {d} дни"
+        mo = d // 30
+        if mo < 12:
+            return f"преди {mo} мес"
+        return f"преди {d // 365} год"
+
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        if self._debate_mem is not None:
+            self._debate_mem.close()
+            self._debate_mem = None
+
+    # ---- VIEW 1a: waiting section A (board.py:308-427) ----------------------
+    def waiting_section_a(self):
+        if not self._caps["has_debate"]:
+            return [], 0
+        con = self._conn
+        rows = con.execute(
+            "SELECT msg_id, role, kind, priority, "
+            "COALESCE(ts, created_at) AS ts, reply_to, COALESCE(body,'') AS body "
+            "FROM debate_messages"
+        ).fetchall()
+        byid = {r["msg_id"]: r for r in rows}
+        children = {}
+        for r in rows:
+            if r["reply_to"]:
+                children.setdefault(r["reply_to"], []).append(r["msg_id"])
+
+        def descendants(mid):
+            seen, stack = set(), list(children.get(mid, []))
+            while stack:
+                c = stack.pop()
+                if c in seen:
+                    continue
+                seen.add(c)
+                stack.extend(children.get(c, []))
+            return seen
+
+        human_msgs = set()
+        have_human_data = False
+        if self._caps["has_recipients"]:
+            try:
+                human_msgs = {
+                    row[0]
+                    for row in con.execute(
+                        "SELECT DISTINCT msg_id FROM debate_message_recipients "
+                        "WHERE lower(recipient) LIKE 'human-%' "
+                        "   OR lower(recipient) LIKE 'human\\_%' ESCAPE '\\' "
+                        "   OR lower(recipient) IN ('human', 'operator', 'оператор')"
+                    ).fetchall()
+                }
+            except sqlite3.OperationalError:
+                human_msgs = set()
+            have_human_data = bool(human_msgs)
+
+        op_replied = set()
+        for r in rows:
+            if r["reply_to"] and _A_IS_OPERATOR_ROLE.match(r["role"] or ""):
+                op_replied.add(r["reply_to"])
+
+        now = self._now()
+        out, cand = [], 0
+        for r in rows:
+            if r["kind"] not in ("Q", "DECISION"):
+                continue
+            if _A_IS_OPERATOR_ROLE.match(r["role"] or ""):
+                continue
+            dt = parse_ts(r["ts"])
+            if dt is None or (now - dt).days > 21:
+                continue
+            cand += 1
+            b = r["body"]
+            if have_human_data:
+                if r["msg_id"] not in human_msgs:
+                    continue
+                fwd_txt = "адресиран до оператора (human-)"
+            else:
+                m = _A_OP_AWAIT.search(b)
+                if not m:
+                    continue
+                s = m.start()
+                if _A_REF.search(b[max(0, s - 45):s + 45]):
+                    continue
+                fwd_txt = m.group(0)[:60]
+            if r["msg_id"] in op_replied:
+                continue
+            desc = descendants(r["msg_id"])
+            if any(
+                (byid[c]["ts"] or "") > (r["ts"] or "")
+                and (
+                    _A_TAKEN.search(byid[c]["body"])
+                    or _A_IS_OPERATOR_ROLE.match(byid[c]["role"] or "")
+                )
+                for c in desc
+            ):
+                continue
+            latest = r["ts"] or ""
+            for c in desc:
+                t = byid[c]["ts"] or ""
+                if t > latest:
+                    latest = t
+            ldt = parse_ts(latest)
+            stale = bool(ldt and (now - ldt).days > 5)
+            out.append({
+                "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
+                "priority": r["priority"] or "INFO", "ts": r["ts"],
+                "age": self._rel(r["ts"]), "line": one_line(b), "body": b,
+                "stale": stale, "fwd": fwd_txt,
+            })
+        out.sort(key=lambda x: x["ts"] or "", reverse=True)
+        return out, cand
+
+    # ---- VIEW 2: recent (board.py:466-521) ----------------------------------
+    def recent(self, hours, role, kinds):
+        if not self._caps["has_debate"]:
+            return {"items": [], "hours": hours, "count": 0, "roles": [], "kinds": []}
+        con = self._conn
+        cutoff = self._now().timestamp() - hours * 3600
+        cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+        kinds = [k for k in (kinds or []) if k] or ["DECISION", "STATE", "STATUS"]
+        qm = ",".join("?" * len(kinds))
+        args = list(kinds)
+        role_clause = ""
+        if role:
+            role_clause = " AND m.role = ?"
+            args.append(role)
+        args.append(cutoff_iso)
+        sql = (
+            "SELECT m.msg_id, m.role, m.kind, m.priority, "
+            "COALESCE(m.ts, m.created_at) AS ts, m.topic_id, m.body "
+            f"FROM debate_messages m WHERE m.kind IN ({qm}){role_clause} "
+            "AND COALESCE(m.ts, m.created_at) >= ? ORDER BY ts DESC LIMIT 200"
+        )
+        items = []
+        for r in con.execute(sql, args).fetchall():
+            items.append({
+                "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
+                "priority": r["priority"] or "", "ts": r["ts"],
+                "age": self._rel(r["ts"]), "topic_id": r["topic_id"],
+                "line": one_line(r["body"]), "body": r["body"] or "",
+            })
+        roles = [
+            r[0]
+            for r in con.execute(
+                "SELECT DISTINCT role FROM debate_messages "
+                "WHERE role IS NOT NULL ORDER BY role"
+            ).fetchall()
+        ]
+        return {"items": items, "hours": hours, "count": len(items),
+                "roles": roles, "kinds": kinds}
+
+    # ---- VIEW 3: topics + topic_thread (board.py:524-619) -------------------
+    def topics(self):
+        if not self._caps["has_debate"]:
+            return {"topics": [], "count": 0}
+        con = self._conn
+        counts = {
+            r["topic_id"]: r["c"]
+            for r in con.execute(
+                "SELECT topic_id, COUNT(*) c FROM debate_messages "
+                "WHERE kind != 'WATERMARK' GROUP BY topic_id"
+            ).fetchall()
+        }
+        last = {
+            r["topic_id"]: r["mx"]
+            for r in con.execute(
+                "SELECT topic_id, MAX(COALESCE(ts,created_at)) mx "
+                "FROM debate_messages GROUP BY topic_id"
+            ).fetchall()
+        }
+        out, seen = [], set()
+        if self._caps["has_debates_tbl"]:
+            for r in con.execute(
+                "SELECT topic_id, title, state, created_at FROM debates"
+            ).fetchall():
+                tid = r["topic_id"]
+                seen.add(tid)
+                out.append({
+                    "topic_id": tid, "title": r["title"] or tid,
+                    "state": r["state"] or "", "count": counts.get(tid, 0),
+                    "last_ts": last.get(tid), "age": self._rel(last.get(tid)),
+                })
+        for tid in counts:
+            if tid not in seen:
+                out.append({
+                    "topic_id": tid, "title": tid, "state": "",
+                    "count": counts.get(tid, 0), "last_ts": last.get(tid),
+                    "age": self._rel(last.get(tid)),
+                })
+        out.sort(key=lambda x: (x["last_ts"] or ""), reverse=True)
+        return {"topics": out, "count": len(out)}
+
+    def topic_thread(self, topic_id):
+        if not topic_id or not self._caps["has_debate"]:
+            return {"topic_id": topic_id, "title": topic_id, "state": "",
+                    "count": 0, "messages": []}
+        con = self._conn
+        title, state = topic_id, ""
+        if self._caps["has_debates_tbl"]:
+            row = con.execute(
+                "SELECT title, state FROM debates WHERE topic_id=?", (topic_id,)
+            ).fetchone()
+            if row:
+                title = row["title"] or topic_id
+                state = row["state"] or ""
+        rows = con.execute(
+            "SELECT msg_id, role, kind, priority, COALESCE(ts, created_at) AS ts, "
+            "reply_to, body FROM debate_messages WHERE topic_id=? AND kind != 'WATERMARK' "
+            "ORDER BY COALESCE(ts, created_at) ASC",
+            (topic_id,),
+        ).fetchall()
+        msgs = [{
+            "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
+            "priority": r["priority"] or "", "ts": r["ts"], "age": self._rel(r["ts"]),
+            "reply_to": r["reply_to"], "line": one_line(r["body"]), "body": r["body"] or "",
+        } for r in rows]
+        return {"topic_id": topic_id, "title": title, "state": state,
+                "count": len(msgs), "messages": msgs}
+
+    # ---- grouped per-source BM25 search (board.py:622-748; M4 verbatim) ------
+    def _debate_index(self):
+        if self._debate_mem is not None:
+            return self._debate_mem
+        mem = sqlite3.connect(":memory:")
+        mem.row_factory = sqlite3.Row
+        mem.execute(
+            "CREATE VIRTUAL TABLE d USING fts5("
+            "msg_id UNINDEXED, topic_id UNINDEXED, role, kind, ts UNINDEXED, "
+            "priority UNINDEXED, body, tokenize='unicode61 remove_diacritics 2')"
+        )
+        rows = self._conn.execute(
+            "SELECT msg_id, COALESCE(topic_id,''), COALESCE(role,''), "
+            "COALESCE(kind,''), COALESCE(ts, created_at, ''), "
+            "COALESCE(priority,''), COALESCE(body,'') FROM debate_messages"
+        ).fetchall()
+        mem.executemany(
+            "INSERT INTO d(msg_id,topic_id,role,kind,ts,priority,body) VALUES(?,?,?,?,?,?,?)",
+            [tuple(r) for r in rows],
+        )
+        mem.commit()
+        self._debate_mem = mem
+        return mem
+
+    def board_search(self, query, limit=25):
+        query = (query or "").strip()
+        result = {"query": query, "debate": [], "tasks": [], "knowledge": []}
+        if not query:
+            return result
+        # debate — in-memory FTS mirror, pure bm25 (verbatim board; no recency)
+        if self._caps["has_debate"]:
+            mem = self._debate_index()
+            hits = []
+            expr = fts_expr(query, "and")
+            if expr:
+                try:
+                    hits = mem.execute(
+                        "SELECT msg_id, topic_id, role, kind, ts, priority, "
+                        "snippet(d, 6, '〈', '〉', ' … ', 12) AS snip, body, "
+                        "bm25(d) AS score FROM d WHERE d MATCH ? ORDER BY score LIMIT ?",
+                        (expr, limit),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    hits = []
+                if not hits:
+                    try:
+                        hits = mem.execute(
+                            "SELECT msg_id, topic_id, role, kind, ts, priority, "
+                            "snippet(d, 6, '〈', '〉', ' … ', 12) AS snip, body, "
+                            "bm25(d) AS score FROM d WHERE d MATCH ? ORDER BY score LIMIT ?",
+                            (fts_expr(query, "or"), limit),
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        hits = []
+            for r in hits:
+                result["debate"].append({
+                    "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
+                    "topic_id": r["topic_id"], "ts": r["ts"], "age": self._rel(r["ts"]),
+                    "snippet": r["snip"] or one_line(r["body"]), "body": r["body"] or "",
+                    "score": round(r["score"], 3),
+                })
+        if self._caps["has_tasks_fts"]:
+            result["tasks"] = self._fts_tasks(query, limit)
+        if self._caps["has_memory_fts"]:
+            result["knowledge"] = self._fts_memory(query, limit)
+        return result
+
+    def _fts_tasks(self, query, limit):
+        tcols = self._caps["tasks"]
+        for mode in ("and", "or"):
+            expr = fts_expr(query, mode)
+            if not expr:
+                return []
+            try:
+                rows = self._conn.execute(
+                    "SELECT t.id, t.title, "
+                    + ("t.type," if "type" in tcols else "'' AS type,")
+                    + ("t.section," if "section" in tcols else "'' AS section,")
+                    + ("t.status," if "status" in tcols else "'' AS status,")
+                    + ("t.project," if "project" in tcols else "'' AS project,")
+                    + " snippet(tasks_fts,1,'〈','〉',' … ',12) AS snip,"
+                    + " bm25(tasks_fts) AS score"
+                    + " FROM tasks_fts JOIN tasks t ON t.rowid = tasks_fts.rowid"
+                    + " WHERE tasks_fts MATCH ? ORDER BY score LIMIT ?",
+                    (expr, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            if rows:
+                return [{
+                    "id": r["id"], "title": r["title"], "type": r["type"],
+                    "section": r["section"], "status": r["status"],
+                    "project": r["project"], "snippet": r["snip"],
+                    "score": round(r["score"], 3),
+                } for r in rows]
+        return []
+
+    def _fts_memory(self, query, limit):
+        for mode in ("and", "or"):
+            expr = fts_expr(query, mode)
+            if not expr:
+                return []
+            try:
+                rows = self._conn.execute(
+                    "SELECT e.id AS eid, COALESCE(e.name, memory_fts.name) AS name, "
+                    "COALESCE(e.entity_type, memory_fts.entity_type) AS etype, "
+                    "COALESCE(e.project,'') AS project, "
+                    "snippet(memory_fts,2,'〈','〉',' … ',14) AS snip, "
+                    "bm25(memory_fts) AS score "
+                    "FROM memory_fts LEFT JOIN entities e ON e.id = memory_fts.rowid "
+                    "WHERE memory_fts MATCH ? ORDER BY score LIMIT ?",
+                    (expr, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            if rows:
+                return [{
+                    "id": r["eid"], "name": r["name"], "type": r["etype"] or "",
+                    "project": r["project"] or "", "snippet": r["snip"],
+                    "score": round(r["score"], 3),
+                } for r in rows]
+        return []
