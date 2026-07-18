@@ -64,6 +64,29 @@ def test_prod_path_fail_closed():
                       forbid_path=PROD)
 
 
+def test_S2a_refusal_precedes_any_db_open(monkeypatch):
+    """Fail-closed refusal happens BEFORE any sqlite3.connect — so prod is never
+    opened and no prod -wal/-shm is touched (S2a)."""
+    import debate_read_dao as drd
+
+    calls = []
+    real_connect = drd.sqlite3.connect
+
+    def spy_connect(*a, **k):
+        calls.append(a[0] if a else k.get("database"))
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(drd.sqlite3, "connect", spy_connect)
+    with pytest.raises(PermissionError) as ei:
+        drd.DebateReadDAO(PROD, forbid_path=PROD)
+    assert calls == [], f"prod must never be opened; sqlite3.connect calls={calls}"
+    assert "refused" in str(ei.value).lower()
+    # no prod sidecar files were created by us
+    for ext in ("-wal", "-shm"):
+        # (they may exist from live actors; we only assert WE did not connect)
+        pass
+
+
 def test_query_only_blocks_writes():
     from debate_read_dao import DebateReadDAO
     import sqlite3
@@ -240,6 +263,57 @@ def test_debate_widget_holds_no_db(qapp):
     assert "db_utils" not in imports and "subprocess" not in imports
     for banned in ("apply_task_mutation", "update_task", "mark_done", "delete_task"):
         assert banned not in names, f"debate_list_widget must not call {banned!r}"
+
+
+def test_S2e_no_cas_or_dml_or_mutation_in_new_code():
+    """Static S3-fence proof: the new debate code has no close/write/CAS
+    capability — no apply_task_mutation, no CAS tokens, no raw DML on a
+    persistent DB, no mutating handler (grep + AST)."""
+    import re
+
+    debate_mods = [os.path.join(REPO, m) for m in
+                   ("debate_read_dao.py", "debate_list_widget.py")]
+    # 1) AST: no banned calls/imports anywhere in the debate modules
+    banned_calls = {"apply_task_mutation", "apply_task_mutation_cas",
+                    "update_task", "mark_done", "delete_task"}
+    banned_imports = {"db_utils", "subprocess", "close_task"}
+    for m in debate_mods:
+        imports, names, calls = (), set(), set()
+        import ast
+        tree = ast.parse(open(m).read())
+        imports = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                imports.update(a.name.split(".")[0] for a in n.names)
+            elif isinstance(n, ast.ImportFrom):
+                if n.module:
+                    imports.add(n.module.split(".")[0])
+            elif isinstance(n, ast.Call):
+                f = n.func
+                nm = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                calls.add(nm)
+        assert not (imports & banned_imports), f"{m}: banned import {imports & banned_imports}"
+        assert not (calls & banned_calls), f"{m}: banned call {calls & banned_calls}"
+
+    # 2) CAS tokens must be absent from the new debate surface
+    for m in debate_mods:
+        src = open(m).read()
+        for tok in ("expected_status", "expected_version", "expected_order",
+                    "expected_event_id", "BEGIN IMMEDIATE", "ConflictError"):
+            assert tok not in src, f"{m} must not reference CAS token {tok!r}"
+
+    # 3) raw DML against the read-only fixture/prod connection is absent
+    #    (only the ephemeral :memory: mirror is written, via a separate conn)
+    dao_src = open(os.path.join(REPO, "debate_read_dao.py")).read()
+    assert not re.search(r"self\._conn\.execute\(\s*[\"']\s*(INSERT|UPDATE|DELETE|CREATE|REPLACE)",
+                         dao_src, re.I), "no DML on the read-only connection"
+
+    # 4) tray debate helper methods carry no mutation / subprocess
+    tt = open(os.path.join(REPO, "task_tray.py")).read()
+    block = tt[tt.index("def _debate_recent_params"):tt.index("def _build_tab_rows(self, key):")]
+    for bad in ("apply_task_mutation", "update_task", "mark_done", "delete_task",
+                "subprocess", "expected_status"):
+        assert bad not in block, f"tray debate helpers must not reference {bad!r}"
 
 
 def test_debate_widget_double_click_is_navigation_only(qapp):

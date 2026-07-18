@@ -26,54 +26,68 @@ guards in the three task-side handlers.
 | `debate_list_widget.py` | NEW — read-only widget (holds no db) | `b59b33c17f94004800ed72ab1fcad2cc4ed972d5fcc7f5e5bb07520aa7a8fe3a` |
 | `task_tray.py` | MOD — tab registration + debate branches + guard | `355fb43ff445437db5e0dcf6c081daa23fca4512bba206e0179dc6e83b81f64e` |
 | `tray_dialogs.py` | MOD — `debate:` guards in double-click + context-menu | `c33fb1caa3c91d6b70232c0be16d1d95bd8da8598a4a81ca7c993ffa6d345804` |
-| `tests/test_tray_readonly_debate.py` | NEW — acceptance + negative tests | `86c0008797e7281f458a4ddcc41047bee391eebf56d02b8beb650b852f9291f0` |
+| `tests/test_tray_readonly_debate.py` | NEW — acceptance + negative tests (17) | `39043148420d4603a5c015d9b2bc84278223a93019d55cb1f9fec8d15a870ced` |
 
-## S2 point 1 — Zero-write surface (falsifiable)
+> **ADVOCATE pre-registered acceptance (dcd888d8c576).** Every falsifiable point
+> S2a–S2e is mapped explicitly below; a break in any is a NO-GO.
 
-AST + behavioral proof that the debate paths carry no mutation, including
-subprocess/helper paths:
+## S2a — Fail-closed refusal DEMONSTRATED, before any DB open
+
+A **real refused attempt** (negative test `test_S2a_refusal_precedes_any_db_open`
++ live run), not grep-absence. The prod-path guard runs in `__init__` **before**
+`sqlite3.connect`, so prod is never opened and no prod `-wal`/`-shm` is touched:
 
 ```
-[debate_read_dao.py]  banned_imports=none  mutation_refs=none  os.system=False
-[debate_list_widget.py] banned_imports=none mutation_refs=none os.system=False
-[debate_read_dao]  mode=ro=True  query_only=True  self._conn_write_stmts=none
-[task_tray debate helpers] mutation_calls=none  subprocess=False
-RESULT: PASS (no debate write surface)
+REFUSED: DebateReadDAO refused forbidden DB path:
+         '/home/rmanov/.claude/memory/memory.db' resolves to the fenced path
+         '/home/rmanov/.claude/memory/memory.db'
+sqlite3.connect calls during refused attempt: []   => prod NEVER opened, no -wal/-shm touched
 ```
 
-- `DebateReadDAO` imports neither `db_utils` nor `subprocess`; calls none of
-  `apply_task_mutation` / `update_task` / `mark_done` / `delete_task`. Its only
-  `INSERT`/`CREATE` statements target the ephemeral `:memory:` FTS mirror used
-  for search — **never** `self._conn` (the fixture/prod connection).
-- `DebateListWidget` holds **no** `db` attribute (structural), never wires
-  `itemChanged`→mutation, and references no task-mutation name.
-- The tray debate helper methods (`_build_debate_rows`, `_load_debate_tab`,
-  `_load_debate_search`, `_on_debate_navigate`) call no mutation and no
-  subprocess.
-- Behavioral: `test_query_only_blocks_writes` proves `CREATE`/`INSERT` on the
-  DAO connection raise `sqlite3.OperationalError` (`PRAGMA query_only=ON`).
+The test spies `sqlite3.connect` and asserts the call list is empty on refusal.
+`test_prod_path_fail_closed` additionally proves a `..`-relative form resolving to
+prod is refused too (realpath check).
 
-## S2 point 2 — Harness DB access (fixtures only, fail-closed prod fence)
+## S2b — mode=ro / query_only on EVERY code path (incl. subprocess/helper)
 
-- Every DAO connection is `file:<path>?mode=ro` + `PRAGMA query_only=ON`.
-- Fail-closed guard: `DebateReadDAO(path, forbid_path=PROD)` raises
-  `PermissionError` when `realpath(path) == realpath(~/.claude/memory/memory.db)`
-  — a **structural non-access** guarantee (O1 model). `test_prod_path_fail_closed`
-  proves it (direct path and a `..`-relative form both refused).
-- The whole test suite passes `forbid_path=PROD` and points only at the two
-  frozen fixtures; it **never opens prod** (not even `mode=ro`).
-- **Prod hash may drift** from other live actors (the running MCP servers write
-  to `~/.claude/memory/memory.db` continuously). That drift is unrelated to this
-  vehicle: this vehicle opened prod **zero** times from the harness, so the
-  **ledger delta for this vehicle actor is empty by construction** (structural
-  non-access, not an after-the-fact diff — the fence forbids opening prod to
-  diff it).
+- Every DAO connection: `file:<path>?mode=ro` **and** `PRAGMA query_only=ON`
+  (behavioral proof `test_query_only_blocks_writes`: `CREATE`/`INSERT` on the DAO
+  connection raise `sqlite3.OperationalError`).
+- **The leak-class from `acb9b91c901f` (a helper without `--db` defaulting to
+  PROD) cannot occur here: there is NO subprocess/helper anywhere on the debate
+  surface.** Scan:
+  ```
+  grep -nE "subprocess|Popen|os.system|os.exec|check_output|run\(" \
+       debate_read_dao.py debate_list_widget.py
+    → debate modules: NO subprocess/exec of any kind (no helper can default to PROD)
+  ```
+  The tray debate helper methods likewise spawn nothing. So there is no code path
+  — direct or spawned — that opens a DB outside the `mode=ro`+`query_only` DAO.
 
-## S2 point 3 — Frozen-clock reproduction (`as_of=2026-07-18T18:42:27Z`)
+## S2c — Ledger delta for this vehicle actor = empty (entire build window)
 
-The harness injects `as_of` (no live `datetime.now` on the harness path). All
-green (`pytest -q` → **15 passed** in the new suite; **103 passed** including the
-existing tray/dialog suites — zero regressions):
+- **Actor-attribution method.** Any prod write goes through
+  `apply_task_mutation` → `task_field_versions.updated_by` (machine id) +
+  `record_memory_event` rows carrying `actor_type`/`actor_id`/`tool_name`. A write
+  by this vehicle would surface as a `task_field_set` event / field-version row
+  tagged with the tray/DAO tool name. **This vehicle defines no such tool name and
+  calls none of those functions** (see S2e).
+- **Empty by construction, whole window.** The build window is `[worktree add at
+  c236d24 … this receipt commit]`. Across it, the only prod-capable code is
+  `DebateReadDAO` opened `mode=ro`+`query_only` (cannot write), and the harness
+  never opened prod at all (S2a/S2b). The tray was never launched. Therefore the
+  vehicle's ledger delta on prod is **∅** — established structurally, **not** by an
+  after-the-fact diff (deliberately: opening prod to diff it would violate the
+  S2a zero-touch fence). Prod-file drift observed during the window
+  (`memory.db` mtime advancing) is attributable to the **other live actors** (the
+  running MCP servers) via the same `actor_id`/`tool_name` columns — not this
+  vehicle.
+
+## S2d — Frozen-clock reproduction of ALL manifest targets + hashes + clean worktree
+
+Harness injects `as_of=2026-07-18T18:42:27Z` (no live `datetime.now`). `pytest -q`
+→ **17 passed** (new suite); **105 passed** across the touched tray/dialog suites,
+**0 regressions**.
 
 | Gate | Fixture | Result |
 |---|---|---|
@@ -81,9 +95,9 @@ existing tray/dialog suites — zero regressions):
 | **T1** recent (role-pin) | FX-B | `recent(1.0,'CODEX_FIXTURE',[DECISION,STATE,STATUS])` == the 10 targets `fxb-rec-01..10` in `ts DESC`; `role=None` == 24 (pin required) |
 | **T3** waiting section-A | FX-B | `section_a == 10` == `{fxb-wait-01..10}` |
 | **T6** topics | FX-B | 10 `fxb-topic-*` present; `topic_thread('fxb-topic-01').count == 3` |
-| **T4** search per-source | FX-B | 15/15 nonces hit **only** their source; **per-source id list + order byte-equal to the board reference** on FX-B (exact-equality, `test_T4_fxb_search_exact_equality_vs_board`) |
+| **T4** search per-source | FX-B | 15/15 nonces hit **only** their source; **per-source id list + order byte-equal to the board reference** on FX-B (`test_T4_fxb_search_exact_equality_vs_board`) |
 
-Time-to-find **data precondition** (scripted; median of 5, under `as_of`):
+Time-to-find **data precondition** (median of 5, under `as_of`):
 
 ```
 T1 recent(role-pin): median=3.96ms   results=10  (zero-scroll: exactly 10 rows)
@@ -91,28 +105,37 @@ T3 waiting_section_a: median=15.90ms  results=10  (zero-scroll: exactly 10 rows)
 T6 topics(targets):   median=3.17ms   results=10  (zero-scroll: exactly 10 rows)
 ```
 
-*Interpretation:* the harness proves the **retrieval precondition** for the
-spec's human-stopwatch T1/T3/T6 medians — the exact 10-target set is returned as
-the entire first screen (zero scroll) in <16 ms. The human stopwatch medians
-(≤10 s / ≤12 s) remain a UI-acceptance step for the adoption stage (they need a
-person + the wired tray window); this receipt establishes that the data layer
-cannot be the bottleneck and the target set is exact and unambiguous.
+*(The human-stopwatch T1/T3/T6 medians — ≤10 s / ≤12 s — remain a UI-acceptance
+step for adoption; this receipt proves the data layer returns the exact 10-target
+first screen in <16 ms, so it cannot be the bottleneck.)*
 
-## S2 point 4 — Post-build artifact hash
+- **Post-build artifact hashes:** the five `sha256` in the file table above
+  (recompute with `sha256sum …`).
+- **Worktree receipt, artifact-scoped clean:** built from `c236d24`; `git diff
+  --stat c236d24` touches **exactly** the 6 artifacts (2 modified + 4 new),
+  1382 insertions / 3 deletions, nothing else. Fixture bytes unchanged across all
+  runs (frozen `50e4f458…` / `06a72ee5…` verified before and after).
 
-See the file table above (five `sha256` values). Recompute:
-`sha256sum debate_read_dao.py debate_list_widget.py task_tray.py tray_dialogs.py tests/test_tray_readonly_debate.py`.
+## S2e — Static S3-fence proof: no close/write/CAS capability
 
-## S2 point 5 — Committed receipt, py_compile + tests green
+`test_S2e_no_cas_or_dml_or_mutation_in_new_code` (grep + AST) asserts across the
+new debate surface:
+- **no** `apply_task_mutation` / `apply_task_mutation_cas` / `update_task` /
+  `mark_done` / `delete_task` call;
+- **no** import of `db_utils` / `subprocess` / `close_task`;
+- **no** CAS tokens (`expected_status` / `expected_version` / `expected_order` /
+  `expected_event_id` / `BEGIN IMMEDIATE` / `ConflictError`);
+- **no** raw DML (`INSERT/UPDATE/DELETE/CREATE/REPLACE`) on the read-only
+  `self._conn` (only the ephemeral `:memory:` search mirror is written, on a
+  separate connection);
+- the tray debate helpers carry no mutation / subprocess / CAS token.
 
+There is no mutating handler in the new code: the only write-shaped verb is the
+`:memory:` FTS build, which never touches a persistent DB.
+
+### py_compile + committed
 - `python3 -m py_compile debate_read_dao.py debate_list_widget.py task_tray.py tray_dialogs.py` → OK.
-- `pytest tests/test_tray_readonly_debate.py -q` → 15 passed.
-- `pytest` over the touched tray/dialog suites → **103 passed, 0 failed**
-  (`test_daily_dashboard`, `test_tray_dialogs`, `test_task_db`,
-  `test_task_tray_reminders`, `test_task_tray_memory_guard`, `test_tray_sync`,
-  `test_tray_readonly_debate`).
-- Fixture bytes unchanged across all runs (frozen hashes `50e4f458…` / `06a72ee5…`
-  verified before and after).
+- Receipt committed on `agent/tray-readonly-tabs` (this file).
 
 ## Fences honored
 
