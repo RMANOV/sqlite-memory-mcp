@@ -106,12 +106,34 @@ def test_query_only_blocks_writes():
 
 # ── frozen-clock reproduction ───────────────────────────────────────────────
 def test_T2_fxa_section_a_zero():
+    """Layer-1 board parity: FX-A section-A (live_await=False) == 0 (unchanged by
+    adoption fix 1)."""
     from debate_read_dao import DebateReadDAO
 
     dao = DebateReadDAO(FX_A, clock=asof_clock, forbid_path=PROD)
     try:
-        items, cand = dao.waiting_section_a()
-        assert len(items) == 0, f"FX-A section_a must be 0 (zero-parity), got {len(items)}"
+        items, cand = dao.waiting_section_a(live_await=False)
+        assert len(items) == 0, f"FX-A layer-1 must be 0 (board parity), got {len(items)}"
+    finally:
+        dao.close()
+
+
+def test_ADOPTIONFIX1_fxa_live_await_surfaces_real_asks():
+    """Adoption fix 1: with the live-await layer ON, FX-A (the real prod snapshot
+    @ as_of) surfaces the operator-await asks that fallback mode showed as 0."""
+    from debate_read_dao import DebateReadDAO
+
+    dao = DebateReadDAO(FX_A, clock=asof_clock, forbid_path=PROD)
+    try:
+        layer1, _ = dao.waiting_section_a(live_await=False)
+        combined, _ = dao.waiting_section_a(live_await=True)
+        assert len(layer1) == 0
+        assert len(combined) > 0, "live-await layer must surface role-addressed asks"
+        # every added row carries a live-await provenance and is ts-DESC sorted
+        assert all(x["fwd"].startswith("live-await:") for x in combined
+                   if x not in layer1)
+        ts = [x["ts"] for x in combined]
+        assert ts == sorted(ts, reverse=True)
     finally:
         dao.close()
 
@@ -132,13 +154,80 @@ def test_T1_fxb_recent_role_pin_exactly_10_in_order():
 
 
 def test_T3_fxb_section_a_10():
+    """Layer-1 (human- recipient) parity: FX-B section-A (live_await=False) is
+    exactly the 10 seeded targets. The live combined view is a superset."""
     from debate_read_dao import DebateReadDAO
 
     dao = DebateReadDAO(FX_B, clock=asof_clock, forbid_path=PROD)
     try:
-        items, _ = dao.waiting_section_a()
-        assert {x["msg_id"] for x in items} == WAIT_TARGETS
-        assert len(items) == 10
+        layer1, _ = dao.waiting_section_a(live_await=False)
+        assert {x["msg_id"] for x in layer1} == WAIT_TARGETS
+        assert len(layer1) == 10
+        combined, _ = dao.waiting_section_a(live_await=True)
+        assert WAIT_TARGETS <= {x["msg_id"] for x in combined}  # 10 targets still present
+        assert len(combined) >= 10
+    finally:
+        dao.close()
+
+
+def _build_synth_debate_db(path, now):
+    """Minimal debate DB (no FK) for the layer-2 unit test."""
+    import sqlite3
+
+    c = sqlite3.connect(path)
+    c.executescript(
+        "CREATE TABLE debates(topic_id TEXT PRIMARY KEY, title TEXT, state TEXT,"
+        " created_at TEXT, created_by_role TEXT, roles_json TEXT);"
+        "CREATE TABLE debate_messages(msg_id TEXT PRIMARY KEY, topic_id TEXT, role TEXT,"
+        " ts TEXT, priority TEXT, kind TEXT, reply_to TEXT, body TEXT, created_at TEXT);"
+        "CREATE TABLE debate_message_recipients(msg_id TEXT, recipient TEXT,"
+        " recipient_mode TEXT DEFAULT 'normal', PRIMARY KEY(msg_id,recipient));"
+    )
+
+    def ts(days=0, hours=0):
+        from datetime import timedelta
+        return (now + timedelta(days=days, hours=hours)).isoformat()
+
+    rows = [
+        # m1: role-addressed marker → layer 2 surfaces
+        ("m1", "t", "CONDUCTOR", ts(-2), "H", "Q", None, "чака операторска ръка за deploy решение", ts(-2)),
+        # m2: marker but already-given (own body _A_TAKEN) → excluded
+        ("m2", "t", "ADVOCATE", ts(-1), "M", "DECISION", None, "операторско GO записано, продължаваме", ts(-1)),
+        # m3: STATUS with 'кажи ' marker → layer 2 surfaces
+        ("m3", "t", "EXECUTOR3", ts(-3), "M", "STATUS", None, "кажи дали да пусна сега", ts(-3)),
+        # m4: human- recipient → layer 1 (must be deduped from layer 2)
+        ("m4", "t", "CONDUCTOR", ts(-2, -1), "H", "Q", None, "чака операторска ръка", ts(-2, -1)),
+        # m5: marker but >21d → excluded
+        ("m5", "t", "CONDUCTOR", ts(-30), "H", "Q", None, "чака операторска ръка", ts(-30)),
+        # m6 + m6r: resolved (descendant records decision taken) → excluded
+        ("m6", "t", "ADVOCATE", ts(-4), "M", "DECISION", None, "нужна операторска ръка", ts(-4)),
+        ("m6r", "t", "CONDUCTOR", ts(-3, -12), "M", "STATUS", "m6", "операторско решение взето", ts(-3, -12)),
+    ]
+    c.executemany("INSERT INTO debate_messages VALUES(?,?,?,?,?,?,?,?,?)", rows)
+    c.execute("INSERT INTO debate_message_recipients(msg_id,recipient) VALUES('m4','human-operator')")
+    c.execute("INSERT INTO debates VALUES('t','T','ACTIVE',?,?,'[]')", (ts(-5), "CONDUCTOR"))
+    c.commit()
+    c.close()
+
+
+def test_ADOPTIONFIX1_live_await_surfaces_role_addressed(tmp_path):
+    """Layer 2 surfaces role-addressed body-marker asks; excludes already-given /
+    aged-out / resolved; dedups the human- recipient row against layer 1."""
+    import datetime as _dt
+    from debate_read_dao import DebateReadDAO
+
+    now = _dt.datetime(2026, 7, 18, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    db = str(tmp_path / "synth.db")
+    _build_synth_debate_db(db, now)
+    dao = DebateReadDAO(db, clock=lambda: now, forbid_path=PROD)
+    try:
+        layer1 = {x["msg_id"] for x in dao.waiting_section_a(live_await=False)[0]}
+        combined = {x["msg_id"] for x in dao.waiting_section_a(live_await=True)[0]}
+        assert layer1 == {"m4"}, f"layer 1 (human- recipient) should be m4, got {layer1}"
+        assert combined == {"m1", "m3", "m4"}, f"combined mismatch: {combined}"
+        assert "m2" not in combined  # already-given GO
+        assert "m5" not in combined  # >21d
+        assert "m6" not in combined  # resolved in-thread
     finally:
         dao.close()
 
@@ -213,7 +302,7 @@ def test_time_to_find_data_precondition():
     try:
         for label, fn, expected in (
             ("recent", lambda: dao.recent(1.0, "CODEX_FIXTURE", ["DECISION", "STATE", "STATUS"])["items"], 10),
-            ("waiting", lambda: dao.waiting_section_a()[0], 10),
+            ("waiting", lambda: dao.waiting_section_a(live_await=False)[0], 10),
             ("topics", lambda: [t for t in dao.topics()["topics"] if t["topic_id"].startswith("fxb-topic-")], 10),
         ):
             t0 = time.perf_counter()
