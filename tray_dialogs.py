@@ -3446,6 +3446,11 @@ class TaskListWidget(QListWidget):
         # this guard cannot suppress any genuine task open.
         if isinstance(data, str) and data.startswith("dashboard:"):
             return
+        # B3 defense-in-depth: debate rows are read-only; never open a task
+        # reader. Debate rows normally live in DebateListWidget, but if one is
+        # ever placed in a TaskListWidget this keeps it inert.
+        if isinstance(data, str) and data.startswith("debate:"):
+            return
         if isinstance(data, str) and data.startswith("entity:"):
             entity_id = int(data.split(":", 1)[1])
             self._open_entity_detail(entity_id)
@@ -3471,6 +3476,10 @@ class TaskListWidget(QListWidget):
         # this guard prevents the (mutation-capable) task menu — including
         # Delete — from ever acting on a projection row.
         if isinstance(data, str) and data.startswith("dashboard:"):
+            return
+        # B3 defense-in-depth: debate rows expose no mutating context menu
+        # (no Delete/Convert/etc.) even if placed in a TaskListWidget.
+        if isinstance(data, str) and data.startswith("debate:"):
             return
         # Entity items get a simplified context menu
         if isinstance(data, str) and data.startswith("entity:"):
