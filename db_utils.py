@@ -3675,12 +3675,20 @@ def apply_task_mutation(
     provenance_map: dict[str, dict[str, Any]] | None = None,
     record_events: bool = True,
     touch_updated_at: bool = True,
+    expected_status: str | None = None,
+    expected_status_order: int | None = None,
+    expected_status_event_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply task changes and persist matching field/event history.
 
     This is the preferred write path for any task update outside low-level merge code.
     """
     raw_changes = {k: v for k, v in changes.items() if k != "updated_at"}
+    status_cas = expected_status is not None
+    if status_cas and set(raw_changes) != {"status"}:
+        raise ValueError("status CAS accepts exactly one field: status")
+    if status_cas and expected_status_order is None:
+        raise ValueError("status CAS requires expected_status_order")
     if "project" in raw_changes:
         raw_changes["project"] = normalize_project_name(raw_changes.get("project"))
     if not raw_changes:
@@ -3694,13 +3702,18 @@ def apply_task_mutation(
         raise ValueError(f"Unknown task columns: {sorted(unknown)}")
 
     changed_fields = tuple(k for k in raw_changes if k in MERGEABLE_FIELDS)
-    select_cols = sorted(set(raw_changes) | {"updated_at"})
+    select_cols = sorted(set(raw_changes) | {"updated_at", "type"})
     row = conn.execute(
         f"SELECT {', '.join(select_cols)} FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
-        return {"updated": 0, "changed_fields": (), "missing": True}
+        return {
+            "updated": 0,
+            "changed_fields": (),
+            "missing": True,
+            "outcome": "conflict" if status_cas else "missing",
+        }
 
     old_values = {field: row[field] for field in changed_fields}
     effective_changes = {
@@ -3709,7 +3722,7 @@ def apply_task_mutation(
     effective_fields = tuple(
         field for field in changed_fields if field in effective_changes
     )
-    if not effective_changes:
+    if not effective_changes and not status_cas:
         return {
             "updated": 0,
             "changed_fields": (),
@@ -3719,6 +3732,74 @@ def apply_task_mutation(
         }
 
     ts = timestamp or now_iso()
+
+    # Optimistic status transitions branch before the ordinary no-op return.
+    # A stale request whose target already equals the current value is still a
+    # conflict: its field-version token no longer names the row the caller saw.
+    if status_cas:
+        if row["type"] != "task":
+            return {
+                "updated": 0,
+                "changed_fields": (),
+                "outcome": "conflict",
+                "reason": "not_task",
+            }
+        version = get_status_version(conn, task_id)
+        if version is None or version[0] <= 0 or version[1] is None:
+            return {
+                "updated": 0,
+                "changed_fields": (),
+                "outcome": "conflict",
+                "reason": "missing_status_version",
+            }
+        target_status = raw_changes["status"]
+        cur = conn.execute(
+            "UPDATE tasks SET status=?, updated_at=?, tombstone_pushed_at=NULL "
+            "WHERE id=? AND type='task' AND status=? "
+            "AND EXISTS (SELECT 1 FROM task_field_versions "
+            "WHERE task_id=? AND field_name='status' AND updated_order=? "
+            "AND source_event_id IS ?)",
+            (
+                target_status,
+                ts,
+                task_id,
+                expected_status,
+                task_id,
+                int(expected_status_order),
+                expected_status_event_id,
+            ),
+        )
+        if cur.rowcount == 0:
+            return {
+                "updated": 0,
+                "changed_fields": (),
+                "outcome": "conflict",
+                "reason": "stale_status_version",
+            }
+        upsert_field_versions(
+            conn,
+            task_id,
+            ("status",),
+            ts,
+            machine_id=machine_id,
+            old_values={"status": expected_status},
+            new_values={"status": target_status},
+            tool_name=tool_name,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source_kind=source_kind,
+            source_ref=source_ref or task_id,
+            provenance_map=provenance_map,
+            record_events=record_events,
+        )
+        return {
+            "updated": 1,
+            "changed_fields": ("status",),
+            "updated_at": ts,
+            "old_values": {"status": expected_status},
+            "new_values": {"status": target_status},
+            "outcome": "applied",
+        }
     if touch_updated_at:
         effective_changes["updated_at"] = ts
 
@@ -3774,6 +3855,20 @@ def get_field_versions(
         (task_id,),
     ).fetchall()
     return {r["field_name"]: (r["updated_at"], r["updated_by"]) for r in rows}
+
+
+def get_status_version(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[int, str | None] | None:
+    """Return the ABA-safe logical token for a task's status field."""
+    row = conn.execute(
+        "SELECT updated_order, source_event_id FROM task_field_versions "
+        "WHERE task_id=? AND field_name='status'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["updated_order"] or 0), row["source_event_id"]
 
 
 def upsert_field_versions(
