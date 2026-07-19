@@ -2617,18 +2617,28 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _on_debate_task_completion_requested(self, payload, checked):
         """Defer a task/note completion outside QListWidget signal dispatch."""
-        if not checked or not isinstance(payload, dict):
+        if not isinstance(payload, dict):
             return
         task_id = str(payload.get("id") or "")
         if not task_id:
+            return
+        if not checked:
+            self._debate_task_inflight.discard(task_id)
             return
         if task_id in self._debate_task_inflight:
             return
         self._debate_task_inflight.add(task_id)
         QTimer.singleShot(
             10,
-            lambda p=dict(payload): self._apply_debate_task_completion(p),
+            lambda p=dict(payload): self._run_debate_task_completion(p),
         )
+
+    def _run_debate_task_completion(self, payload):
+        """Ignore a deferred callback when the operator unchecked meanwhile."""
+        task_id = str(payload.get("id") or "")
+        if task_id not in self._debate_task_inflight:
+            return
+        self._apply_debate_task_completion(payload)
 
     def _invalidate_debate_task_views(self):
         self._debate_source_cache.clear()
@@ -2680,7 +2690,13 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 callback()
             else:
                 self.refresh()
-        except (PermissionError, sqlite3.Error, TypeError, ValueError) as exc:
+        except (
+            PermissionError,
+            RuntimeError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as exc:
             logging.getLogger("task_tray").error(
                 "Error completing task/note %s: %s", task_id, exc, exc_info=True
             )

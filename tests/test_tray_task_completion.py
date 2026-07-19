@@ -259,3 +259,20 @@ def test_stale_completion_token_preserves_foreign_change(tmp_path):
 
     assert result["outcome"] == "conflict"
     assert _status(db_path, "stale-note") == "in_progress"
+
+
+def test_deferred_completion_is_cancelled_by_immediate_uncheck(qapp):
+    from unittest.mock import MagicMock
+    import task_tray
+
+    payload = {"id": "cancel-me"}
+    window = MagicMock()
+    window._debate_task_inflight = {"cancel-me"}
+
+    task_tray.FullWindow._on_debate_task_completion_requested(
+        window, payload, False
+    )
+    task_tray.FullWindow._run_debate_task_completion(window, payload)
+
+    assert "cancel-me" not in window._debate_task_inflight
+    window._apply_debate_task_completion.assert_not_called()
