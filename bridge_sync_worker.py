@@ -48,6 +48,7 @@ from db_utils import (
     export_index_json,
     mark_tombstones_pushed,
     load_remote_tasks_for_merge,
+    task_source_event_ids,
     content_length,
     has_meaningful_content,
     is_archived_duplicate_redirect_task,
@@ -67,6 +68,7 @@ from db_utils import (
     export_provenance_links,
     export_knowledge_links,
     export_memory_events,
+    write_memory_events_file_streaming,
     export_memory_audit_issues,
     export_memory_artifacts,
     export_memory_conflicts,
@@ -581,9 +583,13 @@ def _export_knowledge_ratings(conn: sqlite3.Connection) -> list:
         return []
 
 
-def _export_extended_memory(conn: sqlite3.Connection) -> dict[str, list]:
+def _export_extended_memory(
+    conn: sqlite3.Connection,
+    *,
+    include_memory_events: bool = True,
+) -> dict[str, list]:
     """Export append-only/event/provenance memory artifacts for cross-device sync."""
-    return {
+    exported = {
         "context_chunks": export_context_chunks(conn),
         "context_annotations": export_context_annotations(conn),
         "context_questions": export_context_questions(conn),
@@ -592,12 +598,14 @@ def _export_extended_memory(conn: sqlite3.Connection) -> dict[str, list]:
         "canonical_facts": export_canonical_facts(conn),
         "provenance_links": export_provenance_links(conn),
         "knowledge_links": export_knowledge_links(conn),
-        "memory_events": export_memory_events(conn),
         "memory_audit_issues": export_memory_audit_issues(conn),
         "memory_artifacts": export_memory_artifacts(conn),
         "memory_conflicts": export_memory_conflicts(conn),
         "memory_audit_state": export_memory_audit_state(conn),
     }
+    if include_memory_events:
+        exported["memory_events"] = export_memory_events(conn)
+    return exported
 
 
 def _merge_remote_tasks(tasks_out: list[dict], existing_data: dict) -> list[dict]:
@@ -834,9 +842,26 @@ def _main_locked(
         except (json.JSONDecodeError, OSError, TypeError) as exc:
             log.warning("shared.json read failed for merge: %s", exc)
 
+    # Resolve task artifacts before the extended-memory import so the streaming
+    # ledger reader retains only event IDs actually referenced by task LWW
+    # metadata (plus one causal head per relevant aggregate).
+    remote_tasks, _loaded_from_index = load_remote_tasks_for_merge(
+        bridge_dir,
+        remote_payload,
+        log,
+    )
+    remote_event_subset: list[dict] = []
+
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 10, "Importing remote entities...")
-        br = import_remote_bridge_data(conn, bridge_dir, remote_payload, log)
+        br = import_remote_bridge_data(
+            conn,
+            bridge_dir,
+            remote_payload,
+            log,
+            remote_task_event_ids=task_source_event_ids(remote_tasks),
+            event_subset_out=remote_event_subset,
+        )
         if br["entities"] or br["relations"]:
             log.info(
                 "Imported %d remote entities and %d relations",
@@ -847,11 +872,6 @@ def _main_locked(
             log.info("Imported %d remote knowledge ratings", br["ratings"])
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 15, "Importing remote tasks...")
-        remote_tasks, _loaded_from_index = load_remote_tasks_for_merge(
-            bridge_dir,
-            remote_payload,
-            log,
-        )
         merge_failed = False
         if remote_tasks:
             try:
@@ -859,7 +879,7 @@ def _main_locked(
                     conn,
                     remote_tasks,
                     import_content=True,
-                    remote_events=remote_payload.get("memory_events", []),
+                    remote_events=remote_event_subset,
                 )
                 sync_task_attachments_from_remote(conn, remote_tasks, bridge_dir)
                 log.info("LWW merged %d new tasks, %d field updates", new_t, upd_t)
@@ -1051,7 +1071,16 @@ def _main_locked(
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
         kr_out = _export_knowledge_ratings(conn)
         _progress(progress_callback, 58, "Exporting memory ledger...")
-        extended_memory = _export_extended_memory(conn)
+        # memory_events is hundreds of MB on the live ledger. Stream it to the
+        # same atomic JSON transport file instead of retaining 453k dicts plus
+        # one giant serialized string in the long-lived Qt process.
+        _memory_events_path, memory_event_count = write_memory_events_file_streaming(
+            conn, bridge_dir
+        )
+        log.info("streamed %d memory events", memory_event_count)
+        extended_memory = _export_extended_memory(
+            conn, include_memory_events=False
+        )
     # Export transaction closed
 
     # Phase 4: Build payload + write files + git ops (no transaction)
@@ -1065,7 +1094,9 @@ def _main_locked(
         "tasks": tasks_out,
     }
     # v5: write extended memory to separate files (keeps shared.json under CF Pages 25 MB limit)
-    write_extended_memory_files(bridge_dir, extended_memory)
+    write_extended_memory_files(
+        bridge_dir, extended_memory, skip_keys={"memory_events"}
+    )
     for key in EXTENDED_MEMORY_KEYS:
         payload[key] = []  # empty placeholders for backward compat
     if pub_entities or pub_tasks:
