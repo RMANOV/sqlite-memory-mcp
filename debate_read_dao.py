@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ── Section-A predicate regexes — verbatim from board.py:243-273 ──────────────
 _A_REF = re.compile(
@@ -48,15 +48,15 @@ _A_OP_AWAIT = re.compile(
 )
 _A_IS_OPERATOR_ROLE = re.compile(r"^\s*(human|operator|оператор)", re.I)
 
-# ADOPTION FIX 1 — live-await markers. Prod has NO `human-` recipients, so real
-# operator-await asks address ROLES and carry the await in the BODY; the
-# fallback marker `_A_OP_AWAIT` never fires on them. This broader set is
-# calibrated against the live ledger (FX-A @ as_of: 77 eligible matches across
-# ADVOCATE/CONDUCTOR/EXECUTOR roles) and drives a SECOND section-A layer.
-_A_OPERATOR_AWAIT_LIVE = re.compile(
-    r"(операторск\w*\s+ръка|операторск\w*\s+GO|операторск\w*\s+решени|"
-    r"deploy\s+решени|тво(?:я|ята)\s+ръка|кажи\s|при\s+оператора|"
-    r"\bGO\s+за|чака\w*\s+оператор|ратифицира)",
+# A later descendant can close an otherwise valid operator-await message
+# without being authored by a `human-*` role. Keep this deliberately narrow:
+# generic words such as "затварям" or "PASS" may refer to another lane in the
+# same long reply and must not consume the operator's still-pending action.
+_A_OPERATOR_ACTION_RESOLVED = re.compile(
+    r"(^|\n)[^\n]{0,48}операторск\w*\s+решени\w*\b|"
+    r"операторск\w*\s+(?:GO|верификац\w*|потвърждени\w*)\s+"
+    r"(?:записан\w*|получен\w*|даден\w*|взет\w*|изпълнен\w*)|"
+    r"финален\s+инсталиран\s+стек[\s\S]{0,240}всичко\s+работи",
     re.I,
 )
 
@@ -187,14 +187,14 @@ class DebateReadDAO:
         """Section A = what is waiting on the operator.
 
         Layer 1 = verbatim board `_section_a` (kept intact → T2 board parity).
-        Layer 2 (`live_await=True`, default) = ADOPTION FIX 1: prod carries no
-        `human-` recipients, so genuine operator-await asks — which address
-        ROLES and put the await in the BODY — are invisible to layer 1's
-        fallback. Layer 2 adds `<=21d` messages of kind Q/DECISION/PING/STATUS
-        whose body matches the operator-await markers, deduped against layer 1,
-        with the same author/unresolved/already-given filters and stale>5d
-        marking. `live_await=False` returns layer 1 only (byte-identical to
-        board; used by the T2 parity test).
+        Layer 2 (`live_await=True`, default) handles ledgers where operator asks
+        are routed to team roles rather than a `human-*` recipient. It accepts
+        only explicit waiting/needed/pending language from `_A_OP_AWAIT`.
+        Historical provenance and guardrails such as "operator GO", "operator
+        hand", "ratified", or "say" are not asks by themselves. A later
+        descendant that records the operator action (or a final completed
+        install) resolves the row. `live_await=False` returns layer 1 only
+        (byte-identical to board; used by the T2 parity test).
         """
         if not self._caps["has_debate"]:
             return [], 0
@@ -307,12 +307,19 @@ class DebateReadDAO:
                 if dt is None or (now - dt).days > 21:
                     continue  # (iv) <=21d
                 b = r["body"]
-                m = _A_OPERATOR_AWAIT_LIVE.search(b)
+                lead = re.split(r"\n\s*\n", b, maxsplit=1)[0]
+                # This must express a present request. Broad keyword matching
+                # previously admitted historical receipts and constraints such
+                # as "no deploy without operator GO"; searching the full body
+                # also admitted quoted evidence and even the hotfix receipt's
+                # explanation of "pending operator language". An actionable
+                # ask belongs in the leading paragraph.
+                m = _A_OP_AWAIT.search(lead)
                 if not m:
                     continue  # (ii) operator-await marker in body
                 # exclude already-given / already-recorded GO in this very body
                 if _A_TAKEN.search(b) or _A_REF.search(
-                    b[max(0, m.start() - 45):m.start() + 45]
+                    lead[max(0, m.start() - 45):m.start() + 45]
                 ):
                     continue
                 if r["msg_id"] in op_replied:
@@ -322,6 +329,7 @@ class DebateReadDAO:
                     (byid[c]["ts"] or "") > (r["ts"] or "")
                     and (
                         _A_TAKEN.search(byid[c]["body"])
+                        or _A_OPERATOR_ACTION_RESOLVED.search(byid[c]["body"])
                         or _A_IS_OPERATOR_ROLE.match(byid[c]["role"] or "")
                     )
                     for c in desc
@@ -343,6 +351,52 @@ class DebateReadDAO:
 
         out.sort(key=lambda x: x["ts"] or "", reverse=True)
         return out, cand
+
+    def waiting_section_b(self):
+        """Browser-board section B: relevant open today/next tasks, read-only."""
+        required = {
+            "id", "title", "section", "priority", "status", "due_date",
+            "project", "updated_at",
+        }
+        if not self._caps["has_tasks"] or not required.issubset(self._caps["tasks"]):
+            return [], 0
+        con = self._conn
+        before = con.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status IN ('not_started','in_progress') "
+            "AND section IN ('today','next')"
+        ).fetchone()[0]
+        today = self._now().date()
+        cutoff = today + timedelta(days=21)
+        sql = """
+        SELECT id, title, section, priority, status, due_date, project, updated_at
+        FROM tasks
+        WHERE status IN ('not_started','in_progress')
+          AND section IN ('today','next')
+          AND ( (due_date IS NOT NULL AND date(due_date) <= date(?))
+                OR (priority IN ('high','critical') AND due_date IS NULL)
+                OR (section='today' AND due_date IS NULL) )
+          AND NOT ( project='workstation-maintenance'
+                    AND due_date IS NOT NULL
+                    AND date(due_date) > date(?) )
+        ORDER BY (due_date IS NULL), date(due_date) ASC,
+                 CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                               WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END
+        """
+        items = []
+        for row in con.execute(sql, (cutoff.isoformat(), cutoff.isoformat())).fetchall():
+            items.append({
+                "id": row["id"],
+                "title": row["title"],
+                "section": row["section"] or "",
+                "priority": row["priority"] or "",
+                "status": row["status"] or "",
+                "due_date": (row["due_date"] or "")[:10],
+                "project": row["project"] or "",
+                "updated_at": row["updated_at"] or "",
+                "age": self._rel(row["updated_at"]),
+            })
+        return items, int(before)
 
     # ---- VIEW 2: recent (board.py:466-521) ----------------------------------
     def recent(self, hours, role, kinds):

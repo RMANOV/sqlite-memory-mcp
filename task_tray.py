@@ -846,7 +846,9 @@ from tray_dialogs import (
     _update_theme_colors,
     _build_main_style,
     _build_filter_style,
+    _build_debate_surface_style,
     _build_list_style,
+    _build_debate_reader_style,
     _REFRESH_INTERVAL_MS,
     # Constants
     _UI_COLS,
@@ -859,7 +861,13 @@ from tray_dialogs import (
     create_tray_icon_pixmap,
 )
 from debate_read_dao import DebateReadDAO
-from debate_list_widget import DebateListWidget
+from debate_list_widget import (
+    DebateReaderDialog,
+    DebateTabWidget,
+    apply_debate_controls,
+    default_debate_control_params,
+    normalize_debate_control_params,
+)
 
 _PURGE_INTERVAL_MS = 3_600_000  # 1 hour
 _PERIODIC_PULL_INTERVAL_MS = 15 * 60_000
@@ -1131,18 +1139,50 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             )
             self._debate_dao = None
         self._topics_open_topic = None  # None → digest; else show that thread
+        self._debate_source_cache = {}
 
         self.tab_lists = {}
+        self._debate_pages = {}
+        self._debate_controls = {}
+        self._waiting_task_controls = None
+        self._waiting_task_list = None
         for key in self._tab_keys:
             if key in self._DEBATE_TABS:
-                lw = DebateListWidget()
+                page = DebateTabWidget(key)
+                lw = page.list_widget
                 lw.navigate_requested.connect(self._on_debate_navigate)
+                lw.reader_requested.connect(self._open_debate_reader)
+                page.controls.changed.connect(
+                    lambda params, k=key: self._on_debate_controls_changed(k, params)
+                )
+                page.controls.back_requested.connect(self._on_topics_back)
+                self._debate_pages[key] = page
+                self._debate_controls[key] = page.controls
+                if key == "waiting" and page.secondary_controls is not None:
+                    self._waiting_task_controls = page.secondary_controls
+                    self._waiting_task_list = page.secondary_list
+                    page.secondary_controls.changed.connect(
+                        lambda params: self._on_debate_controls_changed(
+                            "waiting", params, section_b=True
+                        )
+                    )
+                    page.secondary_list.reader_requested.connect(
+                        self._open_debate_reader
+                    )
             else:
                 lw = TaskListWidget(self.db)
                 lw._search_engine = self._search_engine
                 lw.itemChanged.connect(lambda item, k=key: self._on_item_changed(item))
             self.tab_lists[key] = lw
-            self.tabs.addTab(lw, self._tab_labels[key])
+            self.tabs.addTab(
+                self._debate_pages[key] if key in self._DEBATE_TABS else lw,
+                self._tab_labels[key],
+            )
+
+        # TaskListWidget styles itself in its constructor. Debate lists and
+        # controls are separate read-only widgets, so bind them to the same
+        # restored user appearance before the first frame is painted.
+        self._apply_debate_appearance()
 
         # B1a: dashboard rows are a read-only projection. Allow multi-row
         # mouse/keyboard selection and a Ctrl+C that copies the selection (or
@@ -1166,6 +1206,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._tab_views = {
             key: copy.deepcopy(_DEFAULT_TAB_VIEW) for key in self._tab_keys
         }
+        for key in self._DEBATE_TABS:
+            self._tab_views[key]["params"] = default_debate_control_params(key)
         if self._premium_tray_extension:
             premium_key = self._premium_tray_extension.tab_key
             if premium_key in self._tab_views:
@@ -1195,6 +1237,21 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     )
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             pass
+
+        # Materialize the restored JSON state into the visible native controls.
+        # set_state() blocks its own signals, so this cannot trigger a DB read.
+        for key in self._DEBATE_TABS:
+            params = self._normalize_tab_params(
+                key, self._tab_views[key].get("params", {})
+            )
+            self._tab_views[key]["params"] = params
+            self._debate_controls[key].set_state(params)
+        if self._waiting_task_controls is not None:
+            self._waiting_task_controls.set_state(
+                self._tab_views["waiting"]["params"].get(
+                    "section_b_controls", {}
+                )
+            )
 
         # Persist the active tab by key for future compatibility. Do not force
         # Dashboard on startup: it is a curated projection and may be empty.
@@ -1265,7 +1322,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
         self._sort_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._rebuild_sort_menu()
-        toolbar.addWidget(self._sort_btn)
+        self._sort_toolbar_action = toolbar.addWidget(self._sort_btn)
 
         self._design_btn = QToolButton()
         self._design_btn.setText("Design...")
@@ -1357,6 +1414,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         ]
         _is_fixed_initial = _initial_key in _FIXED_VIEW_TABS
         self._sort_btn.setVisible(not _is_fixed_initial)
+        self._sort_toolbar_action.setVisible(not _is_fixed_initial)
         self._update_design_button_visibility()
 
         # Status bar
@@ -1447,14 +1505,33 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     # ── Appearance ─────────────────────────────────────────────────────
 
+    def _apply_debate_appearance(self):
+        """Apply the current user theme/font/bold state to every debate view."""
+        list_style = _build_list_style()
+        surface_style = _build_debate_surface_style()
+        for key in getattr(self, "_DEBATE_TABS", ()):
+            page = self._debate_pages.get(key)
+            if page is not None:
+                page.setStyleSheet(surface_style)
+            lw = self.tab_lists.get(key)
+            if lw is not None:
+                lw.setStyleSheet(list_style)
+                lw.viewport().update()
+        if self._waiting_task_list is not None:
+            self._waiting_task_list.setStyleSheet(list_style)
+            self._waiting_task_list.viewport().update()
+
     def _apply_appearance(self):
         """Rebuild all stylesheets from current theme/font/bold state."""
         _update_theme_colors()
         self.setStyleSheet(_build_main_style())
         self._filter_bar.setStyleSheet(_build_filter_style())
-        for lw in self.tab_lists.values():
+        for key, lw in self.tab_lists.items():
+            if key in self._DEBATE_TABS:
+                continue
             lw.setStyleSheet(_build_list_style())
             lw.viewport().update()
+        self._apply_debate_appearance()
         self._settings.setValue("theme", _td._theme_name)
         self._settings.setValue("font_size", _td._font_size)
         self._settings.setValue("bold", "true" if _td._bold else "false")
@@ -1463,6 +1540,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self.refresh()
 
     def _normalize_tab_params(self, key, params):
+        if key in getattr(self, "_DEBATE_TABS", ()):
+            return normalize_debate_control_params(key, params)
         if self._premium_tray_extension and key == self._premium_tray_extension.tab_key:
             return self._premium_tray_extension.normalize_params(params)
         return dict(params or {})
@@ -2117,11 +2196,33 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 self._sort_actions[self._sort_mode].setChecked(True)
 
             # Rebuild filter chips for new tab
-            self._build_filter_chips()
+            if new_key not in self._DEBATE_TABS:
+                self._build_filter_chips()
 
             # Hide sort/filter UI for fixed tabs
             is_fixed = new_key in _FIXED_VIEW_TABS
-            self._sort_btn.setVisible(not is_fixed)
+            is_debate = new_key in self._DEBATE_TABS
+            show_task_sort = not is_fixed and not is_debate
+            self._sort_btn.setVisible(show_task_sort)
+            self._sort_toolbar_action.setVisible(show_task_sort)
+            self._filter_bar.setVisible(not is_debate)
+            self._search_input.setPlaceholderText(
+                "Търси навсякъде: дебат, задачи, знание…"
+                if is_debate else "Search tasks..."
+            )
+            if is_debate:
+                self._debate_controls[new_key].set_state(
+                    self._tab_views[new_key].get("params", {})
+                )
+                if new_key == "waiting" and self._waiting_task_controls is not None:
+                    self._waiting_task_controls.set_state(
+                        self._tab_views[new_key].get("params", {}).get(
+                            "section_b_controls", {}
+                        )
+                    )
+                self._debate_controls[new_key].set_thread_mode(
+                    new_key == "topics" and bool(self._topics_open_topic)
+                )
             self._update_design_button_visibility()
 
         self._save_ui_state()
@@ -2130,11 +2231,105 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     # ---- Read-only debate tabs (BUILD STEP 1, spec §2/§3) ------------------
     def _debate_recent_params(self):
-        params = self._tab_views.get("recent", {}).get("params", {}) or {}
-        hours = params.get("hours", 1)
+        params = normalize_debate_control_params(
+            "recent", self._tab_views.get("recent", {}).get("params", {})
+        )
+        hours = params.get("hours", 24)
         kinds = params.get("kinds") or ["DECISION", "STATE", "STATUS"]
-        role = params.get("role") or None
-        return hours, kinds, role
+        # Role is a client-side chip in the browser board. Querying all roles
+        # keeps its dynamic option set intact and avoids a second DB round-trip.
+        return hours, kinds, None
+
+    def _on_debate_controls_changed(self, key, params, *, section_b=False):
+        """Persist and apply native client controls without re-reading SQLite."""
+        if key not in self._DEBATE_TABS or key not in self._tab_views:
+            return
+        old = self._normalize_tab_params(
+            key, self._tab_views[key].get("params", {})
+        )
+        if key == "waiting" and section_b:
+            new = copy.deepcopy(old)
+            new["section_b_controls"] = normalize_debate_control_params(
+                "waiting_tasks", params
+            )
+        elif key == "waiting":
+            merged = dict(params or {})
+            merged["section_b_controls"] = old.get("section_b_controls", {})
+            new = self._normalize_tab_params(key, merged)
+        else:
+            new = self._normalize_tab_params(key, params)
+        self._tab_views[key]["params"] = new
+        server_changed = key == "recent" and any(
+            old.get(field) != new.get(field) for field in ("hours", "kinds")
+        )
+        if server_changed:
+            self._debate_source_cache.pop(key, None)
+        self._filtered_cache.pop(key, None)
+        self._save_ui_state()
+
+        idx = self.tabs.currentIndex()
+        if not (0 <= idx < len(self._tab_keys)) or self._tab_keys[idx] != key:
+            return
+        if not server_changed and key in self._debate_source_cache:
+            rows = self._apply_debate_controls(key, self._debate_source_cache[key])
+            self._filtered_cache[key] = rows
+            self._load_debate_tab(key, rows)
+        else:
+            self._load_tab(key)
+
+    def _apply_debate_controls(self, key, rows):
+        """Return a filtered/sorted copy and update the visible result count."""
+        if not rows or "search" in rows:
+            return rows
+        params = self._tab_views.get(key, {}).get("params", {})
+        out = dict(rows)
+        items = []
+        target = ""
+        if key == "recent":
+            target = "items"
+            items = list(rows.get(target, []))
+        elif key == "waiting":
+            section_a = list(rows.get("section_a", []))
+            visible_a = apply_debate_controls(key, section_a, params)
+            section_b = list(rows.get("section_b", []))
+            section_b_params = normalize_debate_control_params(
+                "waiting_tasks", params.get("section_b_controls", {})
+            )
+            visible_b = apply_debate_controls(
+                "waiting_tasks", section_b, section_b_params
+            )
+            out["section_a"] = visible_a
+            out["section_b"] = visible_b
+            out["_control_count"] = (len(visible_a), len(section_a))
+            out["_section_b_control_count"] = (len(visible_b), len(section_b))
+            self._debate_controls[key].set_available(section_a)
+            if self._waiting_task_controls is not None:
+                self._waiting_task_controls.set_available(section_b)
+            return out
+        elif key == "topics" and "thread" in rows:
+            thread = dict(rows.get("thread", {}))
+            items = list(thread.get("messages", []))
+            visible = apply_debate_controls(key, items, params)
+            thread["messages"] = visible
+            out["thread"] = thread
+            out["_control_count"] = (len(visible), len(items))
+            self._debate_controls[key].set_available(items)
+            return out
+        elif key == "topics":
+            digest = dict(rows.get("digest", {}))
+            items = list(digest.get("topics", []))
+            visible = apply_debate_controls(key, items, params)
+            digest["topics"] = visible
+            out["digest"] = digest
+            out["_control_count"] = (len(visible), len(items))
+            self._debate_controls[key].set_available(items)
+            return out
+        if target:
+            visible = apply_debate_controls(key, items, params)
+            out[target] = visible
+            out["_control_count"] = (len(visible), len(items))
+            self._debate_controls[key].set_available(items)
+        return out
 
     def _build_debate_rows(self, key):
         """Return the raw read-only structure for a debate tab (never the task path)."""
@@ -2149,14 +2344,25 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 return {"search": dao.board_search(self._search_text)}
             if key == "recent":
                 hours, kinds, role = self._debate_recent_params()
-                return dao.recent(hours, role, kinds)
-            if key == "waiting":
+                source = dao.recent(hours, role, kinds)
+            elif key == "waiting":
                 items, cand = dao.waiting_section_a()
-                return {"section_a": items, "section_a_before": cand}
-            if key == "topics":
+                task_items, task_before = dao.waiting_section_b()
+                source = {
+                    "section_a": items,
+                    "section_a_before": cand,
+                    "section_b": task_items,
+                    "section_b_before": task_before,
+                }
+            elif key == "topics":
                 if self._topics_open_topic:
-                    return {"thread": dao.topic_thread(self._topics_open_topic)}
-                return {"digest": dao.topics()}
+                    source = {"thread": dao.topic_thread(self._topics_open_topic)}
+                else:
+                    source = {"digest": dao.topics()}
+            else:
+                source = {}
+            self._debate_source_cache[key] = source
+            return self._apply_debate_controls(key, source)
         except sqlite3.Error:
             logging.getLogger("task_tray").warning(
                 "debate read failed for tab %s", key, exc_info=True
@@ -2166,12 +2372,32 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def _load_debate_tab(self, key, rows):
         lw = self.tab_lists[key]
         lw.clear_rows()
+        if key == "waiting" and self._waiting_task_list is not None:
+            self._waiting_task_list.clear_rows()
+            b_visible, b_total = (
+                rows.get("_section_b_control_count", (0, 0)) if rows else (0, 0)
+            )
+            self._waiting_task_controls.set_count(b_visible, b_total)
+        visible, total = rows.get("_control_count", (0, 0)) if rows else (0, 0)
+        self._debate_controls[key].set_count(visible, total)
+        self._debate_controls[key].set_thread_mode(
+            key == "topics" and "thread" in (rows or {})
+        )
         if not rows:
             lw.add_header("—")
             return
         if "search" in rows:
+            self._debate_controls[key].setEnabled(False)
+            if key == "waiting" and self._waiting_task_controls is not None:
+                self._waiting_task_controls.setEnabled(False)
+                self._waiting_task_list.add_header(
+                    "Глобалните резултати са в горния списък"
+                )
             self._load_debate_search(lw, rows["search"])
             return
+        self._debate_controls[key].setEnabled(True)
+        if key == "waiting" and self._waiting_task_controls is not None:
+            self._waiting_task_controls.setEnabled(True)
         if key == "recent":
             items = rows.get("items", [])
             lw.add_header(f"Скорошни решения ({len(items)})")
@@ -2182,12 +2408,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 copy_block = (f"{it.get('role','')} · {it.get('kind','')} · "
                               f"{it.get('age','')} · {mid} · {it.get('body','')}")
                 lw.add_debate_row(mid, text, topic_id=it.get("topic_id"),
-                                  copy_payload=copy_block)
+                                  copy_payload=copy_block,
+                                  reader_payload=self._debate_reader_payload(it))
         elif key == "waiting":
             items = rows.get("section_a", [])
-            lw.add_header(
-                f"Какво чака мен ({len(items)} от {rows.get('section_a_before', 0)})"
-            )
+            # The old denominator counted every recent Q/DECISION candidate,
+            # not operator asks. "1 от 99" was therefore misleading noise on
+            # the operator surface; only the actionable result count belongs
+            # in this header.
+            lw.add_header(f"Какво чака мен ({len(items)})")
             for it in items:
                 mid = it["msg_id"]
                 stale = " ⏳" if it.get("stale") else ""
@@ -2195,7 +2424,44 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                         f"{it.get('age','')}{stale} · {mid[:8]} — {it.get('line','')}")
                 copy_block = (f"{it.get('role','')} · {it.get('kind','')} · "
                               f"{it.get('age','')} · {mid} · {it.get('body','')}")
-                lw.add_debate_row(mid, text, topic_id=None, copy_payload=copy_block)
+                lw.add_debate_row(
+                    mid, text, topic_id=None, copy_payload=copy_block,
+                    reader_payload=self._debate_reader_payload(it),
+                )
+            task_items = rows.get("section_b", [])
+            task_lw = self._waiting_task_list
+            task_lw.add_header(
+                f"Твои задачи — сега ({len(task_items)} от "
+                f"{rows.get('section_b_before', 0)})"
+            )
+            for task in task_items:
+                task_id = str(task.get("id") or "")
+                due = task.get("due_date") or "без срок"
+                text = (
+                    f"[{task.get('section','')}] {task.get('priority','')} · "
+                    f"{due} · {task.get('project','')} — {task.get('title','')}"
+                )
+                record = "\n".join(
+                    f"{name}: {value}" for name, value in (
+                        ("id", task_id),
+                        ("title", task.get("title") or ""),
+                        ("section", task.get("section") or ""),
+                        ("priority", task.get("priority") or ""),
+                        ("status", task.get("status") or ""),
+                        ("due_date", task.get("due_date") or ""),
+                        ("project", task.get("project") or ""),
+                        ("updated_at", task.get("updated_at") or ""),
+                    ) if value
+                )
+                task_lw.add_debate_row(
+                    f"task-{task_id}", text,
+                    copy_payload=record,
+                    reader_payload={
+                        "title": str(task.get("title") or task_id),
+                        "body": str(task.get("title") or ""),
+                        "record": record,
+                    },
+                )
         elif key == "topics":
             if "thread" in rows:
                 th = rows["thread"]
@@ -2210,7 +2476,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     copy_block = (f"{m.get('role','')} · {m.get('kind','')} · "
                                   f"{m.get('age','')} · {mid} · {m.get('body','')}")
                     lw.add_debate_row(mid, text, topic_id=th.get("topic_id"),
-                                      copy_payload=copy_block)
+                                      copy_payload=copy_block,
+                                      reader_payload=self._debate_reader_payload(
+                                          m, topic_id=th.get("topic_id")
+                                      ))
             else:
                 topics = rows.get("digest", {}).get("topics", [])
                 lw.add_header(f"Теми ({len(topics)}) — двоен клик отваря нишката")
@@ -2219,6 +2488,34 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     text = (f"[{t.get('state','')}] {t.get('title','')} · "
                             f"{t.get('count',0)} съобщ. · {t.get('age','')}")
                     lw.add_debate_row(tid, text, topic_id=tid, copy_payload=tid)
+
+    @staticmethod
+    def _debate_reader_payload(item, *, topic_id=None):
+        """Build both human-readable text and a complete copyable record."""
+        msg_id = str(item.get("msg_id") or item.get("id") or "")
+        topic = str(topic_id or item.get("topic_id") or "")
+        body = str(item.get("body") or item.get("title") or "")
+        fields = (
+            ("msg_id", msg_id),
+            ("topic_id", topic),
+            ("role", item.get("role") or ""),
+            ("kind", item.get("kind") or item.get("type") or ""),
+            ("priority", item.get("priority") or ""),
+            ("timestamp", item.get("ts") or item.get("updated_at") or ""),
+        )
+        record = "\n".join(f"{name}: {value}" for name, value in fields if value)
+        if body:
+            record = f"{record}\n\n{body}" if record else body
+        title_bits = [
+            f"[{item.get('kind') or item.get('type') or ''}]",
+            str(item.get("role") or item.get("title") or ""),
+            msg_id,
+        ]
+        return {
+            "title": " · ".join(bit for bit in title_bits if bit),
+            "body": body,
+            "record": record,
+        }
 
     def _load_debate_search(self, lw, result):
         """Render grouped per-source BM25 search results, read-only.
@@ -2237,19 +2534,48 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             text = (f"[{r.get('kind','')}] {r.get('role','')} · {mid[:8]} — "
                     f"{r.get('snippet','') or r.get('body','')}")
             lw.add_debate_row(mid, text, topic_id=r.get("topic_id"),
-                              copy_payload=f"{mid} · {r.get('body','')}")
+                              copy_payload=f"{mid} · {r.get('body','')}",
+                              reader_payload=self._debate_reader_payload(r))
         lw.add_header(f"Задачи/бележки ({len(tasks)})")
         for r in tasks:
             tid = r.get("id", "")
             text = f"[{r.get('type','')}/{r.get('status','')}] {r.get('title','')}"
             lw.add_debate_row(f"task-{tid}", text, topic_id=None,
-                              copy_payload=str(r.get("title", "")))
+                              copy_payload=str(r.get("title", "")),
+                              reader_payload=self._debate_reader_payload(r))
         lw.add_header(f"Знание ({len(knowledge)})")
         for r in knowledge:
             eid = r.get("id", "")
             text = f"[{r.get('type','')}] {r.get('name','')}"
             lw.add_debate_row(f"entity-{eid}", text, topic_id=None,
-                              copy_payload=str(r.get("name", "")))
+                              copy_payload=str(r.get("name", "")),
+                              reader_payload={
+                                  "title": str(r.get("name") or eid),
+                                  "body": str(r.get("name") or ""),
+                                  "record": "\n".join(
+                                      f"{name}: {value}" for name, value in (
+                                          ("id", eid),
+                                          ("type", r.get("type") or ""),
+                                          ("name", r.get("name") or ""),
+                                      ) if value
+                                  ),
+                              })
+
+    def _open_debate_reader(self, payload):
+        """Open a local read-only reader; selection and Ctrl+C stay native."""
+        dialog = DebateReaderDialog(payload, self)
+        dialog.setStyleSheet(_build_debate_reader_style())
+        dialog.exec()
+
+    def _on_topics_back(self):
+        """Return from a read-only thread to the topic digest."""
+        if not self._topics_open_topic:
+            return
+        self._topics_open_topic = None
+        self._debate_source_cache.pop("topics", None)
+        self._filtered_cache.pop("topics", None)
+        self._debate_controls["topics"].set_thread_mode(False)
+        self._load_tab("topics")
 
     def _on_debate_navigate(self, target):
         """In-app navigation from a debate row: open the topics tab on a topic.
@@ -2259,8 +2585,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         if not target:
             return
         self._topics_open_topic = str(target)
+        self._debate_source_cache.pop("topics", None)
+        self._filtered_cache.pop("topics", None)
         if "topics" in self._tab_keys:
-            self._filtered_cache.pop("topics", None)
             self.tabs.setCurrentIndex(self._tab_keys.index("topics"))
             self._load_tab("topics")
 

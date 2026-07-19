@@ -16,6 +16,140 @@ import db_utils
 from schema import init_db
 
 
+def test_memory_events_stream_export_is_byte_equivalent_and_atomic(tmp_path):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = str(tmp_path / "bridge")
+    init_db(db_path)
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [
+            (
+                f"event-{i}", "field.set", "task", f"task-{i}", "description",
+                "system", None, "fedora", "test", i,
+                f"2026-07-19T10:00:0{i}+00:00", None, f"стойност {i}",
+                json.dumps({"i": i}), None, "test", f"ref-{i}", "откъс", 0, 5,
+            )
+            for i in range(1, 4)
+        ]
+        conn.executemany(
+            "INSERT INTO memory_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        expected = db_utils.json_dumps(db_utils.export_memory_events(conn))
+        rel_path, count = db_utils.write_memory_events_file_streaming(
+            conn, bridge_dir
+        )
+    finally:
+        conn.close()
+
+    output = tmp_path / "bridge" / rel_path
+    assert count == 3
+    assert output.read_text(encoding="utf-8") == expected
+    assert not output.with_suffix(".json.tmp").exists()
+
+
+def test_extended_writer_preserves_prestreamed_memory_events(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    event_path = bridge_dir / "extended_memory" / "memory_events.json"
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text('[{"event_id":"sentinel"}]', encoding="utf-8")
+
+    written = db_utils.write_extended_memory_files(
+        str(bridge_dir),
+        {"memory_events": [], "context_chunks": []},
+        skip_keys={"memory_events"},
+    )
+
+    assert event_path.read_text(encoding="utf-8") == '[{"event_id":"sentinel"}]'
+    assert "extended_memory/memory_events.json" not in written
+
+
+def test_extended_export_can_omit_materialized_memory_events(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "export_memory_events",
+        lambda _conn: (_ for _ in ()).throw(AssertionError("must stream, not materialize")),
+    )
+    try:
+        result = bridge_sync_worker._export_extended_memory(
+            conn, include_memory_events=False
+        )
+    finally:
+        conn.close()
+    assert "memory_events" not in result
+
+
+def test_streaming_json_array_parser_handles_tiny_chunks(tmp_path):
+    path = tmp_path / "array.json"
+    payload = [
+        {"id": 1, "text": "кирилица"},
+        {"id": 2, "nested": {"ok": True}},
+    ]
+    path.write_text(db_utils.json_dumps(payload), encoding="utf-8")
+    assert list(db_utils._iter_json_array_file(path, chunk_size=5)) == payload
+
+
+def test_streaming_event_import_keeps_only_required_and_causal_heads(tmp_path):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+
+    def event(event_id, kind, aggregate_id, field, clock):
+        return {
+            "event_id": event_id,
+            "event_type": "field.set",
+            "aggregate_kind": kind,
+            "aggregate_id": aggregate_id,
+            "field_name": field,
+            "actor_type": "system",
+            "actor_id": None,
+            "machine_id": "peer-a",
+            "tool_name": "test",
+            "logical_clock": clock,
+            "event_ts": f"2026-07-19T10:00:{clock:02d}+00:00",
+            "old_value": None,
+            "new_value": str(clock),
+            "payload_json": None,
+            "parent_event_id": None,
+            "source_kind": None,
+            "source_ref": None,
+            "source_excerpt": None,
+            "source_start": None,
+            "source_end": None,
+        }
+
+    events = [
+        event("status-old", "task", "task-1", "status", 1),
+        event("explicit-description", "task", "task-1", "description", 2),
+        event("unneeded-description", "task", "task-2", "description", 3),
+        event("status-new", "task", "task-1", "status", 4),
+        event("fact-old", "fact", "fact-1", None, 5),
+        event("fact-new", "fact", "fact-1", None, 6),
+    ]
+    path = tmp_path / "memory_events.json"
+    path.write_text(db_utils.json_dumps(events), encoding="utf-8")
+    try:
+        processed, subset = db_utils.import_memory_events_file_streaming(
+            conn,
+            path,
+            required_event_ids={"explicit-description"},
+            batch_size=2,
+        )
+        stored = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert processed == stored == len(events)
+    subset_ids = {item["event_id"] for item in subset}
+    assert subset_ids == {"explicit-description", "status-new", "fact-new"}
+
+
 @pytest.fixture
 def setup(tmp_path):
     db_path = str(tmp_path / "test.db")

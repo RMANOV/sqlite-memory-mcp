@@ -118,9 +118,10 @@ def test_T2_fxa_section_a_zero():
         dao.close()
 
 
-def test_ADOPTIONFIX1_fxa_live_await_surfaces_real_asks():
-    """Adoption fix 1: with the live-await layer ON, FX-A (the real prod snapshot
-    @ as_of) surfaces the operator-await asks that fallback mode showed as 0."""
+def test_LIVE_AWAIT_fxa_drops_broad_keyword_false_positives():
+    """The frozen prod snapshot contains historical operator keywords but no
+    explicit unresolved operator request. The live view must stay empty rather
+    than reviving those receipts as work."""
     from debate_read_dao import DebateReadDAO
 
     dao = DebateReadDAO(FX_A, clock=asof_clock, forbid_path=PROD)
@@ -128,12 +129,7 @@ def test_ADOPTIONFIX1_fxa_live_await_surfaces_real_asks():
         layer1, _ = dao.waiting_section_a(live_await=False)
         combined, _ = dao.waiting_section_a(live_await=True)
         assert len(layer1) == 0
-        assert len(combined) > 0, "live-await layer must surface role-addressed asks"
-        # every added row carries a live-await provenance and is ts-DESC sorted
-        assert all(x["fwd"].startswith("live-await:") for x in combined
-                   if x not in layer1)
-        ts = [x["ts"] for x in combined]
-        assert ts == sorted(ts, reverse=True)
+        assert combined == [], "historical operator keywords are not pending asks"
     finally:
         dao.close()
 
@@ -193,7 +189,8 @@ def _build_synth_debate_db(path, now):
         ("m1", "t", "CONDUCTOR", ts(-2), "H", "Q", None, "чака операторска ръка за deploy решение", ts(-2)),
         # m2: marker but already-given (own body _A_TAKEN) → excluded
         ("m2", "t", "ADVOCATE", ts(-1), "M", "DECISION", None, "операторско GO записано, продължаваме", ts(-1)),
-        # m3: STATUS with 'кажи ' marker → layer 2 surfaces
+        # m3: generic 'кажи' is addressed to a team role, not mechanically to
+        # the operator → excluded (this broad marker caused live false positives)
         ("m3", "t", "EXECUTOR3", ts(-3), "M", "STATUS", None, "кажи дали да пусна сега", ts(-3)),
         # m4: human- recipient → layer 1 (must be deduped from layer 2)
         ("m4", "t", "CONDUCTOR", ts(-2, -1), "H", "Q", None, "чака операторска ръка", ts(-2, -1)),
@@ -202,6 +199,20 @@ def _build_synth_debate_db(path, now):
         # m6 + m6r: resolved (descendant records decision taken) → excluded
         ("m6", "t", "ADVOCATE", ts(-4), "M", "DECISION", None, "нужна операторска ръка", ts(-4)),
         ("m6r", "t", "CONDUCTOR", ts(-3, -12), "M", "STATUS", "m6", "операторско решение взето", ts(-3, -12)),
+        # m7: exact production regression. A role-routed implementation order
+        # merely states a deployment guardrail; it does NOT wait on the operator.
+        ("m7", "t", "CONDUCTOR", ts(-6), "H", "Q", None,
+         "EXECUTOR — НОВО РАЗПОРЕЖДАНЕ. Без нов push/merge/deploy без ADVOCATE gate и операторски GO.", ts(-6)),
+        # m8 + m8r: an explicit ask later superseded by a final completed stack.
+        ("m8", "t", "CONDUCTOR", ts(-1), "M", "STATUS", None,
+         "ЧАКАТ операторска sudo команда", ts(-1)),
+        ("m8r", "t", "CONDUCTOR", ts(-1, 1), "M", "STATUS", "m8",
+         "КОРЕКЦИЯ. ФИНАЛЕН ИНСТАЛИРАН СТЕК — всичко работи.", ts(-1, 1)),
+        # m9: audit/receipt prose may quote the classifier vocabulary later in
+        # the body. Only the leading paragraph can declare an actionable ask.
+        ("m9", "t", "EXECUTOR", ts(0, -2), "M", "STATUS", None,
+         "HOTFIX RECEIPT: strict classifier installed.\n\n"
+         "Implementation detail: accepts explicit pending operator language.", ts(0, -2)),
     ]
     c.executemany("INSERT INTO debate_messages VALUES(?,?,?,?,?,?,?,?,?)", rows)
     c.execute("INSERT INTO debate_message_recipients(msg_id,recipient) VALUES('m4','human-operator')")
@@ -211,8 +222,9 @@ def _build_synth_debate_db(path, now):
 
 
 def test_ADOPTIONFIX1_live_await_surfaces_role_addressed(tmp_path):
-    """Layer 2 surfaces role-addressed body-marker asks; excludes already-given /
-    aged-out / resolved; dedups the human- recipient row against layer 1."""
+    """Layer 2 surfaces explicit body-marker asks; excludes broad historical /
+    guardrail keywords, already-given, aged-out, and resolved rows; dedups the
+    human-recipient row against layer 1."""
     import datetime as _dt
     from debate_read_dao import DebateReadDAO
 
@@ -224,10 +236,14 @@ def test_ADOPTIONFIX1_live_await_surfaces_role_addressed(tmp_path):
         layer1 = {x["msg_id"] for x in dao.waiting_section_a(live_await=False)[0]}
         combined = {x["msg_id"] for x in dao.waiting_section_a(live_await=True)[0]}
         assert layer1 == {"m4"}, f"layer 1 (human- recipient) should be m4, got {layer1}"
-        assert combined == {"m1", "m3", "m4"}, f"combined mismatch: {combined}"
+        assert combined == {"m1", "m4"}, f"combined mismatch: {combined}"
         assert "m2" not in combined  # already-given GO
+        assert "m3" not in combined  # generic team-role 'кажи', not an operator ask
         assert "m5" not in combined  # >21d
         assert "m6" not in combined  # resolved in-thread
+        assert "m7" not in combined  # implementation guardrail, exact live regression
+        assert "m8" not in combined  # final completed descendant
+        assert "m9" not in combined  # quoted classifier vocabulary below lead paragraph
     finally:
         dao.close()
 
@@ -367,7 +383,7 @@ def test_S2e_no_cas_or_dml_or_mutation_in_new_code():
                     "update_task", "mark_done", "delete_task"}
     banned_imports = {"db_utils", "subprocess", "close_task"}
     for m in debate_mods:
-        imports, names, calls = (), set(), set()
+        imports, calls = (), set()
         import ast
         tree = ast.parse(open(m).read())
         imports = set()
@@ -438,10 +454,156 @@ def test_debate_widget_context_menu_readonly(qapp, monkeypatch):
     from PyQt6.QtCore import QPoint
 
     w._context_menu(QPoint(0, 0))
-    assert labels == ["Copy msg_id", "Copy row", "Open thread"], (
+    assert labels == [
+        "Копирай ID",
+        "Копирай целия запис",
+        "Копирай избраните",
+        "Копирай всички видими",
+        "Отвори нишката",
+    ], (
         f"context menu must be read-only, got {labels}"
     )
     assert "Delete" not in labels and "Convert to Note" not in labels
+
+
+def test_browser_equivalent_controls_filter_text_and_sort():
+    from debate_list_widget import (
+        apply_debate_controls,
+        default_debate_control_params,
+    )
+
+    rows = [
+        {"msg_id": "old-h", "ts": "2026-07-18T08:00:00Z", "priority": "H",
+         "role": "CONDUCTOR", "kind": "Q", "line": "операторско решение",
+         "body": "нужно е сега", "fwd": "чака оператор"},
+        {"msg_id": "new-m", "ts": "2026-07-19T08:00:00Z", "priority": "M",
+         "role": "ADVOCATE", "kind": "DECISION", "line": "UX verdict",
+         "body": "точният текст", "fwd": "чака оператор"},
+        {"msg_id": "new-h", "ts": "2026-07-19T09:00:00Z", "priority": "H",
+         "role": "ADVOCATE", "kind": "Q", "line": "друг въпрос",
+         "body": "без съвпадение", "fwd": "чака оператор"},
+    ]
+    params = default_debate_control_params("waiting")
+    assert [r["msg_id"] for r in apply_debate_controls("waiting", rows, params)] == [
+        "new-h", "new-m", "old-h"
+    ]  # default web sort: ts DESC
+
+    params["control_filters"] = {
+        "priority": ["M"], "role": ["ADVOCATE"], "kind": ["DECISION"]
+    }
+    params["control_text"] = "ТОЧНИЯТ"
+    assert [r["msg_id"] for r in apply_debate_controls("waiting", rows, params)] == [
+        "new-m"
+    ]
+
+    params = default_debate_control_params("waiting")
+    params["control_sort"] = "priority"
+    params["control_dir"] = 1
+    assert [r["priority"] for r in apply_debate_controls("waiting", rows, params)] == [
+        "H", "H", "M"
+    ]
+    params["control_dir"] = -1
+    assert [r["priority"] for r in apply_debate_controls("waiting", rows, params)] == [
+        "M", "H", "H"
+    ]
+
+
+def test_recent_control_defaults_and_state_normalization():
+    from debate_list_widget import normalize_debate_control_params
+
+    state = normalize_debate_control_params("recent", {})
+    assert state["hours"] == 24
+    assert state["kinds"] == ["DECISION", "STATE", "STATUS"]
+    assert state["control_sort"] == "ts" and state["control_dir"] == -1
+
+    restored = normalize_debate_control_params("recent", {
+        "hours": 72,
+        "kinds": ["DECISION"],
+        "control_sort": "role",
+        "control_dir": 1,
+        "control_text": "UX",
+        "control_filters": {"priority": ["H"], "role": ["EXECUTOR3"]},
+    })
+    assert restored["hours"] == 72
+    assert restored["kinds"] == ["DECISION"]
+    assert restored["control_text"] == "UX"
+    assert restored["control_filters"]["role"] == ["EXECUTOR3"]
+
+
+def test_waiting_section_b_controls_match_browser_due_and_project_logic():
+    from datetime import date, timedelta
+    from debate_list_widget import (
+        apply_debate_controls,
+        default_debate_control_params,
+    )
+
+    today = date.today()
+    rows = [
+        {"id": "overdue", "title": "старо", "section": "today",
+         "priority": "high", "project": "alpha",
+         "due_date": (today - timedelta(days=1)).isoformat(), "updated_at": "1"},
+        {"id": "week", "title": "тази седмица", "section": "next",
+         "priority": "medium", "project": "alpha",
+         "due_date": (today + timedelta(days=5)).isoformat(), "updated_at": "2"},
+        {"id": "later", "title": "по-късно", "section": "next",
+         "priority": "critical", "project": "beta",
+         "due_date": (today + timedelta(days=15)).isoformat(), "updated_at": "3"},
+        {"id": "none", "title": "без срок", "section": "today",
+         "priority": "low", "project": "alpha", "due_date": "", "updated_at": "4"},
+    ]
+    params = default_debate_control_params("waiting_tasks")
+    params["control_filters"] = {
+        "priority": [], "project": ["alpha"], "section": [], "due": ["le7"]
+    }
+    assert [r["id"] for r in apply_debate_controls("waiting_tasks", rows, params)] == [
+        "week"
+    ]
+    params["control_filters"]["due"] = ["none", "overdue"]
+    assert [r["id"] for r in apply_debate_controls("waiting_tasks", rows, params)] == [
+        "overdue", "none"
+    ]
+
+
+def test_reader_supports_partial_and_whole_copy(qapp):
+    from debate_list_widget import DebateReaderDialog
+
+    payload = {
+        "title": "[Q] CONDUCTOR · abc",
+        "body": "първа част\nвтора част",
+        "record": "msg_id: abc\nrole: CONDUCTOR\n\nпърва част\nвтора част",
+    }
+    dlg = DebateReaderDialog(payload)
+    try:
+        # QPlainTextEdit is a native selectable reader: selecting a fragment and
+        # invoking copy must copy only that fragment.
+        cursor = dlg.body_view.textCursor()
+        cursor.setPosition(0)
+        cursor.setPosition(5, cursor.MoveMode.KeepAnchor)
+        dlg.body_view.setTextCursor(cursor)
+        dlg.body_view.copy()
+        assert qapp.clipboard().text() == "първа"
+
+        dlg.copy_full_text()
+        assert qapp.clipboard().text() == payload["body"]
+        dlg.copy_full_record()
+        assert qapp.clipboard().text() == payload["record"]
+    finally:
+        dlg.close()
+
+
+def test_debate_list_ctrl_c_selected_or_all(qapp):
+    from debate_list_widget import DebateListWidget
+
+    w = DebateListWidget()
+    first = w.add_debate_row("m1", "one", copy_payload="record one")
+    second = w.add_debate_row("m2", "two", copy_payload="record two")
+    first.setSelected(True)
+    w.copy_selected()
+    assert qapp.clipboard().text() == "record one"
+    first.setSelected(False)
+    second.setSelected(False)
+    w.copy_selected()
+    assert qapp.clipboard().text() == "record one\n\nrecord two"
 
 
 def test_tasklistwidget_debate_guard_double_click(qapp):
@@ -542,6 +704,52 @@ def test_BLOCKER1_fullwindow_debate_tabs_visible_and_load(qapp, tmp_path, monkey
         # even under the live clock; recent 1h may be empty but is still shown).
         assert fw.tab_lists["waiting"].count() > 0
         assert fw.tab_lists["topics"].count() > 0
+        # Exact browser waiting surface: independent controls and a second
+        # read-only list for relevant today/next tasks.
+        assert fw._waiting_task_controls is not None
+        assert fw._waiting_task_list is not None
+        assert fw._waiting_task_list.count() > 0
+
+        # New native surfaces use the same user-owned appearance pipeline as
+        # the established task tabs from the very first frame.
+        import tray_dialogs as td
+        expected_list_style = td._build_list_style()
+        expected_surface_style = td._build_debate_surface_style()
+        for key in ("recent", "waiting", "topics"):
+            assert fw.tab_lists[key].styleSheet() == expected_list_style
+            assert fw._debate_pages[key].styleSheet() == expected_surface_style
+        assert fw._waiting_task_list.styleSheet() == expected_list_style
+
+        # A later user appearance change propagates to all new tabs and their
+        # secondary list; it is not a hard-coded one-off dark theme.
+        old_appearance = (td._theme_name, td._font_size, td._bold)
+        try:
+            td._theme_name, td._font_size, td._bold = "light", 17, True
+            fw._apply_debate_appearance()
+            light_surface = td._build_debate_surface_style()
+            light_list = td._build_list_style()
+            assert "#f7fafc" in light_surface
+            assert "font-size: 17px" in light_surface
+            assert "font-weight: bold" in light_surface
+            for key in ("recent", "waiting", "topics"):
+                assert fw._debate_pages[key].styleSheet() == light_surface
+                assert fw.tab_lists[key].styleSheet() == light_list
+            assert fw._waiting_task_list.styleSheet() == light_list
+        finally:
+            td._theme_name, td._font_size, td._bold = old_appearance
+            fw._apply_debate_appearance()
+
+        # Per-tab control state is serialized with the existing QSettings view
+        # profile, not lost when the user changes tabs/restarts the tray.
+        state = fw._debate_controls["waiting"].state()
+        state["control_text"] = "fixture waiting ask 1"
+        state["control_sort"] = "role"
+        state["control_dir"] = 1
+        fw._on_debate_controls_changed("waiting", state)
+        import json
+        persisted = json.loads(fw._settings.value("tab_views"))
+        assert persisted["waiting"]["params"]["control_text"] == "fixture waiting ask 1"
+        assert persisted["waiting"]["params"]["control_sort"] == "role"
     finally:
         if getattr(fw, "_debate_dao", None) is not None:
             fw._debate_dao.close()

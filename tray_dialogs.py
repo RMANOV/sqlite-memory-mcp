@@ -340,6 +340,72 @@ def _build_filter_style():
     """
 
 
+def _build_debate_surface_style():
+    """Build native debate controls from the active user appearance.
+
+    This is deliberately not a separate theme: it consumes the same palette,
+    font size, and bold preference as every established tray tab.
+    """
+    t, fs, fw = _T(), _font_size, _fw()
+    return f"""
+        QWidget#debate-page, QWidget#debate-section {{
+            background: {t["bg"]}; color: {t["text"]};
+            font-size: {fs}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls {{
+            background: {t["bg"]}; color: {t["text"]};
+            border-bottom: 1px solid {t["bg3"]};
+            font-size: {fs}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls QLabel {{
+            color: {t["text2"]}; font-size: {fs - 1}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls QLineEdit {{
+            background: {t["bg3"]}; color: {t["text"]};
+            border: 1px solid {t["border"]}; border-radius: 4px;
+            padding: 4px 8px; font-size: {fs}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls QLineEdit:focus {{ border-color: {t["accent"]}; }}
+        QWidget#debate-controls QComboBox {{
+            background: {t["bg3"]}; color: {t["text"]};
+            border: 1px solid {t["border"]}; border-radius: 4px;
+            padding: 3px 8px; font-size: {fs - 1}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls QComboBox QAbstractItemView {{
+            background: {t["bg3"]}; color: {t["text"]};
+            selection-background-color: {t["accent"]}; selection-color: #ffffff;
+        }}
+        QWidget#debate-controls QToolButton {{
+            background: {t["bg3"]}; color: {t["text2"]};
+            border: 1px solid {t["border"]}; border-radius: 10px;
+            padding: 2px 8px; font-size: {fs - 2}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls QToolButton:hover,
+        QWidget#debate-controls QToolButton:checked {{
+            background: {t["accent"]}; color: #ffffff; border-color: {t["accent"]};
+        }}
+        QWidget#debate-controls QPushButton {{
+            background: {t["bg3"]}; color: {t["text"]};
+            border: 1px solid {t["border"]}; border-radius: 4px;
+            padding: 4px 10px; font-size: {fs - 1}px; font-weight: {fw};
+        }}
+        QWidget#debate-controls QPushButton:hover {{
+            background: {t["accent"]}; color: #ffffff;
+        }}
+        QSplitter#debate-splitter::handle {{
+            background: {t["bg2"]}; height: 5px;
+            border-top: 1px solid {t["border"]};
+            border-bottom: 1px solid {t["border"]};
+        }}
+        QMenu {{
+            background: {t["bg2"]}; color: {t["text"]};
+            border: 1px solid {t["border"]}; font-size: {fs}px;
+            font-weight: {fw};
+        }}
+        QMenu::item:selected {{ background: {t["accent"]}; color: #ffffff; }}
+    """
+
+
 def _build_list_style():
     """Build TaskListWidget stylesheet from current theme."""
     t, fs, fw = _T(), _font_size, _fw()
@@ -355,6 +421,30 @@ def _build_list_style():
                                            background: {t["bg2"]}; border-radius: 3px; }}
         QListWidget::indicator:checked {{ border: 2px solid {t["accent"]};
                                          background: {t["accent"]}; border-radius: 3px; }}
+    """
+
+
+def _build_debate_reader_style():
+    """Build the selectable debate reader from the active tray appearance."""
+    t, fs, fw = _T(), _font_size, _fw()
+    return _build_dialog_style() + f"""
+        QDialog {{ background: {t["bg"]}; color: {t["text"]};
+                   font-size: {fs}px; font-weight: {fw}; }}
+        QTabWidget::pane {{
+            background: {t["bg"]}; border: 1px solid {t["border"]};
+        }}
+        QTabBar::tab {{
+            background: {t["bg2"]}; color: {t["text2"]};
+            border: 1px solid {t["border"]}; border-bottom: none;
+            padding: 6px 16px; font-size: {fs}px; font-weight: {fw};
+        }}
+        QTabBar::tab:selected {{ background: {t["accent"]}; color: #ffffff; }}
+        QPlainTextEdit {{
+            background: {t["bg"]}; color: {t["text"]};
+            border: none; padding: 12px; font-size: {fs}px;
+            font-weight: {fw}; selection-background-color: {t["accent"]};
+            selection-color: #ffffff;
+        }}
     """
 
 
