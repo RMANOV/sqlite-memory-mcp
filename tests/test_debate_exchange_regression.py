@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_file_location
+import json
 from pathlib import Path
 import os
 import sqlite3
@@ -12,6 +13,7 @@ import sys
 import pytest
 
 from debate import (
+    DebateError,
     bind_role_session,
     claim_worker_session,
     debate_post_with_recipients,
@@ -202,6 +204,20 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
     ).fetchone()[0] == 0
 
 
+def test_worker_recovery_validation_uses_worker_diagnostic_namespace(exchange_db):
+    con, _path = exchange_db
+    cutoff = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with pytest.raises(DebateError) as exc_info:
+        recover_stale_worker_claims(
+            con,
+            topic_id="EXCHANGE1",
+            older_than_ts=cutoff,
+            minimum_age_seconds=120,
+        )
+    assert exc_info.value.error_type == "worker_claim_recovery_cutoff_too_recent"
+    assert "worker_claim_recovery_cutoff_too_recent" in str(exc_info.value)
+
+
 def test_pump_reads_only_init_or_active_topics_and_stop_wait_is_interruptible(
     tmp_path, monkeypatch
 ):
@@ -240,6 +256,55 @@ def test_pump_reads_only_init_or_active_topics_and_stop_wait_is_interruptible(
     pump._handle_signal(15, None)
     assert pump._wait_or_stop(10.0) is True
     assert (datetime.now(timezone.utc) - started).total_seconds() < 0.5
+
+
+@pytest.mark.parametrize("operation", ["unlink", "replace", "open"])
+def test_pump_log_filesystem_failures_fall_back_without_escaping(
+    operation, tmp_path, monkeypatch, capsys
+):
+    pump = _load_hook(f"debate_pump_log_{operation}_regression", "hooks/debate_pump.py")
+    pump.LOG_PATH = tmp_path / "pump.jsonl"
+    pump.LOG_MAX_BYTES = 1
+    pump.LOG_KEEP = 1
+    pump.LOG_PATH.write_text("rotation required\n", encoding="utf-8")
+
+    if operation == "unlink":
+        archive = pump.LOG_PATH.with_name(f"{pump.LOG_PATH.name}.1")
+        archive.write_text("old archive\n", encoding="utf-8")
+        original = Path.unlink
+
+        def fail_unlink(path, *args, **kwargs):
+            if path == archive:
+                raise OSError("forced unlink failure")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+    elif operation == "replace":
+        original = Path.replace
+
+        def fail_replace(path, target):
+            if path == pump.LOG_PATH:
+                raise OSError("forced replace failure")
+            return original(path, target)
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+    else:
+        pump.LOG_MAX_BYTES = 1024 * 1024
+        original = Path.open
+
+        def fail_open(path, *args, **kwargs):
+            if path == pump.LOG_PATH:
+                raise OSError("forced open failure")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_open)
+
+    pump._log("regression_probe", operation=operation)
+
+    payload = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+    assert payload["event"] == "pump_log_fallback"
+    assert payload["failed_event"] == "regression_probe"
+    assert operation in payload["error"]
 
 
 def test_regression_probe_is_clean():

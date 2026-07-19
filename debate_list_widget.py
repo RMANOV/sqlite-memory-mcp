@@ -54,45 +54,45 @@ _PRIORITY_ORDER = {
 _CONTROL_CONFIG = {
     "waiting": {
         "sorts": (
-            ("ts", "възраст", -1, "ts"),
-            ("priority", "приоритет", 1, "priority"),
-            ("role", "роля", 1, "text"),
-            ("kind", "вид", 1, "text"),
+            ("ts", "Age", -1, "ts"),
+            ("priority", "Priority", 1, "priority"),
+            ("role", "Role", 1, "text"),
+            ("kind", "Kind", 1, "text"),
         ),
         "filters": (
-            ("priority", "приоритет", ("H", "M", "L", "INFO")),
-            ("role", "роля", None),
-            ("kind", "вид", None),
+            ("priority", "Priority", ("H", "M", "L", "INFO")),
+            ("role", "Role", None),
+            ("kind", "Kind", None),
         ),
         "text_fields": ("role", "kind", "line", "body", "fwd"),
     },
     "recent": {
         "sorts": (
-            ("ts", "възраст", -1, "ts"),
-            ("priority", "приоритет", 1, "priority"),
-            ("role", "роля", 1, "text"),
-            ("kind", "вид", 1, "text"),
+            ("ts", "Age", -1, "ts"),
+            ("priority", "Priority", 1, "priority"),
+            ("role", "Role", 1, "text"),
+            ("kind", "Kind", 1, "text"),
         ),
         "filters": (
-            ("priority", "приоритет", ("H", "M", "L", "INFO")),
-            ("role", "роля", None),
-            ("kind", "вид", None),
+            ("priority", "Priority", ("H", "M", "L", "INFO")),
+            ("role", "Role", None),
+            ("kind", "Kind", None),
         ),
         "text_fields": ("role", "kind", "line", "body"),
     },
     "waiting_tasks": {
         "sorts": (
-            ("due_date", "срок", 1, "date"),
-            ("priority", "приоритет", 1, "priority"),
-            ("project", "проект", 1, "text"),
-            ("section", "секция", 1, "text"),
-            ("updated_at", "ъпдейт", -1, "ts"),
+            ("due_date", "Due", 1, "date"),
+            ("priority", "Priority", 1, "priority"),
+            ("project", "Project", 1, "text"),
+            ("section", "Section", 1, "text"),
+            ("updated_at", "Updated", -1, "ts"),
         ),
         "filters": (
-            ("priority", "приоритет", ("critical", "high", "medium", "low")),
-            ("project", "проект", None),
-            ("section", "секция", ("today", "next")),
-            ("due", "срок", ("overdue", "le7", "le21", "none")),
+            ("priority", "Priority", ("critical", "high", "medium", "low")),
+            ("project", "Project", None),
+            ("section", "Section", ("today", "next")),
+            ("due", "Due", ("overdue", "le7", "le21", "none")),
         ),
         "text_fields": ("title", "project", "section", "priority"),
     },
@@ -104,18 +104,18 @@ _CONTROL_CONFIG = {
 }
 
 _RECENT_KIND_PRESETS = (
-    (("DECISION", "STATE", "STATUS"), "решения + статуси"),
-    (("DECISION", "STATE", "STATUS", "A", "Q", "PING"), "всичко значещо"),
-    (("DECISION",), "само DECISION"),
-    (("DECISION", "STATE"), "DECISION + STATE"),
-    (("STATUS",), "само STATUS"),
+    (("DECISION", "STATE", "STATUS"), "Decisions + statuses"),
+    (("DECISION", "STATE", "STATUS", "A", "Q", "PING"), "All meaningful"),
+    (("DECISION",), "Decisions only"),
+    (("DECISION", "STATE"), "Decisions + states"),
+    (("STATUS",), "Statuses only"),
 )
 
 _FILTER_VALUE_LABELS = {
-    "overdue": "Просрочени",
-    "le7": "≤7д",
-    "le21": "≤21д",
-    "none": "Без срок",
+    "overdue": "Overdue",
+    "le7": "≤7d",
+    "le21": "≤21d",
+    "none": "No due date",
 }
 
 
@@ -277,24 +277,24 @@ class DebateControlsWidget(QWidget):
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(6)
 
-        self.back_btn = QPushButton("← теми")
+        self.back_btn = QPushButton("← Topics")
         self.back_btn.setVisible(False)
         self.back_btn.clicked.connect(self.back_requested)
         layout.addWidget(self.back_btn)
 
         if key == "recent":
-            layout.addWidget(QLabel("Период:"))
+            layout.addWidget(QLabel("Period:"))
             self.hours_combo = QComboBox()
             for value, label in (
-                (1, "1 час"), (3, "3 часа"), (6, "6 часа"),
-                (12, "12 часа"), (24, "24 часа"), (72, "3 дни"),
-                (168, "7 дни"),
+                (1, "1 hour"), (3, "3 hours"), (6, "6 hours"),
+                (12, "12 hours"), (24, "24 hours"), (72, "3 days"),
+                (168, "7 days"),
             ):
                 self.hours_combo.addItem(label, value)
             self.hours_combo.currentIndexChanged.connect(self._emit_now)
             layout.addWidget(self.hours_combo)
 
-            layout.addWidget(QLabel("Извличай:"))
+            layout.addWidget(QLabel("Show:"))
             self.kinds_combo = QComboBox()
             for kinds, label in _RECENT_KIND_PRESETS:
                 self.kinds_combo.addItem(label, list(kinds))
@@ -303,21 +303,21 @@ class DebateControlsWidget(QWidget):
 
         config = _CONTROL_CONFIG[key]
         if config["sorts"]:
-            layout.addWidget(QLabel("Сорт:"))
+            layout.addWidget(QLabel("Sort:"))
             self.sort_combo = QComboBox()
             for sort_key, label, default_dir, _sort_type in config["sorts"]:
                 self.sort_combo.addItem(label, (sort_key, default_dir))
             self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
             layout.addWidget(self.sort_combo)
             self.direction_btn = QToolButton()
-            self.direction_btn.setToolTip("Обърни посоката на сортиране")
+            self.direction_btn.setToolTip("Reverse sort direction")
             self.direction_btn.clicked.connect(self._toggle_direction)
             layout.addWidget(self.direction_btn)
 
         for dimension, label, options in config["filters"]:
             button = QToolButton()
             button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-            button.setText(f"{label}: всички ▾")
+            button.setText(f"{label}: All ▾")
             self._filter_buttons[dimension] = button
             self._selected_filters[dimension] = set()
             self._filter_options[dimension] = list(options or [])
@@ -326,7 +326,7 @@ class DebateControlsWidget(QWidget):
         self.text_input = QLineEdit()
         self.text_input.setClearButtonEnabled(True)
         self.text_input.setPlaceholderText(
-            "🔍 филтър по тема…" if key == "topics" else "🔍 филтър в рамките…"
+            "🔍 Filter by topic…" if key == "topics" else "🔍 Filter within results…"
         )
         self.text_input.setMinimumWidth(190)
         self.text_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -426,7 +426,7 @@ class DebateControlsWidget(QWidget):
     def _rebuild_filter_menu(self, dimension: str):
         button = self._filter_buttons[dimension]
         menu = QMenu(button)
-        clear_action = menu.addAction("Всички")
+        clear_action = menu.addAction("All")
         clear_action.triggered.connect(
             lambda _checked=False, d=dimension: self._clear_filter(d)
         )
@@ -450,7 +450,7 @@ class DebateControlsWidget(QWidget):
             if dim == dimension
         )
         button.setText(
-            f"{label}: {len(selected)} ▾" if selected else f"{label}: всички ▾"
+            f"{label}: {len(selected)} ▾" if selected else f"{label}: All ▾"
         )
 
     def _clear_filter(self, dimension: str):
@@ -495,7 +495,7 @@ class DebateReaderDialog(QDialog):
     def __init__(self, payload: dict, parent=None):
         super().__init__(parent)
         self._payload = dict(payload or {})
-        self.setWindowTitle(str(self._payload.get("title") or "Преглед"))
+        self.setWindowTitle(str(self._payload.get("title") or "Viewer"))
         self.resize(820, 560)
 
         layout = QVBoxLayout(self)
@@ -506,15 +506,15 @@ class DebateReaderDialog(QDialog):
         self.record_view = QPlainTextEdit()
         self.record_view.setReadOnly(True)
         self.record_view.setPlainText(str(self._payload.get("record") or ""))
-        tabs.addTab(self.body_view, "Текст")
-        tabs.addTab(self.record_view, "Цял запис")
+        tabs.addTab(self.body_view, "Text")
+        tabs.addTab(self.record_view, "Full record")
         layout.addWidget(tabs)
 
         buttons_row = QHBoxLayout()
-        copy_body = QPushButton("Копирай целия текст")
+        copy_body = QPushButton("Copy full text")
         copy_body.clicked.connect(self.copy_full_text)
         buttons_row.addWidget(copy_body)
-        copy_record = QPushButton("Копирай целия запис")
+        copy_record = QPushButton("Copy full record")
         copy_record.clicked.connect(self.copy_full_record)
         buttons_row.addWidget(copy_record)
         buttons_row.addStretch(1)
@@ -626,13 +626,13 @@ class DebateListWidget(QListWidget):
             return
         menu = QMenu(self)
         reader = item.data(_ROLE_READER)
-        act_open = menu.addAction("Отвори и прочети") if reader else None
-        act_copy_id = menu.addAction("Копирай ID")
-        act_copy_row = menu.addAction("Копирай целия запис")
-        act_copy_selected = menu.addAction("Копирай избраните")
-        act_copy_all = menu.addAction("Копирай всички видими")
+        act_open = menu.addAction("Open and read") if reader else None
+        act_copy_id = menu.addAction("Copy ID")
+        act_copy_row = menu.addAction("Copy full record")
+        act_copy_selected = menu.addAction("Copy selected")
+        act_copy_all = menu.addAction("Copy all visible")
         target = item.data(_ROLE_TOPIC)
-        act_thread = menu.addAction("Отвори нишката") if target else None
+        act_thread = menu.addAction("Open thread") if target else None
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen is None:
             return

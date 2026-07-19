@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -8,7 +9,7 @@ import time
 import pytest
 
 from debate_prompt_context import rank_pending_from_memory_db
-from debate_retrieval import search_debate_context
+from debate_retrieval import _fts_path, search_debate_context
 from schema import init_db
 
 
@@ -210,6 +211,160 @@ def test_search_runs_on_read_only_query_only_connection_with_bounded_runtime(ret
         con.close()
     assert out["results"][0]["msg_id"] == "b00000000002"
     assert time.monotonic() - started < 2.0
+
+
+def test_structural_exact_matches_ignore_recent_literal_scan_cap(retrieval_db):
+    db_path, _spec = retrieval_db
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO debates "
+            "(topic_id,title,state,created_at,created_by_role,roles_json) "
+            "VALUES ('STRUCTURAL_OLD','old structural records','ACTIVE',"
+            "'2026-07-18T00:00:00Z','CONDUCTOR','[]')"
+        )
+        con.execute(
+            "INSERT INTO debate_messages "
+            "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,created_at) "
+            "VALUES ('struct-root','STRUCTURAL_OLD','CONDUCTOR',"
+            "'2026-07-18T00:00:01Z','H','Q',NULL,'analysis',NULL,"
+            "'old structural root','2026-07-18T00:00:01Z')"
+        )
+        con.execute(
+            "INSERT INTO debate_messages "
+            "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,created_at) "
+            "VALUES ('struct-old-target','STRUCTURAL_OLD','EXECUTOR',"
+            "'2026-07-18T00:00:02Z','H','A',NULL,'analysis','struct-root',"
+            "'receipt stored at /opt/archive/debate/ancient.json',"
+            "'2026-07-18T00:00:02Z')"
+        )
+        con.execute(
+            "INSERT INTO debate_message_recipients "
+            "(msg_id,recipient,recipient_mode) "
+            "VALUES ('struct-old-target','recipient-ancient','normal')"
+        )
+        base = datetime(2026, 7, 20, tzinfo=timezone.utc)
+        filler = []
+        for index in range(2001):
+            ts = (base + timedelta(seconds=index)).isoformat().replace("+00:00", "Z")
+            filler.append(
+                (
+                    f"newer-{index:06d}",
+                    "RETRIEVAL1",
+                    "EXECUTOR",
+                    ts,
+                    "L",
+                    "STATUS",
+                    None,
+                    "analysis",
+                    None,
+                    "newer unrelated filler",
+                    ts,
+                )
+            )
+        con.executemany(
+            "INSERT INTO debate_messages "
+            "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            filler,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    cases = {
+        "struct-old-target": {"struct-old-target"},
+        "msg_id:struct-old-target)": {"struct-old-target"},
+        "struct-root": {"struct-root", "struct-old-target"},
+        "reply_to=struct-root.": {"struct-old-target"},
+        "STRUCTURAL_OLD": {"struct-root", "struct-old-target"},
+        "topic_id:STRUCTURAL_OLD.": {"struct-root", "struct-old-target"},
+        "recipient-ancient": {"struct-old-target"},
+        "/opt/archive/debate/ancient.json": {"struct-old-target"},
+        "(/opt/archive/debate/ancient.json).": {"struct-old-target"},
+    }
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        for query, expected in cases.items():
+            out = search_debate_context(
+                con,
+                query=query,
+                limit=10,
+                per_path_limit=20,
+            )
+            assert expected <= {item["msg_id"] for item in out["results"]}, query
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        sqlite3.OperationalError("interrupted"),
+        sqlite3.DatabaseError("database disk image is malformed"),
+        sqlite3.OperationalError("disk I/O error"),
+    ],
+)
+def test_fts_path_propagates_nonlegacy_sqlite_errors(error):
+    class BrokenConnection:
+        def execute(self, *_args, **_kwargs):
+            raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        _fts_path(
+            BrokenConnection(),
+            tokens=["needle"],
+            topic_ids=[],
+            candidate_msg_ids=[],
+            limit=10,
+        )
+
+
+def test_missing_fts_legacy_schema_remains_fail_soft(retrieval_db):
+    db_path, _spec = retrieval_db
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.executescript(
+            "DROP TRIGGER debate_messages_fts_ai;"
+            "DROP TRIGGER debate_messages_fts_ad;"
+            "DROP TRIGGER debate_messages_fts_au;"
+            "DROP TABLE debate_messages_fts;"
+        )
+        out = search_debate_context(
+            con,
+            query="regression gate",
+            topic_ids=["RETRIEVAL1"],
+            limit=5,
+        )
+    finally:
+        con.close()
+    assert out["paths"]["fts_bm25"] == 0
+    assert out["count"] > 0
+
+
+def test_public_deadline_interruption_propagates(retrieval_db):
+    db_path, _spec = retrieval_db
+
+    class InterruptingConnection(sqlite3.Connection):
+        def set_progress_handler(self, callback, n):
+            if callback is None:
+                return super().set_progress_handler(None, 0)
+            return super().set_progress_handler(lambda: 1, 1)
+
+    con = sqlite3.connect(db_path, factory=InterruptingConnection)
+    con.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            search_debate_context(
+                con,
+                query="regression gate",
+                topic_ids=["RETRIEVAL1"],
+                limit=5,
+            )
+    finally:
+        con.close()
 
 
 def test_retrieval_module_has_no_llm_in_loop():

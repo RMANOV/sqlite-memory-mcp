@@ -63,16 +63,45 @@ def _now() -> str:
 
 
 def _log(event: str, **fields: Any) -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
-        LOG_PATH.with_name(f"{LOG_PATH.name}.{LOG_KEEP}").unlink(missing_ok=True)
-        for index in range(LOG_KEEP - 1, 0, -1):
-            older = LOG_PATH.with_name(f"{LOG_PATH.name}.{index}")
-            if older.exists():
-                older.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.{index + 1}"))
-        LOG_PATH.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.1"))
-    with LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": _now(), "event": event, **fields}, ensure_ascii=False) + "\n")
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+            LOG_PATH.with_name(f"{LOG_PATH.name}.{LOG_KEEP}").unlink(missing_ok=True)
+            for index in range(LOG_KEEP - 1, 0, -1):
+                older = LOG_PATH.with_name(f"{LOG_PATH.name}.{index}")
+                if older.exists():
+                    older.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.{index + 1}"))
+            LOG_PATH.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.1"))
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {"ts": _now(), "event": event, **fields},
+                    ensure_ascii=False,
+                    default=repr,
+                )
+                + "\n"
+            )
+    except Exception as exc:
+        # Logging is diagnostic: a rotation/open failure must never terminate
+        # the resident routing pump.  stderr is captured by the user journal.
+        try:
+            sys.stderr.write(
+                json.dumps(
+                    {
+                        "ts": _now(),
+                        "event": "pump_log_fallback",
+                        "failed_event": event,
+                        "error": repr(exc),
+                        "fields": fields,
+                    },
+                    ensure_ascii=False,
+                    default=repr,
+                )
+                + "\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def _load_state() -> dict[str, str]:

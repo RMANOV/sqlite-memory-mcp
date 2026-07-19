@@ -640,19 +640,22 @@ def _parse_iso_utc_dt(value: str) -> datetime:
 
 
 def _validate_reclaim_cutoff(
-    older_than_ts: str, minimum_age_seconds: int
+    older_than_ts: str,
+    minimum_age_seconds: int,
+    *,
+    error_namespace: str = "message_claim_reclaim",
 ) -> None:
     if isinstance(minimum_age_seconds, bool) or not isinstance(
         minimum_age_seconds, int
     ):
         raise DebateError(
             "minimum_age_seconds must be int",
-            error_type="message_claim_reclaim_min_age_invalid",
+            error_type=f"{error_namespace}_min_age_invalid",
         )
     if minimum_age_seconds < 0:
         raise DebateError(
             "minimum_age_seconds must be >= 0",
-            error_type="message_claim_reclaim_min_age_invalid",
+            error_type=f"{error_namespace}_min_age_invalid",
         )
     cutoff = _parse_iso_utc_dt(older_than_ts)
     safe_cutoff = datetime.now(timezone.utc) - timedelta(
@@ -660,9 +663,9 @@ def _validate_reclaim_cutoff(
     )
     if cutoff > safe_cutoff:
         raise DebateError(
-            f"message_claim_reclaim_cutoff_too_recent: older_than_ts={older_than_ts} "
+            f"{error_namespace}_cutoff_too_recent: older_than_ts={older_than_ts} "
             f"must be at least {minimum_age_seconds}s behind current UTC time",
-            error_type="message_claim_reclaim_cutoff_too_recent",
+            error_type=f"{error_namespace}_cutoff_too_recent",
         )
 
 
@@ -1128,7 +1131,11 @@ def recover_stale_worker_claims(
     Every transition is recorded in ``debate_worker_recovery_log``.
     """
     validate_topic_id(topic_id)
-    _validate_reclaim_cutoff(older_than_ts, minimum_age_seconds)
+    _validate_reclaim_cutoff(
+        older_than_ts,
+        minimum_age_seconds,
+        error_namespace="worker_claim_recovery",
+    )
     debate = get_debate(conn, topic_id)
     if debate is None:
         raise DebateError(
