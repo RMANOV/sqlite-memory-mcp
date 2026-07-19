@@ -23,3 +23,4 @@ docs/articles/2026-05-09-convergent-evolution-vs-gbrain.md
 # Local product specifications and implementation concepts are private inputs.
 # Public branches contain code, tests, and separately approved marketing only.
 /.private-specs/
+/S2-READONLY-RECEIPT-2026-07-19.md
