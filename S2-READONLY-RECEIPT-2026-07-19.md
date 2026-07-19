@@ -26,12 +26,12 @@ deliberately **excluded** so its own churn can never make these numbers stale):
 
 | File | Change | +add / −del | sha256 (post-build) |
 |---|---|---|---|
-| `debate_read_dao.py` | NEW — read-only DAO, injected clock, prod fence | +501 / −0 | `a2a92d7bb48be7ccdec2d05ceef483bbad7414ae5ab9fd55ea760e097e064009` |
+| `debate_read_dao.py` | NEW — read-only DAO + **adoption-fix-1 live-await layer** | +575 / −0 | `ae786b19a129674a7f0402a258daa0000fd75109c824d0a72efab4e304cef0c9` |
 | `debate_list_widget.py` | NEW — read-only widget (holds no db) | +114 / −0 | `b59b33c17f94004800ed72ab1fcad2cc4ed972d5fcc7f5e5bb07520aa7a8fe3a` |
-| `task_tray.py` | MOD — tab registration + debate branches + guard + **BLOCKER-1 visibility fix** | +186 / −4 | `a143365324e227607305528e79764b590fdf83da141ae13e9ab2a6e3cf2ddbd7` |
+| `task_tray.py` | MOD — tabs + branches + guard + BLOCKER-1 visibility fix + **adoption-fix-2 tab order** | +187 / −4 | `2ef18c2bc37c2c8c27d82670a9942ad57a1fa87187dc597362d36bc24d2820a5` |
 | `tray_dialogs.py` | MOD — `debate:` guards in double-click + context-menu | +9 / −0 | `c33fb1caa3c91d6b70232c0be16d1d95bd8da8598a4a81ca7c993ffa6d345804` |
-| `tests/test_tray_readonly_debate.py` | NEW — acceptance + negative + integration tests (18) | +499 / −0 | `20fe8300eadf401baef21428653b4b2cbc1f1dc6558031299b0169fab1fa613e` |
-| **Total (code + test artifacts)** | | **+1309 / −4** | |
+| `tests/test_tray_readonly_debate.py` | NEW — acceptance + negative + integration + adoption tests (20) | +588 / −0 | `c4d3405d5c74016d57ec9bb040100fef2a44b47ed9a344047aa82dad59a846cf` |
+| **Total (code + test artifacts)** | | **+1473 / −4** | |
 
 > **ADVOCATE pre-registered acceptance (dcd888d8c576) + re-audit (370313098246).**
 > Every falsifiable point S2a–S2e is mapped explicitly below; a break in any is a
@@ -109,8 +109,9 @@ prod is refused too (realpath check).
 ## S2d — Frozen-clock reproduction of ALL manifest targets + hashes + clean worktree
 
 Harness injects `as_of=2026-07-18T18:42:27Z` (no live `datetime.now`). `pytest -q`
-→ **18 passed** (new suite, incl. the FullWindow visibility regression);
-**107 passed** across the full touched 9-file tray/dialog set, **0 regressions**.
+→ **20 passed** (new suite, incl. the FullWindow visibility regression + the two
+adoption-fix-1 tests); **109 passed** across the full touched 9-file tray/dialog
+set, **0 regressions**.
 
 Reproducible collection command (the exact 9 files that this change touches or
 integrates with):
@@ -126,7 +127,7 @@ QT_QPA_PLATFORM=offscreen python3 -m pytest \
   tests/test_task_tray_memory_guard.py \
   tests/test_premium_task_tray.py \
   tests/test_task_db.py -q
-  → 107 passed
+  → 109 passed
 ```
 
 | Gate | Fixture | Result |
@@ -198,6 +199,55 @@ There is no mutating handler in the new code: the only write-shaped verb is the
   absent; adoption/write stages are explicitly out of scope.
 - No push (repo has `origin`; strictly local commits). No merge to main. No
   live-tray restart/deploy. Prod DB never opened by the harness.
+
+## Adoption fix 1 + 2 (live UI-acceptance MODIFY — main @ `585fd28`)
+
+Two live findings from operator UI-acceptance, fixed on `agent/tray-readonly-tabs`
+(merge-ready; still read-only — no close/write/CAS added):
+
+### Fix 1 — «Какво чака мен» was empty on live data
+
+**Root cause (known from the manifest):** prod carries **zero `human-` recipients**,
+so board `_section_a` runs in fallback-regex mode; but the real operator-await
+asks address **roles** (ADVOCATE/CONDUCTOR/EXECUTOR…) and carry the await in the
+**body**, which the narrow fallback marker never matches → the tab showed 0 while
+half the ledger genuinely waits on the operator.
+
+**Fix:** keep verbatim `_section_a` as **layer 1** (board parity untouched) and add
+a **layer 2** in `waiting_section_a(live_await=True)` (default). Layer 2 admits a
+message iff ALL hold: `kind ∈ {Q, DECISION, PING, STATUS}`, age `≤ 21 d`, author
+not operator, **body matches an operator-await marker**, the body is not itself an
+already-given/recorded GO (`_A_TAKEN` / `_A_REF` near the marker), the thread is
+unresolved (no operator reply, no later `_A_TAKEN` descendant), and the msg is not
+already in layer 1 (**dedup**). Output is `ts DESC`, `stale>5d` badged, layer-2
+rows tagged `fwd="live-await: <phrase>"`.
+
+**Exact marker set** (`_A_OPERATOR_AWAIT_LIVE`, calibrated against the live ledger):
+`операторск\w*\s+ръка` · `операторск\w*\s+GO` · `операторск\w*\s+решени` ·
+`deploy\s+решени` · `тво(я|ята)\s+ръка` · `кажи\s` · `при\s+оператора` ·
+`\bGO\s+за` · `чака\w*\s+оператор` · `ратифицира` (case-insensitive). Calibration
+on FX-A @ `as_of` (counts only, no bodies): 314 eligible → **77 raw marker
+matches** across roles ADVOCATE/ADVOCATE_CODEX/CONDUCTOR/EXECUTOR3.
+
+**FX-A / T2 status (honest):**
+- **Layer 1 (`live_await=False`) on FX-A @ as_of = 0** → the **T2 board-parity
+  contract is fully preserved** (`test_T2_fxa_section_a_zero` still green; the
+  parity test explicitly uses `live_await=False`).
+- **Live combined (`live_await=True`) on FX-A @ as_of = 52** genuine operator-await
+  asks now surfaced (77 raw − already-given − resolved − dedup). This is the new,
+  honestly-documented value the fix produces on the real snapshot; it is proven by
+  `test_ADOPTIONFIX1_fxa_live_await_surfaces_real_asks`. On FX-B the layer-1 10
+  seeded targets stay exactly 10 (`live_await=False`, T3 preserved) and are a
+  subset of the 62-row combined view.
+- Unit proof `test_ADOPTIONFIX1_live_await_surfaces_role_addressed` seeds synthetic
+  role-addressed marker messages and asserts layer 2 surfaces them while excluding
+  already-given / >21 d / resolved and deduping the human- recipient row.
+
+### Fix 2 — tab order
+
+`waiting` («Какво чака мен») now leads the debate tabs in `_tab_keys`
+(`waiting, recent, topics`) — North-Star pain request #1. Existing task-tab
+indices are unchanged (debate tabs remain appended after `done`).
 
 ## What remains for the ADOPTION step (out of scope here)
 

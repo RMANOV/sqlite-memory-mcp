@@ -48,6 +48,18 @@ _A_OP_AWAIT = re.compile(
 )
 _A_IS_OPERATOR_ROLE = re.compile(r"^\s*(human|operator|оператор)", re.I)
 
+# ADOPTION FIX 1 — live-await markers. Prod has NO `human-` recipients, so real
+# operator-await asks address ROLES and carry the await in the BODY; the
+# fallback marker `_A_OP_AWAIT` never fires on them. This broader set is
+# calibrated against the live ledger (FX-A @ as_of: 77 eligible matches across
+# ADVOCATE/CONDUCTOR/EXECUTOR roles) and drives a SECOND section-A layer.
+_A_OPERATOR_AWAIT_LIVE = re.compile(
+    r"(операторск\w*\s+ръка|операторск\w*\s+GO|операторск\w*\s+решени|"
+    r"deploy\s+решени|тво(?:я|ята)\s+ръка|кажи\s|при\s+оператора|"
+    r"\bGO\s+за|чака\w*\s+оператор|ратифицира)",
+    re.I,
+)
+
 
 # ── clock-free helpers (verbatim board.py:166-224) ───────────────────────────
 def parse_ts(ts):
@@ -171,7 +183,19 @@ class DebateReadDAO:
             self._debate_mem = None
 
     # ---- VIEW 1a: waiting section A (board.py:308-427) ----------------------
-    def waiting_section_a(self):
+    def waiting_section_a(self, *, live_await=True):
+        """Section A = what is waiting on the operator.
+
+        Layer 1 = verbatim board `_section_a` (kept intact → T2 board parity).
+        Layer 2 (`live_await=True`, default) = ADOPTION FIX 1: prod carries no
+        `human-` recipients, so genuine operator-await asks — which address
+        ROLES and put the await in the BODY — are invisible to layer 1's
+        fallback. Layer 2 adds `<=21d` messages of kind Q/DECISION/PING/STATUS
+        whose body matches the operator-await markers, deduped against layer 1,
+        with the same author/unresolved/already-given filters and stale>5d
+        marking. `live_await=False` returns layer 1 only (byte-identical to
+        board; used by the T2 parity test).
+        """
         if not self._caps["has_debate"]:
             return [], 0
         con = self._conn
@@ -267,6 +291,56 @@ class DebateReadDAO:
                 "age": self._rel(r["ts"]), "line": one_line(b), "body": b,
                 "stale": stale, "fwd": fwd_txt,
             })
+
+        # ── Layer 2: live-await (ADOPTION FIX 1) ──────────────────────────
+        # Only when live_await; layer-1 output above is byte-identical to board.
+        if live_await:
+            layer1_ids = {x["msg_id"] for x in out}
+            for r in rows:
+                if r["msg_id"] in layer1_ids:
+                    continue  # dedup vs layer 1
+                if r["kind"] not in ("Q", "DECISION", "PING", "STATUS"):
+                    continue
+                if _A_IS_OPERATOR_ROLE.match(r["role"] or ""):
+                    continue  # (v) author not operator
+                dt = parse_ts(r["ts"])
+                if dt is None or (now - dt).days > 21:
+                    continue  # (iv) <=21d
+                b = r["body"]
+                m = _A_OPERATOR_AWAIT_LIVE.search(b)
+                if not m:
+                    continue  # (ii) operator-await marker in body
+                # exclude already-given / already-recorded GO in this very body
+                if _A_TAKEN.search(b) or _A_REF.search(
+                    b[max(0, m.start() - 45):m.start() + 45]
+                ):
+                    continue
+                if r["msg_id"] in op_replied:
+                    continue  # (iii) unresolved — no operator reply
+                desc = descendants(r["msg_id"])
+                if any(
+                    (byid[c]["ts"] or "") > (r["ts"] or "")
+                    and (
+                        _A_TAKEN.search(byid[c]["body"])
+                        or _A_IS_OPERATOR_ROLE.match(byid[c]["role"] or "")
+                    )
+                    for c in desc
+                ):
+                    continue  # (iii) unresolved — no later 'taken' in thread
+                latest = r["ts"] or ""
+                for c in desc:
+                    t = byid[c]["ts"] or ""
+                    if t > latest:
+                        latest = t
+                ldt = parse_ts(latest)
+                stale = bool(ldt and (now - ldt).days > 5)
+                out.append({
+                    "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
+                    "priority": r["priority"] or "INFO", "ts": r["ts"],
+                    "age": self._rel(r["ts"]), "line": one_line(b), "body": b,
+                    "stale": stale, "fwd": f"live-await: {m.group(0)[:48]}",
+                })
+
         out.sort(key=lambda x: x["ts"] or "", reverse=True)
         return out, cand
 

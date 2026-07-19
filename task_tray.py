@@ -1091,14 +1091,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "all",
             "done",
             # Read-only debate tabs (BUILD STEP 1, spec §2/§3). Appended so the
-            # existing tab indices are unchanged.
-            "recent",
+            # existing task tab indices are unchanged. ADOPTION FIX 2: `waiting`
+            # («Какво чака мен») leads — it is North-Star pain request #1.
             "waiting",
+            "recent",
             "topics",
         ]
         # Debate tabs render through DebateListWidget (read-only), never
         # TaskListWidget — no itemChanged/mutation wiring (spec §2.0, B3).
-        self._DEBATE_TABS = ("recent", "waiting", "topics")
+        self._DEBATE_TABS = ("waiting", "recent", "topics")
         if self._premium_tray_extension:
             self._tab_keys.insert(1, self._premium_tray_extension.tab_key)
         self._tab_labels = {
