@@ -120,7 +120,11 @@ def test_high_stakes_uses_stricter_independence_threshold():
 
 
 @pytest.mark.parametrize("field", ["origins", "verifier_origins"])
-def test_attestation_rejects_blank_origin_values(field):
+@pytest.mark.parametrize(
+    "invalid_origins",
+    [frozenset({"  "}), None, 7, "origin", ["origin"]],
+)
+def test_attestation_rejects_invalid_origin_values(field, invalid_origins):
     values = {
         "attestation_id": "a",
         "origins": frozenset({"origin"}),
@@ -129,16 +133,20 @@ def test_attestation_rejects_blank_origin_values(field):
         "verifier_origins": frozenset({"audit-origin"}),
         "verified": True,
     }
-    values[field] = frozenset({"  "})
+    values[field] = invalid_origins
 
     with pytest.raises(ValueError, match="origins"):
         Attestation(**values)
 
 
-def test_restored_malformed_attestation_fails_closed_at_boundary():
+@pytest.mark.parametrize(
+    "invalid_origins",
+    [frozenset({""}), None, 7, "origin", ["origin"]],
+)
+def test_restored_malformed_attestation_fails_closed_at_boundary(invalid_origins):
     malformed = object.__new__(Attestation)
     object.__setattr__(malformed, "attestation_id", "legacy")
-    object.__setattr__(malformed, "origins", frozenset({""}))
+    object.__setattr__(malformed, "origins", invalid_origins)
     object.__setattr__(malformed, "generator_id", "generator")
     object.__setattr__(malformed, "verifier_id", "verifier")
     object.__setattr__(malformed, "verifier_origins", frozenset({"audit"}))

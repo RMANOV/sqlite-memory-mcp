@@ -14,6 +14,7 @@ from db_utils import (
     apply_task_mutation,
     create_task_with_ledger,
     get_conn_immediate,
+    get_status_version,
 )
 from schema import init_db
 from task_status_cas import (
@@ -69,6 +70,28 @@ def test_status_token_supports_default_tuple_rows(db_path):
     assert token.status == "not_started"
     assert token.updated_order > 0
     assert token.source_event_id
+
+
+@pytest.mark.parametrize("event_id", ["", "   "])
+def test_status_token_rejects_blank_legacy_event_ids(db_path, event_id):
+    _create(db_path, "blank-token", "not_started")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE task_field_versions SET source_event_id=? "
+            "WHERE task_id='blank-token' AND field_name='status'",
+            (event_id,),
+        )
+        conn.commit()
+        version = get_status_version(conn, "blank-token")
+        token = status_token(conn, "blank-token")
+    finally:
+        conn.close()
+
+    assert version is not None
+    assert version[0] > 0
+    assert version[1] is None
+    assert token is None
 
 
 def _status(db_path: str, task_id: str) -> str:

@@ -3873,7 +3873,10 @@ def get_status_version(
     ).fetchone()
     if row is None:
         return None
-    return int(row[0] or 0), row[1]
+    source_event_id = row[1]
+    if not isinstance(source_event_id, str) or not source_event_id.strip():
+        source_event_id = None
+    return int(row[0] or 0), source_event_id
 
 
 def upsert_field_versions(
