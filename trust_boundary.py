@@ -8,7 +8,9 @@ from typing import Iterable
 from lazy_verification import independent_origin_count
 
 
-def _valid_origins(origins: frozenset[str]) -> bool:
+def _valid_origins(origins: object) -> bool:
+    if not isinstance(origins, (set, frozenset)):
+        return False
     return bool(origins) and all(
         isinstance(origin, str) and bool(origin.strip()) for origin in origins
     )
