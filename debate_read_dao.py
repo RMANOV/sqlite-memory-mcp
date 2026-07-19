@@ -140,11 +140,13 @@ class DebateReadDAO:
 
         return {
             "tasks": cols("tasks"),
+            "task_field_versions": cols("task_field_versions"),
             "has_recipients": "debate_message_recipients" in names,
             "has_tasks_fts": "tasks_fts" in names,
             "has_memory_fts": "memory_fts" in names,
             "has_debate": "debate_messages" in names,
             "has_tasks": "tasks" in names,
+            "has_task_field_versions": "task_field_versions" in names,
             "has_debates_tbl": "debates" in names,
         }
 
@@ -356,7 +358,7 @@ class DebateReadDAO:
         """Browser-board section B: relevant open today/next tasks, read-only."""
         required = {
             "id", "title", "section", "priority", "status", "due_date",
-            "project", "updated_at",
+            "project", "updated_at", "type",
         }
         if not self._caps["has_tasks"] or not required.issubset(self._caps["tasks"]):
             return [], 0
@@ -368,20 +370,39 @@ class DebateReadDAO:
         ).fetchone()[0]
         today = self._now().date()
         cutoff = today + timedelta(days=21)
-        sql = """
-        SELECT id, title, section, priority, status, due_date, project, updated_at
-        FROM tasks
-        WHERE status IN ('not_started','in_progress')
-          AND section IN ('today','next')
-          AND ( (due_date IS NOT NULL AND date(due_date) <= date(?))
-                OR (priority IN ('high','critical') AND due_date IS NULL)
-                OR (section='today' AND due_date IS NULL) )
-          AND NOT ( project='workstation-maintenance'
-                    AND due_date IS NOT NULL
-                    AND date(due_date) > date(?) )
-        ORDER BY (due_date IS NULL), date(due_date) ASC,
-                 CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
-                               WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END
+        has_versions = (
+            self._caps["has_task_field_versions"]
+            and {"task_id", "field_name", "updated_order", "source_event_id"}
+            <= self._caps["task_field_versions"]
+        )
+        version_select = (
+            ", v.updated_order AS status_order, "
+            "v.source_event_id AS status_event_id"
+            if has_versions
+            else ", 0 AS status_order, NULL AS status_event_id"
+        )
+        version_join = (
+            "LEFT JOIN task_field_versions v "
+            "ON v.task_id = t.id AND v.field_name = 'status'"
+            if has_versions
+            else ""
+        )
+        sql = f"""
+        SELECT t.id, t.title, t.section, t.priority, t.status, t.due_date,
+               t.project, t.updated_at, t.type{version_select}
+        FROM tasks t
+        {version_join}
+        WHERE t.status IN ('not_started','in_progress')
+          AND t.section IN ('today','next')
+          AND ( (t.due_date IS NOT NULL AND date(t.due_date) <= date(?))
+                OR (t.priority IN ('high','critical') AND t.due_date IS NULL)
+                OR (t.section='today' AND t.due_date IS NULL) )
+          AND NOT ( t.project='workstation-maintenance'
+                    AND t.due_date IS NOT NULL
+                    AND date(t.due_date) > date(?) )
+        ORDER BY (t.due_date IS NULL), date(t.due_date) ASC,
+                 CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                                 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END
         """
         items = []
         for row in con.execute(sql, (cutoff.isoformat(), cutoff.isoformat())).fetchall():
@@ -391,9 +412,12 @@ class DebateReadDAO:
                 "section": row["section"] or "",
                 "priority": row["priority"] or "",
                 "status": row["status"] or "",
+                "type": row["type"] or "task",
                 "due_date": (row["due_date"] or "")[:10],
                 "project": row["project"] or "",
                 "updated_at": row["updated_at"] or "",
+                "status_order": int(row["status_order"] or 0),
+                "status_event_id": row["status_event_id"] or "",
                 "age": self._rel(row["updated_at"]),
             })
         return items, int(before)
@@ -574,6 +598,23 @@ class DebateReadDAO:
 
     def _fts_tasks(self, query, limit):
         tcols = self._caps["tasks"]
+        has_versions = (
+            self._caps["has_task_field_versions"]
+            and {"task_id", "field_name", "updated_order", "source_event_id"}
+            <= self._caps["task_field_versions"]
+        )
+        version_select = (
+            "v.updated_order AS status_order, "
+            "v.source_event_id AS status_event_id,"
+            if has_versions
+            else "0 AS status_order, NULL AS status_event_id,"
+        )
+        version_join = (
+            " LEFT JOIN task_field_versions v"
+            " ON v.task_id = t.id AND v.field_name = 'status'"
+            if has_versions
+            else ""
+        )
         for mode in ("and", "or"):
             expr = fts_expr(query, mode)
             if not expr:
@@ -585,9 +626,11 @@ class DebateReadDAO:
                     + ("t.section," if "section" in tcols else "'' AS section,")
                     + ("t.status," if "status" in tcols else "'' AS status,")
                     + ("t.project," if "project" in tcols else "'' AS project,")
+                    + version_select
                     + " snippet(tasks_fts,1,'〈','〉',' … ',12) AS snip,"
                     + " bm25(tasks_fts) AS score"
                     + " FROM tasks_fts JOIN tasks t ON t.rowid = tasks_fts.rowid"
+                    + version_join
                     + " WHERE tasks_fts MATCH ? ORDER BY score LIMIT ?",
                     (expr, limit),
                 ).fetchall()
@@ -598,6 +641,8 @@ class DebateReadDAO:
                     "id": r["id"], "title": r["title"], "type": r["type"],
                     "section": r["section"], "status": r["status"],
                     "project": r["project"], "snippet": r["snip"],
+                    "status_order": int(r["status_order"] or 0),
+                    "status_event_id": r["status_event_id"] or "",
                     "score": round(r["score"], 3),
                 } for r in rows]
         return []

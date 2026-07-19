@@ -3742,12 +3742,12 @@ def apply_task_mutation(
     # A stale request whose target already equals the current value is still a
     # conflict: its field-version token no longer names the row the caller saw.
     if status_cas:
-        if row["type"] != "task":
+        if row["type"] not in ("task", "note"):
             return {
                 "updated": 0,
                 "changed_fields": (),
                 "outcome": "conflict",
-                "reason": "not_task",
+                "reason": "unsupported_type",
             }
         version = get_status_version(conn, task_id)
         if version is None or version[0] <= 0 or version[1] is None:
@@ -3760,7 +3760,7 @@ def apply_task_mutation(
         target_status = raw_changes["status"]
         cur = conn.execute(
             "UPDATE tasks SET status=?, updated_at=?, tombstone_pushed_at=NULL "
-            "WHERE id=? AND type='task' AND status=? "
+            "WHERE id=? AND type IN ('task','note') AND status=? "
             "AND EXISTS (SELECT 1 FROM task_field_versions "
             "WHERE task_id=? AND field_name='status' AND updated_order=? "
             "AND source_event_id IS ?)",

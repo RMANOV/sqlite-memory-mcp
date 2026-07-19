@@ -1,15 +1,16 @@
-"""Read-only debate controls, list, and reader for the native tray.
+"""Debate controls, record list, and reader for the native tray.
 
 The module intentionally owns no database handle.  It accepts already-read
 records, applies the same client-side controls as the browser board, and emits
-navigation/read signals only.  There is no task/debate mutation path here.
+navigation/read signals plus a narrow task-completion intent.  The caller owns
+the audited status transition; debate records remain strictly read-only.
 """
 from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
 
-from PyQt6.QtCore import QSignalBlocker, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +27,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionButton,
+    QStyleOptionViewItem,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -38,6 +43,7 @@ _ROLE_TOPIC = Qt.ItemDataRole.UserRole + 1
 _ROLE_MSGID = Qt.ItemDataRole.UserRole + 2
 _ROLE_COPY = Qt.ItemDataRole.UserRole + 3
 _ROLE_READER = Qt.ItemDataRole.UserRole + 4
+_ROLE_COMPLETION = Qt.ItemDataRole.UserRole + 5
 
 _PRIORITY_ORDER = {
     "critical": 0,
@@ -536,11 +542,85 @@ class DebateReaderDialog(QDialog):
         self._copy(self._payload.get("record", ""))
 
 
+class TrailingTaskCheckDelegate(QStyledItemDelegate):
+    """Paint and activate task completion at the far end of a record row."""
+
+    _PADDING = 10
+
+    @staticmethod
+    def _is_completion(index):
+        return bool(
+            index.flags() & Qt.ItemFlag.ItemIsUserCheckable
+            and isinstance(index.data(_ROLE_COMPLETION), dict)
+        )
+
+    def check_rect(self, option, index):
+        if not self._is_completion(index):
+            return QRect()
+        style = option.widget.style() if option.widget is not None else None
+        if style is None:
+            return QRect()
+        width = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorWidth, None, option.widget
+        )
+        height = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorHeight, None, option.widget
+        )
+        x = option.rect.right() - width - self._PADDING
+        y = option.rect.top() + max(0, (option.rect.height() - height) // 2)
+        return QRect(x, y, width, height)
+
+    def paint(self, painter, option, index):
+        if not self._is_completion(index):
+            super().paint(painter, option, index)
+            return
+
+        check_rect = self.check_rect(option, index)
+        text_option = QStyleOptionViewItem(option)
+        self.initStyleOption(text_option, index)
+        text_option.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        text_option.rect.setRight(check_rect.left() - self._PADDING)
+        QStyledItemDelegate.paint(self, painter, text_option, index)
+
+        button = QStyleOptionButton()
+        button.rect = check_rect
+        button.state = QStyle.StateFlag.State_Enabled
+        state = index.data(Qt.ItemDataRole.CheckStateRole)
+        if state in (Qt.CheckState.Checked, Qt.CheckState.Checked.value):
+            button.state |= QStyle.StateFlag.State_On
+        else:
+            button.state |= QStyle.StateFlag.State_Off
+        style = option.widget.style() if option.widget is not None else None
+        if style is not None:
+            style.drawControl(
+                QStyle.ControlElement.CE_CheckBox, button, painter, option.widget
+            )
+
+    def editorEvent(self, event, model, option, index):
+        if not self._is_completion(index):
+            return super().editorEvent(event, model, option, index)
+        activate = False
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            activate = (
+                event.button() == Qt.MouseButton.LeftButton
+                and self.check_rect(option, index).contains(event.position().toPoint())
+            )
+        elif event.type() == QEvent.Type.KeyPress:
+            activate = event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Select)
+        if not activate:
+            return False
+        current = index.data(Qt.ItemDataRole.CheckStateRole)
+        checked = current in (Qt.CheckState.Checked, Qt.CheckState.Checked.value)
+        target = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+        return bool(model.setData(index, target, Qt.ItemDataRole.CheckStateRole))
+
+
 class DebateListWidget(QListWidget):
-    """Strictly read-only list: selection, reading, copying, and navigation."""
+    """Read/copy records; only explicit task/note rows can request completion."""
 
     navigate_requested = pyqtSignal(str)
     reader_requested = pyqtSignal(object)
+    task_completion_requested = pyqtSignal(object, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -549,6 +629,8 @@ class DebateListWidget(QListWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
         self.itemDoubleClicked.connect(self._on_double_click)
+        self.itemChanged.connect(self._on_item_changed)
+        self.setItemDelegate(TrailingTaskCheckDelegate(self))
 
     def clear_rows(self):
         self.clear()
@@ -556,6 +638,32 @@ class DebateListWidget(QListWidget):
     def add_header(self, text):
         item = QListWidgetItem(text)
         item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.addItem(item)
+        return item
+
+    def add_task_row(
+        self,
+        task_id,
+        text,
+        *,
+        copy_payload=None,
+        reader_payload=None,
+        completion_payload=None,
+    ):
+        """Add a task/note record with an optional trailing Done checkbox."""
+        item = QListWidgetItem(text)
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if isinstance(completion_payload, dict):
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+            item.setData(_ROLE_COMPLETION, dict(completion_payload))
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setToolTip("Mark done")
+        item.setFlags(flags)
+        item.setData(_ROLE_KEY, f"task:{task_id}")
+        item.setData(_ROLE_MSGID, str(task_id))
+        item.setData(_ROLE_COPY, copy_payload if copy_payload is not None else text)
+        if reader_payload is not None:
+            item.setData(_ROLE_READER, dict(reader_payload))
         self.addItem(item)
         return item
 
@@ -584,12 +692,26 @@ class DebateListWidget(QListWidget):
         data = item.data(_ROLE_KEY) if item is not None else None
         return isinstance(data, str) and data.startswith("debate:")
 
+    def _is_record(self, item):
+        data = item.data(_ROLE_KEY) if item is not None else None
+        return isinstance(data, str) and bool(data)
+
+    def _on_item_changed(self, item):
+        payload = item.data(_ROLE_COMPLETION) if item is not None else None
+        if not isinstance(payload, dict):
+            return
+        self.task_completion_requested.emit(
+            dict(payload), item.checkState() == Qt.CheckState.Checked
+        )
+
     def _on_double_click(self, item):
-        if not self._is_debate(item):
+        if not self._is_record(item):
             return
         reader = item.data(_ROLE_READER)
         if reader:
             self.reader_requested.emit(reader)
+            return
+        if not self._is_debate(item):
             return
         target = item.data(_ROLE_TOPIC) or item.data(_ROLE_MSGID)
         if target:
@@ -602,7 +724,7 @@ class DebateListWidget(QListWidget):
             clipboard.setText(str(text))
 
     def _copy_items(self, items):
-        ordered = sorted((item for item in items if self._is_debate(item)), key=self.row)
+        ordered = sorted((item for item in items if self._is_record(item)), key=self.row)
         blocks = [str(item.data(_ROLE_COPY) or item.text() or "") for item in ordered]
         self._copy("\n\n".join(block for block in blocks if block))
 
@@ -622,7 +744,7 @@ class DebateListWidget(QListWidget):
 
     def _context_menu(self, pos):
         item = self.itemAt(pos)
-        if not self._is_debate(item):
+        if not self._is_record(item):
             return
         menu = QMenu(self)
         reader = item.data(_ROLE_READER)
@@ -631,7 +753,7 @@ class DebateListWidget(QListWidget):
         act_copy_row = menu.addAction("Copy full record")
         act_copy_selected = menu.addAction("Copy selected")
         act_copy_all = menu.addAction("Copy all visible")
-        target = item.data(_ROLE_TOPIC)
+        target = item.data(_ROLE_TOPIC) if self._is_debate(item) else None
         act_thread = menu.addAction("Open thread") if target else None
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen is None:
@@ -648,6 +770,17 @@ class DebateListWidget(QListWidget):
             self.copy_all_visible()
         elif chosen == act_thread and target:
             self.navigate_requested.emit(str(target))
+
+    def set_task_checked(self, task_id, checked):
+        """Restore a task checkbox without emitting another completion intent."""
+        key = f"task:{task_id}"
+        with QSignalBlocker(self):
+            for row in range(self.count()):
+                item = self.item(row)
+                if item.data(_ROLE_KEY) == key:
+                    item.setCheckState(
+                        Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                    )
 
 
 class DebateTabWidget(QWidget):

@@ -413,9 +413,14 @@ def test_S2e_no_cas_or_dml_or_mutation_in_new_code():
     assert not re.search(r"self\._conn\.execute\(\s*[\"']\s*(INSERT|UPDATE|DELETE|CREATE|REPLACE)",
                          dao_src, re.I), "no DML on the read-only connection"
 
-    # 4) tray debate helper methods carry no mutation / subprocess
+    # 4) the read-only tray helpers before the explicitly separated completion
+    # adapter carry no mutation / subprocess. The adapter below this boundary
+    # is allowed to carry the exact rendered CAS token for task/note rows only.
     tt = open(os.path.join(REPO, "task_tray.py")).read()
-    block = tt[tt.index("def _debate_recent_params"):tt.index("def _build_tab_rows(self, key):")]
+    block = tt[
+        tt.index("def _debate_recent_params"):
+        tt.index("def _task_completion_payload")
+    ]
     for bad in ("apply_task_mutation", "update_task", "mark_done", "delete_task",
                 "subprocess", "expected_status"):
         assert bad not in block, f"tray debate helpers must not reference {bad!r}"

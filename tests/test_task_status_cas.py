@@ -146,6 +146,20 @@ def test_active_task_can_complete_once(db_path, source):
     assert result["status_token"].status == "done"
 
 
+@pytest.mark.parametrize("source", ["not_started", "in_progress"])
+def test_active_note_can_complete_once(db_path, source):
+    _create(db_path, "complete-note", source, type="note")
+    before = _status_events(db_path, "complete-note")
+
+    result = transition_status(
+        db_path, _token(db_path, "complete-note"), "done", forbid_path=None
+    )
+
+    assert result["outcome"] == "applied"
+    assert _status(db_path, "complete-note") == "done"
+    assert _status_events(db_path, "complete-note") == before + 1
+
+
 def test_done_task_archives_and_returns_undo_token(db_path):
     _create(db_path, "archive", "done")
 
@@ -189,7 +203,7 @@ def test_active_archive_requires_explicit_confirmation(db_path, source):
 
 @pytest.mark.parametrize(
     ("status", "type"),
-    [("archived", "task"), ("cancelled", "task"), ("not_started", "note")],
+    [("archived", "task"), ("cancelled", "task"), ("not_started", "reference")],
 )
 def test_terminal_and_non_task_rows_fail_closed(db_path, status, type):
     _create(db_path, "closed", status, type=type)
