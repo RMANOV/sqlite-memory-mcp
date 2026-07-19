@@ -1,0 +1,38 @@
+{
+  "contract": {
+    "top_k": 1,
+    "rrf_k": 60,
+    "fts_weight": 1.0,
+    "literal_metadata_weight": 0.9,
+    "snippet_cap_bytes": 240,
+    "query_deadline_ms": 750,
+    "tie_break": "score DESC, ts DESC, msg_id DESC",
+    "recall_exclusion": "Top-K truncation may exclude union members; recall-superset is asserted with limit at least the candidate union size."
+  },
+  "messages": [
+    {"msg_id": "a00000000001", "body": "alpha checksum repair receipt", "role": "EXECUTOR", "priority": "H", "kind": "STATUS", "recipient": "CONDUCTOR"},
+    {"msg_id": "b00000000002", "body": "beta watchdog heartbeat recovery", "role": "CONDUCTOR", "priority": "M", "kind": "Q", "recipient": "EXECUTOR"},
+    {"msg_id": "c00000000003", "body": "класиране от паметта за дебат", "role": "ADVOCATE", "priority": "M", "kind": "STATUS", "recipient": "EXECUTOR"},
+    {"msg_id": "d00000000004", "body": "use worker_session_id for the no action receipt", "role": "EXECUTOR", "priority": "H", "kind": "A", "recipient": "CONDUCTOR"},
+    {"msg_id": "e00000000005", "body": "weighted RRF fusion combines both search paths", "role": "EXECUTOR", "priority": "M", "kind": "STATUS", "recipient": "ADVOCATE"},
+    {"msg_id": "f00000000006", "body": "recipient metadata routes exact advocate review", "role": "CONDUCTOR", "priority": "L", "kind": "PING", "recipient": "ADVOCATE"},
+    {"msg_id": "a00000000007", "body": "помпа спиране без timeout abort", "role": "EXECUTOR", "priority": "H", "kind": "STATUS", "recipient": "CONDUCTOR"},
+    {"msg_id": "b00000000008", "body": "UTF-8 snippet is bounded by bytes", "role": "ADVOCATE", "priority": "M", "kind": "A", "recipient": "EXECUTOR"},
+    {"msg_id": "c00000000009", "body": "automatic regression gate blocks broken exchange", "role": "EXECUTOR", "priority": "H", "kind": "STATUS", "recipient": "CONDUCTOR"},
+    {"msg_id": "d00000000010", "body": "new active day keeps old history immutable", "role": "CONDUCTOR", "priority": "M", "kind": "DECISION", "recipient": "EXECUTOR"},
+    {"msg_id": "e00000000011", "body": "unrelated tray rendering observation", "role": "ADVOCATE", "priority": "INFO", "kind": "STATUS", "recipient": "CONDUCTOR"},
+    {"msg_id": "f00000000012", "body": "generic background filler without golden terms", "role": "EXECUTOR", "priority": "L", "kind": "STATUS", "recipient": "ADVOCATE"}
+  ],
+  "queries": [
+    {"query": "alpha checksum", "expected": ["a00000000001"]},
+    {"query": "watchdog heartbeat", "expected": ["b00000000002"]},
+    {"query": "класиране паметта", "expected": ["c00000000003"]},
+    {"query": "worker_session_id", "expected": ["d00000000004"]},
+    {"query": "RRF fusion", "expected": ["e00000000005"]},
+    {"query": "recipient metadata advocate", "expected": ["f00000000006"]},
+    {"query": "помпа спиране", "expected": ["a00000000007"]},
+    {"query": "UTF-8 snippet", "expected": ["b00000000008"]},
+    {"query": "regression gate", "expected": ["c00000000009"]},
+    {"query": "new active day", "expected": ["d00000000010"]}
+  ]
+}

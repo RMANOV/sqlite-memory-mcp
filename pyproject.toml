@@ -44,6 +44,8 @@ py-modules = [
     "daily_digest",
     "db_utils",
     "debate",
+    "debate_prompt_context",
+    "debate_retrieval",
     "debate_ops",
     "enrichment_constants",
     "entity_server",

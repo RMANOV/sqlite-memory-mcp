@@ -14,17 +14,22 @@ Environment=DEBATE_PUMP_MAX_WORKERS_PER_SCAN=1
 Environment=DEBATE_PUMP_MAX_CONCURRENT_WORKERS=1
 Environment=DEBATE_MESSAGE_CLAIM_RECLAIM_SECONDS=900
 Environment=DEBATE_MESSAGE_CLAIM_RECLAIM_INTERVAL=60
+Environment=DEBATE_WORKER_CLAIM_RECOVERY_SECONDS=900
+Environment=DEBATE_WORKER_CLAIM_RECOVERY_INTERVAL=60
+Environment=DEBATE_PUMP_LOG_MAX_BYTES=20971520
+Environment=DEBATE_WAKE_LOG_MAX_BYTES=20971520
+EnvironmentFile=-%h/.config/sqlite-memory/debate-pump.env
 Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 %h/sqlite-memory-mcp/hooks/debate_pump.py --interval 10 --limit 5 --action-kind Q,DECISION,PING
 Nice=10
 CPUWeight=10
-MemoryHigh=3G
-MemoryMax=5G
-TasksMax=256
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=128
 Restart=always
 RestartSec=5
-KillMode=process
-TimeoutStopSec=10
+KillMode=control-group
+TimeoutStopSec=20
 StandardOutput=append:%h/.claude/memory/debate_pump.out
 StandardError=append:%h/.claude/memory/debate_pump.err
 

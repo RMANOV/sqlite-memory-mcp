@@ -740,6 +740,40 @@ CREATE INDEX IF NOT EXISTS idx_debmsg_topic_role_ts
 CREATE INDEX IF NOT EXISTS idx_debmsg_reply_to
     ON debate_messages(reply_to) WHERE reply_to IS NOT NULL;
 
+-- Native, dependency-free debate retrieval.  The prompt/watcher path used to
+-- scan recent rows and inject FIFO bodies, which made a long-lived DAILY topic
+-- both noisy and expensive.  Keep a dedicated FTS5 index so callers can pair
+-- BM25 token search with the literal/metadata path in debate_retrieval.py.
+-- msg_id/topic_id remain stored but unindexed metadata; role/kind/body are
+-- searchable.  A standalone table (rather than external-content FTS) keeps
+-- the TEXT primary key contract simple and makes legacy backfill explicit.
+CREATE VIRTUAL TABLE IF NOT EXISTS debate_messages_fts USING fts5(
+    msg_id UNINDEXED,
+    topic_id UNINDEXED,
+    role,
+    kind,
+    body,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS debate_messages_fts_ai
+AFTER INSERT ON debate_messages BEGIN
+    INSERT INTO debate_messages_fts(msg_id, topic_id, role, kind, body)
+    VALUES (new.msg_id, new.topic_id, new.role, new.kind, new.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS debate_messages_fts_ad
+AFTER DELETE ON debate_messages BEGIN
+    DELETE FROM debate_messages_fts WHERE msg_id = old.msg_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS debate_messages_fts_au
+AFTER UPDATE OF topic_id, role, kind, body ON debate_messages BEGIN
+    DELETE FROM debate_messages_fts WHERE msg_id = old.msg_id;
+    INSERT INTO debate_messages_fts(msg_id, topic_id, role, kind, body)
+    VALUES (new.msg_id, new.topic_id, new.role, new.kind, new.body);
+END;
+
 CREATE TABLE IF NOT EXISTS debate_watermarks (
     topic_id              TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
     role                  TEXT NOT NULL,
@@ -869,6 +903,21 @@ CREATE INDEX IF NOT EXISTS idx_dwc_trigger
     ON debate_worker_claims(trigger_msg_id);
 CREATE INDEX IF NOT EXISTS idx_dwc_state
     ON debate_worker_claims(topic_id, role, state);
+
+CREATE TABLE IF NOT EXISTS debate_worker_recovery_log (
+    recovery_id       TEXT PRIMARY KEY,
+    topic_id          TEXT NOT NULL,
+    role              TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    worker_session_id TEXT NOT NULL,
+    trigger_msg_id    TEXT NOT NULL,
+    previous_state    TEXT NOT NULL,
+    result            TEXT NOT NULL,
+    details_json      TEXT,
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dwrl_topic_created
+    ON debate_worker_recovery_log(topic_id, created_at);
 
 CREATE TABLE IF NOT EXISTS debate_message_claims (
     msg_id           TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
@@ -2168,6 +2217,29 @@ def init_db(db_path: str | None = None) -> None:
             conn.execute("INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')")
             logger.info(
                 "tasks_fts: rebuilt FTS index for %d existing tasks", task_count
+            )
+
+    with _get_conn(_path) as conn:
+        debate_count = conn.execute(
+            "SELECT COUNT(*) FROM debate_messages"
+        ).fetchone()[0]
+        debate_fts_count = conn.execute(
+            "SELECT COUNT(*) FROM debate_messages_fts"
+        ).fetchone()[0]
+        if debate_count != debate_fts_count:
+            # Legacy databases predate the triggers.  Rebuild only when the
+            # row counts disagree; normal startups stay O(1), while a partial
+            # or interrupted backfill repairs deterministically.
+            conn.execute("DELETE FROM debate_messages_fts")
+            conn.execute(
+                "INSERT INTO debate_messages_fts "
+                "(msg_id, topic_id, role, kind, body) "
+                "SELECT msg_id, topic_id, role, kind, body "
+                "FROM debate_messages ORDER BY ts, msg_id"
+            )
+            logger.info(
+                "debate_messages_fts: rebuilt FTS index for %d messages",
+                debate_count,
             )
 
     # Optional: initialize sqlite-vec virtual table for semantic search

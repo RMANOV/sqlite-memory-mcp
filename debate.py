@@ -148,6 +148,7 @@ DEFAULT_VEHICLE = "analysis"
 # Vehicles a bounded wake-worker may execute. ``implementation`` is
 # intentionally excluded — it requires a conductor-approved impl vehicle.
 WAKE_WORKER_VEHICLES = ("analysis", "review")
+_SINGLETON_MESSAGE_WAKE_RESULTS = {"implementation_requires_impl_vehicle"}
 VALID_STATES = ("INIT", "ACTIVE", "RESOLVED", "ARCHIVED")
 VALID_BINDING_STATES = ("active", "retired", "diagnostic")
 VALID_CURSOR_MODES = ("head", "copy", "replay")
@@ -1102,6 +1103,145 @@ def worker_no_action(
         }
     )
     return out
+
+
+def recover_stale_worker_claims(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    older_than_ts: str,
+    minimum_age_seconds: int = 120,
+    live_worker_session_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Reconcile active worker claims whose launcher process is gone.
+
+    A spawned Claude/Codex worker can exit before it calls
+    ``debate_worker_no_action`` (quota/session limit, crash, killed process).
+    The old pump reaped the OS child but left the DB claim active forever.
+    This recovery path is conservative:
+
+    * a live worker session is skipped;
+    * a terminal same-role A/STATUS completes the claim with its ack;
+    * otherwise the orphan is retired without advancing either cursor, so the
+      parent session still sees the addressed trigger as pending.
+
+    Every transition is recorded in ``debate_worker_recovery_log``.
+    """
+    validate_topic_id(topic_id)
+    _validate_reclaim_cutoff(older_than_ts, minimum_age_seconds)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(
+            f"unknown_topic: {topic_id}",
+            error_type="topic_not_found",
+        )
+    live = set(live_worker_session_ids or set())
+    rows = conn.execute(
+        "SELECT * FROM debate_worker_claims "
+        "WHERE topic_id = ? AND state = 'active' AND heartbeat_at < ? "
+        "ORDER BY heartbeat_at ASC, worker_session_id ASC",
+        (topic_id, older_than_ts),
+    ).fetchall()
+    now = now_iso()
+    completed: list[dict[str, Any]] = []
+    retired: list[dict[str, Any]] = []
+    skipped_live: list[str] = []
+    for row in rows:
+        worker_session_id = str(row["worker_session_id"])
+        if worker_session_id in live:
+            skipped_live.append(worker_session_id)
+            continue
+        ack = _terminal_reply_for_trigger(
+            conn,
+            topic_id=topic_id,
+            role=row["role"],
+            trigger_msg_id=row["trigger_msg_id"],
+        )
+        details = _claim_details_dict(row)
+        recovery = {
+            "recovered_at": now,
+            "older_than_ts": older_than_ts,
+            "minimum_age_seconds": minimum_age_seconds,
+            "previous_heartbeat_at": row["heartbeat_at"],
+            "launcher_process_live": False,
+        }
+        if ack is not None:
+            result = "completed_from_terminal"
+            new_state = "completed"
+            ack_msg_id = ack["msg_id"]
+            recovery["ack_msg_id"] = ack_msg_id
+            completed.append(
+                {
+                    "worker_session_id": worker_session_id,
+                    "trigger_msg_id": row["trigger_msg_id"],
+                    "ack_msg_id": ack_msg_id,
+                }
+            )
+        else:
+            result = "retired_orphan_no_terminal"
+            new_state = "retired"
+            ack_msg_id = None
+            recovery["parent_trigger_still_pending"] = True
+            retired.append(
+                {
+                    "worker_session_id": worker_session_id,
+                    "trigger_msg_id": row["trigger_msg_id"],
+                }
+            )
+        details["stale_worker_recovery"] = recovery
+        conn.execute(
+            "UPDATE debate_worker_claims SET state = ?, heartbeat_at = ?, "
+            "completed_at = ?, ack_msg_id = ?, details_json = ? "
+            "WHERE topic_id = ? AND role = ? AND worker_session_id = ? "
+            "AND state = 'active'",
+            (
+                new_state,
+                now,
+                now,
+                ack_msg_id,
+                json_dumps(details),
+                topic_id,
+                row["role"],
+                worker_session_id,
+            ),
+        )
+        recovery_id = new_msg_id()
+        while conn.execute(
+            "SELECT 1 FROM debate_worker_recovery_log "
+            "WHERE recovery_id = ? LIMIT 1",
+            (recovery_id,),
+        ).fetchone():
+            recovery_id = new_msg_id()
+        conn.execute(
+            "INSERT INTO debate_worker_recovery_log "
+            "(recovery_id, topic_id, role, parent_session_id, "
+            " worker_session_id, trigger_msg_id, previous_state, result, "
+            " details_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+            (
+                recovery_id,
+                topic_id,
+                row["role"],
+                row["parent_session_id"],
+                worker_session_id,
+                row["trigger_msg_id"],
+                result,
+                json_dumps(recovery),
+                now,
+            ),
+        )
+    return {
+        "topic_id": topic_id,
+        "topic_state": debate["state"],
+        "older_than_ts": older_than_ts,
+        "minimum_age_seconds": minimum_age_seconds,
+        "completed": completed,
+        "retired": retired,
+        "skipped_live": skipped_live,
+        "completed_count": len(completed),
+        "retired_count": len(retired),
+        "skipped_live_count": len(skipped_live),
+    }
 
 
 def _complete_worker_claim_if_terminal(
@@ -3609,6 +3749,23 @@ def _insert_wake_log(
     binding_generation: int | None = None,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Message-level terminal routing decisions do not have a target session,
+    # so the historical partial unique index could not dedupe them.  A pump
+    # rescan consequently wrote tens of thousands of identical refusal rows.
+    # Return the first durable receipt instead of growing an audit hot-loop.
+    if target_session_id is None and result in _SINGLETON_MESSAGE_WAKE_RESULTS:
+        existing = conn.execute(
+            "SELECT * FROM debate_wake_log "
+            "WHERE trigger_msg_id = ? AND topic_id = ? AND recipient = ? "
+            "AND action = ? AND result = ? AND target_session_id IS NULL "
+            "ORDER BY created_at ASC, wake_id ASC LIMIT 1",
+            (trigger_msg_id, topic_id, recipient, action, result),
+        ).fetchone()
+        if existing is not None:
+            out = dict(existing)
+            out["details"] = json_loads(out.pop("details_json") or "{}")
+            out["duplicate"] = True
+            return out
     wake_id = new_msg_id()
     while conn.execute(
         "SELECT 1 FROM debate_wake_log WHERE wake_id = ? LIMIT 1",
@@ -3630,6 +3787,7 @@ def _insert_wake_log(
         "schema_version": DEBATE_WAKE_SCHEMA_VERSION,
         "details": details or {},
         "created_at": now,
+        "duplicate": False,
     }
     conn.execute(
         "INSERT INTO debate_wake_log "

@@ -71,11 +71,13 @@ def test_debate_pump_service_template_is_agent_safe():
     text = debate_ops.SERVICE_SRC.read_text(encoding="utf-8")
 
     assert "Restart=always" in text
-    assert "KillMode=process" in text
+    assert "KillMode=control-group" in text
+    assert "TimeoutStopSec=20" in text
     assert "DEBATE_WAKE_ACTION=agent" in text
     assert "DEBATE_RESOURCE_BUDGET=auto" in text
+    assert "DEBATE_WORKER_CLAIM_RECOVERY_SECONDS=900" in text
     assert "--action-kind Q,DECISION" in text
-    assert "MemoryMax=5G" in text
+    assert "MemoryMax=3G" in text
     exec_start = next(line for line in text.splitlines() if line.startswith("ExecStart="))
     assert "codex" not in exec_start.lower()
 
