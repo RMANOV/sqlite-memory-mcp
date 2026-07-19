@@ -274,10 +274,14 @@ def test_structural_exact_matches_ignore_recent_literal_scan_cap(retrieval_db):
 
     cases = {
         "struct-old-target": {"struct-old-target"},
+        "msg_id:struct-old-target)": {"struct-old-target"},
         "struct-root": {"struct-root", "struct-old-target"},
+        "reply_to=struct-root.": {"struct-old-target"},
         "STRUCTURAL_OLD": {"struct-root", "struct-old-target"},
+        "topic_id:STRUCTURAL_OLD.": {"struct-root", "struct-old-target"},
         "recipient-ancient": {"struct-old-target"},
         "/opt/archive/debate/ancient.json": {"struct-old-target"},
+        "(/opt/archive/debate/ancient.json).": {"struct-old-target"},
     }
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row

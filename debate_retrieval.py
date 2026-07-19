@@ -38,6 +38,8 @@ _MISSING_FTS_ERRORS = (
     "no such table: debate_messages_fts",
     "no such module: fts5",
 )
+_SURROUNDING_PUNCTUATION = "\"'`()[]{}<>,;:"
+_TRAILING_SENTENCE_PUNCTUATION = ".!?"
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -49,6 +51,15 @@ def _dedupe(values: Iterable[str]) -> list[str]:
             seen.add(clean)
             out.append(clean)
     return out
+
+
+def _strip_surrounding_punctuation(value: str) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .strip(_SURROUNDING_PUNCTUATION)
+        .rstrip(_TRAILING_SENTENCE_PUNCTUATION)
+    )
 
 
 def query_tokens(query: str) -> list[str]:
@@ -156,8 +167,11 @@ def _literal_candidates(
 
 def _structural_values(query: str) -> list[str]:
     raw = str(query or "").strip()
-    unquoted = raw.strip("\"'")
-    prefixed = [match.group(1).strip("\"'") for match in _STRUCTURAL_PREFIX_RE.finditer(raw)]
+    unquoted = _strip_surrounding_punctuation(raw)
+    prefixed = [
+        _strip_surrounding_punctuation(match.group(1))
+        for match in _STRUCTURAL_PREFIX_RE.finditer(raw)
+    ]
     return _dedupe([unquoted, *prefixed])[:8]
 
 
@@ -169,7 +183,7 @@ def _path_literals(query: str) -> list[str]:
     if ("/" in raw or "\\" in raw) and not any(char.isspace() for char in raw):
         out.append(raw)
     for part in raw.split():
-        clean = part.strip("\"'`()[]{}<>,;:")
+        clean = _strip_surrounding_punctuation(part)
         if "/" in clean or "\\" in clean:
             out.append(clean)
     return _dedupe(out)[:4]
