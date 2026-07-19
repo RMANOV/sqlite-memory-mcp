@@ -56,6 +56,21 @@ def _token(db_path: str, task_id: str) -> StatusToken:
     return token
 
 
+def test_status_token_supports_default_tuple_rows(db_path):
+    _create(db_path, "tuple-token", "not_started")
+    conn = sqlite3.connect(db_path)
+    try:
+        token = status_token(conn, "tuple-token")
+    finally:
+        conn.close()
+
+    assert token is not None
+    assert token.task_id == "tuple-token"
+    assert token.status == "not_started"
+    assert token.updated_order > 0
+    assert token.source_event_id
+
+
 def _status(db_path: str, task_id: str) -> str:
     conn = sqlite3.connect(db_path)
     try:
@@ -343,3 +358,24 @@ def test_legacy_mutation_path_remains_unconditional(db_path):
     assert result["updated"] == 1
     assert "outcome" not in result
     assert _status(db_path, "legacy") == "done"
+
+
+@pytest.mark.parametrize("event_id", [None, "", "   "])
+def test_status_cas_requires_nonempty_event_id(db_path, event_id):
+    _create(db_path, "event-id", "not_started")
+    token = _token(db_path, "event-id")
+    before = _status_events(db_path, "event-id")
+
+    with pytest.raises(ValueError, match="expected_status_event_id"):
+        with get_conn_immediate(db_path) as conn:
+            apply_task_mutation(
+                conn,
+                "event-id",
+                {"status": "done"},
+                expected_status=token.status,
+                expected_status_order=token.updated_order,
+                expected_status_event_id=event_id,
+            )
+
+    assert _status(db_path, "event-id") == "not_started"
+    assert _status_events(db_path, "event-id") == before

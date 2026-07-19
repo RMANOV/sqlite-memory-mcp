@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from trust_boundary import (
@@ -115,3 +117,36 @@ def test_high_stakes_uses_stricter_independence_threshold():
 
     assert decision.outward is False
     assert decision.reason == "insufficient_independence"
+
+
+@pytest.mark.parametrize("field", ["origins", "verifier_origins"])
+def test_attestation_rejects_blank_origin_values(field):
+    values = {
+        "attestation_id": "a",
+        "origins": frozenset({"origin"}),
+        "generator_id": "generator",
+        "verifier_id": "verifier",
+        "verifier_origins": frozenset({"audit-origin"}),
+        "verified": True,
+    }
+    values[field] = frozenset({"  "})
+
+    with pytest.raises(ValueError, match="origins"):
+        Attestation(**values)
+
+
+def test_restored_malformed_attestation_fails_closed_at_boundary():
+    malformed = object.__new__(Attestation)
+    object.__setattr__(malformed, "attestation_id", "legacy")
+    object.__setattr__(malformed, "origins", frozenset({""}))
+    object.__setattr__(malformed, "generator_id", "generator")
+    object.__setattr__(malformed, "verifier_id", "verifier")
+    object.__setattr__(malformed, "verifier_origins", frozenset({"audit"}))
+    object.__setattr__(malformed, "verified", True)
+
+    decision = evaluate_boundary([malformed], sample_size=10)
+
+    assert decision.outward is False
+    assert decision.report_only is True
+    assert decision.reason == "invalid_attestation_origins"
+    assert decision.independent_attestations == 0

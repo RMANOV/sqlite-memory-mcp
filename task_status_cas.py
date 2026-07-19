@@ -49,13 +49,13 @@ def status_token(conn: sqlite3.Connection, task_id: str) -> StatusToken | None:
     version = get_status_version(conn, task_id)
     if (
         row is None
-        or row["type"] != "task"
+        or row[1] != "task"
         or version is None
         or version[0] == 0
         or version[1] is None
     ):
         return None
-    return StatusToken(task_id, row["status"], version[0], version[1])
+    return StatusToken(task_id, row[2], version[0], version[1])
 
 
 def _allowed(source: str, target: str, *, confirmed: bool, undo: bool) -> bool:

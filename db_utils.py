@@ -3689,6 +3689,11 @@ def apply_task_mutation(
         raise ValueError("status CAS accepts exactly one field: status")
     if status_cas and expected_status_order is None:
         raise ValueError("status CAS requires expected_status_order")
+    if status_cas and (
+        not isinstance(expected_status_event_id, str)
+        or not expected_status_event_id.strip()
+    ):
+        raise ValueError("status CAS requires expected_status_event_id")
     if "project" in raw_changes:
         raw_changes["project"] = normalize_project_name(raw_changes.get("project"))
     if not raw_changes:
@@ -3868,7 +3873,7 @@ def get_status_version(
     ).fetchone()
     if row is None:
         return None
-    return int(row["updated_order"] or 0), row["source_event_id"]
+    return int(row[0] or 0), row[1]
 
 
 def upsert_field_versions(

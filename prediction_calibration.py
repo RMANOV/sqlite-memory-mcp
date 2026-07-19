@@ -251,7 +251,9 @@ class SQLitePredictionAdapter:
         rows = self.conn.execute(
             "SELECT id, claim_id, probability, issued_at, resolve_by, "
             "anchors_json, resolver FROM predictions "
-            "WHERE status='pending' AND resolve_by<=? ORDER BY resolve_by, id",
+            "WHERE status='pending' "
+            "AND julianday(resolve_by)<=julianday(?) "
+            "ORDER BY julianday(resolve_by), id",
             (_aware_utc(now).isoformat(),),
         ).fetchall()
         return tuple(
@@ -271,6 +273,9 @@ class SQLitePredictionAdapter:
         self._require_slot()
         if resolution.status not in {"resolved", "void"}:
             raise ValueError("only terminal resolutions can be recorded")
+        resolved = _aware_utc(resolved_at)
+        if resolved < _aware_utc(resolution.forecast.resolve_by):
+            raise ValueError("terminal resolution cannot precede resolve_by")
         score = resolution.score
         cur = self.conn.execute(
             "UPDATE predictions SET status=?, outcome=?, brier=?, log_score=?, "
@@ -280,7 +285,7 @@ class SQLitePredictionAdapter:
                 None if resolution.outcome is None else int(resolution.outcome),
                 score.brier if score else None,
                 score.log_score if score else None,
-                _aware_utc(resolved_at).isoformat(),
+                resolved.isoformat(),
                 resolution.forecast.prediction_id,
             ),
         )
