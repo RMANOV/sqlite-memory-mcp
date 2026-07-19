@@ -76,6 +76,7 @@ py-modules = [
     "task_report",
     "task_search",
     "task_server",
+    "task_status_cas",
     "task_tray",
     "tray_dialogs",
     "tray_filters",
