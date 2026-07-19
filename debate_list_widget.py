@@ -1,8 +1,6 @@
-"""Read-only list widget for debate rows (BUILD STEP 1).
+"""Read-only list widget for debate rows.
 
-Implements the §2.0 read-only UI isolation contract of
-BOARD-TO-NATIVE-TRAY-SPEC-2026-07-18.md. This is a *dedicated* widget, not a
-flag on ``TaskListWidget``:
+This is a *dedicated* widget, not a flag on ``TaskListWidget``:
 
 * it holds **no** ``db`` reference — structurally it cannot issue any DB write;
 * it never connects ``itemChanged`` to a mutation callback (no checkbox);
@@ -15,7 +13,7 @@ flag on ``TaskListWidget``:
 
 Rows are inert with respect to TaskDB: select / copy / double-click /
 context-menu can never reach ``apply_task_mutation`` / ``update_task`` /
-``mark_done`` / ``delete_task``. Falsified by the negative tests (spec T7).
+``mark_done`` / ``delete_task``. Negative tests enforce this boundary.
 """
 from __future__ import annotations
 

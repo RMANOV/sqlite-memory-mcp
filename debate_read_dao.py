@@ -1,17 +1,16 @@
-"""Read-only debate access for the native tray (BUILD STEP 1, read-only stages).
+"""Read-only debate access for the native tray.
 
 Faithful port of the proven, no-LLM logic in
 ``operator_board/board.py`` (recent / _section_a / topics / topic_thread /
-search), per BOARD-TO-NATIVE-TRAY-SPEC-2026-07-18.md (§2, §4). This module is
-**read-only by construction**:
+search). This module is **read-only by construction**:
 
 * every connection is opened ``mode=ro`` **and** ``PRAGMA query_only=ON``;
 * it exposes **no** mutation / close / CAS entry point, and never shells out;
 * an optional ``forbid_path`` fail-closed guard refuses to open a DB whose
   realpath matches a forbidden path (the harness passes the prod DB so tests
-  are structurally unable to touch prod — spec §6 B5 lab/prod fence).
+  are structurally unable to touch prod).
 
-Determinism (spec M3): the "now" used by ``recent`` / ``waiting_section_a`` is
+For determinism, the "now" used by ``recent`` / ``waiting_section_a`` is
 supplied by an injected ``clock`` callable. The acceptance harness injects the
 frozen ``as_of``; there is **no** live ``datetime.now`` on the harness path.
 """
