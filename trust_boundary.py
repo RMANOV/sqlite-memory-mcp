@@ -8,6 +8,12 @@ from typing import Iterable
 from lazy_verification import independent_origin_count
 
 
+def _valid_origins(origins: frozenset[str]) -> bool:
+    return bool(origins) and all(
+        isinstance(origin, str) and bool(origin.strip()) for origin in origins
+    )
+
+
 @dataclass(frozen=True)
 class BoundaryPolicy:
     minimum_sample: int = 5
@@ -39,11 +45,11 @@ class Attestation:
     verified: bool
 
     def __post_init__(self) -> None:
-        if not self.attestation_id.strip() or not self.origins:
+        if not self.attestation_id.strip() or not _valid_origins(self.origins):
             raise ValueError("attestation identity and origins are required")
         if not self.generator_id.strip() or not self.verifier_id.strip():
             raise ValueError("generator and verifier identities are required")
-        if not self.verifier_origins:
+        if not _valid_origins(self.verifier_origins):
             raise ValueError("verifier origins are required")
 
 
@@ -94,8 +100,18 @@ def evaluate_boundary(
     ):
         return BoundaryDecision(False, True, "high_stakes_hold", 0)
 
+    rows = list(attestations)
+    # Keep the decision boundary fail-closed even for attestations restored
+    # from an older serializer that may have bypassed today's constructor.
+    if any(
+        not _valid_origins(item.origins)
+        or not _valid_origins(item.verifier_origins)
+        for item in rows
+    ):
+        return BoundaryDecision(False, True, "invalid_attestation_origins", 0)
+
     accepted = [
-        item for item in attestations if item.verified and audit_decoupling(item).passed
+        item for item in rows if item.verified and audit_decoupling(item).passed
     ]
     independent = (
         independent_origin_count([item.origins for item in accepted]) if accepted else 0

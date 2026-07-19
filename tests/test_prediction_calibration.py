@@ -178,3 +178,57 @@ def test_adapter_uses_existing_slot_and_terminal_update_is_conditional():
     assert adapter.record(resolution, resolved_at=NOW + timedelta(days=3)) is True
     assert adapter.record(resolution, resolved_at=NOW + timedelta(days=3)) is False
     assert adapter.pending_due(NOW + timedelta(days=3)) == ()
+
+
+def test_adapter_compares_offset_deadlines_as_instants():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE predictions ("
+        "id TEXT PRIMARY KEY, claim_id TEXT, probability REAL, issued_at TEXT, "
+        "resolve_by TEXT, anchors_json TEXT, resolver TEXT, status TEXT, "
+        "outcome INTEGER, brier REAL, log_score REAL, resolved_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO predictions "
+        "(id, claim_id, probability, issued_at, resolve_by, anchors_json, "
+        "resolver, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+        (
+            "offset-due",
+            "claim-offset",
+            0.6,
+            "2026-07-19T10:00:00+02:00",
+            "2026-07-19T13:00:00+02:00",
+            '["source:offset"]',
+            "mechanical",
+        ),
+    )
+
+    due = SQLitePredictionAdapter(conn).pending_due(
+        datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    )
+
+    assert tuple(row.prediction_id for row in due) == ("offset-due",)
+
+
+def test_adapter_rejects_terminal_resolution_before_deadline():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE predictions ("
+        "id TEXT PRIMARY KEY, claim_id TEXT, probability REAL, issued_at TEXT, "
+        "resolve_by TEXT, anchors_json TEXT, resolver TEXT, status TEXT, "
+        "outcome INTEGER, brier REAL, log_score REAL, resolved_at TEXT)"
+    )
+    adapter = SQLitePredictionAdapter(conn)
+    forecast = _forecast()
+    assert adapter.insert(forecast) is True
+    premature = Resolution(
+        forecast,
+        "resolved",
+        outcome=True,
+        score=score_forecast(forecast.probability, True),
+    )
+
+    with pytest.raises(ValueError, match="precede resolve_by"):
+        adapter.record(premature, resolved_at=NOW + timedelta(days=1))
+
+    assert adapter.pending_due(NOW + timedelta(days=3)) == (forecast,)
