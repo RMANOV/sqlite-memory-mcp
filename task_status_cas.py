@@ -49,7 +49,7 @@ def status_token(conn: sqlite3.Connection, task_id: str) -> StatusToken | None:
     version = get_status_version(conn, task_id)
     if (
         row is None
-        or row[1] != "task"
+        or row[1] not in ("task", "note")
         or version is None
         or version[0] == 0
         or not isinstance(version[1], str)

@@ -105,6 +105,7 @@ from db_utils import (
 )
 from schema import init_db
 from smart_retrieval import suggested_ready
+from task_status_cas import StatusToken, transition_status
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -1146,12 +1147,16 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._debate_controls = {}
         self._waiting_task_controls = None
         self._waiting_task_list = None
+        self._debate_task_inflight = set()
         for key in self._tab_keys:
             if key in self._DEBATE_TABS:
                 page = DebateTabWidget(key)
                 lw = page.list_widget
                 lw.navigate_requested.connect(self._on_debate_navigate)
                 lw.reader_requested.connect(self._open_debate_reader)
+                lw.task_completion_requested.connect(
+                    self._on_debate_task_completion_requested
+                )
                 page.controls.changed.connect(
                     lambda params, k=key: self._on_debate_controls_changed(k, params)
                 )
@@ -1168,6 +1173,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     )
                     page.secondary_list.reader_requested.connect(
                         self._open_debate_reader
+                    )
+                    page.secondary_list.task_completion_requested.connect(
+                        self._on_debate_task_completion_requested
                     )
             else:
                 lw = TaskListWidget(self.db)
@@ -2453,14 +2461,15 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                         ("updated_at", task.get("updated_at") or ""),
                     ) if value
                 )
-                task_lw.add_debate_row(
-                    f"task-{task_id}", text,
+                task_lw.add_task_row(
+                    task_id, text,
                     copy_payload=record,
                     reader_payload={
                         "title": str(task.get("title") or task_id),
                         "body": str(task.get("title") or ""),
                         "record": record,
                     },
+                    completion_payload=self._task_completion_payload(task),
                 )
         elif key == "topics":
             if "thread" in rows:
@@ -2518,12 +2527,11 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         }
 
     def _load_debate_search(self, lw, result):
-        """Render grouped per-source BM25 search results, read-only.
+        """Render grouped per-source BM25 search results.
 
         Verbatim board order per source (no cross-source merge, no recency
-        band — M4). In this read-only stage all three groups render inert in the
-        DebateListWidget; the later write stage splits the tasks group into a
-        TaskListWidget with the gated close.
+        band — M4). Debate and knowledge records remain inert; active task/note
+        records expose the same narrow CAS completion control in all three tabs.
         """
         debate = result.get("debate", [])
         tasks = result.get("tasks", [])
@@ -2540,9 +2548,27 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         for r in tasks:
             tid = r.get("id", "")
             text = f"[{r.get('type','')}/{r.get('status','')}] {r.get('title','')}"
-            lw.add_debate_row(f"task-{tid}", text, topic_id=None,
-                              copy_payload=str(r.get("title", "")),
-                              reader_payload=self._debate_reader_payload(r))
+            record = "\n".join(
+                f"{name}: {value}" for name, value in (
+                    ("id", tid),
+                    ("type", r.get("type") or ""),
+                    ("status", r.get("status") or ""),
+                    ("section", r.get("section") or ""),
+                    ("project", r.get("project") or ""),
+                    ("title", r.get("title") or ""),
+                ) if value
+            )
+            lw.add_task_row(
+                tid,
+                text,
+                copy_payload=record,
+                reader_payload={
+                    "title": str(r.get("title") or tid),
+                    "body": str(r.get("title") or ""),
+                    "record": record,
+                },
+                completion_payload=self._task_completion_payload(r),
+            )
         lw.add_header(f"Knowledge ({len(knowledge)})")
         for r in knowledge:
             eid = r.get("id", "")
@@ -2560,6 +2586,124 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                                       ) if value
                                   ),
                               })
+
+    @staticmethod
+    def _task_completion_payload(task):
+        """Return the exact rendered status token, or None for an inert row."""
+        task_id = str(task.get("id") or "").strip()
+        task_type = str(task.get("type") or "task").strip()
+        status = str(task.get("status") or "").strip()
+        event_id = str(task.get("status_event_id") or "").strip()
+        try:
+            order = int(task.get("status_order") or 0)
+        except (TypeError, ValueError):
+            order = 0
+        if (
+            not task_id
+            or task_type not in {"task", "note"}
+            or status not in {"not_started", "in_progress"}
+            or order <= 0
+            or not event_id
+        ):
+            return None
+        return {
+            "id": task_id,
+            "type": task_type,
+            "title": str(task.get("title") or task_id),
+            "expected_status": status,
+            "expected_order": order,
+            "expected_event_id": event_id,
+        }
+
+    def _on_debate_task_completion_requested(self, payload, checked):
+        """Defer a task/note completion outside QListWidget signal dispatch."""
+        if not isinstance(payload, dict):
+            return
+        task_id = str(payload.get("id") or "")
+        if not task_id:
+            return
+        if not checked:
+            self._debate_task_inflight.discard(task_id)
+            return
+        if task_id in self._debate_task_inflight:
+            return
+        self._debate_task_inflight.add(task_id)
+        QTimer.singleShot(
+            10,
+            lambda p=dict(payload): self._run_debate_task_completion(p),
+        )
+
+    def _run_debate_task_completion(self, payload):
+        """Ignore a deferred callback when the operator unchecked meanwhile."""
+        task_id = str(payload.get("id") or "")
+        if task_id not in self._debate_task_inflight:
+            return
+        self._apply_debate_task_completion(payload)
+
+    def _invalidate_debate_task_views(self):
+        self._debate_source_cache.clear()
+        for key in self._DEBATE_TABS:
+            self._filtered_cache.pop(key, None)
+
+    def _set_debate_task_checked(self, task_id, checked):
+        for page in self._debate_pages.values():
+            page.list_widget.set_task_checked(task_id, checked)
+            if page.secondary_list is not None:
+                page.secondary_list.set_task_checked(task_id, checked)
+
+    def _apply_debate_task_completion(self, payload):
+        """Apply one CAS-safe active -> done transition on the live task DB."""
+        task_id = str(payload.get("id") or "")
+        try:
+            token = StatusToken(
+                task_id=task_id,
+                status=str(payload.get("expected_status") or ""),
+                updated_order=int(payload.get("expected_order") or 0),
+                source_event_id=str(payload.get("expected_event_id") or ""),
+            )
+            if payload.get("type") not in {"task", "note"}:
+                raise ValueError("unsupported record type")
+            result = transition_status(
+                self.db.db_path,
+                token,
+                "done",
+                actor_id="operator",
+                forbid_path=None,
+            )
+            if result.get("outcome") != "applied":
+                reason = result.get("reason") or result.get("outcome") or "conflict"
+                self._set_debate_task_checked(task_id, False)
+                self.status.showMessage(
+                    f"Task was not changed ({reason}); the list was refreshed.",
+                    8000,
+                )
+                self._invalidate_debate_task_views()
+                self.refresh()
+                return
+
+            self._invalidate_debate_task_views()
+            self.status.showMessage(
+                f"Done: {payload.get('title') or task_id}", 5000
+            )
+            callback = getattr(self.db, "on_change", None)
+            if callable(callback):
+                callback()
+            else:
+                self.refresh()
+        except (
+            PermissionError,
+            RuntimeError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logging.getLogger("task_tray").error(
+                "Error completing task/note %s: %s", task_id, exc, exc_info=True
+            )
+            self._set_debate_task_checked(task_id, False)
+            self.status.showMessage(f"DB error — item not saved. {exc}", 8000)
+        finally:
+            self._debate_task_inflight.discard(task_id)
 
     def _open_debate_reader(self, payload):
         """Open a local read-only reader; selection and Ctrl+C stay native."""
