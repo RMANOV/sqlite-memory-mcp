@@ -1100,7 +1100,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "done",
             # Read-only debate tabs (BUILD STEP 1, spec §2/§3). Appended so the
             # existing task tab indices are unchanged. ADOPTION FIX 2: `waiting`
-            # («Какво чака мен») leads — it is North-Star pain request #1.
+            # ("Waiting on Me") leads — it is North-Star pain request #1.
             "waiting",
             "recent",
             "topics",
@@ -1120,9 +1120,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             "notes": "Notes",
             "all": "All",
             "done": "Done",
-            "recent": "Какво реши X",
-            "waiting": "Какво чака мен",
-            "topics": "Дебат по тема",
+            "recent": "Recent Decisions",
+            "waiting": "Waiting on Me",
+            "topics": "Debate by Topic",
         }
         if self._premium_tray_extension:
             self._tab_labels[self._premium_tray_extension.tab_key] = (
@@ -2207,7 +2207,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._sort_toolbar_action.setVisible(show_task_sort)
             self._filter_bar.setVisible(not is_debate)
             self._search_input.setPlaceholderText(
-                "Търси навсякъде: дебат, задачи, знание…"
+                "Search everywhere: debates, tasks, knowledge…"
                 if is_debate else "Search tasks..."
             )
             if is_debate:
@@ -2391,7 +2391,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             if key == "waiting" and self._waiting_task_controls is not None:
                 self._waiting_task_controls.setEnabled(False)
                 self._waiting_task_list.add_header(
-                    "Глобалните резултати са в горния списък"
+                    "Global results are shown in the upper list"
                 )
             self._load_debate_search(lw, rows["search"])
             return
@@ -2400,7 +2400,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._waiting_task_controls.setEnabled(True)
         if key == "recent":
             items = rows.get("items", [])
-            lw.add_header(f"Скорошни решения ({len(items)})")
+            lw.add_header(f"Recent decisions ({len(items)})")
             for it in items:
                 mid = it["msg_id"]
                 text = (f"[{it.get('kind','')}] {it.get('role','')} · "
@@ -2413,10 +2413,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         elif key == "waiting":
             items = rows.get("section_a", [])
             # The old denominator counted every recent Q/DECISION candidate,
-            # not operator asks. "1 от 99" was therefore misleading noise on
+            # not operator asks. "1 of 99" was therefore misleading noise on
             # the operator surface; only the actionable result count belongs
             # in this header.
-            lw.add_header(f"Какво чака мен ({len(items)})")
+            lw.add_header(f"Waiting on me ({len(items)})")
             for it in items:
                 mid = it["msg_id"]
                 stale = " ⏳" if it.get("stale") else ""
@@ -2431,12 +2431,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             task_items = rows.get("section_b", [])
             task_lw = self._waiting_task_list
             task_lw.add_header(
-                f"Твои задачи — сега ({len(task_items)} от "
+                f"Your tasks — now ({len(task_items)} of "
                 f"{rows.get('section_b_before', 0)})"
             )
             for task in task_items:
                 task_id = str(task.get("id") or "")
-                due = task.get("due_date") or "без срок"
+                due = task.get("due_date") or "no due date"
                 text = (
                     f"[{task.get('section','')}] {task.get('priority','')} · "
                     f"{due} · {task.get('project','')} — {task.get('title','')}"
@@ -2482,11 +2482,11 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                                       ))
             else:
                 topics = rows.get("digest", {}).get("topics", [])
-                lw.add_header(f"Теми ({len(topics)}) — двоен клик отваря нишката")
+                lw.add_header(f"Topics ({len(topics)}) — double-click to open thread")
                 for t in topics:
                     tid = t["topic_id"]
                     text = (f"[{t.get('state','')}] {t.get('title','')} · "
-                            f"{t.get('count',0)} съобщ. · {t.get('age','')}")
+                            f"{t.get('count',0)} messages · {t.get('age','')}")
                     lw.add_debate_row(tid, text, topic_id=tid, copy_payload=tid)
 
     @staticmethod
@@ -2528,7 +2528,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         debate = result.get("debate", [])
         tasks = result.get("tasks", [])
         knowledge = result.get("knowledge", [])
-        lw.add_header(f"Дебат ({len(debate)})")
+        lw.add_header(f"Debates ({len(debate)})")
         for r in debate:
             mid = r["msg_id"]
             text = (f"[{r.get('kind','')}] {r.get('role','')} · {mid[:8]} — "
@@ -2536,14 +2536,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             lw.add_debate_row(mid, text, topic_id=r.get("topic_id"),
                               copy_payload=f"{mid} · {r.get('body','')}",
                               reader_payload=self._debate_reader_payload(r))
-        lw.add_header(f"Задачи/бележки ({len(tasks)})")
+        lw.add_header(f"Tasks/notes ({len(tasks)})")
         for r in tasks:
             tid = r.get("id", "")
             text = f"[{r.get('type','')}/{r.get('status','')}] {r.get('title','')}"
             lw.add_debate_row(f"task-{tid}", text, topic_id=None,
                               copy_payload=str(r.get("title", "")),
                               reader_payload=self._debate_reader_payload(r))
-        lw.add_header(f"Знание ({len(knowledge)})")
+        lw.add_header(f"Knowledge ({len(knowledge)})")
         for r in knowledge:
             eid = r.get("id", "")
             text = f"[{r.get('type','')}] {r.get('name','')}"

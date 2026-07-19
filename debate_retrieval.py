@@ -30,6 +30,14 @@ DEFAULT_SNIPPET_BYTES = 480
 DEFAULT_MAX_QUERY_MS = 750
 _TOKEN_RE = re.compile(r"[^\W_]", re.UNICODE)
 _WORD_RE = re.compile(r"[\w-]{2,}", re.UNICODE)
+_STRUCTURAL_PREFIX_RE = re.compile(
+    r"\b(?:msg(?:_id)?|reply(?:_to)?|topic(?:_id)?|recipient)\s*[:=]\s*([^\s,;]+)",
+    re.IGNORECASE,
+)
+_MISSING_FTS_ERRORS = (
+    "no such table: debate_messages_fts",
+    "no such module: fts5",
+)
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -54,6 +62,19 @@ def query_tokens(query: str) -> list[str]:
 
 def _fts_query(tokens: Sequence[str]) -> str:
     return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+def _fts_and_query(tokens: Sequence[str]) -> str:
+    return " AND ".join(
+        f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
+    )
+
+
+def _is_missing_fts_error(exc: sqlite3.Error) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).casefold()
+    return any(marker in message for marker in _MISSING_FTS_ERRORS)
 
 
 def _where_in(column: str, values: Sequence[str]) -> tuple[str, list[str]]:
@@ -102,10 +123,12 @@ def _fts_path(
             " GROUP BY m.msg_id ORDER BY h.lexical_rank ASC, m.ts DESC, m.msg_id DESC",
             [_fts_query(tokens), *topic_params, *candidate_params, limit],
         ).fetchall()
-    except sqlite3.Error:
+    except sqlite3.OperationalError as exc:
         # Legacy/partial installs still have the literal path.  init_db repairs
         # the FTS index, but retrieval itself remains read-only and fail-soft.
-        return []
+        if _is_missing_fts_error(exc):
+            return []
+        raise
     return [_row_payload(row) for row in rows]
 
 
@@ -129,6 +152,121 @@ def _literal_candidates(
         [*topic_params, *candidate_params, scan_limit],
     ).fetchall()
     return [_row_payload(row) for row in rows]
+
+
+def _structural_values(query: str) -> list[str]:
+    raw = str(query or "").strip()
+    unquoted = raw.strip("\"'")
+    prefixed = [match.group(1).strip("\"'") for match in _STRUCTURAL_PREFIX_RE.finditer(raw)]
+    return _dedupe([unquoted, *prefixed])[:8]
+
+
+def _path_literals(query: str) -> list[str]:
+    raw = str(query or "").strip().strip("\"'")
+    if not raw:
+        return []
+    out: list[str] = []
+    if ("/" in raw or "\\" in raw) and not any(char.isspace() for char in raw):
+        out.append(raw)
+    for part in raw.split():
+        clean = part.strip("\"'`()[]{}<>,;:")
+        if "/" in clean or "\\" in clean:
+            out.append(clean)
+    return _dedupe(out)[:4]
+
+
+def _structural_candidates(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    topic_ids: Sequence[str],
+    candidate_msg_ids: Sequence[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Resolve exact structural identifiers without a recent-row scan.
+
+    Base-table primary/secondary indexes cover msg_id, reply_to, topic_id, and
+    recipient.  Path literals are narrowed through FTS and then verified
+    exactly against the body, so an old path hit is not hidden by newer rows.
+    """
+    values = _structural_values(query)
+    if not values:
+        return []
+    topic_sql, topic_params = _where_in("m.topic_id", topic_ids)
+    candidate_sql, candidate_params = _where_in("m.msg_id", candidate_msg_ids)
+    remaining = max(1, int(limit))
+    ids: list[str] = []
+    seen: set[str] = set()
+
+    def collect(sql: str, params: Sequence[Any]) -> None:
+        nonlocal remaining
+        if remaining <= 0:
+            return
+        for row in conn.execute(sql, params).fetchall():
+            msg_id = str(row["msg_id"])
+            if msg_id not in seen:
+                seen.add(msg_id)
+                ids.append(msg_id)
+                remaining -= 1
+                if remaining <= 0:
+                    break
+
+    value_placeholders = ",".join("?" for _ in values)
+    filters = f" {topic_sql} {candidate_sql}"
+    filter_params = [*topic_params, *candidate_params]
+    for column in ("m.msg_id", "m.reply_to", "m.topic_id"):
+        collect(
+            f"SELECT m.msg_id FROM debate_messages m "
+            f"WHERE {column} IN ({value_placeholders}){filters} "
+            "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+            [*values, *filter_params, remaining],
+        )
+    collect(
+        "SELECT m.msg_id FROM debate_message_recipients r "
+        "JOIN debate_messages m ON m.msg_id=r.msg_id "
+        f"WHERE r.recipient IN ({value_placeholders}){filters} "
+        "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+        [*values, *filter_params, remaining],
+    )
+    for path in _path_literals(query):
+        path_tokens = query_tokens(path)
+        if not path_tokens or remaining <= 0:
+            continue
+        try:
+            collect(
+                "SELECT m.msg_id FROM debate_messages_fts "
+                "JOIN debate_messages m "
+                "ON m.msg_id=debate_messages_fts.msg_id "
+                "WHERE debate_messages_fts MATCH ? "
+                "AND (instr(m.body, ?) > 0 "
+                "OR instr(lower(m.body), lower(?)) > 0)"
+                f"{filters} ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+                [
+                    _fts_and_query(path_tokens),
+                    path,
+                    path,
+                    *filter_params,
+                    remaining,
+                ],
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_missing_fts_error(exc):
+                raise
+
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind,"
+        " m.reply_to, m.standing, COALESCE(m.vehicle,'analysis') AS vehicle,"
+        " m.body, m.created_at, GROUP_CONCAT(DISTINCT r.recipient) AS recipients"
+        " FROM debate_messages m"
+        " LEFT JOIN debate_message_recipients r ON r.msg_id = m.msg_id"
+        f" WHERE m.msg_id IN ({placeholders}) GROUP BY m.msg_id",
+        ids,
+    ).fetchall()
+    by_id = {str(row["msg_id"]): _row_payload(row) for row in rows}
+    return [by_id[msg_id] for msg_id in ids if msg_id in by_id]
 
 
 def _literal_score(
@@ -155,6 +293,14 @@ def _literal_score(
     folded = searchable.casefold()
     phrase = query.strip().casefold()
     score = 0.0
+    exact_fields = (
+        (str(item.get("msg_id") or ""), 32.0),
+        (str(item.get("reply_to") or ""), 24.0),
+        (str(item.get("topic_id") or ""), 16.0),
+    )
+    score += sum(weight for value, weight in exact_fields if phrase == value.casefold())
+    if phrase and phrase in {str(value).casefold() for value in item.get("recipients") or []}:
+        score += 20.0
     if phrase and phrase in folded:
         score += 8.0
         if folded.startswith(phrase):
@@ -291,14 +437,39 @@ def _search_debate_context_impl(
         candidate_msg_ids=clean_candidates,
         limit=effective_path_limit,
     )
-    literal_pool = _literal_candidates(
+    structural_pool = _structural_candidates(
+        conn,
+        query=query,
+        topic_ids=clean_topics,
+        candidate_msg_ids=clean_candidates,
+        limit=effective_path_limit,
+    )
+    recent_literal_pool = _literal_candidates(
         conn,
         topic_ids=clean_topics,
         candidate_msg_ids=clean_candidates,
         scan_limit=min(2000, max(200, effective_path_limit * 20)),
     )
+    structural_ranks = {
+        str(item["msg_id"]): rank for rank, item in enumerate(structural_pool, start=1)
+    }
+    literal_pool: list[dict[str, Any]] = []
+    literal_seen: set[str] = set()
+    for item in [*structural_pool, *recent_literal_pool]:
+        msg_id = str(item["msg_id"])
+        if msg_id not in literal_seen:
+            literal_seen.add(msg_id)
+            literal_pool.append(item)
     literal_scored = [
-        (item, _literal_score(item, query, tokens))
+        (
+            item,
+            _literal_score(item, query, tokens)
+            + (
+                12.0 + 1.0 / structural_ranks[str(item["msg_id"])]
+                if str(item["msg_id"]) in structural_ranks
+                else 0.0
+            ),
+        )
         for item in literal_pool
     ]
     literal_scored = [pair for pair in literal_scored if pair[1] > 0]

@@ -455,11 +455,11 @@ def test_debate_widget_context_menu_readonly(qapp, monkeypatch):
 
     w._context_menu(QPoint(0, 0))
     assert labels == [
-        "Копирай ID",
-        "Копирай целия запис",
-        "Копирай избраните",
-        "Копирай всички видими",
-        "Отвори нишката",
+        "Copy ID",
+        "Copy full record",
+        "Copy selected",
+        "Copy all visible",
+        "Open thread",
     ], (
         f"context menu must be read-only, got {labels}"
     )
@@ -688,9 +688,15 @@ def test_BLOCKER1_fullwindow_debate_tabs_visible_and_load(qapp, tmp_path, monkey
     fw = task_tray.FullWindow(db, sync_host=None)
     try:
         # __init__ already ran refresh(); all three debate tabs must be visible.
+        expected_labels = {
+            "recent": "Recent Decisions",
+            "waiting": "Waiting on Me",
+            "topics": "Debate by Topic",
+        }
         for key in ("recent", "waiting", "topics"):
             idx = fw._tab_keys.index(key)
             assert fw.tabs.isTabVisible(idx), f"{key} tab hidden after refresh (BLOCKER 1)"
+            assert fw.tabs.tabText(idx) == expected_labels[key]
         # Simulate a periodic refresh — they must STILL be visible.
         fw.refresh()
         for key in ("recent", "waiting", "topics"):
