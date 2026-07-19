@@ -38,6 +38,8 @@ AGENT_LOG_DIR = Path(
 )
 TARGET_TOOL = "mcp__sqlite_intel__debate_post_with_recipients"
 POST_SCHEMA_VERSION = "debate_post_with_recipients.v1"
+LOG_MAX_BYTES = int(os.environ.get("DEBATE_WAKE_LOG_MAX_BYTES", str(20 * 1024 * 1024)))
+LOG_KEEP = max(1, int(os.environ.get("DEBATE_WAKE_LOG_KEEP", "3")))
 
 
 def _now() -> str:
@@ -47,6 +49,13 @@ def _now() -> str:
 def _log(event: str, **fields: Any) -> None:
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+            LOG_PATH.with_name(f"{LOG_PATH.name}.{LOG_KEEP}").unlink(missing_ok=True)
+            for index in range(LOG_KEEP - 1, 0, -1):
+                older = LOG_PATH.with_name(f"{LOG_PATH.name}.{index}")
+                if older.exists():
+                    older.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.{index + 1}"))
+            LOG_PATH.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.1"))
         payload = {"ts": _now(), "event": event, **fields}
         with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -126,8 +135,8 @@ Task:
 2. The launcher has already written exactly one human-readable RECEIVED line
    to stdout/log for this wake. Do not print a second RECEIVED line.
 3. If there is no substantive work, call debate_worker_no_action with this
-   topic_id, role, session_id, trigger_msg_id, and a short reason. Then reply
-   NO_ACTION and do not post.
+   topic_id, role, worker_session_id (the session_id shown above),
+   trigger_msg_id, and a short reason. Then reply NO_ACTION and do not post.
 4. If there is work, post at most one focused debate response with
    debate_post_with_recipients. Do not use bare debate_post: unaddressed
    messages are invisible to the pump.
@@ -250,7 +259,10 @@ def _agent_command(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -
             "--cd",
             str(REPO),
             "--dangerously-bypass-approvals-and-sandbox",
-            ]
+            "--ephemeral",
+            "--config",
+            'model_reasoning_effort="low"',
+        ]
     return None
 
 
@@ -437,6 +449,10 @@ def _launch_agent(target: dict[str, Any], trigger_msg_id: str, topic_id: str) ->
             "DEBATE_SESSION_ID": session_id,
             "DEBATE_TOPICS": topic_id,
             "DEBATE_WAKE_PARENT_MSG_ID": trigger_msg_id,
+            # Wake workers fetch their authoritative inbox with MCP tools.
+            # Bypass the legacy global-subscription prompt wrapper so a
+            # worker cannot inherit unrelated role bodies or stale backlog.
+            "CODEX_DEBATE_WRAPPER_BYPASS": "1",
             "DEBATE_WAKE_REMAINING": str(
                 max(
                     0,

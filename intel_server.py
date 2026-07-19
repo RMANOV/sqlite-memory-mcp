@@ -87,6 +87,7 @@ from debate import (
     post_message as _debate_post_dao,
     prepare_wake_dry_run as _debate_prepare_wake_dry_run_dao,
     read_messages as _debate_read_dao,
+    recover_stale_worker_claims as _debate_recover_worker_claims_dao,
     reclaim_stale_message_claims as _debate_reclaim_message_claims_dao,
     reap_worker_claims as _debate_reap_worker_claims_dao,
     rotate_role_binding as _debate_rotate_role_binding_dao,
@@ -96,6 +97,7 @@ from debate import (
     validate_topic_id as _debate_validate_topic_id,
     worker_no_action as _debate_worker_no_action_dao,
 )
+from debate_retrieval import search_debate_context as _search_debate_context
 from premium_runtime import (
     evaluate_debate_protocol_creation_gate,
     maybe_mount_premium_extensions,
@@ -1452,6 +1454,49 @@ def debate_search(topic_id: str, query: str, limit: int = 50) -> str:
         return _debate_error_response(exc)
 
 
+# Tool 27c: bounded hybrid debate retrieval (FTS5 BM25 + literal/metadata)
+@mcp.tool()
+def debate_context_search(
+    topic_id: str,
+    query: str,
+    limit: int = 10,
+    role: str = "",
+    session_id: str = "",
+) -> str:
+    """Rank relevant debate context without dumping full message bodies.
+
+    Runs two native-memory.db retrieval paths: FTS5/BM25 token search and a
+    Unicode literal/metadata search.  Results are merged with weighted RRF,
+    then re-ranked by direct recipient, priority, kind, recency, unresolved-Q,
+    active-topic, and body-length signals.  Every result contains a bounded
+    snippet plus source ranks and score receipts; the full body is omitted.
+    """
+    try:
+        _debate_validate_topic_id(topic_id)
+        with _get_conn() as conn:
+            # Read-only equivalent for the retrieval call.  Schema migration
+            # happens before this wrapper opens; the ranked search itself can
+            # execute no writes even if a future helper accidentally tries.
+            conn.execute("PRAGMA query_only=ON")
+            if _debate_get_debate(conn, topic_id) is None:
+                raise _DebateError(f"unknown_topic: {topic_id}")
+            out = _search_debate_context(
+                conn,
+                query=query,
+                topic_ids=[topic_id],
+                target_role=role,
+                target_session_id=session_id,
+                limit=limit,
+            )
+            out["topic_id"] = topic_id
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error("debate_context_search failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
 # Tool 28: debate_state
 @mcp.tool()
 def debate_state(
@@ -1995,6 +2040,39 @@ def debate_worker_no_action(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_worker_no_action failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# Tool 43b: reconcile workers whose launcher process exited without a receipt
+@mcp.tool()
+def debate_worker_recover_stale(
+    topic_id: str,
+    older_than_ts: str,
+    minimum_age_seconds: int = 120,
+) -> str:
+    """Retire dead worker claims without hiding their parent trigger.
+
+    This manual surface assumes no worker in the selected stale set is live;
+    the resident pump performs the same DAO operation with a live-PID allow
+    list.  A matching terminal A/STATUS completes the claim; otherwise it is
+    retired while the parent cursor remains unchanged.
+    """
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_recover_worker_claims_dao(
+                conn,
+                topic_id=topic_id,
+                older_than_ts=older_than_ts,
+                minimum_age_seconds=minimum_age_seconds,
+                live_worker_session_ids=set(),
+            )
+            return json.dumps(out)
+    except _DebateError as exc:
+        return _debate_error_response(exc)
+    except Exception as exc:
+        logger.error(
+            "debate_worker_recover_stale failed: %s", exc, exc_info=True
+        )
         return _debate_error_response(exc)
 
 

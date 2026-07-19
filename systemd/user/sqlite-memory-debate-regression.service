@@ -1,0 +1,12 @@
+[Unit]
+Description=Fail-closed sqlite-memory debate exchange regression gate
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/sqlite-memory-mcp
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/sqlite-memory-mcp/scripts/run_debate_exchange_regression.py --timeout-seconds 120 --receipt %h/.local/state/sqlite-memory/debate-regression-latest.json
+TimeoutStartSec=150
+Nice=15
+CPUWeight=10
+MemoryMax=2G

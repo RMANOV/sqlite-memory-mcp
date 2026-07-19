@@ -15,6 +15,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,7 +42,10 @@ STATE_PATH = Path(
 POST_SCHEMA_VERSION = "debate_post_with_recipients.v1"
 
 STOP = False
+STOP_EVENT = threading.Event()
 CHILDREN: set[int] = set()
+LOG_MAX_BYTES = int(os.environ.get("DEBATE_PUMP_LOG_MAX_BYTES", str(20 * 1024 * 1024)))
+LOG_KEEP = max(1, int(os.environ.get("DEBATE_PUMP_LOG_KEEP", "3")))
 
 
 def _split_csv_values(values: list[str] | str | None) -> list[str]:
@@ -60,6 +64,13 @@ def _now() -> str:
 
 def _log(event: str, **fields: Any) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+        LOG_PATH.with_name(f"{LOG_PATH.name}.{LOG_KEEP}").unlink(missing_ok=True)
+        for index in range(LOG_KEEP - 1, 0, -1):
+            older = LOG_PATH.with_name(f"{LOG_PATH.name}.{index}")
+            if older.exists():
+                older.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.{index + 1}"))
+        LOG_PATH.replace(LOG_PATH.with_name(f"{LOG_PATH.name}.1"))
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": _now(), "event": event, **fields}, ensure_ascii=False) + "\n")
 
@@ -116,8 +127,10 @@ def _fetch_new(
         return con.execute(
             "SELECT DISTINCT m.msg_id, m.topic_id, m.ts "
             "FROM debate_messages m "
+            "JOIN debates d ON d.topic_id = m.topic_id "
             "JOIN debate_message_recipients r ON r.msg_id = m.msg_id "
             "WHERE (m.ts > ? OR (m.ts = ? AND m.msg_id > ?)) "
+            "AND d.state IN ('INIT','ACTIVE') "
             f"{topic_sql} "
             f"{kind_sql} "
             "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
@@ -271,20 +284,36 @@ def _claim_reclaim_cutoff(stale_seconds: int) -> str:
     )
 
 
+def _active_topic_ids(topics: list[str]) -> list[str]:
+    if topics:
+        return topics
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return [
+            str(row[0])
+            for row in con.execute(
+                "SELECT topic_id FROM debates "
+                "WHERE state IN ('INIT','ACTIVE') ORDER BY topic_id"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+
 def _reclaim_stale_message_claims(
     *,
     topics: list[str],
     stale_seconds: int,
     minimum_age_seconds: int,
 ) -> None:
-    if not topics or stale_seconds <= 0:
+    if stale_seconds <= 0:
         return
     sys.path.insert(0, str(REPO))
     from db_utils import get_conn_immediate
     from debate import reclaim_stale_message_claims
 
     older_than_ts = _claim_reclaim_cutoff(stale_seconds)
-    for topic_id in topics:
+    for topic_id in _active_topic_ids(topics):
         try:
             with get_conn_immediate() as conn:
                 out = reclaim_stale_message_claims(
@@ -303,6 +332,86 @@ def _reclaim_stale_message_claims(
             continue
         if out.get("reclaimed_count") or out.get("completed_count"):
             _log("message_claim_reclaim", **out)
+
+
+def _pid_is_live_agent(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        if len(stat) > 2 and stat[2] == "Z":
+            return False
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return False
+    return b"codex" in cmdline or b"claude" in cmdline
+
+
+def _live_worker_session_ids(topic_id: str) -> set[str]:
+    """Resolve live derived workers from their durable real-spawn receipts."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT c.worker_session_id, w.details_json "
+            "FROM debate_worker_claims c "
+            "LEFT JOIN debate_wake_log w ON w.wake_id = ("
+            " SELECT w2.wake_id FROM debate_wake_log w2 "
+            " WHERE w2.topic_id=c.topic_id "
+            "   AND w2.trigger_msg_id=c.trigger_msg_id "
+            "   AND w2.target_session_id=c.worker_session_id "
+            "   AND w2.action='external_agent_spawn' "
+            " ORDER BY w2.created_at DESC, w2.wake_id DESC LIMIT 1"
+            ") "
+            "WHERE c.topic_id=? AND c.state='active'",
+            (topic_id,),
+        ).fetchall()
+    finally:
+        con.close()
+    live: set[str] = set()
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+            pid = int(details.get("pid") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if pid > 0 and _pid_is_live_agent(pid):
+            live.add(str(row["worker_session_id"]))
+    return live
+
+
+def _recover_stale_worker_claims(
+    *,
+    topics: list[str],
+    stale_seconds: int,
+    minimum_age_seconds: int,
+) -> None:
+    if stale_seconds <= 0:
+        return
+    sys.path.insert(0, str(REPO))
+    from db_utils import get_conn_immediate
+    from debate import recover_stale_worker_claims
+
+    older_than_ts = _claim_reclaim_cutoff(stale_seconds)
+    for topic_id in _active_topic_ids(topics):
+        try:
+            live = _live_worker_session_ids(topic_id)
+            with get_conn_immediate() as conn:
+                out = recover_stale_worker_claims(
+                    conn,
+                    topic_id=topic_id,
+                    older_than_ts=older_than_ts,
+                    minimum_age_seconds=minimum_age_seconds,
+                    live_worker_session_ids=live,
+                )
+        except Exception as exc:
+            _log(
+                "worker_claim_recovery_failed",
+                topic_id=topic_id,
+                older_than_ts=older_than_ts,
+                error=repr(exc),
+            )
+            continue
+        if out.get("retired_count") or out.get("completed_count"):
+            _log("worker_claim_recovery", **out)
 
 
 def _track_launched_children(before: set[int]) -> int:
@@ -354,9 +463,17 @@ def _cap_positive(base: int, cap: int) -> int:
 def _handle_signal(_signum: int, _frame: Any) -> None:
     global STOP
     STOP = True
+    STOP_EVENT.set()
+
+
+def _wait_or_stop(seconds: float) -> bool:
+    return STOP_EVENT.wait(max(0.0, seconds))
 
 
 def main() -> int:
+    global STOP
+    STOP = False
+    STOP_EVENT.clear()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--topic",
@@ -405,6 +522,24 @@ def main() -> int:
         help="DAO guard against too-recent reclaim cutoffs",
     )
     parser.add_argument(
+        "--worker-claim-recovery-seconds",
+        type=int,
+        default=int(os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_SECONDS", "900")),
+        help="retire dead wake-worker claims older than this; <=0 disables",
+    )
+    parser.add_argument(
+        "--worker-claim-recovery-interval",
+        type=float,
+        default=float(os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_INTERVAL", "60")),
+        help="seconds between dead worker reconciliation sweeps",
+    )
+    parser.add_argument(
+        "--worker-claim-recovery-min-age-seconds",
+        type=int,
+        default=int(os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_MIN_AGE_SECONDS", "120")),
+        help="DAO guard against too-recent worker recovery cutoffs",
+    )
+    parser.add_argument(
         "--suppress-role",
         action="append",
         default=None,
@@ -448,8 +583,12 @@ def main() -> int:
         message_claim_reclaim_seconds=args.message_claim_reclaim_seconds,
         message_claim_reclaim_interval=args.message_claim_reclaim_interval,
         message_claim_reclaim_min_age_seconds=args.message_claim_reclaim_min_age_seconds,
+        worker_claim_recovery_seconds=args.worker_claim_recovery_seconds,
+        worker_claim_recovery_interval=args.worker_claim_recovery_interval,
+        worker_claim_recovery_min_age_seconds=args.worker_claim_recovery_min_age_seconds,
     )
     last_claim_reclaim_at = 0.0
+    last_worker_recovery_at = 0.0
 
     while not STOP:
         _reap_children()
@@ -464,6 +603,18 @@ def main() -> int:
                 minimum_age_seconds=args.message_claim_reclaim_min_age_seconds,
             )
             last_claim_reclaim_at = time.monotonic()
+        if (
+            not args.once
+            and args.worker_claim_recovery_seconds > 0
+            and time.monotonic() - last_worker_recovery_at
+            >= max(1.0, args.worker_claim_recovery_interval)
+        ):
+            _recover_stale_worker_claims(
+                topics=topics,
+                stale_seconds=args.worker_claim_recovery_seconds,
+                minimum_age_seconds=args.worker_claim_recovery_min_age_seconds,
+            )
+            last_worker_recovery_at = time.monotonic()
         try:
             loop_interval = max(0.2, args.interval)
             effective_action_kinds = action_kinds
@@ -482,7 +633,7 @@ def main() -> int:
                     _log("pump_paused_by_resource_budget", **auto_budget.to_dict())
                     if args.once:
                         break
-                    time.sleep(max(loop_interval, auto_budget.interval_seconds))
+                    _wait_or_stop(max(loop_interval, auto_budget.interval_seconds))
                     continue
                 effective_action_kinds = [
                     kind for kind in action_kinds if kind in set(auto_budget.action_kinds)
@@ -507,7 +658,7 @@ def main() -> int:
                     _log("pump_paused_by_empty_resource_budget", **auto_budget.to_dict())
                     if args.once:
                         break
-                    time.sleep(loop_interval)
+                    _wait_or_stop(loop_interval)
                     continue
 
             rows = _fetch_new(
@@ -592,7 +743,7 @@ def main() -> int:
             _log("scan_failed", error=repr(exc))
         if args.once:
             break
-        time.sleep(loop_interval)
+        _wait_or_stop(loop_interval)
 
     _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)

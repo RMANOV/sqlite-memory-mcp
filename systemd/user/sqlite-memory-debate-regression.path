@@ -1,0 +1,18 @@
+[Unit]
+Description=Run debate exchange regression gate after debate code changes
+
+[Path]
+PathChanged=%h/sqlite-memory-mcp/debate.py
+PathChanged=%h/sqlite-memory-mcp/debate_retrieval.py
+PathChanged=%h/sqlite-memory-mcp/debate_prompt_context.py
+PathChanged=%h/sqlite-memory-mcp/intel_server.py
+PathChanged=%h/sqlite-memory-mcp/schema.py
+PathChanged=%h/sqlite-memory-mcp/hooks/debate_pump.py
+PathChanged=%h/sqlite-memory-mcp/hooks/debate_wake.py
+PathChanged=%h/sqlite-memory-mcp/tests/fixtures/debate_regression_probe.txt
+PathChanged=%h/.local/bin/codex-debate-wrapper
+PathChanged=%h/.local/bin/codex-debate-adaptive-watch
+Unit=sqlite-memory-debate-regression.service
+
+[Install]
+WantedBy=default.target
