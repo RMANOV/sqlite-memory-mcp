@@ -21,8 +21,43 @@ python bin/debate_ops.py doctor
 python bin/debate_ops.py refresh-hooks
 python bin/debate_ops.py install-service
 python bin/debate_ops.py status
+python bin/debate_ops.py start
+python bin/debate_ops.py stop
+python bin/debate_ops.py uninstall
 python bin/debate_ops.py smoke
 ```
+
+## Windows runtime (REV 2.2 zero-paste delivery)
+
+On Windows the same commands manage a **user-level Scheduled Task**
+(`SqliteMemoryDebatePump`) instead of a systemd unit — no admin required:
+
+- runs hidden at user logon via `pythonw.exe`, working directory = repo,
+  `MultipleInstances=IgnoreNew`, automatic restart on failure;
+- initial machine cap `--max-concurrent-workers 1` (backlog waits, is never
+  lost) and `--mcp-prefix mcp__sqlite_unified__` for spawned claude workers;
+- **post-commit wake**: `debate_post` / `debate_post_with_recipients` fire the
+  named kernel event `Local\SqliteMemoryDebateWakeV1` strictly AFTER the DB
+  commit. The pump blocks on that event (`WaitForMultipleObjects`) with a
+  bounded ~30s timeout sweep, so a crash between commit and signal is always
+  replayed from the durable rows; the event itself is only a latency hint;
+- **graceful stop**: `debate_ops.py stop` sets
+  `Local\SqliteMemoryDebatePumpStopV1`; the pump exits after the current scan
+  without killing in-flight workers (`schtasks /End` only as fallback);
+- **worker identity** is `pid + create_time` (recorded in the spawn receipt) —
+  a reused PID is never accepted as the old worker, and a pump restart never
+  retires a live Windows worker;
+- workers spawn hidden (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`) with a
+  `shutil.which`-resolved executable and a bounded spawn-log directory
+  (`DEBATE_WAKE_AGENT_LOG_KEEP`, default 50);
+- `status`/`doctor` read `~/.claude/memory/debate_pump_heartbeat.json`
+  (pid + create_time + ts) and distinguish running / stale / stopped;
+- resource governor: memory comes from psutil (Win32 fallback); zero total
+  memory is a loud adapter error, never `mem_available_low_0mib`; unknown
+  temperature lands in the guarded-concurrency tier, never a permanent block.
+
+The `debate_wake.disable` and `debate_wake.sleep_until` kill-switch files
+below remain authoritative on Windows exactly as on Linux.
 
 `doctor` checks the three operational invariants:
 
