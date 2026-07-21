@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -22,8 +23,18 @@ from pathlib import Path
 from typing import Any
 
 
-REPO = Path(os.environ.get("DEBATE_REPO", "/home/rmanov/sqlite-memory-mcp"))
 HOOK_DIR = Path(__file__).resolve().parent
+
+
+def _default_repo() -> Path:
+    candidate = HOOK_DIR.parent
+    if (candidate / "debate.py").is_file():
+        return candidate
+    return Path("/home/rmanov/sqlite-memory-mcp")
+
+
+REPO = Path(os.environ.get("DEBATE_REPO", str(_default_repo())))
+IS_WINDOWS = sys.platform == "win32"
 LOG_PATH = Path(
     os.environ.get(
         "DEBATE_WAKE_HOOK_LOG",
@@ -169,7 +180,9 @@ def _default_write_to(role: str) -> str:
     return "CONDUCTOR"
 
 
-def _receipt_event(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> dict[str, Any]:
+def _receipt_event(
+    target: dict[str, Any], trigger_msg_id: str, topic_id: str
+) -> dict[str, Any]:
     role = str(target.get("target_role") or "")
     sender = "UNKNOWN"
     what = "process addressed debate message"
@@ -231,18 +244,24 @@ def _record_receipt_event(event: dict[str, Any]) -> None:
         )
 
 
-def _agent_command(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> list[str] | None:
+def _agent_command(
+    target: dict[str, Any], trigger_msg_id: str, topic_id: str
+) -> list[str] | None:
     runtime = str(target.get("target_runtime") or "")
     if runtime in {"cc", "claude"}:
+        # The MCP server name differs per deployment (sqlite_intel on the
+        # Fedora stack, sqlite_unified on Windows); the tool suffixes do not.
+        prefix = os.environ.get("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_intel__")
         allowed = ",".join(
-            [
-                "mcp__sqlite_intel__debate_signal_check",
-                "mcp__sqlite_intel__debate_post_with_recipients",
-                "mcp__sqlite_intel__debate_signal_advance",
-                "mcp__sqlite_intel__debate_binding_list",
-                "mcp__sqlite_intel__debate_worker_claim",
-                "mcp__sqlite_intel__debate_worker_no_action",
-            ]
+            prefix + suffix
+            for suffix in (
+                "debate_signal_check",
+                "debate_post_with_recipients",
+                "debate_signal_advance",
+                "debate_binding_list",
+                "debate_worker_claim",
+                "debate_worker_no_action",
+            )
         )
         return [
             "claude",
@@ -273,6 +292,7 @@ def _record_real_spawn(
     target: dict[str, Any],
     pid: int,
     log_path: Path,
+    create_time: float | None = None,
 ) -> dict[str, Any] | None:
     sys.path.insert(0, str(REPO))
     try:
@@ -285,7 +305,9 @@ def _record_real_spawn(
     action = os.environ.get("DEBATE_WAKE_SPAWN_ACTION_NAME", "external_agent_spawn")
     source_action = os.environ.get("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
     target_session_id = str(target.get("target_session_id") or "")
-    source_target_session_id = str(target.get("source_target_session_id") or target_session_id)
+    source_target_session_id = str(
+        target.get("source_target_session_id") or target_session_id
+    )
     target_role = str(target.get("target_role") or "")
     target_runtime = str(target.get("target_runtime") or "")
     launched_at = now_iso()
@@ -307,6 +329,7 @@ def _record_real_spawn(
             details = {
                 "source_wake_id": source["wake_id"] if source else None,
                 "pid": pid,
+                "create_time": create_time,
                 "launcher_pid": os.getpid(),
                 "log": str(log_path),
                 "launched_at": launched_at,
@@ -414,7 +437,9 @@ def _claim_worker_target(
                 details={"source": "debate_wake_hook"},
             )
     except Exception as exc:
-        _log("worker_claim_failed", msg_id=trigger_msg_id, error=repr(exc), target=target)
+        _log(
+            "worker_claim_failed", msg_id=trigger_msg_id, error=repr(exc), target=target
+        )
         return {**target, "claim_error": repr(exc)}
 
     out = dict(target)
@@ -427,7 +452,9 @@ def _claim_worker_target(
     return out
 
 
-def _launch_agent(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> dict[str, Any]:
+def _launch_agent(
+    target: dict[str, Any], trigger_msg_id: str, topic_id: str
+) -> dict[str, Any]:
     target = _claim_worker_target(target, trigger_msg_id, topic_id)
     if target.get("result") == "worker_claim_completed":
         return {"launched": False, "reason": "worker_claim_completed", "target": target}
@@ -438,10 +465,27 @@ def _launch_agent(target: dict[str, Any], trigger_msg_id: str, topic_id: str) ->
     if cmd is None:
         return {"launched": False, "reason": "unsupported_runtime"}
 
+    # Explicit executable resolution: bare names depend on the caller's PATH
+    # semantics (and on Windows would silently miss .cmd shims); a missing
+    # runtime must be a typed refusal, not a spawn exception.
+    resolved = shutil.which(cmd[0])
+    if not resolved:
+        _log("agent_executable_not_found", executable=cmd[0], msg_id=trigger_msg_id)
+        return {
+            "launched": False,
+            "reason": "executable_not_found",
+            "executable": cmd[0],
+        }
+    cmd = [resolved, *cmd[1:]]
+
     AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _prune_agent_logs()
     role = str(target.get("target_role") or "role").lower()
     session_id = str(target.get("target_session_id") or "session")
-    log_path = AGENT_LOG_DIR / f"{_now().replace(':', '').replace('.', '-')}-{role}-{trigger_msg_id}.log"
+    log_path = (
+        AGENT_LOG_DIR
+        / f"{_now().replace(':', '').replace('.', '-')}-{role}-{trigger_msg_id}.log"
+    )
     env = os.environ.copy()
     env.update(
         {
@@ -474,26 +518,58 @@ def _launch_agent(target: dict[str, Any], trigger_msg_id: str, topic_id: str) ->
         log.write((receipt_line + "\n").encode("utf-8"))
         log.flush()
         _record_receipt_event(receipt_event)
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(REPO),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        popen_kwargs: dict[str, Any] = {
+            "cwd": str(REPO),
+            "env": env,
+            "stdin": subprocess.PIPE,
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+        }
+        if IS_WINDOWS:
+            # Hidden bounded worker: no console window; own process group so
+            # stopping the pump never takes in-flight workers down with it.
+            popen_kwargs["creationflags"] = (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         if proc.stdin is not None:
-            proc.stdin.write(_wake_prompt(target, trigger_msg_id, topic_id).encode("utf-8"))
+            proc.stdin.write(
+                _wake_prompt(target, trigger_msg_id, topic_id).encode("utf-8")
+            )
             proc.stdin.close()
+    create_time: float | None = None
+    try:
+        import psutil
+
+        create_time = float(psutil.Process(proc.pid).create_time())
+    except Exception:
+        create_time = None  # identity check degrades to pid-only for this spawn
     audit = _record_real_spawn(
         trigger_msg_id=trigger_msg_id,
         topic_id=topic_id,
         target=target,
         pid=proc.pid,
         log_path=log_path,
+        create_time=create_time,
     )
     return {"launched": True, "pid": proc.pid, "log": str(log_path), "audit": audit}
+
+
+def _prune_agent_logs() -> None:
+    """Keep the newest N spawn logs so the log dir stays bounded."""
+    keep = max(1, int(os.environ.get("DEBATE_WAKE_AGENT_LOG_KEEP", "50")))
+    try:
+        logs = sorted(
+            AGENT_LOG_DIR.glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in logs[keep:]:
+            stale.unlink(missing_ok=True)
+    except Exception as exc:
+        _log("agent_log_prune_failed", error=repr(exc))
 
 
 def _handle_tool_response(tool_response: dict[str, Any]) -> dict[str, Any] | None:
@@ -509,7 +585,9 @@ def _handle_tool_response(tool_response: dict[str, Any]) -> dict[str, Any] | Non
         )
 
 
-def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
+def _maybe_dispatch(
+    tool_response: dict[str, Any], out: dict[str, Any]
+) -> dict[str, Any]:
     targets = out.get("targets", []) if isinstance(out, dict) else []
     mode = os.environ.get("DEBATE_WAKE_ACTION", "dry_run")
     resource_budget = None
@@ -519,11 +597,19 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
             from debate_resource_budget import current_debate_resource_budget
 
             resource_budget = current_debate_resource_budget()
-            _log("wake_resource_budget", msg_id=tool_response.get("msg_id"), **resource_budget.to_dict())
+            _log(
+                "wake_resource_budget",
+                msg_id=tool_response.get("msg_id"),
+                **resource_budget.to_dict(),
+            )
             if mode == "agent" and not resource_budget.allow_agent:
                 mode = "dry_run"
         except Exception as exc:
-            _log("wake_resource_budget_failed", msg_id=tool_response.get("msg_id"), error=repr(exc))
+            _log(
+                "wake_resource_budget_failed",
+                msg_id=tool_response.get("msg_id"),
+                error=repr(exc),
+            )
             if mode == "agent":
                 mode = "dry_run"
     disable_file = Path(
@@ -617,7 +703,9 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
         return {"mode": mode, "launches": []}
 
     budget = int(
-        os.environ.get("DEBATE_WAKE_REMAINING", os.environ.get("DEBATE_WAKE_BUDGET", "1"))
+        os.environ.get(
+            "DEBATE_WAKE_REMAINING", os.environ.get("DEBATE_WAKE_BUDGET", "1")
+        )
     )
     if resource_budget is not None:
         budget = min(budget, max(0, resource_budget.wake_budget))
@@ -644,7 +732,11 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
         finally:
             con.close()
     if not topic_id:
-        _log("agent_launch_skipped", reason="unknown_topic", msg_id=tool_response.get("msg_id"))
+        _log(
+            "agent_launch_skipped",
+            reason="unknown_topic",
+            msg_id=tool_response.get("msg_id"),
+        )
         return {"mode": mode, "launches": [], "reason": "unknown_topic"}
 
     launches = []
@@ -659,9 +751,7 @@ def _maybe_dispatch(tool_response: dict[str, Any], out: dict[str, Any]) -> dict[
                 skipped_target=target,
             )
             break
-        launch = _launch_agent(
-            target, str(tool_response.get("msg_id") or ""), topic_id
-        )
+        launch = _launch_agent(target, str(tool_response.get("msg_id") or ""), topic_id)
         if launch.get("launched"):
             remaining -= 1
             _mark_source_wake_result(
@@ -718,7 +808,11 @@ def _agent_resolution_disabled(tool_response: dict[str, Any]) -> bool:
 
         budget = current_debate_resource_budget()
     except Exception as exc:
-        _log("agent_resolution_resource_budget_failed", msg_id=tool_response.get("msg_id"), error=repr(exc))
+        _log(
+            "agent_resolution_resource_budget_failed",
+            msg_id=tool_response.get("msg_id"),
+            error=repr(exc),
+        )
         return True
     if not budget.allow_agent:
         _log(
@@ -759,7 +853,9 @@ def _run_hook() -> int:
         # wake_log rows here: the resident pump is the catch-up path and
         # must be able to claim the normal action without seeing a false
         # duplicate from the exhausted child hook.
-        _log("agent_budget_exhausted_pre_resolution", msg_id=tool_response.get("msg_id"))
+        _log(
+            "agent_budget_exhausted_pre_resolution", msg_id=tool_response.get("msg_id")
+        )
         return 0
 
     sys.path.insert(0, str(REPO))

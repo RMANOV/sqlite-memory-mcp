@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,7 +90,11 @@ def _read_max_temp_c(hwmon_root: Path = Path("/sys/class/hwmon")) -> float | Non
     for hwmon in hwmons:
         try:
             name_path = hwmon / "name"
-            name = name_path.read_text(encoding="utf-8").strip() if name_path.exists() else ""
+            name = (
+                name_path.read_text(encoding="utf-8").strip()
+                if name_path.exists()
+                else ""
+            )
         except Exception:
             name = ""
         if name not in {"coretemp", "k10temp", "dell_smm", "thinkpad", "acpitz"}:
@@ -130,8 +135,11 @@ def _count_live_agents(proc: Path = Path("/proc")) -> int:
     )
     for pid in pids:
         try:
-            cmdline = (pid / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", errors="replace"
+            cmdline = (
+                (pid / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", errors="replace")
             )
         except Exception:
             continue
@@ -142,7 +150,118 @@ def _count_live_agents(proc: Path = Path("/proc")) -> int:
     return count
 
 
+_WINDOWS_AGENT_NEEDLES = ("claude", "codex")
+_WINDOWS_SIDECAR_NEEDLES = (
+    "daemon",  # claude transient daemon + spare-pool supervisor
+    "--bg-pty-host",
+    "--chrome-native-host",
+    "unified_server.py",
+    "debate_pump.py",
+    "pythonw",
+)
+
+
+def _windows_count_live_agents() -> int:
+    """Best-effort live agent census via psutil process enumeration.
+
+    Spare-pool claude sessions are indistinguishable from real ones and may
+    be counted — that over-count only makes the governor MORE conservative,
+    never less, so it is the safe failure direction.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    count = 0
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            cmdline = " ".join(
+                proc.info["cmdline"] or [proc.info["name"] or ""]
+            ).lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if not cmdline:
+            continue
+        if any(needle in cmdline for needle in _WINDOWS_SIDECAR_NEEDLES):
+            continue
+        if any(needle in cmdline for needle in _WINDOWS_AGENT_NEEDLES):
+            count += 1
+    return count
+
+
+def _windows_memory_fallback_mib() -> tuple[int, int]:
+    """GlobalMemoryStatusEx fallback when psutil is unavailable."""
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return 0, 0
+    return int(status.ullTotalPhys // (1024 * 1024)), int(
+        status.ullAvailPhys // (1024 * 1024)
+    )
+
+
+def _read_windows_snapshot() -> ResourceSnapshot:
+    """Windows adapter: psutil preferred, Win32 fallback for memory.
+
+    Zero total memory on a supported Windows host is an ADAPTER error (the
+    probes failed), never a real machine state — raise instead of letting the
+    governor misclassify it as ``mem_available_low_0mib`` and block forever.
+    Temperature is unavailable on this platform: ``None`` deliberately lands
+    in the guarded-concurrency tier, not in a permanent block.
+    """
+    mem_total = mem_available = swap_total = swap_free = 0
+    load1 = 0.0
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        mem_total = int(vm.total // (1024 * 1024))
+        mem_available = int(vm.available // (1024 * 1024))
+        sm = psutil.swap_memory()
+        swap_total = int(sm.total // (1024 * 1024))
+        swap_free = int(sm.free // (1024 * 1024))
+        try:
+            load1 = float(psutil.getloadavg()[0])
+        except (OSError, AttributeError):
+            load1 = 0.0
+    except ImportError:
+        mem_total, mem_available = _windows_memory_fallback_mib()
+    if mem_total <= 0:
+        raise RuntimeError(
+            "windows_memory_adapter_error: both psutil and GlobalMemoryStatusEx "
+            "failed to report physical memory on a supported Windows host"
+        )
+    return ResourceSnapshot(
+        mem_total_mib=mem_total,
+        mem_available_mib=mem_available,
+        swap_total_mib=swap_total,
+        swap_free_mib=swap_free,
+        cpu_count=max(1, os.cpu_count() or 1),
+        load1=load1,
+        memory_full_avg10=0.0,  # no PSI on Windows — neutral value
+        max_temp_c=None,  # unknown → guarded tier by design
+        live_agent_count=_windows_count_live_agents(),
+    )
+
+
 def read_resource_snapshot() -> ResourceSnapshot:
+    if sys.platform == "win32":
+        return _read_windows_snapshot()
     mem_total, mem_available, swap_total, swap_free = _read_meminfo()
     return ResourceSnapshot(
         mem_total_mib=mem_total,
@@ -283,7 +402,9 @@ def current_debate_resource_budget() -> DebateResourceBudget:
             os.path.expanduser("~/.claude/memory/debate_resource_budget_state.json"),
         )
     )
-    return apply_operator_sleep(apply_recovery_hysteresis(budget, state_path=state_path))
+    return apply_operator_sleep(
+        apply_recovery_hysteresis(budget, state_path=state_path)
+    )
 
 
 def _utc_now() -> str:
@@ -422,7 +543,9 @@ def _load_state(path: Path) -> dict[str, object]:
 def _write_state(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     tmp.replace(path)
 
 
@@ -468,7 +591,9 @@ def apply_recovery_hysteresis(
             {
                 "blocked": True,
                 "healthy_streak": 0,
-                "temp_ewma_c": round(temp_ewma, 2) if temp is not None else previous_ewma,
+                "temp_ewma_c": round(temp_ewma, 2)
+                if temp is not None
+                else previous_ewma,
                 "temp_sample_count": temp_sample_count,
                 "tier": budget.tier,
                 "reason": budget.reason,
@@ -509,7 +634,9 @@ def apply_recovery_hysteresis(
             {
                 "blocked": False,
                 "healthy_streak": required_healthy_samples,
-                "temp_ewma_c": round(temp_ewma, 2) if temp is not None else previous_ewma,
+                "temp_ewma_c": round(temp_ewma, 2)
+                if temp is not None
+                else previous_ewma,
                 "temp_sample_count": temp_sample_count,
                 "tier": budget.tier,
                 "reason": budget.reason,
@@ -525,7 +652,9 @@ def apply_recovery_hysteresis(
             {
                 "blocked": True,
                 "healthy_streak": healthy_streak,
-                "temp_ewma_c": round(temp_ewma, 2) if temp is not None else previous_ewma,
+                "temp_ewma_c": round(temp_ewma, 2)
+                if temp is not None
+                else previous_ewma,
                 "temp_sample_count": temp_sample_count,
                 "tier": "blocked",
                 "reason": f"recovery_hysteresis_{healthy_streak}_of_{required_healthy_samples}",
@@ -561,7 +690,9 @@ def apply_recovery_hysteresis(
 
 
 def main() -> int:
-    print(json.dumps(current_debate_resource_budget().to_dict(), indent=2, sort_keys=True))
+    print(
+        json.dumps(current_debate_resource_budget().to_dict(), indent=2, sort_keys=True)
+    )
     return 0
 
 

@@ -862,12 +862,12 @@ def reflect_cancel(run_id: str) -> str:
         with _get_conn() as conn:
             _dao_cancel_run(conn, run_id)
             row = _dao_get_run(conn, run_id)
-            return json.dumps({"run_id": run_id, "status": row["status"] if row else None})
+            return json.dumps(
+                {"run_id": run_id, "status": row["status"] if row else None}
+            )
     except _ReflectionStateError as exc:
         logger.info("reflect_cancel rejected: %s", exc)
-        return json.dumps(
-            {"error": str(exc), "error_type": "invalid_state_transition"}
-        )
+        return json.dumps({"error": str(exc), "error_type": "invalid_state_transition"})
     except Exception as exc:
         logger.error("reflect_cancel failed: %s", exc, exc_info=True)
         return _reflect_error_response(exc)
@@ -890,9 +890,7 @@ def reflect_archive(run_id: str) -> str:
             )
     except _ReflectionStateError as exc:
         logger.info("reflect_archive rejected: %s", exc)
-        return json.dumps(
-            {"error": str(exc), "error_type": "invalid_state_transition"}
-        )
+        return json.dumps({"error": str(exc), "error_type": "invalid_state_transition"})
     except Exception as exc:
         logger.error("reflect_archive failed: %s", exc, exc_info=True)
         return _reflect_error_response(exc)
@@ -969,9 +967,7 @@ def reflect_apply(
         if candidate_ids_csv:
             ids = [s.strip() for s in candidate_ids_csv.split(",") if s.strip()]
         with _get_conn() as conn:
-            summary = _apply_run(
-                conn, run_id, candidate_ids=ids, applied_by=applied_by
-            )
+            summary = _apply_run(conn, run_id, candidate_ids=ids, applied_by=applied_by)
             logger.info(
                 "reflect_apply: run=%s applied=%d skipped=%d failed=%d",
                 run_id,
@@ -982,7 +978,11 @@ def reflect_apply(
             return json.dumps(summary)
     except _ReflectionStateError as exc:
         msg = str(exc)
-        et = "not_found" if msg.startswith("run_not_found") else "invalid_state_transition"
+        et = (
+            "not_found"
+            if msg.startswith("run_not_found")
+            else "invalid_state_transition"
+        )
         return json.dumps({"error": msg, "error_type": et})
     except Exception as exc:
         logger.error("reflect_apply failed: %s", exc, exc_info=True)
@@ -1018,9 +1018,7 @@ def reflect_review(
                 limit=limit,
                 offset=offset,
             )
-            apply_snaps, _ = _dao_list_apply_snapshots(
-                conn, run_id=run_id, limit=1000
-            )
+            apply_snaps, _ = _dao_list_apply_snapshots(conn, run_id=run_id, limit=1000)
             applied_ids = {s["candidate_id"] for s in apply_snaps}
             for r in rows:
                 r["already_applied"] = r["candidate_id"] in applied_ids
@@ -1057,12 +1055,14 @@ def reflect_discard(run_id: str) -> str:
             # fallback: enforce per-connection in case caller bypassed.
             conn.execute("PRAGMA foreign_keys = ON")
             rows_deleted = _dao_discard_run(conn, run_id)
-            return json.dumps(
-                {"run_id": run_id, "rows_deleted": rows_deleted}
-            )
+            return json.dumps({"run_id": run_id, "rows_deleted": rows_deleted})
     except _ReflectionStateError as exc:
         msg = str(exc)
-        et = "not_found" if msg.startswith("run_not_found") else "invalid_state_transition"
+        et = (
+            "not_found"
+            if msg.startswith("run_not_found")
+            else "invalid_state_transition"
+        )
         return json.dumps({"error": msg, "error_type": et})
     except Exception as exc:
         logger.error("reflect_discard failed: %s", exc, exc_info=True)
@@ -1156,8 +1156,7 @@ def import_from_gbrain(
                 skip_if_exists=skip_if_exists,
             )
             logger.info(
-                "import_from_gbrain: dir=%s entities_created=%d "
-                "files_parsed=%d",
+                "import_from_gbrain: dir=%s entities_created=%d files_parsed=%d",
                 input_dir,
                 counts["entities_created"],
                 counts["files_parsed"],
@@ -1280,7 +1279,10 @@ def debate_init(
             out["seeded_bindings"] = seeded_bindings
             logger.info(
                 "debate_init: topic=%s state=%s roles=%d seeded_bindings=%d",
-                out["topic_id"], out["state"], len(out["roles"]), len(seeded_bindings),
+                out["topic_id"],
+                out["state"],
+                len(out["roles"]),
+                len(seeded_bindings),
             )
             return json.dumps(out)
     except _DebateError as exc:
@@ -1289,6 +1291,26 @@ def debate_init(
     except Exception as exc:
         logger.error("debate_init failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
+
+
+def _signal_wake_after_commit() -> None:
+    """Windows-only latency hint for the resident debate pump.
+
+    Fires strictly AFTER the write transaction has committed (callers invoke
+    it outside the connection context manager). The named event is only a
+    hint — the durable outbox is the message/recipient/wake rows themselves —
+    so any failure here must never surface into the post result.
+    """
+    import sys as _sys
+
+    if _sys.platform != "win32":
+        return
+    try:
+        from debate_wake_signal import signal_wake
+
+        signal_wake()
+    except Exception:  # noqa: BLE001 — a failed hint must never fail the post
+        logger.debug("debate wake signal failed", exc_info=True)
 
 
 # Tool 26: debate_post
@@ -1323,11 +1345,18 @@ def debate_post(
         with _get_conn_immediate() as conn:
             out = _debate_post_dao(
                 conn,
-                topic_id=topic_id, role=role, priority=priority,
-                kind=kind, body=body, reply_to=reply_to or None,
-                standing=standing, vehicle=vehicle or None,
+                topic_id=topic_id,
+                role=role,
+                priority=priority,
+                kind=kind,
+                body=body,
+                reply_to=reply_to or None,
+                standing=standing,
+                vehicle=vehicle or None,
             )
-            return json.dumps(out)
+        # Transaction committed on context exit; only now hint the pump.
+        _signal_wake_after_commit()
+        return json.dumps(out)
     except _DebateError as exc:
         logger.info("debate_post rejected: %s", exc)
         return _debate_error_response(exc)
@@ -1365,16 +1394,19 @@ def debate_read(
     try:
         kind_filter = (
             [k.strip() for k in kind_filter_csv.split(",") if k.strip()]
-            if kind_filter_csv else None
+            if kind_filter_csv
+            else None
         )
         priority_filter = (
             [p.strip() for p in priority_filter_csv.split(",") if p.strip()]
-            if priority_filter_csv else None
+            if priority_filter_csv
+            else None
         )
         with _get_conn() as conn:
             out = _debate_read_dao(
                 conn,
-                topic_id=topic_id, role=role,
+                topic_id=topic_id,
+                role=role,
                 since_msg_id=since_msg_id or None,
                 since_ts=since_ts or None,
                 since_latest_compaction=since_latest_compaction,
@@ -1421,11 +1453,7 @@ def debate_search(topic_id: str, query: str, limit: int = 50) -> str:
 
         # Escape LIKE wildcards so the query is matched literally. Order
         # matters: escape the escape char FIRST, then the wildcards.
-        escaped = (
-            query.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
 
         _debate_validate_topic_id(topic_id)
@@ -1440,13 +1468,15 @@ def debate_search(topic_id: str, query: str, limit: int = 50) -> str:
                 (topic_id, pattern, effective_limit),
             ).fetchall()
             messages = [dict(r) for r in rows]
-            return json.dumps({
-                "topic_id": topic_id,
-                "query": query,
-                "count": len(messages),
-                "limit": effective_limit,
-                "messages": messages,
-            })
+            return json.dumps(
+                {
+                    "topic_id": topic_id,
+                    "query": query,
+                    "count": len(messages),
+                    "limit": effective_limit,
+                    "messages": messages,
+                }
+            )
     except _DebateError as exc:
         return _debate_error_response(exc)
     except Exception as exc:
@@ -1513,8 +1543,10 @@ def debate_state(
         with _get_conn_immediate() as conn:
             out = _debate_transition_dao(
                 conn,
-                topic_id=topic_id, role=role,
-                new_state=new_state, reason=reason or "",
+                topic_id=topic_id,
+                role=role,
+                new_state=new_state,
+                reason=reason or "",
             )
             return json.dumps(out)
     except _DebateError as exc:
@@ -1537,8 +1569,10 @@ def debate_escalate(
         with _get_conn() as conn:
             out = _debate_escalate_dao(
                 conn,
-                topic_id=topic_id, role=role,
-                reason=reason, target_role=target_role,
+                topic_id=topic_id,
+                role=role,
+                reason=reason,
+                target_role=target_role,
             )
             return json.dumps(out)
     except _DebateError as exc:
@@ -1565,7 +1599,9 @@ def debate_compact(
         with _get_conn() as conn:
             out = _debate_compact(
                 conn,
-                topic_id=topic_id, role=role, body=body,
+                topic_id=topic_id,
+                role=role,
+                body=body,
                 since_ts=since_ts or None,
                 until_ts=until_ts or None,
             )
@@ -1597,7 +1633,8 @@ def debate_advance_watermark(
         with _get_conn() as conn:
             out = _debate_advance_watermark_dao(
                 conn,
-                topic_id=topic_id, role=role,
+                topic_id=topic_id,
+                role=role,
                 processed_up_to_msg_id=processed_up_to_msg_id,
             )
             return json.dumps(out)
@@ -1641,20 +1678,19 @@ def debate_post_with_recipients(
     RESOLVED topics block all non-STATE kinds.
     """
     try:
-        addressed_to = [
-            r.strip() for r in addressed_to_csv.split(",") if r.strip()
-        ]
-        diagnostic_to = [
-            r.strip() for r in diagnostic_to_csv.split(",") if r.strip()
-        ]
+        addressed_to = [r.strip() for r in addressed_to_csv.split(",") if r.strip()]
+        diagnostic_to = [r.strip() for r in diagnostic_to_csv.split(",") if r.strip()]
         # v3.9.3: BEGIN IMMEDIATE wrapper — write path requires
         # serialized reads + writes against other writers (msg:34adcb3e
         # amendment 1A). Race-safety contract is wrapper-scoped.
         with _get_conn_immediate() as conn:
             out = _debate_post_with_recipients_dao(
                 conn,
-                topic_id=topic_id, role=role,
-                priority=priority, kind=kind, body=body,
+                topic_id=topic_id,
+                role=role,
+                priority=priority,
+                kind=kind,
+                body=body,
                 addressed_to=addressed_to,
                 diagnostic_to=diagnostic_to,
                 conductor_override_msg_id=conductor_override_msg_id or None,
@@ -1662,14 +1698,14 @@ def debate_post_with_recipients(
                 standing=standing,
                 vehicle=vehicle or None,
             )
-            return json.dumps(out)
+        # Transaction committed on context exit; only now hint the pump.
+        _signal_wake_after_commit()
+        return json.dumps(out)
     except _DebateError as exc:
         logger.info("debate_post_with_recipients rejected: %s", exc)
         return _debate_error_response(exc)
     except Exception as exc:
-        logger.error(
-            "debate_post_with_recipients failed: %s", exc, exc_info=True
-        )
+        logger.error("debate_post_with_recipients failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 
@@ -1699,7 +1735,9 @@ def debate_signal_check(
         with _get_conn_immediate() as conn:
             out = _debate_signal_check_dao(
                 conn,
-                session_id=session_id, role=role, topic_id=topic_id,
+                session_id=session_id,
+                role=role,
+                topic_id=topic_id,
                 since_msg_id=since_msg_id or None,
                 since_ts=since_ts or None,
                 limit=limit,
@@ -1738,7 +1776,9 @@ def debate_signal_advance(
         with _get_conn_immediate() as conn:
             out = _debate_signal_advance_dao(
                 conn,
-                session_id=session_id, role=role, topic_id=topic_id,
+                session_id=session_id,
+                role=role,
+                topic_id=topic_id,
                 last_processed_msg_id=last_processed_msg_id,
             )
             return json.dumps(out)
@@ -1895,7 +1935,9 @@ def debate_rotate_binding(
 
 # Tool 38: debate_close_topic (v3.10 close helper)
 @mcp.tool()
-def debate_close_topic(topic_id: str, role: str, new_state: str, reason: str = "") -> str:
+def debate_close_topic(
+    topic_id: str, role: str, new_state: str, reason: str = ""
+) -> str:
     """Close a topic through the authoritative debate_state transition path.
 
     Binding retirement happens in the same transaction as RESOLVED/ARCHIVED.
@@ -2009,9 +2051,7 @@ def debate_message_claim_reclaim(
     except _DebateError as exc:
         return _debate_error_response(exc)
     except Exception as exc:
-        logger.error(
-            "debate_message_claim_reclaim failed: %s", exc, exc_info=True
-        )
+        logger.error("debate_message_claim_reclaim failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 
@@ -2070,9 +2110,7 @@ def debate_worker_recover_stale(
     except _DebateError as exc:
         return _debate_error_response(exc)
     except Exception as exc:
-        logger.error(
-            "debate_worker_recover_stale failed: %s", exc, exc_info=True
-        )
+        logger.error("debate_worker_recover_stale failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
 
 

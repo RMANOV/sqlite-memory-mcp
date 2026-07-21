@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Windows named-event wake signaling for the debate pump.
+
+Latency hint only: the durable outbox is the addressed message + recipient
+rows + wake/claim state in SQLite. A lost or early-consumed event is always
+recovered by the pump's bounded timeout sweep and startup backlog sweep.
+
+Contract:
+- ``signal_wake()`` is called strictly AFTER a successful DB commit and must
+  never raise into the caller (a failed signal must not fail the post).
+- The pump waits with ``wait_for_wake_or_stop()``; ``signal_stop()`` asks a
+  resident pump to exit gracefully without killing in-flight workers.
+- Auto-reset events; single resident waiter. A SetEvent that fires while the
+  pump is scanning leaves the event signaled, so the next wait returns
+  immediately — at worst one extra scan, never a lost trigger.
+
+Non-Windows platforms: every call is a cheap no-op ("unsupported").
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+def _wake_event_name() -> str:
+    """Resolved per call so tests can isolate themselves from a live pump
+    sharing the default name (auto-reset events release only one waiter)."""
+    return os.environ.get("DEBATE_WAKE_EVENT_NAME", r"Local\SqliteMemoryDebateWakeV1")
+
+
+def _stop_event_name() -> str:
+    return os.environ.get(
+        "DEBATE_PUMP_STOP_EVENT_NAME", r"Local\SqliteMemoryDebatePumpStopV1"
+    )
+
+
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+_HANDLES: dict[str, int] = {}
+
+
+def is_supported() -> bool:
+    return sys.platform == "win32"
+
+
+def _kernel32():
+    import ctypes
+
+    return ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+
+def _open_or_create(name: str) -> int | None:
+    """CreateEventW opens the existing named event or creates it (auto-reset)."""
+    if not is_supported():
+        return None
+    handle = _HANDLES.get(name)
+    if handle:
+        return handle
+    try:
+        handle = _kernel32().CreateEventW(None, False, False, name)
+    except Exception:
+        return None
+    if not handle:
+        return None
+    _HANDLES[name] = handle
+    return handle
+
+
+def _signal(name: str) -> bool:
+    handle = _open_or_create(name)
+    if not handle:
+        return False
+    try:
+        return bool(_kernel32().SetEvent(handle))
+    except Exception:
+        return False
+
+
+def signal_wake() -> bool:
+    """Post-commit latency hint. Never raises."""
+    return _signal(_wake_event_name())
+
+
+def signal_stop() -> bool:
+    """Ask the resident pump to exit gracefully. Never raises."""
+    return _signal(_stop_event_name())
+
+
+def wait_for_wake_or_stop(timeout_seconds: float) -> str:
+    """Block until wake/stop event or timeout.
+
+    Returns "wake", "stop", "timeout" or "unsupported". Stop has priority
+    when both are signaled (listed first in WaitForMultipleObjects).
+    """
+    if not is_supported():
+        return "unsupported"
+    stop_handle = _open_or_create(_stop_event_name())
+    wake_handle = _open_or_create(_wake_event_name())
+    if not stop_handle or not wake_handle:
+        return "unsupported"
+    import ctypes
+
+    handles = (ctypes.c_void_p * 2)(stop_handle, wake_handle)
+    timeout_ms = max(0, int(timeout_seconds * 1000))
+    try:
+        result = _kernel32().WaitForMultipleObjects(2, handles, False, timeout_ms)
+    except Exception:
+        return "unsupported"
+    if result == _WAIT_OBJECT_0:
+        return "stop"
+    if result == _WAIT_OBJECT_0 + 1:
+        return "wake"
+    if result == _WAIT_TIMEOUT:
+        return "timeout"
+    return "timeout"
+
+
+def close_handles() -> None:
+    """Release cached handles (tests / process teardown)."""
+    if not is_supported():
+        _HANDLES.clear()
+        return
+    for handle in _HANDLES.values():
+        try:
+            _kernel32().CloseHandle(handle)
+        except Exception:
+            pass
+    _HANDLES.clear()

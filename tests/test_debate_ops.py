@@ -1,13 +1,35 @@
 import json
+import os
 import stat
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import debate_ops
 import install_doctor
+
+
+def _symlinks_available(tmp_path_factory=None) -> bool:
+    """Windows grants symlink creation only to admin/dev-mode users."""
+    import tempfile
+
+    probe_dir = Path(tempfile.mkdtemp(prefix="symlink-probe-"))
+    target = probe_dir / "target"
+    link = probe_dir / "link"
+    try:
+        target.write_text("x", encoding="utf-8")
+        os.symlink(target, link)
+        return True
+    except OSError:
+        return False
+    finally:
+        link.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        probe_dir.rmdir()
 
 
 def test_debate_ops_smoke_runs_expected_test_subset(monkeypatch):
@@ -31,19 +53,27 @@ def test_debate_ops_smoke_runs_expected_test_subset(monkeypatch):
     assert captured["check"] is False
 
 
-def test_debate_ops_install_service_dry_run(capsys):
+def test_debate_ops_install_service_dry_run(monkeypatch, capsys):
+    # The systemd install path is pure logic + mocked IO: force the Linux
+    # branch so its contract stays covered on every development platform.
+    monkeypatch.setattr(debate_ops, "IS_WINDOWS", False)
     rc = debate_ops.main(["install-service", "--dry-run"])
     payload = json.loads(capsys.readouterr().out)
 
     assert rc == 0
     assert payload["service"] == "sqlite-memory-debate-pump.service"
     assert payload["dry_run"] is True
-    assert payload["target"].endswith("/.config/systemd/user/sqlite-memory-debate-pump.service")
+    assert (
+        payload["target"]
+        .replace("\\", "/")
+        .endswith("/.config/systemd/user/sqlite-memory-debate-pump.service")
+    )
 
 
 def test_debate_ops_install_service_runs_systemctl(monkeypatch, tmp_path, capsys):
     calls = []
     service_dst = tmp_path / "sqlite-memory-debate-pump.service"
+    monkeypatch.setattr(debate_ops, "IS_WINDOWS", False)
     monkeypatch.setattr(debate_ops, "SERVICE_DST", service_dst)
 
     def fake_run(cmd, cwd, check, capture_output=False, text=False):
@@ -78,11 +108,19 @@ def test_debate_pump_service_template_is_agent_safe():
     assert "DEBATE_WORKER_CLAIM_RECOVERY_SECONDS=900" in text
     assert "--action-kind Q,DECISION" in text
     assert "MemoryMax=3G" in text
-    exec_start = next(line for line in text.splitlines() if line.startswith("ExecStart="))
+    exec_start = next(
+        line for line in text.splitlines() if line.startswith("ExecStart=")
+    )
     assert "codex" not in exec_start.lower()
 
 
-def test_install_doctor_codex_wrapper_check_accepts_expected_symlink(monkeypatch, tmp_path):
+@pytest.mark.skipif(
+    not _symlinks_available(),
+    reason="symlink creation requires admin/dev-mode on Windows",
+)
+def test_install_doctor_codex_wrapper_check_accepts_expected_symlink(
+    monkeypatch, tmp_path
+):
     monkeypatch.delenv("CODEX_DEBATE_CODEX_BIN", raising=False)
     monkeypatch.delenv("CODEX_DEBATE_WRAPPER", raising=False)
     wrapper = tmp_path / "codex-debate-wrapper"

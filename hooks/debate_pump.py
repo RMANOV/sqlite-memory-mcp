@@ -23,7 +23,19 @@ from typing import Any
 
 
 HOOK_DIR = Path(__file__).resolve().parent
-REPO = Path(os.environ.get("DEBATE_REPO", "/home/rmanov/sqlite-memory-mcp"))
+
+
+def _default_repo() -> Path:
+    """Prefer the repo this hook actually lives in; keep the legacy Linux
+    default for deployments where hooks are copied out of the repo tree."""
+    candidate = HOOK_DIR.parent
+    if (candidate / "debate.py").is_file():
+        return candidate
+    return Path("/home/rmanov/sqlite-memory-mcp")
+
+
+REPO = Path(os.environ.get("DEBATE_REPO", str(_default_repo())))
+IS_WINDOWS = sys.platform == "win32"
 DB_PATH = Path(
     os.environ.get("SQLITE_MEMORY_DB", os.path.expanduser("~/.claude/memory/memory.db"))
 )
@@ -37,6 +49,14 @@ STATE_PATH = Path(
     os.environ.get(
         "DEBATE_PUMP_STATE",
         os.path.expanduser("~/.claude/memory/debate_pump_state.json"),
+    )
+)
+# Default next to the state file so tests that redirect DEBATE_PUMP_STATE
+# inherit heartbeat isolation instead of writing into the production dir.
+HEARTBEAT_PATH = Path(
+    os.environ.get(
+        "DEBATE_PUMP_HEARTBEAT",
+        str(STATE_PATH.with_name("debate_pump_heartbeat.json")),
     )
 )
 POST_SCHEMA_VERSION = "debate_post_with_recipients.v1"
@@ -125,6 +145,48 @@ def _save_state(last_ts: str, last_msg_id: str) -> None:
         encoding="utf-8",
     )
     tmp.replace(STATE_PATH)
+
+
+_SELF_CREATE_TIME: float | None = None
+
+
+def _self_create_time() -> float | None:
+    global _SELF_CREATE_TIME
+    if _SELF_CREATE_TIME is None:
+        try:
+            import psutil
+
+            _SELF_CREATE_TIME = float(psutil.Process(os.getpid()).create_time())
+        except Exception:
+            _SELF_CREATE_TIME = 0.0
+    return _SELF_CREATE_TIME or None
+
+
+def _write_heartbeat(last_ts: str, last_msg_id: str) -> None:
+    """Durable liveness marker: pid + create_time let ``debate_ops status``
+    distinguish running / stale (file present, process gone or reused PID) /
+    stopped. Never fatal."""
+    try:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HEARTBEAT_PATH.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "create_time": _self_create_time(),
+                    "ts": _now(),
+                    "last_ts": last_ts,
+                    "last_msg_id": last_msg_id,
+                    "live_children": len(CHILDREN),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(HEARTBEAT_PATH)
+    except Exception as exc:
+        _log("heartbeat_write_failed", error=repr(exc))
 
 
 def _topic_clause(topics: list[str]) -> tuple[str, list[str]]:
@@ -308,8 +370,10 @@ def _throttle_reason(
 
 
 def _claim_reclaim_cutoff(stale_seconds: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)).isoformat().replace(
-        "+00:00", "Z"
+    return (
+        (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds))
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
 
@@ -363,7 +427,37 @@ def _reclaim_stale_message_claims(
             _log("message_claim_reclaim", **out)
 
 
-def _pid_is_live_agent(pid: int) -> bool:
+def _windows_pid_is_live_agent(pid: int, expected_create_time: float | None) -> bool:
+    """Real Windows process liveness with PID-reuse protection.
+
+    Identity = pid + create_time (spec REV 2.2): a reused PID whose create
+    time differs from the recorded spawn receipt is NOT the old worker.
+    If psutil is missing we cannot verify — treat the worker as live so a
+    blind sweep never retires a genuinely running Windows worker.
+    """
+    try:
+        import psutil
+    except ImportError:
+        _log("windows_liveness_psutil_missing", pid=pid)
+        return True
+    try:
+        proc = psutil.Process(pid)
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        if (
+            expected_create_time is not None
+            and abs(proc.create_time() - float(expected_create_time)) > 2.0
+        ):
+            return False  # PID reuse: different process wearing the old PID
+        cmdline = " ".join(proc.cmdline() or [proc.name()]).lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
+    return "codex" in cmdline or "claude" in cmdline
+
+
+def _pid_is_live_agent(pid: int, expected_create_time: float | None = None) -> bool:
+    if IS_WINDOWS:
+        return _windows_pid_is_live_agent(pid, expected_create_time)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
         if len(stat) > 2 and stat[2] == "Z":
@@ -402,7 +496,12 @@ def _live_worker_session_ids(topic_id: str) -> set[str]:
             pid = int(details.get("pid") or 0)
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        if pid > 0 and _pid_is_live_agent(pid):
+        create_time: float | None
+        try:
+            create_time = float(details["create_time"])
+        except (KeyError, TypeError, ValueError):
+            create_time = None  # legacy receipt without identity — pid-only check
+        if pid > 0 and _pid_is_live_agent(pid, create_time):
             live.add(str(row["worker_session_id"]))
     return live
 
@@ -443,14 +542,29 @@ def _recover_stale_worker_claims(
             _log("worker_claim_recovery", **out)
 
 
+def _windows_child_pids() -> set[int]:
+    try:
+        import psutil
+
+        return {p.pid for p in psutil.Process(os.getpid()).children(recursive=False)}
+    except Exception:
+        return set()
+
+
 def _track_launched_children(before: set[int]) -> int:
     """Track direct child PIDs so the resident pump does not leave zombies."""
+    if IS_WINDOWS:
+        after = _windows_child_pids()
+        launched = after - before
+        CHILDREN.update(launched)
+        return len(launched)
     try:
         after = {
             int(pid)
             for pid in os.listdir("/proc")
             if pid.isdigit()
-            and Path("/proc") .joinpath(pid, "stat").read_text().split()[3] == str(os.getpid())
+            and Path("/proc").joinpath(pid, "stat").read_text().split()[3]
+            == str(os.getpid())
         }
     except Exception:
         return 0
@@ -460,6 +574,13 @@ def _track_launched_children(before: set[int]) -> int:
 
 
 def _reap_children() -> None:
+    if IS_WINDOWS:
+        # No zombie state on Windows: prune exited children; a reused PID
+        # that no longer looks like an agent process is pruned as well.
+        for pid in list(CHILDREN):
+            if not _pid_is_live_agent(pid):
+                CHILDREN.discard(pid)
+        return
     for pid in list(CHILDREN):
         try:
             waited, _status = os.waitpid(pid, os.WNOHANG)
@@ -495,7 +616,74 @@ def _handle_signal(_signum: int, _frame: Any) -> None:
     STOP_EVENT.set()
 
 
+def _another_pump_is_live() -> bool:
+    """Singleton guard (Windows): Run-key autostart cannot express
+    MultipleInstances=IgnoreNew, so the pump enforces it itself via the
+    heartbeat's pid + create_time identity."""
+    try:
+        heartbeat = json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    pid = int(heartbeat.get("pid") or 0)
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        import psutil
+
+        proc = psutil.Process(pid)
+        expected = heartbeat.get("create_time")
+        if expected and abs(proc.create_time() - float(expected)) > 2.0:
+            return False  # PID reuse — the old pump is gone
+        cmdline = " ".join(proc.cmdline() or []).lower()
+    except Exception:
+        return False
+    return "debate_pump" in cmdline
+
+
+WINDOWS_SWEEP_SECONDS = float(os.environ.get("DEBATE_PUMP_WINDOWS_SWEEP_SECONDS", "30"))
+
+
 def _wait_or_stop(seconds: float) -> bool:
+    """Sleep until the next scan is due; returns True when stopping.
+
+    Windows: block on the named kernel wake/stop events with a bounded
+    timeout (default 30s). The post-commit SetEvent cuts the latency to
+    near-zero; the timeout is the guaranteed sweep that replays anything
+    committed while no event was delivered (crash-between-commit-and-signal
+    recovery). Non-Windows keeps the plain interval sleep.
+    """
+    if IS_WINDOWS:
+        try:
+            sys.path.insert(0, str(REPO))
+            from debate_wake_signal import wait_for_wake_or_stop
+        except Exception as exc:
+            _log("windows_wait_adapter_failed", error=repr(exc))
+            return STOP_EVENT.wait(max(0.0, seconds))
+        # Kernel wait in short slices so the thread-level STOP_EVENT
+        # (signal handlers, tests) stays interruptible too: a wake/stop
+        # event still cuts the wait to near-zero, and a STOP_EVENT set
+        # between slices is honored within ~250ms.
+        deadline = time.monotonic() + min(max(0.2, seconds), WINDOWS_SWEEP_SECONDS)
+        while True:
+            if STOP_EVENT.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return STOP_EVENT.is_set()
+            try:
+                outcome = wait_for_wake_or_stop(min(0.25, remaining))
+            except Exception as exc:
+                _log("windows_wait_adapter_failed", error=repr(exc))
+                return STOP_EVENT.wait(max(0.0, remaining))
+            if outcome == "stop":
+                global STOP
+                STOP = True
+                STOP_EVENT.set()
+                return True
+            if outcome == "wake":
+                return STOP_EVENT.is_set()
+            if outcome == "unsupported":
+                return STOP_EVENT.wait(max(0.0, remaining))
     return STOP_EVENT.wait(max(0.0, seconds))
 
 
@@ -547,7 +735,9 @@ def main() -> int:
     parser.add_argument(
         "--message-claim-reclaim-min-age-seconds",
         type=int,
-        default=int(os.environ.get("DEBATE_MESSAGE_CLAIM_RECLAIM_MIN_AGE_SECONDS", "120")),
+        default=int(
+            os.environ.get("DEBATE_MESSAGE_CLAIM_RECLAIM_MIN_AGE_SECONDS", "120")
+        ),
         help="DAO guard against too-recent reclaim cutoffs",
     )
     parser.add_argument(
@@ -565,7 +755,9 @@ def main() -> int:
     parser.add_argument(
         "--worker-claim-recovery-min-age-seconds",
         type=int,
-        default=int(os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_MIN_AGE_SECONDS", "120")),
+        default=int(
+            os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_MIN_AGE_SECONDS", "120")
+        ),
         help="DAO guard against too-recent worker recovery cutoffs",
     )
     parser.add_argument(
@@ -573,7 +765,19 @@ def main() -> int:
         action="append",
         default=None,
     )
+    parser.add_argument(
+        "--mcp-prefix",
+        default="",
+        help="MCP tool prefix for spawned claude workers (Task Scheduler has "
+        "no env block, so the Windows install passes it as an argument), "
+        "e.g. mcp__sqlite_unified__",
+    )
     args = parser.parse_args()
+    if args.mcp_prefix:
+        os.environ["DEBATE_WAKE_MCP_PREFIX"] = args.mcp_prefix
+    if IS_WINDOWS and not args.once and _another_pump_is_live():
+        _log("pump_already_running_exit", pid=os.getpid())
+        return 0
 
     topics = _split_csv_values(args.topic)
     action_kind_values = args.action_kind or os.environ.get(
@@ -621,6 +825,7 @@ def main() -> int:
 
     while not STOP:
         _reap_children()
+        _write_heartbeat(last_ts, last_msg_id)
         if (
             args.message_claim_reclaim_seconds > 0
             and time.monotonic() - last_claim_reclaim_at
@@ -665,9 +870,15 @@ def main() -> int:
                     _wait_or_stop(max(loop_interval, auto_budget.interval_seconds))
                     continue
                 effective_action_kinds = [
-                    kind for kind in action_kinds if kind in set(auto_budget.action_kinds)
+                    kind
+                    for kind in action_kinds
+                    if kind in set(auto_budget.action_kinds)
                 ]
-                effective_limit = min(args.limit, auto_budget.limit) if args.limit > 0 else auto_budget.limit
+                effective_limit = (
+                    min(args.limit, auto_budget.limit)
+                    if args.limit > 0
+                    else auto_budget.limit
+                )
                 effective_max_workers_per_scan = _cap_positive(
                     max_workers_per_scan,
                     auto_budget.max_workers_per_scan,
@@ -678,13 +889,19 @@ def main() -> int:
                 )
                 os.environ["DEBATE_WAKE_BUDGET"] = str(
                     min(
-                        int(os.environ.get("DEBATE_WAKE_BUDGET", str(default_wake_budget))),
+                        int(
+                            os.environ.get(
+                                "DEBATE_WAKE_BUDGET", str(default_wake_budget)
+                            )
+                        ),
                         max(0, auto_budget.wake_budget),
                     )
                 )
                 loop_interval = max(loop_interval, auto_budget.interval_seconds)
                 if not effective_action_kinds or effective_limit <= 0:
-                    _log("pump_paused_by_empty_resource_budget", **auto_budget.to_dict())
+                    _log(
+                        "pump_paused_by_empty_resource_budget", **auto_budget.to_dict()
+                    )
                     if args.once:
                         break
                     _wait_or_stop(loop_interval)
@@ -703,7 +920,9 @@ def main() -> int:
             partial_pending = False
             for row in rows:
                 _reap_children()
-                estimated_worker_demand = _estimate_worker_demand(row["msg_id"], suppressed_roles)
+                estimated_worker_demand = _estimate_worker_demand(
+                    row["msg_id"], suppressed_roles
+                )
                 reason = _throttle_reason(
                     estimated_worker_demand=estimated_worker_demand,
                     launched_this_scan=launched_this_scan,
@@ -776,6 +995,13 @@ def main() -> int:
 
     _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)
+    try:
+        # Clean exit removes the heartbeat so status reads "stopped", not
+        # "stale"; a crashed pump leaves it behind — which is the signal
+        # that distinguishes the two.
+        HEARTBEAT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
     return 0
 
 

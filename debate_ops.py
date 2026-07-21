@@ -34,7 +34,14 @@ def _run(cmd: list[str], *, capture: bool = False) -> subprocess.CompletedProces
     )
 
 
+IS_WINDOWS = sys.platform == "win32"
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
+    if IS_WINDOWS:
+        import debate_ops_windows
+
+        return debate_ops_windows.cmd_doctor()
     import install_doctor
 
     payload = install_doctor.run_doctor(check_debate_runtime=True)
@@ -62,6 +69,23 @@ def _systemctl(args: list[str]) -> dict[str, object]:
 
 
 def cmd_install_service(args: argparse.Namespace) -> int:
+    if IS_WINDOWS:
+        import debate_ops_windows
+
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "task": debate_ops_windows.TASK_NAME,
+                        "dry_run": True,
+                        "pythonw": str(debate_ops_windows._pythonw()),
+                        "pump_args": debate_ops_windows.PUMP_ARGS,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        return debate_ops_windows.cmd_install(start=not args.no_start)
     if not SERVICE_SRC.is_file():
         print(f"missing service template: {SERVICE_SRC}", file=sys.stderr)
         return 1
@@ -91,7 +115,40 @@ def cmd_install_service(args: argparse.Namespace) -> int:
 
 
 def cmd_status(_: argparse.Namespace) -> int:
-    return _run(["systemctl", "--user", "status", SERVICE_NAME, "--no-pager"]).returncode
+    if IS_WINDOWS:
+        import debate_ops_windows
+
+        return debate_ops_windows.cmd_status()
+    return _run(
+        ["systemctl", "--user", "status", SERVICE_NAME, "--no-pager"]
+    ).returncode
+
+
+def cmd_start(_: argparse.Namespace) -> int:
+    if IS_WINDOWS:
+        import debate_ops_windows
+
+        return debate_ops_windows.cmd_start()
+    return _run(["systemctl", "--user", "start", SERVICE_NAME]).returncode
+
+
+def cmd_stop(_: argparse.Namespace) -> int:
+    if IS_WINDOWS:
+        import debate_ops_windows
+
+        return debate_ops_windows.cmd_stop()
+    return _run(["systemctl", "--user", "stop", SERVICE_NAME]).returncode
+
+
+def cmd_uninstall(_: argparse.Namespace) -> int:
+    if IS_WINDOWS:
+        import debate_ops_windows
+
+        return debate_ops_windows.cmd_uninstall()
+    result = _run(["systemctl", "--user", "disable", "--now", SERVICE_NAME])
+    SERVICE_DST.unlink(missing_ok=True)
+    _run(["systemctl", "--user", "daemon-reload"])
+    return result.returncode
 
 
 def cmd_smoke(args: argparse.Namespace) -> int:
@@ -161,8 +218,25 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--no-start", action="store_true")
     install.set_defaults(func=cmd_install_service)
 
-    status = sub.add_parser("status", help="Show the systemd user service status.")
+    status = sub.add_parser(
+        "status",
+        help="Show pump service/task status (systemd on Linux, Scheduled Task + heartbeat on Windows).",
+    )
     status.set_defaults(func=cmd_status)
+
+    start = sub.add_parser("start", help="Start the resident debate pump.")
+    start.set_defaults(func=cmd_start)
+
+    stop = sub.add_parser(
+        "stop",
+        help="Stop the resident pump gracefully (in-flight workers survive).",
+    )
+    stop.set_defaults(func=cmd_stop)
+
+    uninstall = sub.add_parser(
+        "uninstall", help="Stop and remove the pump service/Scheduled Task."
+    )
+    uninstall.set_defaults(func=cmd_uninstall)
 
     smoke = sub.add_parser("smoke", help="Run focused debate runtime smoke tests.")
     smoke.add_argument("--verbose", action="store_true")
