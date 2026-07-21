@@ -24,7 +24,9 @@ def test_debate_wake_agent_budget_caps_successful_launches(monkeypatch):
     monkeypatch.setenv("DEBATE_WAKE_BUDGET", "1")
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setenv("DEBATE_WAKE_DISABLE_FILE", "/tmp/sqlite-memory-test-no-disable")
-    monkeypatch.setattr(module, "_mark_source_wake_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module, "_mark_source_wake_result", lambda *args, **kwargs: None
+    )
     launches = []
 
     def fake_launch(target, trigger_msg_id, topic_id):
@@ -33,7 +35,11 @@ def test_debate_wake_agent_budget_caps_successful_launches(monkeypatch):
 
     monkeypatch.setattr(module, "_launch_agent", fake_launch)
     out = module._maybe_dispatch(
-        {"msg_id": "abc123", "topic_id": "T", "schema_version": "debate_post_with_recipients.v1"},
+        {
+            "msg_id": "abc123",
+            "topic_id": "T",
+            "schema_version": "debate_post_with_recipients.v1",
+        },
         {
             "targets": [
                 {
@@ -72,7 +78,9 @@ def test_debate_wake_accepts_claude_runtime_alias():
 
 
 def test_resource_budget_blocks_supercritical_heat_and_large_agent_set():
-    module = _load_hook_module("debate_resource_budget_blocked_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_blocked_test", "hooks/debate_resource_budget.py"
+    )
 
     budget = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -94,7 +102,9 @@ def test_resource_budget_blocks_supercritical_heat_and_large_agent_set():
 
 
 def test_resource_budget_treats_single_hot_core_sample_as_soft_signal():
-    module = _load_hook_module("debate_resource_budget_hot_spike_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_hot_spike_test", "hooks/debate_resource_budget.py"
+    )
 
     budget = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -116,7 +126,9 @@ def test_resource_budget_treats_single_hot_core_sample_as_soft_signal():
 
 
 def test_resource_budget_operator_sleep_blocks_until_timestamp(tmp_path):
-    module = _load_hook_module("debate_resource_budget_sleep_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_sleep_test", "hooks/debate_resource_budget.py"
+    )
     path = tmp_path / "sleep_until"
     now = datetime(2026, 5, 24, 9, 0, tzinfo=timezone.utc)
     path.write_text(
@@ -153,7 +165,9 @@ def test_resource_budget_operator_sleep_blocks_until_timestamp(tmp_path):
 
 
 def test_resource_budget_allows_small_budget_on_healthy_machine():
-    module = _load_hook_module("debate_resource_budget_healthy_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_healthy_test", "hooks/debate_resource_budget.py"
+    )
 
     budget = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -175,7 +189,9 @@ def test_resource_budget_allows_small_budget_on_healthy_machine():
 
 
 def test_resource_budget_treats_unknown_temperature_as_soft_signal():
-    module = _load_hook_module("debate_resource_budget_unknown_temp_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_unknown_temp_test", "hooks/debate_resource_budget.py"
+    )
 
     budget = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -197,7 +213,9 @@ def test_resource_budget_treats_unknown_temperature_as_soft_signal():
 
 
 def test_resource_budget_does_not_require_swap_on_no_swap_host():
-    module = _load_hook_module("debate_resource_budget_no_swap_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_no_swap_test", "hooks/debate_resource_budget.py"
+    )
 
     budget = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -218,7 +236,9 @@ def test_resource_budget_does_not_require_swap_on_no_swap_host():
 
 
 def test_resource_budget_low_memory_machine_uses_relative_headroom():
-    module = _load_hook_module("debate_resource_budget_small_machine_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_small_machine_test", "hooks/debate_resource_budget.py"
+    )
 
     budget = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -238,8 +258,12 @@ def test_resource_budget_low_memory_machine_uses_relative_headroom():
     assert budget.tier in {"guarded", "normal"}
 
 
-def test_resource_budget_recovery_hysteresis_requires_repeated_healthy_samples(tmp_path):
-    module = _load_hook_module("debate_resource_budget_hysteresis_test", "hooks/debate_resource_budget.py")
+def test_resource_budget_recovery_hysteresis_requires_repeated_healthy_samples(
+    tmp_path,
+):
+    module = _load_hook_module(
+        "debate_resource_budget_hysteresis_test", "hooks/debate_resource_budget.py"
+    )
     path = tmp_path / "state.json"
     spike = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -269,7 +293,9 @@ def test_resource_budget_recovery_hysteresis_requires_repeated_healthy_samples(t
     )
 
     for _ in range(4):
-        assert module.apply_recovery_hysteresis(spike, state_path=path).allow_agent is True
+        assert (
+            module.apply_recovery_hysteresis(spike, state_path=path).allow_agent is True
+        )
     sustained = module.apply_recovery_hysteresis(spike, state_path=path)
     assert sustained.allow_agent is False
     assert sustained.reason == "sustained_temperature_ewma_96c"
@@ -287,7 +313,10 @@ def test_resource_budget_recovery_hysteresis_requires_repeated_healthy_samples(t
             live_agent_count=1,
         )
     )
-    assert module.apply_recovery_hysteresis(supercritical, state_path=path).allow_agent is False
+    assert (
+        module.apply_recovery_hysteresis(supercritical, state_path=path).allow_agent
+        is False
+    )
     path.unlink()
     first_spike = module.apply_recovery_hysteresis(spike, state_path=path)
     assert first_spike.allow_agent is True
@@ -301,7 +330,9 @@ def test_resource_budget_recovery_hysteresis_requires_repeated_healthy_samples(t
 
 
 def test_resource_budget_recovery_hysteresis_allows_sustained_mid_90s(tmp_path):
-    module = _load_hook_module("debate_resource_budget_mid_90s_test", "hooks/debate_resource_budget.py")
+    module = _load_hook_module(
+        "debate_resource_budget_mid_90s_test", "hooks/debate_resource_budget.py"
+    )
     path = tmp_path / "state.json"
     hot_but_workable = module.compute_debate_resource_budget(
         module.ResourceSnapshot(
@@ -324,8 +355,12 @@ def test_resource_budget_recovery_hysteresis_allows_sustained_mid_90s(tmp_path):
     assert budget.wake_budget == 1
 
 
-def test_resource_budget_live_agent_count_ignores_sqlite_memory_sidecars(monkeypatch, tmp_path):
-    module = _load_hook_module("debate_resource_budget_count_test", "hooks/debate_resource_budget.py")
+def test_resource_budget_live_agent_count_ignores_sqlite_memory_sidecars(
+    monkeypatch, tmp_path
+):
+    module = _load_hook_module(
+        "debate_resource_budget_count_test", "hooks/debate_resource_budget.py"
+    )
     proc = tmp_path / "proc"
     proc.mkdir()
     commands = {
@@ -345,7 +380,9 @@ def test_resource_budget_live_agent_count_ignores_sqlite_memory_sidecars(monkeyp
 
 
 def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tmp_path):
-    module = _load_hook_module("debate_pump_budget_default_test", "hooks/debate_pump.py")
+    module = _load_hook_module(
+        "debate_pump_budget_default_test", "hooks/debate_pump.py"
+    )
     module.LOG_PATH = tmp_path / "pump.jsonl"
     module.STATE_PATH = tmp_path / "pump_state.json"
     module.STOP = False
@@ -356,6 +393,10 @@ def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tm
     monkeypatch.delenv("DEBATE_WAKE_BUDGET", raising=False)
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 1)
+    # Synthetic rows are not inserted into DB_PATH; the terminal gate would
+    # otherwise treat the unknown msg as terminal and skip dispatch. This
+    # unit test exercises the dispatch path, so force not-terminal.
+    monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
     monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: None)
@@ -457,7 +498,9 @@ def test_debate_pump_treats_implementation_as_zero_bounded_worker_demand(
     assert module._estimate_worker_demand("impl-q", set()) == 0
 
 
-def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(monkeypatch, tmp_path):
+def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(
+    monkeypatch, tmp_path
+):
     module = _load_hook_module("debate_pump_cursor_test", "hooks/debate_pump.py")
     module.LOG_PATH = tmp_path / "pump.jsonl"
     module.STATE_PATH = tmp_path / "pump_state.json"
@@ -472,9 +515,12 @@ def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(monkeypatc
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
-    monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id)))
+    monkeypatch.setattr(
+        module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id))
+    )
 
     def fail_dispatch(row, suppressed_roles):
         dispatches.append(row["msg_id"])
@@ -504,7 +550,9 @@ def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(monkeypatc
 
 
 def test_debate_pump_allows_partial_dispatch_when_message_has_more_targets_than_scan_budget():
-    module = _load_hook_module("debate_pump_partial_throttle_test", "hooks/debate_pump.py")
+    module = _load_hook_module(
+        "debate_pump_partial_throttle_test", "hooks/debate_pump.py"
+    )
 
     assert (
         module._throttle_reason(
@@ -531,21 +579,27 @@ def test_debate_pump_allows_partial_dispatch_when_message_has_more_targets_than_
 def test_debate_pump_keeps_cursor_on_partially_dispatched_multi_recipient_message(
     monkeypatch, tmp_path
 ):
-    module = _load_hook_module("debate_pump_partial_cursor_test", "hooks/debate_pump.py")
+    module = _load_hook_module(
+        "debate_pump_partial_cursor_test", "hooks/debate_pump.py"
+    )
     module.LOG_PATH = tmp_path / "pump.jsonl"
     module.STATE_PATH = tmp_path / "pump_state.json"
     module.STOP = False
     rows = [{"msg_id": "m1", "topic_id": "T", "ts": "2026-05-20T00:00:01Z"}]
-    demand = iter([3, 2])
     dispatches = []
     saved = []
 
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
-    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: next(demand))
+    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 3)
+    # Not terminal → after dispatching, the just-dispatched (in-flight)
+    # trigger holds the cursor until a later scan proves it terminal.
+    monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
-    monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id)))
+    monkeypatch.setattr(
+        module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id))
+    )
 
     def dispatch_one(row, suppressed_roles):
         dispatches.append(row["msg_id"])
@@ -572,24 +626,32 @@ def test_debate_pump_keeps_cursor_on_partially_dispatched_multi_recipient_messag
     assert module.main() == 0
     assert dispatches == ["m1"]
     assert saved == []
-    assert "pump_partial_dispatch_pending" in module.LOG_PATH.read_text(encoding="utf-8")
+    assert "pump_dispatched_hold_cursor" in module.LOG_PATH.read_text(encoding="utf-8")
 
 
-def test_debate_pump_advances_cursor_after_last_recipient_is_handled(monkeypatch, tmp_path):
-    module = _load_hook_module("debate_pump_complete_cursor_test", "hooks/debate_pump.py")
+def test_debate_pump_advances_cursor_after_last_recipient_is_handled(
+    monkeypatch, tmp_path
+):
+    module = _load_hook_module(
+        "debate_pump_complete_cursor_test", "hooks/debate_pump.py"
+    )
     module.LOG_PATH = tmp_path / "pump.jsonl"
     module.STATE_PATH = tmp_path / "pump_state.json"
     module.STOP = False
     rows = [{"msg_id": "m1", "topic_id": "T", "ts": "2026-05-20T00:00:01Z"}]
-    demand = iter([1, 0])
     saved = []
 
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
-    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: next(demand))
+    monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 0)
+    # Last recipient handled → the trigger is terminal → cursor advances
+    # past it (new contract: advance only on a proven-terminal trigger).
+    monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: True)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
-    monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id)))
+    monkeypatch.setattr(
+        module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id))
+    )
     monkeypatch.setattr(module, "_dispatch_row", lambda row, suppressed_roles: 1)
     monkeypatch.setattr(
         sys,

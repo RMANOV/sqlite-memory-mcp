@@ -36,6 +36,9 @@ DISABLE_FILE = Path(os.path.expanduser("~/.claude/memory/debate_wake.disable"))
 SLEEP_FILE = Path(os.path.expanduser("~/.claude/memory/debate_wake.sleep_until"))
 HEARTBEAT_FRESH_SECONDS = 90
 # Machine-specific initial worker cap (task 0d806934): backlog waits, is not lost.
+# action-kind explicitly includes PING (advocate BLOCK high-risk): the pump
+# default omits it, and the governor's action_kinds intersection can only
+# subtract — so without listing it here an explicit H/PING wake is dropped.
 PUMP_ARGS = [
     "--max-concurrent-workers",
     "1",
@@ -43,6 +46,16 @@ PUMP_ARGS = [
     "1",
     "--mcp-prefix",
     "mcp__sqlite_unified__",
+    "--action-kind",
+    "Q",
+    "--action-kind",
+    "A",
+    "--action-kind",
+    "DECISION",
+    "--action-kind",
+    "STATE",
+    "--action-kind",
+    "PING",
 ]
 
 
@@ -390,13 +403,31 @@ def cmd_doctor() -> int:
     except Exception as exc:
         checks["resource_budget"] = {"ok": False, "error": repr(exc)}
     query = _schtasks(["/Query", "/TN", TASK_NAME])
-    checks["scheduled_task"] = {"ok": not query.get("returncode")}
-    checks["pump"] = pump_state()
+    task_registered = not query.get("returncode")
+    run_key = _run_key_installed()
+    state = pump_state()
+    # Autostart is satisfied by EITHER a Scheduled Task OR the HKCU Run key
+    # (managed machines deny schtasks). doctor treats autostart + a running
+    # pump as MANDATORY (advocate BLOCK high-risk #2: pump/task were advisory).
+    checks["autostart"] = {
+        "ok": task_registered or run_key,
+        "mechanism": "scheduled_task"
+        if task_registered
+        else ("run_key" if run_key else "none"),
+    }
+    checks["pump_running"] = {"ok": state.get("state") == "running", **state}
     checks["kill_switches"] = {
         "disable_file": DISABLE_FILE.exists(),
         "sleep_until_file": SLEEP_FILE.exists(),
     }
-    hard_keys = ("psutil", "pythonw", "wake_event", "resource_budget")
+    hard_keys = (
+        "psutil",
+        "pythonw",
+        "wake_event",
+        "resource_budget",
+        "autostart",
+        "pump_running",
+    )
     ok = all(
         bool(checks[key].get("ok"))
         for key in hard_keys

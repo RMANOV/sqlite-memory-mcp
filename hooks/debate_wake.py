@@ -272,6 +272,19 @@ def _agent_command(
             allowed,
         ]
     if runtime == "codex":
+        # Advocate BLOCK high-risk #3: the codex route runs with
+        # --dangerously-bypass-approvals-and-sandbox (inherited Linux
+        # behavior). A zero-paste pump turns that into an automatic attack
+        # surface, so on Windows the route is OFF unless explicitly enabled.
+        # Typed refusal (unsupported_runtime) — never a silent bypass.
+        if IS_WINDOWS and os.environ.get("DEBATE_WAKE_CODEX_ENABLED", "0") != "1":
+            _log(
+                "codex_route_disabled_on_windows",
+                msg_id=trigger_msg_id,
+                topic_id=topic_id,
+                hint="set DEBATE_WAKE_CODEX_ENABLED=1 to enable",
+            )
+            return None
         return [
             "codex",
             "exec",
@@ -320,12 +333,6 @@ def _record_real_spawn(
                 "AND action = ? ORDER BY created_at DESC LIMIT 1",
                 (trigger_msg_id, source_target_session_id, source_action),
             ).fetchone()
-            wake_id = new_msg_id()
-            while conn.execute(
-                "SELECT 1 FROM debate_wake_log WHERE wake_id = ? LIMIT 1",
-                (wake_id,),
-            ).fetchone():
-                wake_id = new_msg_id()
             details = {
                 "source_wake_id": source["wake_id"] if source else None,
                 "pid": pid,
@@ -338,28 +345,66 @@ def _record_real_spawn(
                 "parent_session_id": target.get("parent_session_id"),
                 "worker_claim": target.get("worker_claim"),
             }
-            conn.execute(
-                "INSERT OR IGNORE INTO debate_wake_log "
-                "(wake_id, trigger_msg_id, topic_id, recipient, target_role, "
-                " target_session_id, target_runtime, binding_generation, action, "
-                " result, schema_version, details_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    wake_id,
-                    trigger_msg_id,
-                    topic_id,
-                    str(target.get("recipient") or ""),
-                    target_role,
-                    target_session_id,
-                    target_runtime,
-                    None,
-                    action,
-                    "real_spawn",
-                    DEBATE_WAKE_SCHEMA_VERSION,
-                    json_dumps(details),
-                    launched_at,
-                ),
-            )
+            # Requeue retry: the unique (trigger, session, action) receipt
+            # index forbids a second row, but liveness reads pid+create_time
+            # from this receipt — a re-spawned worker must refresh it or the
+            # recovery sweep keeps checking the DEAD previous pid.
+            prior = conn.execute(
+                "SELECT wake_id, details_json FROM debate_wake_log "
+                "WHERE trigger_msg_id = ? AND target_session_id = ? "
+                "AND action = ? LIMIT 1",
+                (trigger_msg_id, target_session_id, action),
+            ).fetchone()
+            if prior is not None:
+                wake_id = prior["wake_id"]
+                try:
+                    prior_details = json.loads(prior["details_json"] or "{}")
+                except Exception:
+                    prior_details = {}
+                retries = prior_details.get("spawn_retries")
+                details["spawn_retries"] = (
+                    retries if isinstance(retries, list) else []
+                ) + [
+                    {
+                        "pid": prior_details.get("pid"),
+                        "create_time": prior_details.get("create_time"),
+                        "launched_at": prior_details.get("launched_at"),
+                    }
+                ]
+                conn.execute(
+                    "UPDATE debate_wake_log SET details_json = ?, created_at = ? "
+                    "WHERE wake_id = ?",
+                    (json_dumps(details), launched_at, wake_id),
+                )
+            else:
+                wake_id = new_msg_id()
+                while conn.execute(
+                    "SELECT 1 FROM debate_wake_log WHERE wake_id = ? LIMIT 1",
+                    (wake_id,),
+                ).fetchone():
+                    wake_id = new_msg_id()
+                conn.execute(
+                    "INSERT OR IGNORE INTO debate_wake_log "
+                    "(wake_id, trigger_msg_id, topic_id, recipient, target_role, "
+                    " target_session_id, target_runtime, binding_generation, action, "
+                    " result, schema_version, details_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        wake_id,
+                        trigger_msg_id,
+                        topic_id,
+                        str(target.get("recipient") or ""),
+                        target_role,
+                        target_session_id,
+                        target_runtime,
+                        None,
+                        action,
+                        "real_spawn",
+                        DEBATE_WAKE_SCHEMA_VERSION,
+                        json_dumps(details),
+                        launched_at,
+                    ),
+                )
         return {
             "wake_id": wake_id,
             "result": "real_spawn",
@@ -455,19 +500,21 @@ def _claim_worker_target(
 def _launch_agent(
     target: dict[str, Any], trigger_msg_id: str, topic_id: str
 ) -> dict[str, Any]:
-    target = _claim_worker_target(target, trigger_msg_id, topic_id)
-    if target.get("result") == "worker_claim_completed":
-        return {"launched": False, "reason": "worker_claim_completed", "target": target}
-    if target.get("claim_error"):
-        return {"launched": False, "reason": "worker_claim_failed", "target": target}
-
+    # RUNTIME PREFLIGHT BEFORE CLAIM (advocate BLOCK #3): resolving the
+    # command and executable must happen BEFORE acquiring a worker claim.
+    # Otherwise a disabled/unsupported runtime (e.g. codex off on Windows)
+    # or a missing executable leaves an orphaned claim that the recovery
+    # sweep later turns into a false terminal_no_action — a technical
+    # failure masquerading as a valid zero-work completion. A preflight
+    # refusal makes NO claim, so the trigger stays genuinely pending.
     cmd = _agent_command(target, trigger_msg_id, topic_id)
     if cmd is None:
+        _log(
+            "agent_runtime_unsupported_no_claim",
+            msg_id=trigger_msg_id,
+            runtime=str(target.get("target_runtime") or ""),
+        )
         return {"launched": False, "reason": "unsupported_runtime"}
-
-    # Explicit executable resolution: bare names depend on the caller's PATH
-    # semantics (and on Windows would silently miss .cmd shims); a missing
-    # runtime must be a typed refusal, not a spawn exception.
     resolved = shutil.which(cmd[0])
     if not resolved:
         _log("agent_executable_not_found", executable=cmd[0], msg_id=trigger_msg_id)
@@ -477,6 +524,13 @@ def _launch_agent(
             "executable": cmd[0],
         }
     cmd = [resolved, *cmd[1:]]
+
+    # Runtime is real → now it is safe to acquire the logical claim.
+    target = _claim_worker_target(target, trigger_msg_id, topic_id)
+    if target.get("result") == "worker_claim_completed":
+        return {"launched": False, "reason": "worker_claim_completed", "target": target}
+    if target.get("claim_error"):
+        return {"launched": False, "reason": "worker_claim_failed", "target": target}
 
     AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
     _prune_agent_logs()

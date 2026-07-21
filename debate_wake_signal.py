@@ -127,3 +127,65 @@ def close_handles() -> None:
         except Exception:
             pass
     _HANDLES.clear()
+
+
+# ── Pump singleton mutex ─────────────────────────────────────────────────
+
+_ERROR_ALREADY_EXISTS = 183
+_SINGLETON_HANDLE: int | None = None
+
+
+def _singleton_mutex_name() -> str:
+    return os.environ.get(
+        "DEBATE_PUMP_SINGLETON_MUTEX", r"Local\SqliteMemoryDebatePumpSingletonV1"
+    )
+
+
+def acquire_pump_singleton() -> bool:
+    """Atomic OS-level pump singleton (advocate BLOCK high-risk #1).
+
+    The heartbeat-file guard is advisory (read-check-act race); a named
+    mutex is atomic. The handle is held for the process lifetime — the OS
+    releases it on ANY exit path, so a crashed pump never wedges the slot.
+    Returns True when this process owns the singleton. Non-Windows: True
+    (systemd already enforces single instance there).
+    """
+    global _SINGLETON_HANDLE
+    if not is_supported():
+        return True
+    if _SINGLETON_HANDLE:
+        return True
+    import ctypes
+
+    try:
+        # Dedicated use_last_error binding: GetLastError via plain
+        # ctypes.windll is unreliable (interpreter may issue intervening
+        # Win32 calls between CreateMutexW and the read).
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, True, _singleton_mutex_name())
+        last_error = ctypes.get_last_error()
+        if not handle:
+            return False
+        if last_error == _ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return False
+        _SINGLETON_HANDLE = handle
+        return True
+    except Exception:
+        return False
+
+
+def release_pump_singleton() -> None:
+    """Explicit release (tests). Production relies on process exit."""
+    global _SINGLETON_HANDLE
+    if _SINGLETON_HANDLE and is_supported():
+        import ctypes
+
+        try:
+            handle = ctypes.c_void_p(_SINGLETON_HANDLE)
+            _kernel32().ReleaseMutex(handle)
+            _kernel32().CloseHandle(handle)
+        except Exception:
+            pass
+    _SINGLETON_HANDLE = None

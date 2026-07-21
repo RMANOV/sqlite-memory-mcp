@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import signal
+import re
 import sqlite3
 import sys
 import threading
@@ -36,6 +37,7 @@ def _default_repo() -> Path:
 
 REPO = Path(os.environ.get("DEBATE_REPO", str(_default_repo())))
 IS_WINDOWS = sys.platform == "win32"
+_ROLE_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
 DB_PATH = Path(
     os.environ.get("SQLITE_MEMORY_DB", os.path.expanduser("~/.claude/memory/memory.db"))
 )
@@ -249,56 +251,156 @@ def _filter_targets(out: dict[str, Any], suppressed_roles: set[str]) -> dict[str
     return filtered
 
 
+def _recipient_bindings(
+    con: sqlite3.Connection, msg_id: str, suppressed_roles: set[str]
+) -> list[tuple[str, str]]:
+    """Resolve (recipient_role, bound_session_id) for a trigger's recipients,
+    skipping suppressed roles and recipients without an active binding."""
+    msg = con.execute(
+        "SELECT topic_id, vehicle FROM debate_messages WHERE msg_id = ?",
+        (msg_id,),
+    ).fetchone()
+    if msg is None:
+        return []
+    if str(msg["vehicle"] or "analysis") == "implementation":
+        return []  # fail-closed vehicle: never a bounded wake-worker
+    rows = con.execute(
+        "SELECT recipient, recipient_mode FROM debate_message_recipients "
+        "WHERE msg_id = ? ORDER BY recipient",
+        (msg_id,),
+    ).fetchall()
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        recipient = str(row["recipient"] or "").strip()
+        if recipient.upper() in suppressed_roles:
+            continue
+        if row["recipient_mode"] == "normal":
+            binding = con.execute(
+                "SELECT session_id FROM debate_role_bindings "
+                "WHERE topic_id = ? AND role = ? AND state = 'active' "
+                "ORDER BY generation DESC LIMIT 1",
+                (msg["topic_id"], recipient),
+            ).fetchone()
+            role = recipient
+        else:
+            binding = con.execute(
+                "SELECT role, session_id FROM debate_role_bindings "
+                "WHERE topic_id = ? AND session_id = ? AND state = 'diagnostic' "
+                "ORDER BY generation DESC LIMIT 1",
+                (msg["topic_id"], recipient),
+            ).fetchone()
+            role = str(binding["role"]) if binding else recipient
+        if binding is None:
+            continue
+        out.append((role, str(binding["session_id"])))
+    return out
+
+
+def _has_unbound_addressed_recipient(
+    con: sqlite3.Connection, msg_id: str, suppressed_roles: set[str]
+) -> bool:
+    """True if the trigger addresses a role-mode recipient that currently has
+    NO active binding (and is not suppressed / not an impl vehicle).
+
+    Advocate BLOCK #2: such a message is genuinely pending — a worker just
+    cannot take it yet — so the cursor must NOT treat it as terminal and skip
+    it. It is distinct from a message whose only recipients are suppressed
+    (e.g. CONDUCTOR) or direct-session, which IS terminal for wake purposes."""
+    msg = con.execute(
+        "SELECT topic_id, vehicle FROM debate_messages WHERE msg_id = ?",
+        (msg_id,),
+    ).fetchone()
+    if msg is None or str(msg["vehicle"] or "analysis") == "implementation":
+        return False
+    rows = con.execute(
+        "SELECT recipient, recipient_mode FROM debate_message_recipients "
+        "WHERE msg_id = ?",
+        (msg_id,),
+    ).fetchall()
+    for row in rows:
+        recipient = str(row["recipient"] or "").strip()
+        if recipient.upper() in suppressed_roles:
+            continue
+        if row["recipient_mode"] != "normal":
+            continue  # diagnostic/direct-session is not a role-wake target
+        if not _ROLE_RE.fullmatch(recipient):
+            continue  # a literal session-id recipient, not a role
+        binding = con.execute(
+            "SELECT 1 FROM debate_role_bindings "
+            "WHERE topic_id = ? AND role = ? AND state = 'active' LIMIT 1",
+            (msg["topic_id"], recipient),
+        ).fetchone()
+        if binding is None:
+            return True
+    return False
+
+
+def _recipient_claim_state(
+    con: sqlite3.Connection, topic_id: str, role: str, trigger_msg_id: str
+) -> str | None:
+    """Latest worker-claim state for (topic, role, trigger), or None."""
+    row = con.execute(
+        "SELECT state FROM debate_worker_claims "
+        "WHERE topic_id = ? AND role = ? AND trigger_msg_id = ? "
+        "ORDER BY claimed_at DESC LIMIT 1",
+        (topic_id, role, trigger_msg_id),
+    ).fetchone()
+    return str(row["state"]) if row else None
+
+
+def _recipient_has_terminal_reply(
+    con: sqlite3.Connection, topic_id: str, role: str, trigger_msg_id: str
+) -> bool:
+    return (
+        con.execute(
+            "SELECT 1 FROM debate_messages "
+            "WHERE topic_id = ? AND role = ? AND reply_to = ? "
+            "AND kind IN ('A','STATUS') LIMIT 1",
+            (topic_id, role, trigger_msg_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def _estimate_worker_demand(msg_id: str, suppressed_roles: set[str]) -> int:
+    """Recipients that need a NEW worker spawn right now (throttle input).
+
+    A recipient is NOT counted (already covered) when: its worker claim is
+    active (in-flight — do not double-spawn) or completed, OR a terminal
+    reply exists, OR the wake result is notified/terminal_no_action. It IS
+    counted when the claim is retired/absent and no terminal reply exists —
+    i.e. a dead worker whose work must be re-dispatched (advocate BLOCK
+    critical #1: a stale 'dispatched' wake_log row must not suppress forever).
+    """
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
         msg = con.execute(
-            "SELECT topic_id, vehicle FROM debate_messages WHERE msg_id = ?",
+            "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
             (msg_id,),
         ).fetchone()
         if msg is None:
             return 0
-        # ``implementation`` is deliberately refused by the bounded wake
-        # router: it requires a conductor-approved edit-capable vehicle.  It
-        # therefore creates no per-session wake result/worker claim.  Treat it
-        # as zero bounded-worker demand here so the resident pump can advance
-        # past the typed refusal instead of retrying the same message forever.
-        if str(msg["vehicle"] or "analysis") == "implementation":
-            return 0
-        rows = con.execute(
-            "SELECT recipient, recipient_mode FROM debate_message_recipients "
-            "WHERE msg_id = ? ORDER BY recipient",
-            (msg_id,),
-        ).fetchall()
-        demand = 0
+        topic_id = str(msg["topic_id"])
         action = os.environ.get("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
-        for row in rows:
-            recipient = str(row["recipient"] or "").strip()
-            if recipient.upper() in suppressed_roles:
+        demand = 0
+        for role, session_id in _recipient_bindings(con, msg_id, suppressed_roles):
+            if _recipient_has_terminal_reply(con, topic_id, role, msg_id):
                 continue
-            binding: sqlite3.Row | None = None
-            if row["recipient_mode"] == "normal":
-                binding = con.execute(
-                    "SELECT session_id FROM debate_role_bindings "
-                    "WHERE topic_id = ? AND role = ? AND state = 'active' "
-                    "ORDER BY generation DESC LIMIT 1",
-                    (msg["topic_id"], recipient),
-                ).fetchone()
-            else:
-                binding = con.execute(
-                    "SELECT session_id FROM debate_role_bindings "
-                    "WHERE topic_id = ? AND session_id = ? AND state = 'diagnostic' "
-                    "ORDER BY generation DESC LIMIT 1",
-                    (msg["topic_id"], recipient),
-                ).fetchone()
-            if binding is None:
+            claim_state = _recipient_claim_state(con, topic_id, role, msg_id)
+            if claim_state in {"active", "completed"}:
+                continue  # in-flight or done — no new spawn needed
+            if claim_state == "retired":
+                demand += 1  # proven-dead worker → re-dispatch (advocate #1)
                 continue
+            # No claim recorded. A prior dispatched/notified/terminal wake row
+            # means the launcher is mid-flight (claim about to land) — covered.
+            # Otherwise this recipient was never dispatched → needs first spawn.
             latest = con.execute(
                 "SELECT result FROM debate_wake_log "
                 "WHERE trigger_msg_id = ? AND target_session_id = ? "
                 "AND action = ? ORDER BY created_at DESC LIMIT 1",
-                (msg_id, binding["session_id"], action),
+                (msg_id, session_id, action),
             ).fetchone()
             if latest is not None and str(latest["result"]) in {
                 "dispatched",
@@ -308,6 +410,61 @@ def _estimate_worker_demand(msg_id: str, suppressed_roles: set[str]) -> int:
                 continue
             demand += 1
         return demand
+    finally:
+        con.close()
+
+
+def _trigger_is_terminal(msg_id: str, suppressed_roles: set[str]) -> bool:
+    """Cursor-advance gate (advocate BLOCK critical #1): the pump cursor may
+    pass a trigger ONLY when every recipient reached a terminal outcome.
+
+    Terminal = a reply/STATUS exists, OR the worker claim is completed, OR
+    the wake result is notified/terminal_no_action, OR there is no eligible
+    binding. A merely-dispatched trigger with an active (in-flight) claim is
+    NOT terminal — the cursor stays behind it so a dead worker is re-examined
+    and re-dispatched rather than silently skipped. A retired claim without a
+    reply is likewise NOT terminal (pending re-dispatch)."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        msg = con.execute(
+            "SELECT topic_id FROM debate_messages WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        if msg is None:
+            return True  # unknown message: nothing to block on
+        topic_id = str(msg["topic_id"])
+        # A role-mode recipient with no active binding = genuinely pending
+        # work a worker cannot take yet. NOT terminal (advocate BLOCK #2):
+        # holding the cursor keeps the addressed message visible instead of
+        # silently skipping it. (Escalation of a chronically-unbound target
+        # is tracked separately — a held cursor is safe, a skip is not.)
+        if _has_unbound_addressed_recipient(con, msg_id, suppressed_roles):
+            return False
+        bindings = _recipient_bindings(con, msg_id, suppressed_roles)
+        if not bindings:
+            # No eligible worker recipient at all: impl vehicle, or only
+            # suppressed / direct-session recipients. Nothing to wake.
+            return True
+        action = os.environ.get("DEBATE_WAKE_ACTION_NAME", "post_tool_use_wake")
+        for role, session_id in bindings:
+            if _recipient_has_terminal_reply(con, topic_id, role, msg_id):
+                continue
+            if _recipient_claim_state(con, topic_id, role, msg_id) == "completed":
+                continue
+            latest = con.execute(
+                "SELECT result FROM debate_wake_log "
+                "WHERE trigger_msg_id = ? AND target_session_id = ? "
+                "AND action = ? ORDER BY created_at DESC LIMIT 1",
+                (msg_id, session_id, action),
+            ).fetchone()
+            if latest is not None and str(latest["result"]) in {
+                "notified",
+                "terminal_no_action",
+            }:
+                continue
+            return False  # this recipient is not resolved yet
+        return True
     finally:
         con.close()
 
@@ -466,6 +623,24 @@ def _pid_is_live_agent(pid: int, expected_create_time: float | None = None) -> b
     except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
         return False
     return b"codex" in cmdline or b"claude" in cmdline
+
+
+def _machine_live_worker_count(topics: list[str]) -> int:
+    """Count live wake-workers across active topics from durable spawn
+    receipts, not just this process's CHILDREN set.
+
+    Advocate BLOCK high-risk #1: after a pump restart, CHILDREN starts
+    empty, so a worker that outlived the old pump would not count toward
+    max_concurrent_workers — a restarted pump could exceed the cap. This
+    DB-backed count reconciles the in-process view with reality (workers
+    proven live by pid+create_time in their spawn receipt)."""
+    live: set[str] = set()
+    for topic_id in _active_topic_ids(topics):
+        try:
+            live |= _live_worker_session_ids(topic_id)
+        except Exception as exc:
+            _log("machine_live_worker_count_failed", topic_id=topic_id, error=repr(exc))
+    return len(live)
 
 
 def _live_worker_session_ids(topic_id: str) -> set[str]:
@@ -775,9 +950,23 @@ def main() -> int:
     args = parser.parse_args()
     if args.mcp_prefix:
         os.environ["DEBATE_WAKE_MCP_PREFIX"] = args.mcp_prefix
-    if IS_WINDOWS and not args.once and _another_pump_is_live():
-        _log("pump_already_running_exit", pid=os.getpid())
-        return 0
+    if IS_WINDOWS and not args.once:
+        # Atomic OS mutex (advocate BLOCK high-risk #1): the heartbeat-file
+        # guard is a read-check-act race — two pumps racing at logon could
+        # both pass it. CreateMutexW is atomic; the loser exits. The
+        # advisory heartbeat check stays as a cheap fast-path log.
+        try:
+            sys.path.insert(0, str(REPO))
+            from debate_wake_signal import acquire_pump_singleton
+
+            if not acquire_pump_singleton():
+                _log("pump_singleton_held_exit", pid=os.getpid())
+                return 0
+        except Exception as exc:
+            _log("pump_singleton_check_failed", error=repr(exc))
+            if _another_pump_is_live():
+                _log("pump_already_running_exit", pid=os.getpid())
+                return 0
 
     topics = _split_csv_values(args.topic)
     action_kind_values = args.action_kind or os.environ.get(
@@ -800,11 +989,27 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     state = _load_state()
-    last_ts = args.since or state.get("last_ts") or _now()
-    last_msg_id = "" if args.since else state.get("last_msg_id", "")
+    # Startup backlog sweep (advocate BLOCK critical #2): a missing or
+    # corrupt state file previously defaulted the cursor to now(), so any
+    # addressed message committed before the pump started was invisible
+    # forever. On a fresh start with no persisted cursor, begin from epoch
+    # so the durable backlog is swept; wake_log/worker_claim dedup in
+    # _estimate_worker_demand makes re-examining handled messages a no-op,
+    # not a re-dispatch. An explicit --since still wins.
+    startup_backlog_sweep = not args.since and not state.get("last_ts")
+    if args.since:
+        last_ts = args.since
+        last_msg_id = ""
+    elif state.get("last_ts"):
+        last_ts = state["last_ts"]
+        last_msg_id = state.get("last_msg_id", "")
+    else:
+        last_ts = "1970-01-01T00:00:00Z"
+        last_msg_id = ""
     _log(
         "pump_start",
         pid=os.getpid(),
+        startup_backlog_sweep=startup_backlog_sweep,
         topics=topics,
         interval=args.interval,
         last_ts=last_ts,
@@ -918,15 +1123,47 @@ def main() -> int:
             launched_this_scan = 0
             throttled = False
             partial_pending = False
+            # Baseline machine-wide live worker count (Windows: reconciles a
+            # restarted pump's empty CHILDREN with workers that outlived the
+            # previous instance). Computed once per scan; workers launched
+            # during this scan are tracked by launched_this_scan + CHILDREN.
+            baseline_live_workers = (
+                _machine_live_worker_count(topics) if IS_WINDOWS else 0
+            )
             for row in rows:
                 _reap_children()
+                live_children = max(len(CHILDREN), baseline_live_workers)
+                msg_id = row["msg_id"]
+                # Terminal → advance the cursor past it and keep scanning.
+                if _trigger_is_terminal(msg_id, suppressed_roles):
+                    last_ts = row["ts"]
+                    last_msg_id = msg_id
+                    _save_state(last_ts, last_msg_id)
+                    continue
+                # Not terminal. Does it need a NEW worker spawn, or is one
+                # already in-flight? demand counts only recipients with a
+                # dead/absent claim + no reply (advocate BLOCK critical #1).
                 estimated_worker_demand = _estimate_worker_demand(
-                    row["msg_id"], suppressed_roles
+                    msg_id, suppressed_roles
                 )
+                if estimated_worker_demand <= 0:
+                    # In-flight worker exists; no new spawn. Hold the cursor
+                    # behind this trigger until it becomes terminal — never
+                    # re-dispatch a live worker.
+                    partial_pending = True
+                    _log(
+                        "pump_trigger_in_flight_hold_cursor",
+                        msg_id=msg_id,
+                        topic_id=row["topic_id"],
+                        live_children=live_children,
+                        last_ts=last_ts,
+                        last_msg_id=last_msg_id,
+                    )
+                    break
                 reason = _throttle_reason(
                     estimated_worker_demand=estimated_worker_demand,
                     launched_this_scan=launched_this_scan,
-                    live_children=len(CHILDREN),
+                    live_children=live_children,
                     max_workers_per_scan=effective_max_workers_per_scan,
                     max_concurrent_workers=effective_max_concurrent_workers,
                 )
@@ -935,11 +1172,11 @@ def main() -> int:
                     _log(
                         "pump_dispatch_throttled",
                         reason=reason,
-                        msg_id=row["msg_id"],
+                        msg_id=msg_id,
                         topic_id=row["topic_id"],
                         estimated_worker_demand=estimated_worker_demand,
                         launched_this_scan=launched_this_scan,
-                        live_children=len(CHILDREN),
+                        live_children=live_children,
                         max_workers_per_scan=effective_max_workers_per_scan,
                         max_concurrent_workers=effective_max_concurrent_workers,
                         last_ts=last_ts,
@@ -950,29 +1187,21 @@ def main() -> int:
                     launched_this_scan += _dispatch_row(row, suppressed_roles)
                     dispatched_rows += 1
                 except Exception as exc:
-                    _log("dispatch_failed", msg_id=row["msg_id"], error=repr(exc))
+                    _log("dispatch_failed", msg_id=msg_id, error=repr(exc))
                     break
-                remaining_worker_demand = _estimate_worker_demand(
-                    row["msg_id"], suppressed_roles
+                # Just dispatched → in-flight, not terminal → hold the cursor
+                # here and re-evaluate on the next scan.
+                partial_pending = True
+                _log(
+                    "pump_dispatched_hold_cursor",
+                    msg_id=msg_id,
+                    topic_id=row["topic_id"],
+                    launched_this_scan=launched_this_scan,
+                    live_children=live_children,
+                    last_ts=last_ts,
+                    last_msg_id=last_msg_id,
                 )
-                if remaining_worker_demand > 0:
-                    partial_pending = True
-                    _log(
-                        "pump_partial_dispatch_pending",
-                        msg_id=row["msg_id"],
-                        topic_id=row["topic_id"],
-                        remaining_worker_demand=remaining_worker_demand,
-                        launched_this_scan=launched_this_scan,
-                        live_children=len(CHILDREN),
-                        max_workers_per_scan=effective_max_workers_per_scan,
-                        max_concurrent_workers=effective_max_concurrent_workers,
-                        last_ts=last_ts,
-                        last_msg_id=last_msg_id,
-                    )
-                    break
-                last_ts = row["ts"]
-                last_msg_id = row["msg_id"]
-                _save_state(last_ts, last_msg_id)
+                break
             if rows:
                 _log(
                     "scan_batch",

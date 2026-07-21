@@ -29,8 +29,18 @@ python bin/debate_ops.py smoke
 
 ## Windows runtime (REV 2.2 zero-paste delivery)
 
-On Windows the same commands manage a **user-level Scheduled Task**
-(`SqliteMemoryDebatePump`) instead of a systemd unit — no admin required:
+On Windows the same commands manage a resident user-level pump. `install-service`
+first tries a **user-level Scheduled Task** (`SqliteMemoryDebatePump`); on a
+managed machine where IT policy denies `schtasks /Create` (observed on this
+host: `ERROR: Access is denied.`) it automatically falls back to an **HKCU
+`...\CurrentVersion\Run` entry** — user-writable, starts at logon, no admin.
+`status`/`doctor` report which mechanism is active (`autostart_mechanism`).
+Trade-off: the Run-key path has **no automatic restart-on-failure** (only the
+Scheduled Task does); a crashed pump is restarted at next logon or via
+`debate_ops.py start`. `MultipleInstances=IgnoreNew` is enforced regardless by
+an atomic named-mutex singleton guard inside the pump. `doctor` treats a
+running pump + a present autostart mechanism as **mandatory** checks. No admin
+required either way:
 
 - runs hidden at user logon via `pythonw.exe`, working directory = repo,
   `MultipleInstances=IgnoreNew`, automatic restart on failure;

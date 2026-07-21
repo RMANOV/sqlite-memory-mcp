@@ -324,6 +324,61 @@ def test_agent_command_mcp_prefix_is_configurable(monkeypatch):
     assert "mcp__sqlite_intel__" not in allowed
 
 
+@windows_only
+def test_codex_route_disabled_by_default_on_windows(monkeypatch):
+    """Advocate BLOCK high-risk #3: the auto-spawned codex route runs with
+    --dangerously-bypass-approvals-and-sandbox. On Windows it must be a typed
+    refusal unless explicitly enabled — never a silent automatic bypass."""
+    import debate_wake
+
+    monkeypatch.delenv("DEBATE_WAKE_CODEX_ENABLED", raising=False)
+    assert debate_wake._agent_command({"target_runtime": "codex"}, "m1", "T1") is None
+    monkeypatch.setenv("DEBATE_WAKE_CODEX_ENABLED", "1")
+    cmd = debate_wake._agent_command({"target_runtime": "codex"}, "m1", "T1")
+    assert cmd is not None and "--ephemeral" in cmd
+
+
+@windows_only
+def test_pump_singleton_mutex_is_atomic_cross_process():
+    """Advocate BLOCK high-risk #1: the singleton must be an atomic OS mutex,
+    not a read-check-act heartbeat race. A second acquirer in a fresh process
+    (no shared in-process handle) must lose while the first holds it."""
+    import subprocess
+
+    # Unique mutex name so the test does not collide with a live production
+    # pump that holds the default singleton mutex.
+    env = dict(os.environ)
+    env["DEBATE_PUMP_SINGLETON_MUTEX"] = rf"Local\DebateSingletonTest{os.getpid()}"
+    code = (
+        "import sys; sys.path.insert(0, r'"
+        + str(REPO)
+        + "'); from debate_wake_signal import acquire_pump_singleton; "
+    )
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            code
+            + "import time; print(acquire_pump_singleton(), flush=True); time.sleep(4)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "True"
+        contender = subprocess.run(
+            [sys.executable, "-c", code + "print(acquire_pump_singleton())"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        assert contender.stdout.strip() == "False"
+    finally:
+        holder.wait(timeout=15)
+
+
 def test_agent_log_dir_stays_bounded(tmp_path, monkeypatch):
     import debate_wake
 

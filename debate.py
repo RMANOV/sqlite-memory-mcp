@@ -17,6 +17,7 @@ validators + state machine.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 import re
 import secrets
 import sqlite3
@@ -119,9 +120,7 @@ _WATERMARK_RE = re.compile(
 # msg:932b9bab). Reason text accepts any single-line content (the
 # `.+` excludes newlines by default); multi-line bodies are rejected
 # intentionally so structured logs stay one row per transition.
-_STATE_BODY_RE = re.compile(
-    r"^(INIT|ACTIVE|RESOLVED|ARCHIVED)(\s+\[reason: .+\])?$"
-)
+_STATE_BODY_RE = re.compile(r"^(INIT|ACTIVE|RESOLVED|ARCHIVED)(\s+\[reason: .+\])?$")
 
 
 VALID_PRIORITIES = ("H", "M", "L", "INFO")
@@ -178,9 +177,7 @@ class DebateError(ValueError):
     semantics for existing callers.
     """
 
-    def __init__(
-        self, message: str, *, error_type: str = "debate_validation"
-    ) -> None:
+    def __init__(self, message: str, *, error_type: str = "debate_validation") -> None:
         super().__init__(message)
         self.error_type = error_type
 
@@ -194,30 +191,22 @@ def validate_topic_id(topic_id: str) -> None:
 
 def validate_role(role: str) -> None:
     if not isinstance(role, str) or not ROLE_RE.fullmatch(role):
-        raise DebateError(
-            f"invalid_role: {role!r} must match {ROLE_RE.pattern}"
-        )
+        raise DebateError(f"invalid_role: {role!r} must match {ROLE_RE.pattern}")
 
 
 def validate_msg_id(msg_id: str) -> None:
     if not isinstance(msg_id, str) or not MSG_ID_RE.fullmatch(msg_id):
-        raise DebateError(
-            f"invalid_msg_id: {msg_id!r} must match {MSG_ID_RE.pattern}"
-        )
+        raise DebateError(f"invalid_msg_id: {msg_id!r} must match {MSG_ID_RE.pattern}")
 
 
 def validate_iso_utc(ts: str) -> None:
     if not isinstance(ts, str) or not ISO_UTC_RE.fullmatch(ts):
-        raise DebateError(
-            f"invalid_iso_utc: {ts!r} (expected e.g. 2026-05-09T16:35Z)"
-        )
+        raise DebateError(f"invalid_iso_utc: {ts!r} (expected e.g. 2026-05-09T16:35Z)")
 
 
 def validate_priority(priority: str) -> None:
     if priority not in VALID_PRIORITIES:
-        raise DebateError(
-            f"invalid_priority: {priority!r} not in {VALID_PRIORITIES}"
-        )
+        raise DebateError(f"invalid_priority: {priority!r} not in {VALID_PRIORITIES}")
 
 
 def validate_topic_priority_lane(lane: str) -> None:
@@ -231,9 +220,7 @@ def validate_topic_priority_lane(lane: str) -> None:
 
 def validate_kind(kind: str) -> None:
     if kind not in VALID_KINDS:
-        raise DebateError(
-            f"invalid_kind: {kind!r} not in {VALID_KINDS}"
-        )
+        raise DebateError(f"invalid_kind: {kind!r} not in {VALID_KINDS}")
 
 
 def validate_vehicle(vehicle: str) -> None:
@@ -268,9 +255,7 @@ def normalize_vehicle(vehicle: str | None) -> str:
 
 def validate_state(state: str) -> None:
     if state not in VALID_STATES:
-        raise DebateError(
-            f"invalid_state: {state!r} not in {VALID_STATES}"
-        )
+        raise DebateError(f"invalid_state: {state!r} not in {VALID_STATES}")
 
 
 def validate_transition(old_state: str, new_state: str) -> None:
@@ -329,9 +314,7 @@ def init_debate(
             raise DebateError("invalid_roles_entry: missing role")
         validate_role(role)
         if not isinstance(session_id, str) or not session_id:
-            raise DebateError(
-                f"invalid_roles_entry: role {role} missing session_id"
-            )
+            raise DebateError(f"invalid_roles_entry: role {role} missing session_id")
     if resolve_by is not None:
         validate_iso_utc(resolve_by)
 
@@ -345,9 +328,7 @@ def init_debate(
         same_roles = json_loads(existing["roles_json"]) == roles
         if same_roles:
             return _row_to_debate_dict(existing)
-        raise DebateError(
-            f"topic_exists_with_different_roles: {topic_id}"
-        )
+        raise DebateError(f"topic_exists_with_different_roles: {topic_id}")
 
     now = now_iso()
     metadata = _normalize_initial_topic_priority_metadata(
@@ -383,9 +364,7 @@ def init_debate(
     }
 
 
-def get_debate(
-    conn: sqlite3.Connection, topic_id: str
-) -> dict[str, Any] | None:
+def get_debate(conn: sqlite3.Connection, topic_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT topic_id, title, state, created_at, created_by_role, "
         "resolve_by, archived_at, roles_json, metadata_json "
@@ -514,11 +493,18 @@ def validate_session_id(session_id: str) -> None:
 
 
 def is_worker_session_id(session_id: str) -> bool:
-    return isinstance(session_id, str) and WORKER_SESSION_ID_RE.fullmatch(session_id) is not None
+    return (
+        isinstance(session_id, str)
+        and WORKER_SESSION_ID_RE.fullmatch(session_id) is not None
+    )
 
 
 def worker_parent_session_id(session_id: str) -> str | None:
-    m = WORKER_SESSION_ID_RE.fullmatch(session_id) if isinstance(session_id, str) else None
+    m = (
+        WORKER_SESSION_ID_RE.fullmatch(session_id)
+        if isinstance(session_id, str)
+        else None
+    )
     return m.group("parent") if m else None
 
 
@@ -568,8 +554,7 @@ def _validate_conductor_override(
         )
     validate_msg_id(override_msg_id)
     row = conn.execute(
-        "SELECT role, kind FROM debate_messages "
-        "WHERE msg_id = ? AND topic_id = ?",
+        "SELECT role, kind FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
         (override_msg_id, topic_id),
     ).fetchone()
     if row is None or row["role"] != "CONDUCTOR" or row["kind"] != "DECISION":
@@ -608,9 +593,7 @@ def _binding_count(conn: sqlite3.Connection, topic_id: str, role: str) -> int:
     ).fetchone()["c"]
 
 
-def _next_binding_generation(
-    conn: sqlite3.Connection, topic_id: str, role: str
-) -> int:
+def _next_binding_generation(conn: sqlite3.Connection, topic_id: str, role: str) -> int:
     row = conn.execute(
         "SELECT COALESCE(MAX(generation), 0) + 1 AS generation "
         "FROM debate_role_bindings WHERE topic_id = ? AND role = ?",
@@ -658,9 +641,7 @@ def _validate_reclaim_cutoff(
             error_type=f"{error_namespace}_min_age_invalid",
         )
     cutoff = _parse_iso_utc_dt(older_than_ts)
-    safe_cutoff = datetime.now(timezone.utc) - timedelta(
-        seconds=minimum_age_seconds
-    )
+    safe_cutoff = datetime.now(timezone.utc) - timedelta(seconds=minimum_age_seconds)
     if cutoff > safe_cutoff:
         raise DebateError(
             f"{error_namespace}_cutoff_too_recent: older_than_ts={older_than_ts} "
@@ -679,6 +660,35 @@ def _terminal_reply_for_trigger(
         "ORDER BY ts ASC, msg_id ASC LIMIT 1",
         (topic_id, role, trigger_msg_id),
     ).fetchone()
+
+
+def _dispatch_still_covers_trigger(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
+) -> bool:
+    """Is a prior 'dispatched' wake still covering this (role, trigger)?
+
+    True when the work is either in-flight or done: the worker claim is
+    active or completed, OR a terminal reply already exists. False when the
+    claim was retired (dead worker) and no reply landed — the stale
+    'dispatched' row must not suppress re-dispatch (advocate BLOCK #1)."""
+    if _terminal_reply_for_trigger(
+        conn, topic_id=topic_id, role=role, trigger_msg_id=trigger_msg_id
+    ):
+        return True
+    claim = conn.execute(
+        "SELECT state FROM debate_worker_claims "
+        "WHERE topic_id = ? AND role = ? AND trigger_msg_id = ? "
+        "ORDER BY claimed_at DESC LIMIT 1",
+        (topic_id, role, trigger_msg_id),
+    ).fetchone()
+    # Only an explicitly RETIRED claim (a proven-dead worker) un-suppresses
+    # a 'dispatched' trigger. active/completed = covered; a missing claim is
+    # left covered too — in production the launcher records the claim BEFORE
+    # marking 'dispatched' (preflight-then-claim order), so 'dispatched' with
+    # no claim is not a real state and must not trigger spurious re-dispatch.
+    if claim is None:
+        return True
+    return str(claim["state"]) != "retired"
 
 
 def _decision_is_nonstanding(conn: sqlite3.Connection, msg_id: str) -> bool:
@@ -914,6 +924,71 @@ def claim_worker_session(
                 "AND trigger_msg_id = ?",
                 (topic_id, role, parent_session_id, trigger_msg_id),
             ).fetchone()
+        elif existing["state"] == "retired":
+            # REQUEUE (advocate BLOCK critical #1): a retired orphan claim
+            # previously suppressed re-dispatch forever — the trigger's work
+            # was silently lost. Reactivate the same claim (PK forbids a
+            # second row) with a bounded retry budget; past the budget the
+            # claim reports requeue_exhausted so the router surfaces the
+            # loss explicitly instead of retrying forever.
+            details = _claim_details_dict(existing)
+            requeues = int(details.get("requeue_count") or 0)
+            max_requeues = int(os.environ.get("DEBATE_WORKER_MAX_REQUEUES", "2"))
+            if requeues >= max_requeues:
+                if not details.get("requeue_exhausted"):
+                    details["requeue_exhausted"] = True
+                    details["requeue_exhausted_at"] = now
+                    conn.execute(
+                        "UPDATE debate_worker_claims SET details_json = ? "
+                        "WHERE topic_id = ? AND role = ? "
+                        "AND parent_session_id = ? AND trigger_msg_id = ?",
+                        (
+                            json_dumps(details),
+                            topic_id,
+                            role,
+                            parent_session_id,
+                            trigger_msg_id,
+                        ),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM debate_worker_claims "
+                        "WHERE topic_id = ? AND role = ? "
+                        "AND parent_session_id = ? AND trigger_msg_id = ?",
+                        (topic_id, role, parent_session_id, trigger_msg_id),
+                    ).fetchone()
+                out = _claim_row_dict(existing)
+                out["duplicate"] = True
+                out["no_action"] = True
+                out["requeue_exhausted"] = True
+                return out
+            details["requeue_count"] = requeues + 1
+            details["reactivated_at"] = now
+            conn.execute(
+                "UPDATE debate_worker_claims SET state = 'active', "
+                "heartbeat_at = ?, completed_at = NULL, ack_msg_id = NULL, "
+                "details_json = ? "
+                "WHERE topic_id = ? AND role = ? AND parent_session_id = ? "
+                "AND trigger_msg_id = ? AND state = 'retired'",
+                (
+                    now,
+                    json_dumps(details),
+                    topic_id,
+                    role,
+                    parent_session_id,
+                    trigger_msg_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM debate_worker_claims "
+                "WHERE topic_id = ? AND role = ? AND parent_session_id = ? "
+                "AND trigger_msg_id = ?",
+                (topic_id, role, parent_session_id, trigger_msg_id),
+            ).fetchone()
+            out = _claim_row_dict(row)
+            out["duplicate"] = False
+            out["no_action"] = False
+            out["reactivated"] = True
+            return out
         out = _claim_row_dict(existing)
         out["duplicate"] = True
         out["no_action"] = existing["state"] != "active"
@@ -1011,8 +1086,7 @@ def worker_no_action(
         )
 
     ref = conn.execute(
-        "SELECT msg_id, ts FROM debate_messages "
-        "WHERE msg_id = ? AND topic_id = ?",
+        "SELECT msg_id, ts FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
         (trigger_msg_id, topic_id),
     ).fetchone()
     if ref is None:
@@ -1214,8 +1288,7 @@ def recover_stale_worker_claims(
         )
         recovery_id = new_msg_id()
         while conn.execute(
-            "SELECT 1 FROM debate_worker_recovery_log "
-            "WHERE recovery_id = ? LIMIT 1",
+            "SELECT 1 FROM debate_worker_recovery_log WHERE recovery_id = ? LIMIT 1",
             (recovery_id,),
         ).fetchone():
             recovery_id = new_msg_id()
@@ -1565,9 +1638,7 @@ def post_message(
         if parent is None:
             raise DebateError(f"unknown_reply_to: {reply_to}")
         if parent["topic_id"] != topic_id:
-            raise DebateError(
-                f"reply_to_cross_topic: {reply_to} not in {topic_id}"
-            )
+            raise DebateError(f"reply_to_cross_topic: {reply_to} not in {topic_id}")
         parent_kind = parent["kind"]
         parent_standing = parent["standing"]
 
@@ -1604,9 +1675,7 @@ def post_message(
                 (watermark_target, topic_id),
             ).fetchone()
             if ref_msg is None:
-                raise DebateError(
-                    f"watermark_msg_not_in_topic: {watermark_target}"
-                )
+                raise DebateError(f"watermark_msg_not_in_topic: {watermark_target}")
             watermark_resolved = (ref_msg["msg_id"], ref_msg["ts"])
         else:
             # Deprecated keyword form. Parsed for back-compat, but DAO
@@ -1634,8 +1703,7 @@ def post_message(
             wm_msg_id = m.group("msg_id")
             if not ISO_UTC_RE.fullmatch(wm_ts_claimed):
                 raise DebateError(
-                    f"invalid_watermark_ts: {wm_ts_claimed!r} "
-                    "(expect ISO 8601 UTC)"
+                    f"invalid_watermark_ts: {wm_ts_claimed!r} (expect ISO 8601 UTC)"
                 )
             ref_msg = conn.execute(
                 "SELECT msg_id, ts FROM debate_messages "
@@ -1643,9 +1711,7 @@ def post_message(
                 (wm_msg_id, topic_id),
             ).fetchone()
             if ref_msg is None:
-                raise DebateError(
-                    f"watermark_msg_not_in_topic: {wm_msg_id}"
-                )
+                raise DebateError(f"watermark_msg_not_in_topic: {wm_msg_id}")
             if ref_msg["ts"] != wm_ts_claimed:
                 raise DebateError(
                     f"watermark_ts_mismatch: body claimed ts="
@@ -1657,16 +1723,13 @@ def post_message(
     standing_db = _standing_to_db(standing)
 
     if kind == "DECISION" and reply_to is not None and parent_kind != "Q":
-        raise DebateError(
-            f"decision_reply_to_must_be_Q: parent kind={parent_kind!r}"
-        )
+        raise DebateError(f"decision_reply_to_must_be_Q: parent kind={parent_kind!r}")
 
     if kind in ("A", "STATUS") and reply_to is not None:
         one_shot_parent = (
-            (parent_kind == "DECISION" and parent_standing == 0)
-            or _worker_claim_exists(
-                conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
-            )
+            parent_kind == "DECISION" and parent_standing == 0
+        ) or _worker_claim_exists(
+            conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
         )
         if one_shot_parent:
             existing_terminal = _terminal_reply_for_trigger(
@@ -1845,14 +1908,12 @@ def read_messages(
     if since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
-            "SELECT ts, msg_id FROM debate_messages "
-            "WHERE msg_id = ? AND topic_id = ?",
+            "SELECT ts, msg_id FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
             (since_msg_id, topic_id),
         ).fetchone()
         if ref is None:
             raise DebateError(
-                f"unknown_since_msg_id: {since_msg_id} not found in "
-                f"topic {topic_id}"
+                f"unknown_since_msg_id: {since_msg_id} not found in topic {topic_id}"
             )
         cursor_ts = ref["ts"]
         cursor_msg_id = ref["msg_id"]
@@ -1990,9 +2051,7 @@ def advance_watermark(
 # ── v3.10: role/session lifecycle authority ───────────────────────────
 
 
-def list_role_bindings(
-    conn: sqlite3.Connection, *, topic_id: str
-) -> dict[str, Any]:
+def list_role_bindings(conn: sqlite3.Connection, *, topic_id: str) -> dict[str, Any]:
     validate_topic_id(topic_id)
     debate = get_debate(conn, topic_id)
     if debate is None:
@@ -2061,10 +2120,7 @@ def bind_role_session(
     retired_worker_claims = 0
 
     if state == "active":
-        if (
-            existing_active is not None
-            and existing_active["session_id"] != session_id
-        ):
+        if existing_active is not None and existing_active["session_id"] != session_id:
             if not replace_active:
                 raise DebateError(
                     f"duplicate_active_binding: role {role} already "
@@ -2335,9 +2391,7 @@ def add_role_to_debate(
             }
     else:
         # Append the role to the declared roster atomically with the binding.
-        new_roles = list(debate["roles"]) + [
-            {"role": role, "session_id": session_id}
-        ]
+        new_roles = list(debate["roles"]) + [{"role": role, "session_id": session_id}]
         conn.execute(
             "UPDATE debates SET roles_json = ? WHERE topic_id = ?",
             (json_dumps(new_roles), topic_id),
@@ -2489,7 +2543,9 @@ def _retire_bindings_for_transition(
         (
             now,
             now,
-            f"topic_{new_state.lower()}:{reason}" if reason else f"topic_{new_state.lower()}",
+            f"topic_{new_state.lower()}:{reason}"
+            if reason
+            else f"topic_{new_state.lower()}",
             topic_id,
             *states,
         ),
@@ -2532,9 +2588,7 @@ def transition_state(
     old_state = debate["state"]
     validate_transition(old_state, new_state)
     if not role_in_debate(debate["roles"], role):
-        raise DebateError(
-            f"unknown_role_for_topic: {role} not in declared roles"
-        )
+        raise DebateError(f"unknown_role_for_topic: {role} not in declared roles")
 
     if new_state == "RESOLVED":
         blocking = _open_blocking_questions(conn, topic_id)
@@ -2555,9 +2609,7 @@ def transition_state(
     # Reason text now lives where it semantically belongs — alongside
     # the state it explains — and the return value's `body` field
     # accurately reflects what's in debate_messages.
-    state_body = (
-        new_state if not reason else f"{new_state} [reason: {reason}]"
-    )
+    state_body = new_state if not reason else f"{new_state} [reason: {reason}]"
     msg = post_message(
         conn,
         topic_id=topic_id,
@@ -2677,7 +2729,9 @@ def set_topic_priority(
     }
 
 
-def _due_reason_and_score(resolve_by: str | None, now_dt: datetime) -> tuple[str | None, int]:
+def _due_reason_and_score(
+    resolve_by: str | None, now_dt: datetime
+) -> tuple[str | None, int]:
     if not resolve_by:
         return None, 0
     try:
@@ -2790,7 +2844,9 @@ def list_open_debate_work(
     for row in rows:
         debate = _row_to_debate_dict(row)
         topic_id = debate["topic_id"]
-        metadata = debate.get("metadata") if isinstance(debate.get("metadata"), dict) else {}
+        metadata = (
+            debate.get("metadata") if isinstance(debate.get("metadata"), dict) else {}
+        )
         priority_metadata = _topic_priority_metadata(metadata)
         explicit_lane = _explicit_topic_priority_lane(metadata)
         messages = conn.execute(
@@ -3050,9 +3106,7 @@ def _validate_recipient(
             )
         roles_iter = json_loads(debates_row["roles_json"])
     declared_roles = {
-        r["role"]
-        for r in roles_iter
-        if isinstance(r, dict) and "role" in r
+        r["role"] for r in roles_iter if isinstance(r, dict) and "role" in r
     }
     if recipient in declared_roles:
         return
@@ -3466,8 +3520,7 @@ def debate_signal_check(
     if since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
-            "SELECT ts, msg_id FROM debate_messages "
-            "WHERE msg_id = ? AND topic_id = ?",
+            "SELECT ts, msg_id FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
             (since_msg_id, topic_id),
         ).fetchone()
         if ref is None:
@@ -3648,8 +3701,7 @@ def debate_signal_advance(
     validate_msg_id(last_processed_msg_id)
 
     ref = conn.execute(
-        "SELECT msg_id, ts FROM debate_messages "
-        "WHERE msg_id = ? AND topic_id = ?",
+        "SELECT msg_id, ts FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
         (last_processed_msg_id, topic_id),
     ).fetchone()
     if ref is None:
@@ -3819,6 +3871,38 @@ def _insert_wake_log(
         ),
     )
     return row
+
+
+def _reset_wake_log_for_redispatch(
+    conn: sqlite3.Connection,
+    *,
+    trigger_msg_id: str,
+    target_session_id: str,
+    action: str,
+    result: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Reset an existing wake row so a dead worker's trigger can re-dispatch.
+
+    The (trigger, session, action) UNIQUE index forbids a second row, so a
+    re-dispatch must UPDATE the stale 'dispatched' row in place (fresh result
+    + created_at) rather than INSERT (advocate BLOCK #1 — the INSERT path
+    crashed on UNIQUE). Returns the updated row, or None if none existed."""
+    existing = conn.execute(
+        "SELECT wake_id FROM debate_wake_log "
+        "WHERE trigger_msg_id = ? AND target_session_id = ? AND action = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (trigger_msg_id, target_session_id, action),
+    ).fetchone()
+    if existing is None:
+        return None
+    now = now_iso()
+    conn.execute(
+        "UPDATE debate_wake_log SET result = ?, created_at = ?, details_json = ? "
+        "WHERE wake_id = ?",
+        (result, now, json_dumps(details or {"redispatch": True}), existing["wake_id"]),
+    )
+    return {"wake_id": existing["wake_id"], "result": result, "created_at": now}
 
 
 def _latest_wake_result(
@@ -4005,10 +4089,28 @@ def prepare_wake_dry_run(
                 target_session_id=binding["session_id"],
                 action=action,
             )
+            # A 'dispatched' wake row suppresses re-dispatch ONLY while the
+            # worker is genuinely covering the trigger — i.e. its claim is
+            # active (in-flight) or completed, or a terminal reply exists.
+            # If the claim was retired (dead worker) and no terminal reply
+            # landed, the stale 'dispatched' row must NOT suppress: the work
+            # is unfinished and must be re-dispatched (advocate BLOCK #1, the
+            # at-least-once defect). 'notified'/'terminal_no_action' remain
+            # terminal.
+            suppress = False
             if latest_result and (
                 action == "dry_run_wake"
-                or latest_result in {"dispatched", "notified", "terminal_no_action"}
+                or latest_result in {"notified", "terminal_no_action"}
             ):
+                suppress = True
+            elif latest_result == "dispatched":
+                suppress = _dispatch_still_covers_trigger(
+                    conn,
+                    topic_id=topic_id,
+                    role=binding["role"],
+                    trigger_msg_id=msg_id,
+                )
+            if suppress:
                 suppressed += 1
                 targets.append(
                     {
@@ -4031,20 +4133,35 @@ def prepare_wake_dry_run(
                     }
                 )
                 continue
-            log = _insert_wake_log(
-                conn,
-                trigger_msg_id=msg_id,
-                topic_id=topic_id,
-                recipient=recipient,
-                action=action,
-                result=result,
-                target_role=binding["role"],
-                target_session_id=binding["session_id"],
-                target_runtime=binding["runtime"],
-                binding_generation=binding["generation"],
-                details={"recipient_mode": mode},
-            )
-            logs.append(log)
+            if latest_result is not None:
+                # A prior wake row exists for this (session, action) — a dead
+                # worker we chose NOT to suppress. The UNIQUE index forbids a
+                # second row, so reset the existing one in place instead of
+                # INSERTing (advocate BLOCK #1: INSERT crashed here).
+                log = _reset_wake_log_for_redispatch(
+                    conn,
+                    trigger_msg_id=msg_id,
+                    target_session_id=binding["session_id"],
+                    action=action,
+                    result=result,
+                    details={"recipient_mode": mode, "redispatch": True},
+                )
+            else:
+                log = _insert_wake_log(
+                    conn,
+                    trigger_msg_id=msg_id,
+                    topic_id=topic_id,
+                    recipient=recipient,
+                    action=action,
+                    result=result,
+                    target_role=binding["role"],
+                    target_session_id=binding["session_id"],
+                    target_runtime=binding["runtime"],
+                    binding_generation=binding["generation"],
+                    details={"recipient_mode": mode},
+                )
+            if log is not None:
+                logs.append(log)
             targets.append(
                 {
                     "recipient": recipient,

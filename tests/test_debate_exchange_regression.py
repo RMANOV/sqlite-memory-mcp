@@ -96,8 +96,14 @@ def _claim(con: sqlite3.Connection, trigger: dict):
     )
 
 
-def test_wake_prompt_uses_real_worker_no_action_argument_and_bounded_codex_mode():
+def test_wake_prompt_uses_real_worker_no_action_argument_and_bounded_codex_mode(
+    monkeypatch,
+):
     wake = _load_hook("debate_wake_exchange_regression", "hooks/debate_wake.py")
+    # The codex route is gated OFF on Windows unless explicitly enabled
+    # (advocate BLOCK high-risk #3: auto-spawned --dangerously-bypass is an
+    # attack surface). This test verifies the command SHAPE, so opt in.
+    monkeypatch.setenv("DEBATE_WAKE_CODEX_ENABLED", "1")
     prompt = wake._wake_prompt(
         {"target_role": "EXECUTOR", "target_session_id": "codex-executor1-W7"},
         "a00000000001",
@@ -161,8 +167,10 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
         reply_to=terminal_trigger["msg_id"],
         vehicle="analysis",
     )
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat().replace(
-        "+00:00", "Z"
+    stale = (
+        (datetime.now(timezone.utc) - timedelta(minutes=20))
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     con.execute(
         "UPDATE debate_worker_claims SET heartbeat_at=? WHERE topic_id='EXCHANGE1'",
@@ -171,8 +179,10 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
     before_messages = con.execute(
         "SELECT count(*) FROM debate_messages WHERE topic_id='EXCHANGE1'"
     ).fetchone()[0]
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat().replace(
-        "+00:00", "Z"
+    cutoff = (
+        (datetime.now(timezone.utc) - timedelta(minutes=15))
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     out = recover_stale_worker_claims(
         con,
@@ -198,10 +208,13 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
     assert out["completed_count"] == 1
     assert out["retired_count"] == 1
     assert out["skipped_live_count"] == 1
-    assert con.execute(
-        "SELECT count(*) FROM debate_signal_state "
-        "WHERE session_id='codex-executor1' AND topic_id='EXCHANGE1'"
-    ).fetchone()[0] == 0
+    assert (
+        con.execute(
+            "SELECT count(*) FROM debate_signal_state "
+            "WHERE session_id='codex-executor1' AND topic_id='EXCHANGE1'"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_worker_recovery_validation_uses_worker_diagnostic_namespace(exchange_db):
@@ -317,12 +330,12 @@ def test_regression_probe_is_clean():
 
 
 def test_systemd_path_gate_watches_exchange_code_and_has_runtime_bound():
-    path_unit = (
-        ROOT / "systemd/user/sqlite-memory-debate-regression.path"
-    ).read_text(encoding="utf-8")
-    service = (
-        ROOT / "systemd/user/sqlite-memory-debate-regression.service"
-    ).read_text(encoding="utf-8")
+    path_unit = (ROOT / "systemd/user/sqlite-memory-debate-regression.path").read_text(
+        encoding="utf-8"
+    )
+    service = (ROOT / "systemd/user/sqlite-memory-debate-regression.service").read_text(
+        encoding="utf-8"
+    )
     for relative in (
         "debate.py",
         "debate_retrieval.py",
