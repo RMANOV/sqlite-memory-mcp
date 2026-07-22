@@ -1686,6 +1686,17 @@ def main() -> int:
 
     _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)
+    if IS_WINDOWS and not args.once:
+        try:
+            # Release the singleton before publishing the stopped state.  The
+            # lifecycle command may start the replacement as soon as the
+            # heartbeat disappears; leaving release to interpreter teardown
+            # creates a small but real stop -> start race.
+            from debate_wake_signal import release_pump_singleton
+
+            release_pump_singleton()
+        except Exception as exc:
+            _log("pump_singleton_release_failed", error=repr(exc))
     try:
         # Clean exit removes the heartbeat so status reads "stopped", not
         # "stale"; a crashed pump leaves it behind — which is the signal

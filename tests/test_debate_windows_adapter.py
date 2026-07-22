@@ -423,6 +423,49 @@ def test_pump_singleton_claims_existing_unowned_mutex():
         observer.wait(timeout=15)
 
 
+@windows_only
+def test_pump_singleton_explicit_release_precedes_process_exit():
+    """A clean pump can hand off its lease before interpreter teardown."""
+    import subprocess
+
+    env = dict(os.environ)
+    env["DEBATE_PUMP_SINGLETON_MUTEX"] = rf"Local\DebateReleaseTest{os.getpid()}"
+    repo_bootstrap = "import sys; sys.path.insert(0, r'" + str(REPO) + "'); "
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            repo_bootstrap
+            + "from debate_wake_signal import acquire_pump_singleton, "
+            + "release_pump_singleton; import time; "
+            + "print(acquire_pump_singleton(), flush=True); "
+            + "release_pump_singleton(); print('released', flush=True); time.sleep(4)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "True"
+        assert holder.stdout.readline().strip() == "released"
+        contender = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                repo_bootstrap
+                + "from debate_wake_signal import acquire_pump_singleton; "
+                + "print(acquire_pump_singleton())",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        assert contender.stdout.strip() == "True"
+    finally:
+        holder.wait(timeout=15)
+
+
 def test_agent_log_dir_stays_bounded(tmp_path, monkeypatch):
     import debate_wake
 
@@ -479,6 +522,80 @@ def test_pump_state_running_stale_stopped(tmp_path, monkeypatch):
     state = dow.pump_state()
     assert state["state"] == "stale"
     assert state["pid_live"] is False
+
+
+def test_stop_waits_for_captured_process_after_heartbeat_disappears(
+    monkeypatch, capsys
+):
+    import debate_ops_windows as dow
+    import debate_wake_signal
+
+    heartbeat = {"pid": 1234, "create_time": 5678.0}
+    liveness = iter([True, True, False])
+    monkeypatch.setattr(dow, "_read_heartbeat", lambda: heartbeat)
+    monkeypatch.setattr(dow, "_heartbeat_pid_live", lambda _hb: next(liveness))
+    monkeypatch.setattr(
+        dow, "pump_state", lambda: {"state": "stopped", "heartbeat": None}
+    )
+    monkeypatch.setattr(debate_wake_signal, "signal_stop", lambda: True)
+    monkeypatch.setattr(dow.time, "sleep", lambda _seconds: None)
+
+    assert dow.cmd_stop(timeout_seconds=5.0) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] == "graceful"
+
+
+def test_start_requires_observed_running_heartbeat(monkeypatch, capsys):
+    import debate_ops_windows as dow
+
+    states = iter(
+        [
+            {"state": "stopped", "heartbeat": None},
+            {"state": "stopped", "heartbeat": None},
+        ]
+    )
+    monkeypatch.setattr(dow, "pump_state", lambda: next(states))
+    monkeypatch.setattr(
+        dow,
+        "_schtasks",
+        lambda _args: {"returncode": 1, "stdout": "", "stderr": "missing"},
+    )
+    monkeypatch.setattr(dow, "_spawn_pump_now", lambda: {"spawned_pid": 9876})
+    monkeypatch.setattr(
+        dow,
+        "_wait_for_pump_running",
+        lambda: {"state": "stopped", "heartbeat": None},
+    )
+
+    assert dow.cmd_start() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["fallback"]["spawned_pid"] == 9876
+    assert payload["pump_state"]["state"] == "stopped"
+
+
+def test_stop_when_already_stopped_does_not_leave_stop_event_signaled(
+    monkeypatch, capsys
+):
+    import debate_ops_windows as dow
+    import debate_wake_signal
+
+    signaled = False
+
+    def signal_stop():
+        nonlocal signaled
+        signaled = True
+        return True
+
+    monkeypatch.setattr(dow, "_read_heartbeat", lambda: None)
+    monkeypatch.setattr(
+        dow, "pump_state", lambda: {"state": "stopped", "heartbeat": None}
+    )
+    monkeypatch.setattr(debate_wake_signal, "signal_stop", signal_stop)
+
+    assert dow.cmd_stop() == 0
+    assert signaled is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] == "already_stopped"
 
 
 @windows_only
