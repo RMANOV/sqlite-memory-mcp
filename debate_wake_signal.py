@@ -36,6 +36,7 @@ def _stop_event_name() -> str:
 
 
 _WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED_0 = 0x00000080
 _WAIT_TIMEOUT = 0x00000102
 _HANDLES: dict[str, int] = {}
 
@@ -131,7 +132,6 @@ def close_handles() -> None:
 
 # ── Pump singleton mutex ─────────────────────────────────────────────────
 
-_ERROR_ALREADY_EXISTS = 183
 _SINGLETON_HANDLE: int | None = None
 
 
@@ -163,11 +163,13 @@ def acquire_pump_singleton() -> bool:
         # Win32 calls between CreateMutexW and the read).
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateMutexW.restype = ctypes.c_void_p
-        handle = kernel32.CreateMutexW(None, True, _singleton_mutex_name())
-        last_error = ctypes.get_last_error()
+        handle = kernel32.CreateMutexW(None, False, _singleton_mutex_name())
         if not handle:
             return False
-        if last_error == _ERROR_ALREADY_EXISTS:
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint
+        wait_result = kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0)
+        if wait_result not in (_WAIT_OBJECT_0, _WAIT_ABANDONED_0):
             kernel32.CloseHandle(ctypes.c_void_p(handle))
             return False
         _SINGLETON_HANDLE = handle
