@@ -40,68 +40,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 logger = logging.getLogger("task_tray")
-_GIT_PULL_TIMEOUT = 120
 _POST_SYNC_DB_WATCH_COOLDOWN_SECONDS = 90.0
-
-
-def _bridge_head(repo_dir: str) -> str | None:
-    from db_utils import git_run
-
-    result = git_run(repo_dir, "rev-parse", "HEAD", timeout=10)
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
-
-
-def _bridge_git_pull(repo_dir: str):
-    from db_utils import git_retry
-
-    fetch = git_retry(
-        repo_dir,
-        "fetch",
-        "origin",
-        "main",
-        timeout=_GIT_PULL_TIMEOUT,
-    )
-    if fetch.returncode != 0:
-        return fetch
-
-    local = git_retry(repo_dir, "rev-parse", "HEAD", timeout=10)
-    remote = git_retry(repo_dir, "rev-parse", "origin/main", timeout=10)
-    base = git_retry(repo_dir, "merge-base", "HEAD", "origin/main", timeout=10)
-    if local.returncode != 0 or remote.returncode != 0 or base.returncode != 0:
-        detail = " ".join(
-            (result.stderr or result.stdout).strip()
-            for result in (local, remote, base)
-            if result.returncode != 0
-        ).strip()
-        return subprocess.CompletedProcess(
-            ["git", "graph-inspect"],
-            1,
-            "",
-            detail or "bridge git graph inspection failed",
-        )
-
-    local_sha = local.stdout.strip()
-    remote_sha = remote.stdout.strip()
-    base_sha = base.stdout.strip()
-    if local_sha == remote_sha or base_sha == remote_sha:
-        return fetch
-    if base_sha == local_sha:
-        return git_retry(
-            repo_dir,
-            "merge",
-            "--ff-only",
-            "origin/main",
-            timeout=_GIT_PULL_TIMEOUT,
-        )
-
-    return subprocess.CompletedProcess(
-        ["git", "merge", "--ff-only", "origin/main"],
-        1,
-        "",
-        "bridge repo local and origin/main diverged; explicit recovery required",
-    )
 
 
 def _normalize_filter_payload(filter_payload):
@@ -275,39 +214,11 @@ class BridgeSyncMixin:
 
         def _run():
             try:
-                before_head = _bridge_head(self._BRIDGE_DIR)
-                pull_result = _bridge_git_pull(self._BRIDGE_DIR)
-                if pull_result.returncode != 0:
-                    detail = (pull_result.stderr or pull_result.stdout).strip()
-                    self._log_sync_event(
-                        "result",
-                        initiator=initiator,
-                        mode="pull_only",
-                        pulled=False,
-                        changed=False,
-                        error=detail or "git pull failed",
-                    )
-                    return
-
-                after_head = _bridge_head(self._BRIDGE_DIR)
-                # Bootstrap follows the same import path as periodic pull: when
-                # HEAD advanced during pull, fall through to bridge_sync_worker
-                # so the local SQLite absorbs remote changes (tombstones, edits).
-                # Returning early here would leave local state stale after a
-                # HEAD change — only git-pulled, never imported.
-                if before_head and after_head and before_head == after_head:
-                    self._log_sync_event(
-                        "result",
-                        initiator=initiator,
-                        mode="pull_only",
-                        pulled=True,
-                        changed=False,
-                        imported=0,
-                    )
-                    return
-
                 import bridge_sync_worker
 
+                # The worker owns the cross-process repo lock.  It must perform
+                # fetch/fast-forward itself; a tray-side pre-pull races other
+                # writers outside that lock.
                 stats = bridge_sync_worker.main(
                     pull_only=True,
                     progress_callback=lambda pct, label: self._bridge_progress.emit(
@@ -317,13 +228,17 @@ class BridgeSyncMixin:
                 imported = stats.get("imported_new", 0) + stats.get(
                     "imported_updated", 0
                 )
+                blocked = stats.get("blocked_by_repo_state", False)
                 self._log_sync_event(
                     "result",
                     initiator=initiator,
                     mode="pull_only",
+                    pulled=not blocked,
+                    changed=bool(imported),
                     imported=imported,
                     pushed=stats.get("pushed", False),
                     already_running=stats.get("already_running", False),
+                    error=stats.get("message") if blocked else None,
                 )
                 if imported:
                     self._bridge_done.emit(f"Pulled {imported} updates from remote")

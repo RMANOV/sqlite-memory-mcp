@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Thin MCP server exposing only bridge sync tools.
 
-Shares the same SQLite database as the main sqlite-kb server.
-Exists because Claude Code 2.x has a tool-count limit per MCP server
-(~9 tools visible out of 50), so bridge tools are split into a separate server.
+Shares the same SQLite database as the main sqlite-kb server and keeps the bridge
+surface independently deployable; ``unified_server.py`` also mounts it.
 """
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ import os
 import socket
 import sqlite3
 import subprocess
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -55,7 +53,6 @@ from db_utils import (
     sync_task_attachments_from_remote as _sync_task_attachments_from_remote,
     _task_storage_path,
     BRIDGE_REPO,
-    BRIDGE_SYNC_DELAY,
     git_run as _git_run,
     ensure_bridge_git_identity as _ensure_bridge_git_identity,
     ensure_bridge_repo_ready as _ensure_bridge_repo_ready,
@@ -100,38 +97,6 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
-
-# ── Debounced bridge auto-sync ──────────────────────────────────────
-_bridge_sync_timer: threading.Timer | None = None
-_bridge_sync_lock = threading.Lock()
-_BRIDGE_SYNC_DELAY = BRIDGE_SYNC_DELAY  # shared with task_tray via db_utils
-
-
-def _schedule_bridge_sync():
-    """Schedule a debounced bridge sync. Resets timer on each call."""
-    global _bridge_sync_timer
-    with _bridge_sync_lock:
-        if _bridge_sync_timer is not None:
-            _bridge_sync_timer.cancel()
-        _bridge_sync_timer = threading.Timer(_BRIDGE_SYNC_DELAY, _run_bridge_sync)
-        _bridge_sync_timer.daemon = True  # don't block process exit
-        _bridge_sync_timer.start()
-
-
-def _run_bridge_sync():
-    """Execute bridge sync in background thread."""
-    global _bridge_sync_timer
-    try:
-        import bridge_sync_worker
-
-        stats = bridge_sync_worker.main()
-        logger.info("auto-sync: %s", stats)
-    except Exception as exc:
-        logger.warning("auto-sync failed: %s", exc)
-    finally:
-        with _bridge_sync_lock:
-            _bridge_sync_timer = None
-
 
 # ── Bridge helpers ────────────────────────────────────────────────────────
 
@@ -665,6 +630,10 @@ def bridge_push(tag: str = "shared", force: bool = False) -> str:
                 promoted_tasks,
             )
 
+    # Commit import/promotion writes before any generated-file I/O. The export
+    # phase below keeps a read snapshot only, so slow disk writes never retain a
+    # SQLite write lock and block unrelated MCP mutations.
+    with _get_conn() as conn:
         ent_rows = conn.execute(
             "SELECT id, name, entity_type, project, created_at, updated_at "
             "FROM entities WHERE project LIKE ? ORDER BY name",

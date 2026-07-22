@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Thin MCP server exposing only entity management tools.
 
-Shares the same SQLite database as the main sqlite-kb server.
-Exists because Claude Code 2.x has a tool-count limit per MCP server
-(~9 tools visible out of 50), so entity tools are split into a separate server.
+Shares the same SQLite database as the main sqlite-kb server and keeps the entity
+surface independently deployable; ``unified_server.py`` also mounts it.
 """
 
 from __future__ import annotations
@@ -38,6 +37,25 @@ mcp = FastMCP(
         "Shares DB with sqlite-kb."
     ),
 )
+
+
+def _observations_by_entity(conn, entity_ids) -> dict[int, list[str]]:
+    ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
+    if not ids:
+        return {}
+    grouped: dict[int, list[str]] = {}
+    for offset in range(0, len(ids), 500):
+        id_batch = ids[offset : offset + 500]
+        placeholders = ",".join("?" for _ in id_batch)
+        rows = conn.execute(
+            "SELECT entity_id,content FROM observations "
+            f"WHERE entity_id IN ({placeholders}) ORDER BY entity_id,id",
+            id_batch,
+        ).fetchall()
+        for row in rows:
+            grouped.setdefault(int(row["entity_id"]), []).append(row["content"])
+    return grouped
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: link_task_entity
@@ -157,24 +175,23 @@ def suggest_task_links(task_id: str, limit: int = 5) -> str:
         ).fetchall()
 
         linked_ids = TaskDAO.get_linked_entity_ids(conn, task_id)
+        observations = _observations_by_entity(
+            conn, [candidate["rowid"] for candidate in candidates]
+        )
 
         scored = []
         for c in candidates:
             if c["rowid"] in linked_ids:
                 continue
 
-            obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ?",
-                (c["rowid"],),
-            ).fetchall()
-            obs_text = " ".join(o["content"] for o in obs)
+            obs_text = " ".join(observations.get(c["rowid"], []))
             entity_tokens = _tokenize(f"{c['name']} {obs_text}")
 
             if not entity_tokens:
                 continue
 
-            t_tok = set(list(task_tokens)[:500])
-            e_tok = set(list(entity_tokens)[:500])
+            t_tok = set(sorted(task_tokens)[:500])
+            e_tok = set(sorted(entity_tokens)[:500])
             intersection = t_tok & e_tok
             union = t_tok | e_tok
             jaccard = len(intersection) / len(union) if union else 0.0
@@ -227,13 +244,12 @@ def find_entity_overlaps(
 
         seen_pairs: set[tuple[int, int]] = set()
         overlaps = []
+        observations = _observations_by_entity(
+            conn, [source["id"] for source in sources]
+        )
 
         for src in sources:
-            src_obs = conn.execute(
-                "SELECT content FROM observations WHERE entity_id = ?",
-                (src["id"],),
-            ).fetchall()
-            src_text = " ".join(o["content"] for o in src_obs)
+            src_text = " ".join(observations.get(src["id"], []))
             src_tokens = _tokenize(f"{src['name']} {src_text}")
 
             if not src_tokens:
@@ -248,6 +264,14 @@ def find_entity_overlaps(
                 "FROM memory_fts WHERE memory_fts MATCH ? LIMIT 50",
                 (fts_q,),
             ).fetchall()
+            missing_ids = [
+                candidate["rowid"]
+                for candidate in candidates
+                if candidate["rowid"] not in observations
+            ]
+            observations.update(_observations_by_entity(conn, missing_ids))
+            for missing_id in missing_ids:
+                observations.setdefault(missing_id, [])
 
             for cand in candidates:
                 cand_id = cand["rowid"]
@@ -259,18 +283,14 @@ def find_entity_overlaps(
                     continue
                 seen_pairs.add(pair_key)
 
-                cand_obs = conn.execute(
-                    "SELECT content FROM observations WHERE entity_id = ?",
-                    (cand_id,),
-                ).fetchall()
-                cand_text = " ".join(o["content"] for o in cand_obs)
+                cand_text = " ".join(observations.get(cand_id, []))
                 cand_tokens = _tokenize(f"{cand['name']} {cand_text}")
 
                 if not cand_tokens:
                     continue
 
-                s_tok = set(list(src_tokens)[:500])
-                c_tok = set(list(cand_tokens)[:500])
+                s_tok = set(sorted(src_tokens)[:500])
+                c_tok = set(sorted(cand_tokens)[:500])
                 intersection = s_tok & c_tok
                 union_set = s_tok | c_tok
                 jaccard = len(intersection) / len(union_set) if union_set else 0.0

@@ -86,6 +86,7 @@ from db_utils import (
     promote_pending_public_entities,
     sync_task_attachments_from_remote,
 )
+from bridge_merge_driver import ensure_entities_index_parseable
 from surface_contract import BRIDGE_GIT_STAGE_PATHS
 
 log = logging.getLogger("bridge_sync_worker")
@@ -106,6 +107,50 @@ _push_failure_count = 0
 _push_backoff_until = 0.0  # monotonic time
 _PUSH_BACKOFF_BASE = 60
 _PUSH_BACKOFF_MAX = 600
+
+_NON_FAST_FORWARD_MARKERS = (
+    "non-fast-forward",
+    "(fetch first)",
+    "remote contains work that you do not have locally",
+)
+
+
+def _is_non_fast_forward_push_failure(
+    result: subprocess.CompletedProcess,
+) -> bool:
+    """Return True only for an explicit remote-ahead push rejection."""
+    if result.returncode == 0:
+        return False
+    detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    return any(marker in detail for marker in _NON_FAST_FORWARD_MARKERS)
+
+
+def _recover_non_fast_forward_push(bridge_dir: str) -> tuple[bool, str]:
+    """Discard a generated local bridge commit after a peer wins the push race.
+
+    The bridge checkout is a DB-derived transport artifact and this function is
+    called only while the repo sync lock is held.  A fresh fetch is mandatory
+    before resetting so ``origin/main`` names the winning remote commit.
+    """
+    fetch = git_retry(
+        bridge_dir,
+        "fetch",
+        "origin",
+        "main",
+        timeout=_GIT_PULL_TIMEOUT,
+    )
+    if fetch.returncode != 0:
+        return False, f"fetch failed: {_git_detail(fetch)}"
+    reset = git_retry(
+        bridge_dir,
+        "reset",
+        "--hard",
+        "origin/main",
+        timeout=_GIT_PULL_TIMEOUT,
+    )
+    if reset.returncode != 0:
+        return False, f"reset failed: {_git_detail(reset)}"
+    return True, "local generated commit reset to origin/main"
 
 
 def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
@@ -272,6 +317,7 @@ def _check_sync_safety(
     conn: sqlite3.Connection,
     bridge_dir: str,
     threshold: int = _SAFETY_THRESHOLD,
+    bridge_tasks: list[dict] | None = None,
 ) -> dict:
     """Compare local DB state vs bridge files. Flag destructive content changes."""
     tasks_dir = Path(bridge_dir) / "tasks"
@@ -289,12 +335,10 @@ def _check_sync_safety(
         "examples": [],
     }
 
-    for task_file in tasks_dir.glob("*.json"):
-        try:
-            bridge_task = _json_loads(task_file.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            continue
+    if bridge_tasks is None:
+        bridge_tasks = _load_bridge_task_snapshots(bridge_dir)
 
+    for bridge_task in bridge_tasks:
         tid = bridge_task.get("id")
         if not tid:
             continue
@@ -362,7 +406,27 @@ def _check_sync_safety(
     return stats
 
 
-def _auto_heal_sync_safety(conn: sqlite3.Connection, bridge_dir: str) -> dict:
+def _load_bridge_task_snapshots(bridge_dir: str) -> list[dict]:
+    """Parse bridge task files once for the paired heal/safety checks."""
+    tasks_dir = Path(bridge_dir) / "tasks"
+    if not tasks_dir.exists():
+        return []
+    snapshots: list[dict] = []
+    for task_file in tasks_dir.glob("*.json"):
+        try:
+            task = _json_loads(task_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if isinstance(task, dict):
+            snapshots.append(task)
+    return snapshots
+
+
+def _auto_heal_sync_safety(
+    conn: sqlite3.Connection,
+    bridge_dir: str,
+    bridge_tasks: list[dict] | None = None,
+) -> dict:
     """Restore richer bridge content into local DB before export when safe to do so."""
     tasks_dir = Path(bridge_dir) / "tasks"
     stats = {
@@ -374,12 +438,10 @@ def _auto_heal_sync_safety(conn: sqlite3.Connection, bridge_dir: str) -> dict:
     if not tasks_dir.exists():
         return stats
 
-    for task_file in tasks_dir.glob("*.json"):
-        try:
-            bridge_task = _json_loads(task_file.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            continue
+    if bridge_tasks is None:
+        bridge_tasks = _load_bridge_task_snapshots(bridge_dir)
 
+    for bridge_task in bridge_tasks:
         tid = bridge_task.get("id")
         if not tid:
             continue
@@ -834,6 +896,8 @@ def _main_locked(
 
     migrate_to_per_task_files(bridge_dir)
     migrate_entities_to_per_files(bridge_dir)
+    if pull_only:
+        ensure_entities_index_parseable(bridge_dir, log)
 
     remote_payload: dict = {}
     if shared_path.exists():
@@ -947,9 +1011,12 @@ def _main_locked(
 
     # Safety valve: check BEFORE export (bridge files still contain remote data)
     if not force:
+        bridge_tasks = _load_bridge_task_snapshots(bridge_dir)
         with get_conn(_db_path) as conn:
-            repairs = _auto_heal_sync_safety(conn, bridge_dir)
-            safety = _check_sync_safety(conn, bridge_dir)
+            repairs = _auto_heal_sync_safety(
+                conn, bridge_dir, bridge_tasks=bridge_tasks
+            )
+            safety = _check_sync_safety(conn, bridge_dir, bridge_tasks=bridge_tasks)
         if repairs["tasks_touched"]:
             log.info(
                 "Safety auto-restore repaired %d tasks (%d descriptions, %d notes)",
@@ -1078,9 +1145,7 @@ def _main_locked(
             conn, bridge_dir
         )
         log.info("streamed %d memory events", memory_event_count)
-        extended_memory = _export_extended_memory(
-            conn, include_memory_events=False
-        )
+        extended_memory = _export_extended_memory(conn, include_memory_events=False)
     # Export transaction closed
 
     # Phase 4: Build payload + write files + git ops (no transaction)
@@ -1207,8 +1272,18 @@ def _main_locked(
     push_result = git_retry(bridge_dir, "push", timeout=_GIT_PUSH_TIMEOUT)
     pushed = push_result.returncode == 0
     push_message = (push_result.stderr or push_result.stdout or "").strip()
+    non_fast_forward_recovered = False
     if not pushed and push_message:
         log.warning("git push failed: %s", push_message)
+    if not pushed and _is_non_fast_forward_push_failure(push_result):
+        non_fast_forward_recovered, recovery_detail = _recover_non_fast_forward_push(
+            bridge_dir
+        )
+        if non_fast_forward_recovered:
+            log.warning("git push race self-healed: %s", recovery_detail)
+        else:
+            log.error("git push race recovery failed: %s", recovery_detail)
+        push_message = f"{push_message}; {recovery_detail}".strip("; ")
 
     # Update push-failure backoff state (process-local)
     global _push_failure_count, _push_backoff_until
@@ -1277,5 +1352,6 @@ def _main_locked(
         "deployed": deployed,
         "imported_new": new_t,
         "imported_updated": upd_t,
+        "non_fast_forward_recovered": non_fast_forward_recovered,
         "message": push_message if not pushed else None,
     }

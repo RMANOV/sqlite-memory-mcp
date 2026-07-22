@@ -9,6 +9,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from fastmcp import Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -24,6 +25,12 @@ import unified_server
 
 
 _ROOT = Path(__file__).resolve().parents[1]
+
+
+async def _list_tools(mcp):
+    """List the externally visible surface through FastMCP's public client API."""
+    async with Client(mcp) as client:
+        return await client.list_tools()
 
 
 def test_server_exposes_sqlite3_for_fallback_handlers():
@@ -185,8 +192,9 @@ def test_task_server_instructions_make_description_the_default_body_field():
     assert "Use find_by_title when only a remembered phrase is known" in (
         task_server.mcp.instructions
     )
-    assert "Use upsert_note_by_title_project for idempotent research/decision notes" in (
-        task_server.mcp.instructions
+    assert (
+        "Use upsert_note_by_title_project for idempotent research/decision notes"
+        in (task_server.mcp.instructions)
     )
     assert "confidence gating" in task_server.mcp.instructions
     assert "main long-form task/note text in ``description`` by default" in (
@@ -225,14 +233,14 @@ def test_tool_schemas_are_openai_client_compatible(module):
     schema is not a plain object or that lean on top-level combinators, and
     they require every ``required`` name to be a declared property.
     """
-    tools = asyncio.run(module.mcp.list_tools())
+    tools = asyncio.run(_list_tools(module.mcp))
     if not tools:
         pytest.skip(f"{module.__name__} intentionally exposes no MCP tools")
 
     forbidden_top_level_keys = {"oneOf", "anyOf", "allOf", "enum", "not"}
 
     for tool in tools:
-        schema = tool.parameters
+        schema = tool.inputSchema
         assert schema.get("type") == "object", (module.__name__, tool.name)
         assert not (forbidden_top_level_keys & set(schema)), (
             module.__name__,
@@ -252,8 +260,10 @@ def test_tool_schemas_are_openai_client_compatible(module):
 
 
 def test_task_create_schema_keeps_typed_title_property():
-    tools = asyncio.run(task_server.mcp.list_tools())
-    create_schema = next(t.parameters for t in tools if t.name == "create_task_or_note")
+    tools = asyncio.run(_list_tools(task_server.mcp))
+    create_schema = next(
+        t.inputSchema for t in tools if t.name == "create_task_or_note"
+    )
     assert create_schema["properties"]["title"]["type"] == "string"
 
 

@@ -467,6 +467,54 @@ def test_bridge_push_writes_and_stages_shared_js(bridge_env, monkeypatch):
     )
 
 
+def test_bridge_push_releases_write_transaction_before_file_export(
+    bridge_env, monkeypatch
+):
+    db_path, _bridge_dir = bridge_env
+    old = "2026-01-01T00:00:00+00:00"
+    with _db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id,title,status,visibility,publish_requested_at,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("publish-probe", "Probe", "not_started", "pending_public", old, old, old),
+        )
+
+    def transactional_conn():
+        conn = sqlite3.connect(db_path, timeout=0.1)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(bridge_server, "_get_conn", transactional_conn)
+    original_export = bridge_server._export_task_files
+    write_probe_succeeded = []
+
+    def export_with_concurrent_write_probe(conn, bridge_dir, changed_since=None):
+        probe = sqlite3.connect(db_path, isolation_level=None, timeout=0.1)
+        try:
+            probe.execute("PRAGMA busy_timeout=100")
+            probe.execute("BEGIN IMMEDIATE")
+            probe.execute("ROLLBACK")
+            write_probe_succeeded.append(True)
+        finally:
+            probe.close()
+        return original_export(conn, bridge_dir, changed_since=changed_since)
+
+    monkeypatch.setattr(
+        bridge_server, "_export_task_files", export_with_concurrent_write_probe
+    )
+    monkeypatch.setattr(
+        bridge_server, "_ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_server, "_git", lambda *args: _cp(args))
+
+    result = json.loads(bridge_server.bridge_push.fn(force=True))
+
+    assert "error" not in result
+    assert write_probe_succeeded == [True]
+
+
 def test_bridge_push_writes_kanban_payload_before_staging(bridge_env, monkeypatch):
     """Regression: surface_contract git-stages kanban_payload.json, so bridge_push
     MUST generate it before ``git add`` — otherwise staging fatals with

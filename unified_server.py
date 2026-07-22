@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified SQLite MCP Server — all 50 tools in a single process.
+"""Unified SQLite MCP Server — all domain tools in a single process.
 
 Consolidates the 7 domain servers (core, tasks, session, entity, intel,
 bridge, collab) into one FastMCP instance using mount(). This avoids running
@@ -20,25 +20,13 @@ from premium_runtime import maybe_mount_premium_extensions
 # Each module creates its own FastMCP instance and registers tools via
 # @mcp.tool() at import time. We mount them all into a unified instance.
 
-from server import (
-    mcp as core_mcp,
-)  # 9 tools: entity/obs/relation CRUD, search, read_graph
-from task_server import (
-    mcp as tasks_mcp,
-)  # 6 tools: create/update/query/digest/archive/bump
-from session_server import (
-    mcp as session_mcp,
-)  # 5 tools: save/recall/search/health/resume
-from entity_server import (
-    mcp as entity_mcp,
-)  # 7 tools: link/unlink/get_links/tasks/suggest/overlap/merge
-from intel_server import (
-    mcp as intel_mcp,
-)  # 8 tools: assess/clarify/answer/extract/promote/pack/impact/enrich
-from bridge_server import mcp as bridge_mcp  # 6 tools: bridge push/pull/status/sync
-from collab_server import (
-    mcp as collab_mcp,
-)  # 9 tools: collaboration/sharing/verification
+from server import mcp as core_mcp
+from task_server import mcp as tasks_mcp
+from session_server import mcp as session_mcp
+from entity_server import mcp as entity_mcp
+from intel_server import mcp as intel_mcp
+from bridge_server import mcp as bridge_mcp
+from collab_server import mcp as collab_mcp
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 logger = setup_logger("sqlite-unified", "unified_server.log")

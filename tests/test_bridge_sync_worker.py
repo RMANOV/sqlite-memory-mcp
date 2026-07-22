@@ -11,7 +11,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import bridge_sync_worker
-from bridge_sync_worker import _auto_heal_sync_safety, _check_sync_safety
+from bridge_sync_worker import (
+    _auto_heal_sync_safety,
+    _check_sync_safety,
+    _load_bridge_task_snapshots,
+)
 import db_utils
 from schema import init_db
 
@@ -25,10 +29,26 @@ def test_memory_events_stream_export_is_byte_equivalent_and_atomic(tmp_path):
     try:
         rows = [
             (
-                f"event-{i}", "field.set", "task", f"task-{i}", "description",
-                "system", None, "fedora", "test", i,
-                f"2026-07-19T10:00:0{i}+00:00", None, f"стойност {i}",
-                json.dumps({"i": i}), None, "test", f"ref-{i}", "откъс", 0, 5,
+                f"event-{i}",
+                "field.set",
+                "task",
+                f"task-{i}",
+                "description",
+                "system",
+                None,
+                "fedora",
+                "test",
+                i,
+                f"2026-07-19T10:00:0{i}+00:00",
+                None,
+                f"стойност {i}",
+                json.dumps({"i": i}),
+                None,
+                "test",
+                f"ref-{i}",
+                "откъс",
+                0,
+                5,
             )
             for i in range(1, 4)
         ]
@@ -37,9 +57,7 @@ def test_memory_events_stream_export_is_byte_equivalent_and_atomic(tmp_path):
             rows,
         )
         expected = db_utils.json_dumps(db_utils.export_memory_events(conn))
-        rel_path, count = db_utils.write_memory_events_file_streaming(
-            conn, bridge_dir
-        )
+        rel_path, count = db_utils.write_memory_events_file_streaming(conn, bridge_dir)
     finally:
         conn.close()
 
@@ -73,7 +91,9 @@ def test_extended_export_can_omit_materialized_memory_events(tmp_path, monkeypat
     monkeypatch.setattr(
         bridge_sync_worker,
         "export_memory_events",
-        lambda _conn: (_ for _ in ()).throw(AssertionError("must stream, not materialize")),
+        lambda _conn: (_ for _ in ()).throw(
+            AssertionError("must stream, not materialize")
+        ),
     )
     try:
         result = bridge_sync_worker._export_extended_memory(
@@ -728,6 +748,121 @@ def test_git_retry_returns_timeout_result(monkeypatch):
     assert "timed out after 7s" in result.stderr
 
 
+def test_non_fast_forward_push_recovery_resets_generated_divergence(tmp_path):
+    """A peer winning the push race must not permanently brick the checkout."""
+
+    def git(cwd, *args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=check,
+        )
+
+    remote = tmp_path / "remote.git"
+    writer = tmp_path / "writer"
+    local = tmp_path / "local"
+    peer = tmp_path / "peer"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(tmp_path, "clone", str(remote), str(writer))
+    git(writer, "config", "user.name", "Bridge Test")
+    git(writer, "config", "user.email", "bridge@example.test")
+    git(writer, "config", "commit.gpgsign", "false")
+    git(writer, "checkout", "-b", "main")
+    (writer / "shared.json").write_text('{"version":1}\n', encoding="utf-8")
+    git(writer, "add", "shared.json")
+    git(writer, "commit", "-m", "base")
+    git(writer, "push", "-u", "origin", "main")
+    git(tmp_path, "clone", "--branch", "main", str(remote), str(local))
+    git(tmp_path, "clone", "--branch", "main", str(remote), str(peer))
+    for repo in (local, peer):
+        git(repo, "config", "user.name", "Bridge Test")
+        git(repo, "config", "user.email", "bridge@example.test")
+        git(repo, "config", "commit.gpgsign", "false")
+
+    (local / "local-generated.json").write_text("{}\n", encoding="utf-8")
+    git(local, "add", "local-generated.json")
+    git(local, "commit", "-m", "local generated export")
+    local_generated_sha = git(local, "rev-parse", "HEAD").stdout.strip()
+
+    (peer / "peer.json").write_text("{}\n", encoding="utf-8")
+    git(peer, "add", "peer.json")
+    git(peer, "commit", "-m", "peer wins")
+    git(peer, "push", "origin", "main")
+
+    rejected = git(local, "push", "origin", "main", check=False)
+    assert rejected.returncode != 0
+    assert bridge_sync_worker._is_non_fast_forward_push_failure(rejected)
+
+    recovered, detail = bridge_sync_worker._recover_non_fast_forward_push(str(local))
+
+    assert recovered is True, detail
+    local_head = git(local, "rev-parse", "HEAD").stdout.strip()
+    remote_head = git(local, "rev-parse", "origin/main").stdout.strip()
+    assert local_head == remote_head
+    assert local_head != local_generated_sha
+    assert (local / "peer.json").exists()
+    assert not (local / "local-generated.json").exists()
+
+
+def test_generic_push_failure_never_authorizes_hard_reset():
+    result = _cp(
+        ("push",),
+        returncode=1,
+        stderr="remote: permission denied by branch protection",
+    )
+
+    assert bridge_sync_worker._is_non_fast_forward_push_failure(result) is False
+
+
+def test_safety_heal_and_check_reuse_one_task_parse(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    tasks_dir = bridge_dir / "tasks"
+    tasks_dir.mkdir(parents=True)
+    init_db(db_path)
+    now = db_utils.now_iso()
+    with sqlite3.connect(db_path, isolation_level=None) as raw:
+        raw.execute(
+            "INSERT INTO tasks (id,title,description,notes,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("task-once", "Task", "body", "notes", now, now),
+        )
+    (tasks_dir / "task-once.json").write_text(
+        json.dumps(
+            {
+                "id": "task-once",
+                "title": "Task",
+                "description": "body",
+                "notes": "notes",
+                "updated_at": now,
+            }
+        ),
+        encoding="utf-8",
+    )
+    real_loads = bridge_sync_worker._json_loads
+    parse_count = 0
+
+    def counting_loads(payload):
+        nonlocal parse_count
+        parse_count += 1
+        return real_loads(payload)
+
+    monkeypatch.setattr(bridge_sync_worker, "_json_loads", counting_loads)
+    snapshots = _load_bridge_task_snapshots(str(bridge_dir))
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _auto_heal_sync_safety(conn, str(bridge_dir), bridge_tasks=snapshots)
+        safety = _check_sync_safety(conn, str(bridge_dir), bridge_tasks=snapshots)
+    finally:
+        conn.close()
+
+    assert safety["is_safe"] is True
+    assert parse_count == 1
+
+
 def test_bridge_sync_worker_pull_only_skips_export_and_push(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     bridge_dir = tmp_path / "bridge"
@@ -778,6 +913,69 @@ def test_bridge_sync_worker_pull_only_skips_export_and_push(tmp_path, monkeypatc
         ("rev-parse", "origin/main"),
         ("merge-base", "HEAD", "origin/main"),
     ]
+
+
+def test_pull_only_repairs_entities_index_before_remote_import(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    entities_dir = bridge_dir / "entities"
+    entities_dir.mkdir(parents=True)
+    init_db(db_path)
+    ts = "2026-07-21T10:00:00+00:00"
+    (bridge_dir / "shared.json").write_text(
+        json.dumps({"version": 4, "entities": [], "relations": [], "tasks": []}),
+        encoding="utf-8",
+    )
+    (bridge_dir / "entities_index.json").write_text(
+        '{"entities":[]}\n{"entities":[]}', encoding="utf-8"
+    )
+    (entities_dir / "41.json").write_text(
+        json.dumps(
+            {
+                "id": 41,
+                "name": "Remote entity",
+                "entityType": "company",
+                "project": "shared:bridge",
+                "observations": [{"content": "remote", "createdAt": ts}],
+                "createdAt": ts,
+                "updatedAt": ts,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        if args == ("fetch", "origin", "main"):
+            return _cp(args)
+        if args in {
+            ("rev-parse", "HEAD"),
+            ("rev-parse", "origin/main"),
+            ("merge-base", "HEAD", "origin/main"),
+        }:
+            return _cp(args, stdout="same-sha\n")
+        raise AssertionError(f"Unexpected git_retry call: {args}")
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+
+    result = bridge_sync_worker.main(
+        db_path=db_path,
+        bridge_repo=str(bridge_dir),
+        pull_only=True,
+    )
+
+    assert result["pull_only"] is True
+    with sqlite3.connect(db_path) as conn:
+        imported = conn.execute(
+            "SELECT name FROM entities WHERE name='Remote entity'"
+        ).fetchone()
+    assert imported == ("Remote entity",)
+    repaired = json.loads(
+        (bridge_dir / "entities_index.json").read_text(encoding="utf-8")
+    )
+    assert repaired["entities"][0]["id"] == 41
 
 
 def test_bridge_sync_worker_pull_conflict_fails_closed_without_reset(
