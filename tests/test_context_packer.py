@@ -8,7 +8,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from context_packer import build_context_pack, warm_recent_task_packs
+from context_packer import (
+    _estimate_tokens,
+    _find_relevant_entities,
+    build_context_pack,
+    warm_recent_task_packs,
+)
 from schema import init_db
 
 
@@ -78,6 +83,41 @@ def _insert_fact(
         ") VALUES (?, 'fact', ?, 'chunk', ?, NULL, NULL, ?, 1.0, ?)",
         (f"prov-{fact_id}", fact_id, f"source-{fact_id}", f"{subject} {predicate}", ts),
     )
+
+
+def test_vector_only_entity_hits_are_normalized_for_common_reranker(conn, monkeypatch):
+    import smart_retrieval
+    import vec_search
+
+    monkeypatch.setattr(vec_search, "VEC_AVAILABLE", True)
+    monkeypatch.setattr(
+        vec_search,
+        "vector_search",
+        lambda *_args, **_kwargs: [
+            {
+                "eid": 42,
+                "name": "Vector-only entity",
+                "entity_type": "concept",
+                "project": None,
+                "distance": 0.1,
+            }
+        ],
+    )
+
+    def fake_rerank(_conn, rows, *_args):
+        assert rows[0]["rank"] < 0
+        return [{**rows[0], "_score": 0.9}]
+
+    monkeypatch.setattr(smart_retrieval, "rerank_entities", fake_rerank)
+
+    result = _find_relevant_entities(
+        conn,
+        query="vector only",
+        linked_ids=[],
+        session_id=None,
+    )
+
+    assert result["by_id"] == {42: 0.9}
 
 
 def test_task_scoped_pack_matches_snake_case_tool_keyword(conn):
@@ -187,6 +227,8 @@ def test_executor_body_suppresses_context_fragments_when_fact_is_present(conn):
     assert "## Canonical Facts" in result["body"]
     assert "## Context Fragments" not in result["body"]
     assert result["sections"]["chunks"] == 0
+    fact_line = next(line for line in result["body"].splitlines() if "[FACT]" in line)
+    assert result["token_usage"] == _estimate_tokens(fact_line)
 
 
 def test_executor_pack_hides_contradicted_facts(conn):
@@ -218,6 +260,32 @@ def test_executor_pack_hides_contradicted_facts(conn):
 
     assert "Redis" not in result["body"]
     assert result["sections"]["facts"] == 0
+
+
+def test_fact_provenance_is_loaded_in_one_batch(conn):
+    for index in range(3):
+        _insert_fact(
+            conn,
+            f"fact-batch-{index}",
+            subject=f"Batch subject {index}",
+            predicate="uses",
+            object_text="batched provenance lookup",
+        )
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        build_context_pack(conn, token_budget=1200, persist=False)
+    finally:
+        conn.set_trace_callback(None)
+
+    provenance_reads = [
+        statement
+        for statement in statements
+        if "FROM provenance_links" in statement and "subject_kind = 'fact'" in statement
+    ]
+    assert len(provenance_reads) == 1
+    assert " IN (" in provenance_reads[0]
 
 
 def test_warm_recent_task_packs_only_builds_information_rich_tasks(conn):

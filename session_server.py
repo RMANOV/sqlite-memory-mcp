@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Thin MCP server exposing session management and knowledge health tools.
 
-Shares the same SQLite database as the main sqlite-kb server.
-Exists because Claude Code 2.x has a tool-count limit per MCP server
-(~9 tools visible out of 50), so session tools are split into a separate server.
+Shares the same SQLite database as the main sqlite-kb server and keeps the session
+surface independently deployable; ``unified_server.py`` also mounts it.
 """
 
 from __future__ import annotations

@@ -451,6 +451,25 @@ def test_task_xml_encodes_spec_constraints():
     assert str(dow.ROOT) in xml  # working directory is the repo
 
 
+def test_task_xml_escapes_windows_paths_and_arguments(monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    import debate_ops_windows as dow
+
+    monkeypatch.setattr(dow, "ROOT", Path(r"C:\repo&ops<one>"))
+    monkeypatch.setattr(dow, "PUMP_SCRIPT", Path(r"C:\repo&ops<one>\pump.py"))
+    monkeypatch.setattr(dow, "PUMP_ARGS", ["--topic", "A&B<C>"])
+    monkeypatch.setattr(dow, "_pythonw", lambda: Path(r"C:\py&thon\pythonw.exe"))
+
+    xml = dow._task_xml()
+    root = ET.fromstring(xml)
+    namespace = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+    assert root.findtext(".//t:Command", namespaces=namespace) == str(dow._pythonw())
+    assert root.findtext(".//t:WorkingDirectory", namespaces=namespace) == str(dow.ROOT)
+    assert "A&B<C>" in root.findtext(".//t:Arguments", namespaces=namespace)
+
+
 # --- Pump wait integration ---------------------------------------------------
 
 

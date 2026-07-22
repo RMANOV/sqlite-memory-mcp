@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Thin MCP server exposing Intelligence v2 tools.
 
-Shares the same SQLite database as the main sqlite-kb server.
-Exists because Claude Code 2.x has a tool-count limit per MCP server
-(~9 tools visible out of 50), so intelligence tools are split into a separate server.
+Shares the same SQLite database as the main sqlite-kb server and keeps the
+intelligence surface independently deployable; ``unified_server.py`` also mounts it.
 """
 
 from __future__ import annotations
@@ -1059,10 +1058,8 @@ def reflect_discard(run_id: str) -> str:
     """
     try:
         with _get_conn() as conn:
-            # FK CASCADE only fires if PRAGMA foreign_keys=ON, which
-            # production paths set in db_utils._PRAGMAS. Defensive
-            # fallback: enforce per-connection in case caller bypassed.
-            conn.execute("PRAGMA foreign_keys = ON")
+            # db_utils configures foreign_keys before opening the transaction;
+            # changing this PRAGMA after BEGIN would be a documented no-op.
             rows_deleted = _dao_discard_run(conn, run_id)
             return json.dumps({"run_id": run_id, "rows_deleted": rows_deleted})
     except _ReflectionStateError as exc:

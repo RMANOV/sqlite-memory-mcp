@@ -8,6 +8,7 @@ Reads/writes directly to ~/.claude/memory/memory.db.
 
 import atexit
 import copy
+import ctypes
 import faulthandler
 import json
 import logging
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import uuid
 import time
+from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 
 
@@ -84,7 +86,7 @@ _OPTIONAL_PIPELINE_ERRORS = (
     ValueError,
 )
 
-from task_search import TaskSearchEngine
+from task_search import TaskSearchEngine, build_bounded_index_rows
 
 from db_utils import (
     DB_PATH,
@@ -139,8 +141,48 @@ def _bounded_tray_limit(limit: int | None, hard_cap: int) -> int:
     return min(max(1, value), hard_cap)
 
 
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = (
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    )
+
+
+def _windows_rss_mb() -> float:
+    """Return current process working set in MiB through the Windows API."""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(_ProcessMemoryCounters),
+            wintypes.DWORD,
+        )
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return 0.0
+        return counters.WorkingSetSize / (1024 * 1024)
+    except (AttributeError, OSError, ValueError):
+        return 0.0
+
+
 def _current_rss_mb() -> float:
-    """Return current process RSS in MiB from procfs."""
+    """Return current process RSS in MiB on Windows and procfs platforms."""
+    if os.name == "nt":
+        return _windows_rss_mb()
     try:
         with open("/proc/self/statm", encoding="utf-8") as fh:
             rss_pages = int(fh.read().split()[1])
@@ -150,39 +192,13 @@ def _current_rss_mb() -> float:
         return 0.0
 
 
-def _trim_index_text(value):
-    if isinstance(value, str) and len(value) > _TRAY_INDEX_TEXT_CHARS:
-        return value[:_TRAY_INDEX_TEXT_CHARS]
-    return value
-
-
 def _tray_search_index_rows(*groups: list[dict]) -> list[dict]:
     """Build a bounded, lightweight search-index projection for the tray."""
-    rows = []
-    seen = set()
-    fields = (
-        "id",
-        "title",
-        "description",
-        "notes",
-        "project",
-        "section",
-        "status",
-        "priority",
-        "due_date",
-        "type",
-        "updated_at",
+    return build_bounded_index_rows(
+        *groups,
+        limit=_TRAY_SEARCH_INDEX_LIMIT,
+        text_chars=_TRAY_INDEX_TEXT_CHARS,
     )
-    for group in groups:
-        for task in group:
-            task_id = task.get("id")
-            if not task_id or task_id in seen:
-                continue
-            seen.add(task_id)
-            rows.append({field: _trim_index_text(task.get(field)) for field in fields})
-            if len(rows) >= _TRAY_SEARCH_INDEX_LIMIT:
-                return rows
-    return rows
 
 
 class TaskDB:
@@ -1049,6 +1065,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._raw_cache: dict[str, list] = {}
         self._tab_total_counts: dict[str, int] = {}
         self._search_engine = db.search_engine
+        self._search_index_dirty = True
         self._premium_tray_extension = maybe_load_task_tray_extension(
             server_name="sqlite-task-tray"
         )
@@ -1199,16 +1216,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # navigation, snooze, archive, or done toggle.
         dash_lw = self.tab_lists.get("dashboard")
         if dash_lw is not None:
-            dash_lw.setSelectionMode(
-                QAbstractItemView.SelectionMode.ExtendedSelection
-            )
-            dash_copy = QShortcut(
-                QKeySequence(QKeySequence.StandardKey.Copy), dash_lw
-            )
+            dash_lw.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            dash_copy = QShortcut(QKeySequence(QKeySequence.StandardKey.Copy), dash_lw)
             dash_copy.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            dash_copy.activated.connect(
-                lambda lw=dash_lw: self._copy_dashboard(lw)
-            )
+            dash_copy.activated.connect(lambda lw=dash_lw: self._copy_dashboard(lw))
 
         # B1: Per-tab view state dict (sort + filters per tab)
         self._tab_views = {
@@ -1256,9 +1267,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._debate_controls[key].set_state(params)
         if self._waiting_task_controls is not None:
             self._waiting_task_controls.set_state(
-                self._tab_views["waiting"]["params"].get(
-                    "section_b_controls", {}
-                )
+                self._tab_views["waiting"]["params"].get("section_b_controls", {})
             )
 
         # Persist the active tab by key for future compatibility. Do not force
@@ -1462,45 +1471,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._refresh_timer.timeout.connect(self.refresh)
 
         self.refresh()
-
-    def _on_db_changed(self, path):
-        """DB file changed — start/restart debounce timers."""
-        self._db_refresh_debounce.start()  # 500ms UI refresh debounce
-        self._refresh_db_watch_paths()
-        if not getattr(self, "_auto_sync_enabled", True):
-            return
-        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
-            return  # suppress sync cascade from own sync operations
-        self._auto_sync_timer.start()  # 60s bridge sync debounce
-
-    def _on_db_dir_changed(self, path):
-        """Directory changed — catch WAL create/rotate events."""
-        self._db_refresh_debounce.start()
-        watch_paths_changed = self._refresh_db_watch_paths()
-        if not getattr(self, "_auto_sync_enabled", True):
-            return
-        if self._sync_run_active or time.monotonic() < self._sync_cooldown_until:
-            return
-        if watch_paths_changed:
-            self._auto_sync_timer.start()
-
-    def _refresh_db_watch_paths(self):
-        """Ensure DB watcher tracks the DB, WAL, and parent directory."""
-        wanted_dirs = {self._db_watch_dir}
-        wanted_files = set()
-        db_path = Path(self.db.db_path)
-        for candidate in (db_path, Path(f"{self.db.db_path}-wal")):
-            if candidate.exists():
-                wanted_files.add(str(candidate))
-        current_files = set(self._db_watcher.files())
-        current_dirs = set(self._db_watcher.directories())
-        stale = sorted((current_files - wanted_files) | (current_dirs - wanted_dirs))
-        if stale:
-            self._db_watcher.removePaths(stale)
-        missing = sorted((wanted_files - current_files) | (wanted_dirs - current_dirs))
-        if missing:
-            self._db_watcher.addPaths(missing)
-        return bool(stale or missing)
 
     def _run_purge(self):
         self._last_purged = self.db.purge_old_done(days=30)
@@ -2065,12 +2035,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 logger.warning("premium tray rows unavailable: %s", exc, exc_info=True)
                 premium_rows = []
 
-        # Rebuild SmartKey search index with a bounded projection. The tray must
-        # not retain every closed note/task body just to keep fuzzy search warm.
-        self._search_engine.rebuild_index(
-            _tray_search_index_rows(all_active, premium_rows, done)
-        )
-
         ready_review = self.db.get_ready_review_tasks(limit=_TRAY_READY_REVIEW_LIMIT)
         suggested = suggested_ready(
             all_active + ready_review,
@@ -2097,6 +2061,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
         # Keep only raw buckets. Filtering/sorting/rendering is lazy per active tab.
         self._raw_cache = raw
+        self._search_index_dirty = True
         self._filtered_cache = {}
         self._tab_total_counts = {}
         if self._search_text:
@@ -2113,7 +2078,10 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # visible through the initial + every periodic refresh (their `raw` bucket
         # is always empty, so they would otherwise be hidden by the count check).
         always_visible = (
-            "suggested", "today", "notes", "projects",
+            "suggested",
+            "today",
+            "notes",
+            "projects",
             *getattr(self, "_DEBATE_TABS", ()),
         )
         if premium_key:
@@ -2158,6 +2126,19 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 parts.append(f"{exc_count} exclude")
             msg += f" | Filters: {', '.join(parts)}"
         self.status.showMessage(msg)
+
+    def _ensure_search_index(self):
+        """Build the resident fuzzy index only when a search consumes it."""
+        if not getattr(self, "_search_index_dirty", True):
+            return
+        all_rows = self._raw_cache.get("all", [])
+        premium_rows = []
+        if self._premium_tray_extension:
+            premium_rows = self._raw_cache.get(self._premium_tray_extension.tab_key, [])
+        self._search_engine.rebuild_index(
+            _tray_search_index_rows(all_rows, premium_rows)
+        )
+        self._search_index_dirty = False
 
     def _on_tab_changed(self, idx):
         """Handle tab switch: save current tab's view, load new tab's view."""
@@ -2216,7 +2197,8 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             self._filter_bar.setVisible(not is_debate)
             self._search_input.setPlaceholderText(
                 "Search everywhere: debates, tasks, knowledge…"
-                if is_debate else "Search tasks..."
+                if is_debate
+                else "Search tasks..."
             )
             if is_debate:
                 self._debate_controls[new_key].set_state(
@@ -2224,9 +2206,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 )
                 if new_key == "waiting" and self._waiting_task_controls is not None:
                     self._waiting_task_controls.set_state(
-                        self._tab_views[new_key].get("params", {}).get(
-                            "section_b_controls", {}
-                        )
+                        self._tab_views[new_key]
+                        .get("params", {})
+                        .get("section_b_controls", {})
                     )
                 self._debate_controls[new_key].set_thread_mode(
                     new_key == "topics" and bool(self._topics_open_topic)
@@ -2252,9 +2234,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """Persist and apply native client controls without re-reading SQLite."""
         if key not in self._DEBATE_TABS or key not in self._tab_views:
             return
-        old = self._normalize_tab_params(
-            key, self._tab_views[key].get("params", {})
-        )
+        old = self._normalize_tab_params(key, self._tab_views[key].get("params", {}))
         if key == "waiting" and section_b:
             new = copy.deepcopy(old)
             new["section_b_controls"] = normalize_debate_control_params(
@@ -2411,13 +2391,21 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             lw.add_header(f"Recent decisions ({len(items)})")
             for it in items:
                 mid = it["msg_id"]
-                text = (f"[{it.get('kind','')}] {it.get('role','')} · "
-                        f"{it.get('age','')} · {mid[:8]} — {it.get('line','')}")
-                copy_block = (f"{it.get('role','')} · {it.get('kind','')} · "
-                              f"{it.get('age','')} · {mid} · {it.get('body','')}")
-                lw.add_debate_row(mid, text, topic_id=it.get("topic_id"),
-                                  copy_payload=copy_block,
-                                  reader_payload=self._debate_reader_payload(it))
+                text = (
+                    f"[{it.get('kind', '')}] {it.get('role', '')} · "
+                    f"{it.get('age', '')} · {mid[:8]} — {it.get('line', '')}"
+                )
+                copy_block = (
+                    f"{it.get('role', '')} · {it.get('kind', '')} · "
+                    f"{it.get('age', '')} · {mid} · {it.get('body', '')}"
+                )
+                lw.add_debate_row(
+                    mid,
+                    text,
+                    topic_id=it.get("topic_id"),
+                    copy_payload=copy_block,
+                    reader_payload=self._debate_reader_payload(it),
+                )
         elif key == "waiting":
             items = rows.get("section_a", [])
             # The old denominator counted every recent Q/DECISION candidate,
@@ -2428,12 +2416,19 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             for it in items:
                 mid = it["msg_id"]
                 stale = " ⏳" if it.get("stale") else ""
-                text = (f"[{it.get('kind','')}] {it.get('role','')} · "
-                        f"{it.get('age','')}{stale} · {mid[:8]} — {it.get('line','')}")
-                copy_block = (f"{it.get('role','')} · {it.get('kind','')} · "
-                              f"{it.get('age','')} · {mid} · {it.get('body','')}")
+                text = (
+                    f"[{it.get('kind', '')}] {it.get('role', '')} · "
+                    f"{it.get('age', '')}{stale} · {mid[:8]} — {it.get('line', '')}"
+                )
+                copy_block = (
+                    f"{it.get('role', '')} · {it.get('kind', '')} · "
+                    f"{it.get('age', '')} · {mid} · {it.get('body', '')}"
+                )
                 lw.add_debate_row(
-                    mid, text, topic_id=None, copy_payload=copy_block,
+                    mid,
+                    text,
+                    topic_id=None,
+                    copy_payload=copy_block,
                     reader_payload=self._debate_reader_payload(it),
                 )
             task_items = rows.get("section_b", [])
@@ -2446,11 +2441,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 task_id = str(task.get("id") or "")
                 due = task.get("due_date") or "no due date"
                 text = (
-                    f"[{task.get('section','')}] {task.get('priority','')} · "
-                    f"{due} · {task.get('project','')} — {task.get('title','')}"
+                    f"[{task.get('section', '')}] {task.get('priority', '')} · "
+                    f"{due} · {task.get('project', '')} — {task.get('title', '')}"
                 )
                 record = "\n".join(
-                    f"{name}: {value}" for name, value in (
+                    f"{name}: {value}"
+                    for name, value in (
                         ("id", task_id),
                         ("title", task.get("title") or ""),
                         ("section", task.get("section") or ""),
@@ -2459,10 +2455,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                         ("due_date", task.get("due_date") or ""),
                         ("project", task.get("project") or ""),
                         ("updated_at", task.get("updated_at") or ""),
-                    ) if value
+                    )
+                    if value
                 )
                 task_lw.add_task_row(
-                    task_id, text,
+                    task_id,
+                    text,
                     copy_payload=record,
                     reader_payload={
                         "title": str(task.get("title") or task_id),
@@ -2475,27 +2473,37 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             if "thread" in rows:
                 th = rows["thread"]
                 lw.add_header(
-                    f"◀ {th.get('title','')} [{th.get('state','')}] ({th.get('count',0)})"
+                    f"◀ {th.get('title', '')} [{th.get('state', '')}] ({th.get('count', 0)})"
                 )
                 for m in th.get("messages", []):
                     mid = m["msg_id"]
                     indent = "    " if m.get("reply_to") else ""
-                    text = (f"{indent}[{m.get('kind','')}] {m.get('role','')} · "
-                            f"{m.get('age','')} · {mid[:8]} — {m.get('line','')}")
-                    copy_block = (f"{m.get('role','')} · {m.get('kind','')} · "
-                                  f"{m.get('age','')} · {mid} · {m.get('body','')}")
-                    lw.add_debate_row(mid, text, topic_id=th.get("topic_id"),
-                                      copy_payload=copy_block,
-                                      reader_payload=self._debate_reader_payload(
-                                          m, topic_id=th.get("topic_id")
-                                      ))
+                    text = (
+                        f"{indent}[{m.get('kind', '')}] {m.get('role', '')} · "
+                        f"{m.get('age', '')} · {mid[:8]} — {m.get('line', '')}"
+                    )
+                    copy_block = (
+                        f"{m.get('role', '')} · {m.get('kind', '')} · "
+                        f"{m.get('age', '')} · {mid} · {m.get('body', '')}"
+                    )
+                    lw.add_debate_row(
+                        mid,
+                        text,
+                        topic_id=th.get("topic_id"),
+                        copy_payload=copy_block,
+                        reader_payload=self._debate_reader_payload(
+                            m, topic_id=th.get("topic_id")
+                        ),
+                    )
             else:
                 topics = rows.get("digest", {}).get("topics", [])
                 lw.add_header(f"Topics ({len(topics)}) — double-click to open thread")
                 for t in topics:
                     tid = t["topic_id"]
-                    text = (f"[{t.get('state','')}] {t.get('title','')} · "
-                            f"{t.get('count',0)} messages · {t.get('age','')}")
+                    text = (
+                        f"[{t.get('state', '')}] {t.get('title', '')} · "
+                        f"{t.get('count', 0)} messages · {t.get('age', '')}"
+                    )
                     lw.add_debate_row(tid, text, topic_id=tid, copy_payload=tid)
 
     @staticmethod
@@ -2539,24 +2547,32 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         lw.add_header(f"Debates ({len(debate)})")
         for r in debate:
             mid = r["msg_id"]
-            text = (f"[{r.get('kind','')}] {r.get('role','')} · {mid[:8]} — "
-                    f"{r.get('snippet','') or r.get('body','')}")
-            lw.add_debate_row(mid, text, topic_id=r.get("topic_id"),
-                              copy_payload=f"{mid} · {r.get('body','')}",
-                              reader_payload=self._debate_reader_payload(r))
+            text = (
+                f"[{r.get('kind', '')}] {r.get('role', '')} · {mid[:8]} — "
+                f"{r.get('snippet', '') or r.get('body', '')}"
+            )
+            lw.add_debate_row(
+                mid,
+                text,
+                topic_id=r.get("topic_id"),
+                copy_payload=f"{mid} · {r.get('body', '')}",
+                reader_payload=self._debate_reader_payload(r),
+            )
         lw.add_header(f"Tasks/notes ({len(tasks)})")
         for r in tasks:
             tid = r.get("id", "")
-            text = f"[{r.get('type','')}/{r.get('status','')}] {r.get('title','')}"
+            text = f"[{r.get('type', '')}/{r.get('status', '')}] {r.get('title', '')}"
             record = "\n".join(
-                f"{name}: {value}" for name, value in (
+                f"{name}: {value}"
+                for name, value in (
                     ("id", tid),
                     ("type", r.get("type") or ""),
                     ("status", r.get("status") or ""),
                     ("section", r.get("section") or ""),
                     ("project", r.get("project") or ""),
                     ("title", r.get("title") or ""),
-                ) if value
+                )
+                if value
             )
             lw.add_task_row(
                 tid,
@@ -2572,20 +2588,26 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         lw.add_header(f"Knowledge ({len(knowledge)})")
         for r in knowledge:
             eid = r.get("id", "")
-            text = f"[{r.get('type','')}] {r.get('name','')}"
-            lw.add_debate_row(f"entity-{eid}", text, topic_id=None,
-                              copy_payload=str(r.get("name", "")),
-                              reader_payload={
-                                  "title": str(r.get("name") or eid),
-                                  "body": str(r.get("name") or ""),
-                                  "record": "\n".join(
-                                      f"{name}: {value}" for name, value in (
-                                          ("id", eid),
-                                          ("type", r.get("type") or ""),
-                                          ("name", r.get("name") or ""),
-                                      ) if value
-                                  ),
-                              })
+            text = f"[{r.get('type', '')}] {r.get('name', '')}"
+            lw.add_debate_row(
+                f"entity-{eid}",
+                text,
+                topic_id=None,
+                copy_payload=str(r.get("name", "")),
+                reader_payload={
+                    "title": str(r.get("name") or eid),
+                    "body": str(r.get("name") or ""),
+                    "record": "\n".join(
+                        f"{name}: {value}"
+                        for name, value in (
+                            ("id", eid),
+                            ("type", r.get("type") or ""),
+                            ("name", r.get("name") or ""),
+                        )
+                        if value
+                    ),
+                },
+            )
 
     @staticmethod
     def _task_completion_payload(task):
@@ -2682,9 +2704,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 return
 
             self._invalidate_debate_task_views()
-            self.status.showMessage(
-                f"Done: {payload.get('title') or task_id}", 5000
-            )
+            self.status.showMessage(f"Done: {payload.get('title') or task_id}", 5000)
             callback = getattr(self.db, "on_change", None)
             if callable(callback):
                 callback()
@@ -2748,6 +2768,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             return source
 
         if self._search_text:
+            self._ensure_search_index()
             search_results = self._search_engine.search(
                 self._search_text,
                 source,
@@ -2795,9 +2816,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         header = QListWidgetItem(text)
         # B1a: selectable (for mouse/keyboard select + Ctrl+C) but NOT
         # checkable/editable — so selecting/copying cannot mutate task state.
-        header.setFlags(
-            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        )
+        header.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         header.setBackground(QColor("#1d2b36"))
         header.setForeground(QColor("#d9e2ec"))
         font = header.font()
@@ -2820,9 +2839,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         # checkable/editable. Double-click/context-menu are guarded against the
         # `dashboard:` UserRole prefix in TaskListWidget, so selecting/copying a
         # row cannot navigate, snooze, archive, delete, or mutate any task.
-        item.setFlags(
-            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        )
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         item.setForeground(QColor(_DASHBOARD_KIND_COLOR.get(kind, "#cbd5e1")))
         tooltip_bits = [
             f"task_id={row.get('task_id')}",
@@ -3003,7 +3020,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             task_id.startswith("entity:")
             or task_id.startswith("premium:")
             or task_id.startswith("dashboard:")
-            or task_id.startswith("debate:")  # B3 defense-in-depth: read-only debate rows
+            or task_id.startswith(
+                "debate:"
+            )  # B3 defense-in-depth: read-only debate rows
         ):
             return
         checked = item.checkState() == Qt.CheckState.Checked

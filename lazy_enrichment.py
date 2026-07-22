@@ -12,9 +12,11 @@ import logging
 import re
 import sqlite3
 import uuid
+from datetime import datetime
 from typing import Any
 
 from db_utils import (
+    _sqlite_has_column,
     add_provenance_link,
     now_iso,
     record_memory_event,
@@ -123,6 +125,7 @@ def extract_inline_claims(
     now = now_iso()
     patterns = _get_patterns()
     count = 0
+    canonical_facts_has_valid_from: bool | None = None
 
     for regex, predicate in patterns:
         for m in regex.finditer(observation_text):
@@ -136,7 +139,7 @@ def extract_inline_claims(
             # Compute adaptive confidence
             base = _PREDICATE_BASE_CONFIDENCE.get(predicate, 0.5)
             existing = conn.execute(
-                "SELECT claim_id, confidence, status FROM lazy_claims "
+                "SELECT claim_id, confidence, status, hit_count FROM lazy_claims "
                 "WHERE subject = ? AND predicate = ? AND object_text = ? "
                 "ORDER BY rowid DESC LIMIT 1",
                 (subject, predicate, object_text),
@@ -153,17 +156,15 @@ def extract_inline_claims(
                     ).fetchone()["cnt"]
                     confidence = max(0.0, base - REJECTION_PENALTY * rej_count)
                 else:
-                    # Evidence accumulation — count prior evidence for cap
-                    evidence_count = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM lazy_claims "
-                        "WHERE subject = ? AND predicate = ? AND object_text = ?",
-                        (subject, predicate, object_text),
-                    ).fetchone()["cnt"]
+                    # One row represents a claim, so evidence must accumulate on
+                    # that row rather than via COUNT(*) over de-duplicated claims.
+                    evidence_count = int(existing["hit_count"] or 1)
                     boost = min(EVIDENCE_BOOST_CAP, evidence_count * EVIDENCE_BOOST_PER)
                     confidence = min(1.0, base + boost)
                 # Update existing claim
                 conn.execute(
-                    "UPDATE lazy_claims SET confidence = ?, updated_at = ? "
+                    "UPDATE lazy_claims SET confidence = ?, hit_count = hit_count + 1, "
+                    "updated_at = ? "
                     "WHERE claim_id = ?",
                     (confidence, now, existing["claim_id"]),
                 )
@@ -175,8 +176,8 @@ def extract_inline_claims(
                 conn.execute(
                     "INSERT INTO lazy_claims "
                     "(claim_id, entity_id, observation_id, subject, predicate, "
-                    "object_text, confidence, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?, ?)",
+                    "object_text, confidence, hit_count, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'candidate', ?, ?)",
                     (
                         claim_id,
                         entity_id,
@@ -193,13 +194,26 @@ def extract_inline_claims(
 
             # Auto-promote if threshold met
             if confidence >= AUTO_PROMOTE_THRESHOLD:
-                auto_promote_claim(conn, claim_id, confidence)
+                if canonical_facts_has_valid_from is None:
+                    canonical_facts_has_valid_from = _sqlite_has_column(
+                        conn, "canonical_facts", "valid_from"
+                    )
+                auto_promote_claim(
+                    conn,
+                    claim_id,
+                    confidence,
+                    has_valid_from=canonical_facts_has_valid_from,
+                )
 
     return count
 
 
 def auto_promote_claim(
-    conn: sqlite3.Connection, claim_id: str, confidence: float
+    conn: sqlite3.Connection,
+    claim_id: str,
+    confidence: float,
+    *,
+    has_valid_from: bool | None = None,
 ) -> str | None:
     """Promote a lazy claim to canonical_facts with validation_mode='auto_lazy'.
 
@@ -243,13 +257,9 @@ def auto_promote_claim(
             now,
             now,
         ]
-        if (
-            "valid_from"
-            in {
-                col["name"]
-                for col in conn.execute("PRAGMA table_info('canonical_facts')")
-            }.copy()
-        ):
+        if has_valid_from is None:
+            has_valid_from = _sqlite_has_column(conn, "canonical_facts", "valid_from")
+        if has_valid_from:
             columns.append("valid_from")
             values.append(now)
         conn.execute(
@@ -403,29 +413,31 @@ def detect_stale_entities(
 ) -> list[dict]:
     """Find entities with no updates or accesses in N days."""
     results: list[dict] = []
-    rows = conn.execute(
-        "SELECT e.id, e.name, e.entity_type, e.project, e.updated_at "
-        "FROM entities e "
-        "WHERE e.updated_at < datetime('now', ? || ' days') "
-        "ORDER BY e.updated_at ASC LIMIT 100",
-        (f"-{staleness_days}",),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT e.id, e.name, e.entity_type, e.project, e.updated_at, "
+            "MAX(a.accessed_at) AS last_access "
+            "FROM entities e "
+            "LEFT JOIN entity_access_log a ON a.entity_id = e.id "
+            "WHERE e.updated_at < datetime('now', ? || ' days') "
+            "GROUP BY e.id, e.name, e.entity_type, e.project, e.updated_at "
+            "ORDER BY e.updated_at ASC LIMIT 100",
+            (f"-{staleness_days}",),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Compatibility with intentionally minimal/legacy schemas.
+        rows = conn.execute(
+            "SELECT e.id, e.name, e.entity_type, e.project, e.updated_at, "
+            "NULL AS last_access FROM entities e "
+            "WHERE e.updated_at < datetime('now', ? || ' days') "
+            "ORDER BY e.updated_at ASC LIMIT 100",
+            (f"-{staleness_days}",),
+        ).fetchall()
 
     for r in rows:
-        # Check access log for recent access
-        try:
-            access = conn.execute(
-                "SELECT MAX(accessed_at) AS last_access "
-                "FROM entity_access_log WHERE entity_id = ?",
-                (r["id"],),
-            ).fetchone()
-            last_access = access["last_access"] if access else None
-        except sqlite3.OperationalError:
-            last_access = None
+        last_access = r["last_access"]
 
         if last_access:
-            from datetime import datetime
-
             try:
                 if datetime.fromisoformat(last_access) > datetime.fromisoformat(
                     r["updated_at"]
@@ -460,8 +472,14 @@ def promote_ready_claims(conn: sqlite3.Connection) -> list[dict]:
     except sqlite3.OperationalError:
         return results
 
+    has_valid_from = _sqlite_has_column(conn, "canonical_facts", "valid_from")
     for row in ready:
-        fact_id = auto_promote_claim(conn, row["claim_id"], row["confidence"])
+        fact_id = auto_promote_claim(
+            conn,
+            row["claim_id"],
+            row["confidence"],
+            has_valid_from=has_valid_from,
+        )
         if fact_id:
             results.append(
                 {

@@ -51,6 +51,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,7 @@ _REVOKED_BODY = "> [!warning] Revoked\n> This published note was revoked in the 
 
 _GOV_STATE_PUBLISHED = "published"
 _GOV_STATE_REVOKED = "revoked"
+_STALE_TMP_SECONDS = 3600
 
 # Filename slug charset allowlist (path-traversal / weird-char defense). The
 # canonical, collision-free identity is the trailing immutable id; the slug is
@@ -364,7 +366,11 @@ def select_published_notes(conn: sqlite3.Connection) -> list[PublishRecord]:
                 governance_state=_GOV_STATE_PUBLISHED,
                 approved_at=r["updated_at"],
                 updated_at=r["updated_at"],
-                extra={"type": r["type"], "status": r["status"], "project": r["project"]},
+                extra={
+                    "type": r["type"],
+                    "status": r["status"],
+                    "project": r["project"],
+                },
             )
         )
     return out
@@ -560,6 +566,24 @@ def _atomic_write(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
+def _cleanup_stale_tmp_files(vault_root: Path) -> int:
+    """Best-effort cleanup of old emitter temps without racing active emits."""
+    cutoff = time.time() - _STALE_TMP_SECONDS
+    removed = 0
+    for subdir in (SUBDIR_FACTS, SUBDIR_ENTITIES, SUBDIR_RELATIONS, SUBDIR_NOTES):
+        managed_dir = vault_root / subdir
+        if not managed_dir.is_dir():
+            continue
+        for tmp_path in managed_dir.glob("*.md.tmp"):
+            try:
+                if tmp_path.stat().st_mtime <= cutoff:
+                    tmp_path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
 def _resolve_under_root(vault_root: Path, relpath: str) -> Path:
     """Resolve a vault-relative path, rejecting any escape outside the root."""
     root = vault_root.resolve()
@@ -591,6 +615,7 @@ def emit(
     db = db_path or DB_PATH
     vault_root = Path(vault_path or DEFAULT_VAULT_PATH)
     result = EmitResult()
+    _cleanup_stale_tmp_files(vault_root)
 
     conn = open_readonly(db)
     try:
@@ -678,9 +703,7 @@ def _tombstone_orphans(
 
 
 _FM_FIELD_RE = re.compile(r'^([a-z_]+):\s*"(.*)"\s*$', re.MULTILINE)
-_GOVSTATE_LINE_RE = re.compile(
-    r'^governance_state:\s*"[a-z_]+"\s*$', re.MULTILINE
-)
+_GOVSTATE_LINE_RE = re.compile(r'^governance_state:\s*"[a-z_]+"\s*$', re.MULTILINE)
 
 
 def _make_tombstone_from_existing(path: Path, existing: str) -> str | None:
@@ -710,7 +733,7 @@ def _make_tombstone_from_existing(path: Path, existing: str) -> str | None:
     title = title_match.group(1).strip() if title_match else fields["source_id"]
 
     new_frontmatter = _GOVSTATE_LINE_RE.sub(
-        f'governance_state: {_yaml_scalar(_GOV_STATE_REVOKED)}',
+        f"governance_state: {_yaml_scalar(_GOV_STATE_REVOKED)}",
         frontmatter,
         count=1,
     )

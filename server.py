@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""SQLite-backed MCP Memory Server — Core Knowledge Graph (9 tools).
+"""SQLite-backed MCP Memory Server — Core Knowledge Graph.
 
 Production-quality persistent memory with WAL concurrent safety,
 FTS5 BM25-ranked search. Tools 1-9: entity/observation/relation CRUD,
 read_graph, search_nodes, open_nodes.
 
-Other tools split into domain micro-servers (session, bridge, collab,
-entity, intel) to stay under Claude Code's ~9 tool visibility limit.
+Other tools remain split into domain servers for modular startup, ownership,
+and fault isolation; ``unified_server.py`` mounts the complete surface.
 """
 
 from __future__ import annotations
@@ -66,6 +66,23 @@ mcp = FastMCP(
 def _fts_remove(conn, entity_id: int) -> None:
     """Remove entity from FTS index."""
     conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (entity_id,))
+
+
+def _record_entity_access(
+    conn: sqlite3.Connection, entity_ids: list[int], tool_name: str
+) -> None:
+    """Best-effort batched access telemetry for read tools."""
+    if not entity_ids:
+        return
+    now = _now()
+    try:
+        conn.executemany(
+            "INSERT INTO entity_access_log (entity_id, tool_name, accessed_at) "
+            "VALUES (?, ?, ?)",
+            [(entity_id, tool_name, now) for entity_id in dict.fromkeys(entity_ids)],
+        )
+    except sqlite3.OperationalError as exc:
+        logger.debug("Access log write failed: %s", exc)
 
 
 # ── One-time JSONL migration ────────────────────────────────────────────
@@ -285,9 +302,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                 try:
                     _vec_sync(conn, eid)
                 except Exception as exc:
-                    logger.debug(
-                        "vec_sync(%s) skipped: %s", eid, exc, exc_info=True
-                    )
+                    logger.debug("vec_sync(%s) skipped: %s", eid, exc, exc_info=True)
             if contents:
                 try:
                     from lazy_enrichment import extract_inline_claims
@@ -397,9 +412,7 @@ def delete_entities(entityNames: list[str]) -> str:
                 try:
                     _vec_remove(conn, eid)
                 except Exception as exc:
-                    logger.debug(
-                        "vec_remove(%s) skipped: %s", eid, exc, exc_info=True
-                    )
+                    logger.debug("vec_remove(%s) skipped: %s", eid, exc, exc_info=True)
             conn.execute("DELETE FROM entities WHERE id = ?", (eid,))
             deleted += 1
 
@@ -449,9 +462,7 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
                 try:
                     _vec_sync(conn, eid)
                 except Exception as exc:
-                    logger.debug(
-                        "vec_sync(%s) skipped: %s", eid, exc, exc_info=True
-                    )
+                    logger.debug("vec_sync(%s) skipped: %s", eid, exc, exc_info=True)
 
     logger.info("delete_observations: %d deleted", deleted)
     return json.dumps({"deleted": deleted})
@@ -662,16 +673,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                     entity["project"] = r["project"]
                 results.append(entity)
 
-        now = _now()
-        try:
-            for eid in eids:
-                conn.execute(
-                    "INSERT INTO entity_access_log (entity_id, tool_name, accessed_at) "
-                    "VALUES (?, 'search_nodes', ?)",
-                    (eid, now),
-                )
-        except sqlite3.OperationalError as e:
-            logger.debug("Access log write failed: %s", e)
+        _record_entity_access(conn, eids, "search_nodes")
 
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
     return json.dumps({"entities": results, "query": query})
@@ -707,17 +709,7 @@ def open_nodes(names: list[str]) -> str:
             _export_relations(conn, found_ids) if len(found_ids) >= 2 else []
         )
 
-        if found_ids:
-            now = _now()
-            try:
-                for eid in found_ids:
-                    conn.execute(
-                        "INSERT INTO entity_access_log (entity_id, tool_name, accessed_at) "
-                        "VALUES (?, 'open_nodes', ?)",
-                        (eid, now),
-                    )
-            except sqlite3.OperationalError:
-                pass
+        _record_entity_access(conn, found_ids, "open_nodes")
 
     return json.dumps({"entities": entities_out, "relations": relations_out})
 

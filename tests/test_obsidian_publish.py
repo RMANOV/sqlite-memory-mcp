@@ -27,6 +27,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -126,7 +127,12 @@ def governed_db(db_path):
     conn = _conn(db_path)
     try:
         # APPROVED (eligible)
-        pub_a = _add_entity(conn, "Public Alpha", visibility="public", obs=["alpha obs 1", "alpha obs 2"])
+        pub_a = _add_entity(
+            conn,
+            "Public Alpha",
+            visibility="public",
+            obs=["alpha obs 1", "alpha obs 2"],
+        )
         pub_b = _add_entity(conn, "Public Beta", visibility="public", obs=["beta obs"])
         _add_relation(conn, pub_a, pub_b, "depends_on")  # both public -> eligible
         _add_task(conn, "note-pub", "Published Note", visibility="public")
@@ -134,7 +140,9 @@ def governed_db(db_path):
 
         # DENIED (must NEVER be emitted)
         priv = _add_entity(conn, "Private One", visibility="private", obs=["secret"])
-        pend = _add_entity(conn, "Pending One", visibility="pending_public", obs=["staged"])
+        pend = _add_entity(
+            conn, "Pending One", visibility="pending_public", obs=["staged"]
+        )
         _add_relation(conn, pub_a, priv, "references")  # one endpoint private -> denied
         _add_relation(conn, pub_a, pend, "references")  # one endpoint pending -> denied
         _add_task(conn, "note-priv", "Private Note", visibility="private")
@@ -314,6 +322,21 @@ def test_idempotent_reemit_is_byte_identical(governed_db, vault):
     assert len(r2.skipped) >= len(r1.written)
 
 
+def test_emit_removes_only_stale_managed_tmp_files(governed_db, vault):
+    notes_dir = Path(vault) / op.SUBDIR_NOTES
+    notes_dir.mkdir(parents=True)
+    stale = notes_dir / "orphan.md.tmp"
+    fresh = notes_dir / "active.md.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    fresh.write_text("fresh", encoding="utf-8")
+    os.utime(stale, (1, 1))
+
+    op.emit(db_path=governed_db["db"], vault_path=vault)
+
+    assert not stale.exists()
+    assert fresh.exists()
+
+
 def test_determinism_fresh_dir(governed_db, tmp_path):
     """Same governed input -> byte-identical output into two FRESH dirs."""
     v1 = str(tmp_path / "v1")
@@ -364,7 +387,9 @@ def test_revoked_fact_becomes_tombstone(governed_db, vault):
     orig_hash = op._HASH_RE.search(orig_published).group(1)
     orig_genver = op._FM_FIELD_RE.search(
         "\n".join(
-            ln for ln in orig_published.splitlines() if ln.startswith("generator_version:")
+            ln
+            for ln in orig_published.splitlines()
+            if ln.startswith("generator_version:")
         )
     ).group(2)
 
@@ -468,7 +493,11 @@ def test_legitimate_source_update_is_not_flagged_as_overwrite(governed_db, vault
     try:
         conn.execute(
             "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
-            (governed_db["public_entity"], "freshly added observation", "2026-06-01T00:00:00+00:00"),
+            (
+                governed_db["public_entity"],
+                "freshly added observation",
+                "2026-06-01T00:00:00+00:00",
+            ),
         )
         conn.execute(
             "UPDATE entities SET updated_at='2026-06-01T00:00:00+00:00' WHERE id=?",

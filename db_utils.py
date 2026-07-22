@@ -2863,6 +2863,51 @@ class TaskDAO:
         return ids
 
     @staticmethod
+    def bump_overdue_priority(
+        conn: sqlite3.Connection,
+        target_priority: str,
+        *,
+        dry_run: bool = False,
+        tool_name: str = "db_utils.TaskDAO.bump_overdue_priority",
+    ) -> list[dict[str, Any]]:
+        """Raise overdue task priorities; notes are never candidates."""
+        if target_priority not in PRIORITY_RANK:
+            raise ValueError(f"Invalid priority: {target_priority}")
+        target_rank = PRIORITY_RANK[target_priority]
+        lower_priorities = [
+            priority for priority, rank in PRIORITY_RANK.items() if rank < target_rank
+        ]
+        if not lower_priorities:
+            return []
+
+        exclusions = ",".join("?" * len(TASK_ACTIVE_EXCLUSIONS))
+        priorities = ",".join("?" * len(lower_priorities))
+        rows = conn.execute(
+            f"SELECT id, title, priority, due_date FROM tasks "
+            "WHERE type = 'task' AND due_date < date('now') "
+            f"AND status NOT IN ({exclusions}) "
+            f"AND priority IN ({priorities})",
+            [*TASK_ACTIVE_EXCLUSIONS, *lower_priorities],
+        ).fetchall()
+        candidates = [dict(row) for row in rows]
+        if dry_run:
+            return candidates
+
+        ts = now_iso()
+        bumped: list[dict[str, Any]] = []
+        for candidate in candidates:
+            result = apply_task_mutation(
+                conn,
+                candidate["id"],
+                {"priority": target_priority},
+                timestamp=ts,
+                tool_name=tool_name,
+            )
+            if result.get("updated", 0):
+                bumped.append(candidate)
+        return bumped
+
+    @staticmethod
     def promote_pending_public(
         conn: sqlite3.Connection,
         cutoff_ts: str,
@@ -3907,10 +3952,8 @@ def upsert_field_versions(
     _old = old_values or {}
     _new = new_values or {}
     _prov = provenance_map or {}
-    has_old = _sqlite_has_column(conn, "task_field_versions", "old_value")
-    has_new = _sqlite_has_column(conn, "task_field_versions", "new_value")
-    has_order = _sqlite_has_column(conn, "task_field_versions", "updated_order")
-    has_event = _sqlite_has_column(conn, "task_field_versions", "source_event_id")
+    column_flags = _task_field_version_column_flags(conn)
+    has_old, has_new, has_order, has_event = column_flags
     for field in fields:
         ov = _old.get(field)
         nv = _new.get(field)
@@ -3958,7 +4001,20 @@ def upsert_field_versions(
             if has_order
             else None,
             source_event_id=(event_meta or {}).get("event_id") if has_event else None,
+            column_flags=column_flags,
         )
+
+
+def _task_field_version_column_flags(
+    conn: sqlite3.Connection,
+) -> tuple[bool, bool, bool, bool]:
+    """Probe optional field-version columns once for a batch of writes."""
+    return (
+        _sqlite_has_column(conn, "task_field_versions", "old_value"),
+        _sqlite_has_column(conn, "task_field_versions", "new_value"),
+        _sqlite_has_column(conn, "task_field_versions", "updated_order"),
+        _sqlite_has_column(conn, "task_field_versions", "source_event_id"),
+    )
 
 
 def _store_task_field_version(
@@ -3972,19 +4028,25 @@ def _store_task_field_version(
     new_value: str | None = None,
     updated_order: int | None = None,
     source_event_id: str | None = None,
+    column_flags: tuple[bool, bool, bool, bool] | None = None,
 ) -> None:
+    has_old, has_new, has_order, has_event = (
+        column_flags
+        if column_flags is not None
+        else _task_field_version_column_flags(conn)
+    )
     columns = ["task_id", "field_name", "updated_at", "updated_by"]
     values: list[Any] = [task_id, field_name, updated_at, updated_by]
-    if _sqlite_has_column(conn, "task_field_versions", "old_value"):
+    if has_old:
         columns.append("old_value")
         values.append(old_value)
-    if _sqlite_has_column(conn, "task_field_versions", "new_value"):
+    if has_new:
         columns.append("new_value")
         values.append(new_value)
-    if _sqlite_has_column(conn, "task_field_versions", "updated_order"):
+    if has_order:
         columns.append("updated_order")
         values.append(int(updated_order or 0))
-    if _sqlite_has_column(conn, "task_field_versions", "source_event_id"):
+    if has_event:
         columns.append("source_event_id")
         values.append(source_event_id)
     placeholders = ", ".join("?" for _ in columns)
@@ -4010,12 +4072,16 @@ ENTITY_EXPORT_COLS = (
 
 def _task_field_version_select(
     conn: sqlite3.Connection,
+    column_flags: tuple[bool, bool, bool, bool] | None = None,
 ) -> tuple[str, bool, bool]:
+    _has_old, has_new, has_order, has_event = (
+        column_flags
+        if column_flags is not None
+        else _task_field_version_column_flags(conn)
+    )
     cols = ["task_id", "field_name", "updated_at", "updated_by"]
-    if _sqlite_has_column(conn, "task_field_versions", "new_value"):
+    if has_new:
         cols.append("new_value")
-    has_order = _sqlite_has_column(conn, "task_field_versions", "updated_order")
-    has_event = _sqlite_has_column(conn, "task_field_versions", "source_event_id")
     if has_order:
         cols.append("updated_order")
     if has_event:
@@ -4801,6 +4867,75 @@ def _field_version_sort_key(
     return (0, parse_iso_datetime_for_compare(updated_at), str(updated_by or ""))
 
 
+def _future_skew_seconds(candidate_ts: str | None, now: str) -> float:
+    return (
+        parse_iso_datetime_for_compare(candidate_ts)
+        - parse_iso_datetime_for_compare(now)
+    ).total_seconds()
+
+
+def _clamp_field_version_clock(
+    updated_at: str,
+    updated_order: int,
+    now: str,
+) -> tuple[str, int, bool]:
+    clamped_at = now if _future_skew_seconds(updated_at, now) > 5 else updated_at
+    clamped_order = int(updated_order or 0)
+    physical_ms, counter = _decode_logical_clock(clamped_order)
+    now_ms = _iso_to_epoch_ms(now)
+    if clamped_order >= _HLC_PACKED_MIN and physical_ms > now_ms + 5_000:
+        clamped_order = _pack_logical_clock(now_ms, counter)
+    return (
+        clamped_at,
+        clamped_order,
+        clamped_at != updated_at or clamped_order != int(updated_order or 0),
+    )
+
+
+def _clamp_remote_field_versions(remote_fts: Any, now: str) -> bool:
+    """Clamp future wall timestamps and packed HLC clocks in bridge metadata."""
+    if not isinstance(remote_fts, dict):
+        return False
+
+    changed = False
+    for field, raw_entry in list(remote_fts.items()):
+        entry = list(raw_entry) if isinstance(raw_entry, tuple) else raw_entry
+        if entry is not raw_entry:
+            remote_fts[field] = entry
+
+        if isinstance(entry, list):
+            updated_at = str(entry[0] or "") if entry else ""
+            order_index = 2
+        elif isinstance(entry, dict):
+            updated_at = str(entry.get("updated_at") or "")
+            order_index = None
+        else:
+            continue
+
+        try:
+            if order_index is not None:
+                order = int(entry[order_index] if len(entry) > order_index else 0)
+            else:
+                order = int(entry.get("updated_order", 0))
+        except (TypeError, ValueError):
+            continue
+        clamped_at, clamped_order, entry_changed = _clamp_field_version_clock(
+            updated_at, order, now
+        )
+        if entry_changed:
+            if order_index is not None:
+                if entry:
+                    entry[0] = clamped_at
+                if len(entry) > order_index:
+                    entry[order_index] = clamped_order
+            else:
+                entry["updated_at"] = clamped_at
+                if "updated_order" in entry or clamped_order:
+                    entry["updated_order"] = clamped_order
+            changed = True
+    return changed
+
+
 def merge_import_tasks(
     conn: sqlite3.Connection,
     remote_tasks: list[dict],
@@ -4828,6 +4963,7 @@ def merge_import_tasks(
     updated_fields = 0
     now = now_iso()
     _clock_skew_warned = False  # only log once per merge batch
+    field_version_column_flags = _task_field_version_column_flags(conn)
 
     # Sort parents before children to avoid FK violations
     tasks_sorted = sorted(
@@ -4846,19 +4982,60 @@ def merge_import_tasks(
             f"SELECT id, updated_at FROM tasks WHERE id IN ({placeholders})",
             remote_ids,
         ).fetchall()
-        existing_map = {r["id"]: r for r in existing_rows}
+        existing_map: dict[str, dict[str, Any]] = {}
+        for row in existing_rows:
+            local_updated_at = str(row["updated_at"] or "")
+            if _future_skew_seconds(local_updated_at, now) > 5:
+                local_updated_at = now
+                if not _clock_skew_warned:
+                    _log.warning(
+                        "Clock skew detected in local task %s; clamping future "
+                        "timestamps and logical clocks to now.",
+                        row["id"],
+                    )
+                    _clock_skew_warned = True
+            existing_map[row["id"]] = {
+                "id": row["id"],
+                "updated_at": local_updated_at,
+            }
 
-        fv_select, has_order, has_event = _task_field_version_select(conn)
+        fv_select, has_order, has_event = _task_field_version_select(
+            conn, field_version_column_flags
+        )
         fv_rows = conn.execute(
             f"SELECT {fv_select} FROM task_field_versions WHERE task_id IN ({placeholders})",
             remote_ids,
         ).fetchall()
         fv_map: dict[str, dict[str, tuple[str, str, int, str | None]]] = {}
+        raw_local_status_versions: dict[str, tuple[str, str, int, str | None]] = {}
         for r in fv_rows:
-            fv_map.setdefault(r["task_id"], {})[r["field_name"]] = (
-                r["updated_at"],
-                r["updated_by"],
+            raw_field_version = (
+                str(r["updated_at"] or ""),
+                str(r["updated_by"] or ""),
                 int(r["updated_order"]) if has_order else 0,
+                r["source_event_id"] if has_event else None,
+            )
+            if r["field_name"] == "status":
+                raw_local_status_versions[r["task_id"]] = raw_field_version
+            field_updated_at, field_updated_order, field_clock_skewed = (
+                _clamp_field_version_clock(
+                    raw_field_version[0],
+                    raw_field_version[2],
+                    now,
+                )
+            )
+            if field_clock_skewed:
+                if not _clock_skew_warned:
+                    _log.warning(
+                        "Clock skew detected in local task %s; clamping future "
+                        "timestamps and logical clocks for this merge.",
+                        r["task_id"],
+                    )
+                    _clock_skew_warned = True
+            fv_map.setdefault(r["task_id"], {})[r["field_name"]] = (
+                field_updated_at,
+                r["updated_by"],
+                field_updated_order,
                 r["source_event_id"] if has_event else None,
             )
 
@@ -4871,6 +5048,7 @@ def merge_import_tasks(
         existing_map = {}
         fv_map = {}
         task_content_map = {}
+        raw_local_status_versions = {}
 
     local_status_authority = _compute_authoritative_task_statuses(
         conn, list(task_content_map.values())
@@ -4885,6 +5063,22 @@ def merge_import_tasks(
         remote["project"] = normalize_project_name(remote.get("project"))
         remote_fts = remote.get("_field_ts", {})
         fallback_ts = remote.get("updated_at", "")
+        raw_remote_status_version = _parse_field_ts(remote_fts, "status", fallback_ts)
+        row_skew_seconds = _future_skew_seconds(fallback_ts, now)
+        field_clock_skewed = _clamp_remote_field_versions(remote_fts, now)
+        if row_skew_seconds > 5:
+            fallback_ts = now
+            if _timestamp_is_newer(remote.get("updated_at", ""), now):
+                remote["updated_at"] = now
+        if field_clock_skewed:
+            remote["_field_ts"] = remote_fts
+        if (row_skew_seconds > 5 or field_clock_skewed) and not _clock_skew_warned:
+            _log.warning(
+                "Clock skew detected in remote task %s; clamping future "
+                "timestamps and logical clocks to now.",
+                tid,
+            )
+            _clock_skew_warned = True
         source_machine_id = (
             remote.get("_source_machine_id")
             or remote.get("source_machine")
@@ -4930,6 +5124,22 @@ def merge_import_tasks(
             event_by_id=remote_event_by_id,
             event_head=remote_status_heads.get(tid),
         )
+        resolved_remote_status_version = (
+            str(remote_status_state.get("updated_at") or remote_status_ts),
+            str(remote_status_state.get("updated_by") or remote_status_by),
+            int(remote_status_state.get("updated_order") or remote_status_order),
+            remote_status_state.get("source_event_id") or remote_status_event_id,
+        )
+        if _field_version_sort_key(
+            resolved_remote_status_version[0],
+            resolved_remote_status_version[1],
+            resolved_remote_status_version[2],
+        ) > _field_version_sort_key(
+            raw_remote_status_version[0],
+            raw_remote_status_version[1],
+            raw_remote_status_version[2],
+        ):
+            raw_remote_status_version = resolved_remote_status_version
         resolved_remote_status = _normalize_task_status_value(
             remote_status_state.get("value")
         )
@@ -4965,37 +5175,21 @@ def merge_import_tasks(
                 ):
                     remote["updated_at"] = remote_status_state["updated_at"]
                     fallback_ts = remote["updated_at"]
-
-        # Clock skew detection + clamping: prevent future timestamps from
-        # permanently winning all LWW merges (LW-02 fix)
-        if _timestamp_is_newer(fallback_ts, now):
-            try:
-                delta = (
-                    datetime.fromisoformat(fallback_ts) - datetime.fromisoformat(now)
-                ).total_seconds()
-                if delta > 5:
-                    if not _clock_skew_warned:
-                        _log.warning(
-                            "Clock skew detected: remote is %.1fs ahead (task %s). "
-                            "Clamping future timestamps to now.",
-                            delta,
-                            tid,
-                        )
-                        _clock_skew_warned = True
-                    # Clamp all future field timestamps to now
-                    fallback_ts = now
-                    if _timestamp_is_newer(remote.get("updated_at", ""), now):
-                        remote["updated_at"] = now
-                    fts = remote.get("_field_ts", {})
-                    for f_key, f_val in fts.items():
-                        if (
-                            isinstance(f_val, list)
-                            and f_val
-                            and _timestamp_is_newer(str(f_val[0]), now)
-                        ):
-                            f_val[0] = now
-            except (ValueError, TypeError):
-                pass
+        resolved_row_skewed = _future_skew_seconds(fallback_ts, now) > 5
+        if resolved_row_skewed:
+            fallback_ts = now
+            if _timestamp_is_newer(remote.get("updated_at", ""), now):
+                remote["updated_at"] = now
+        resolved_field_skewed = _clamp_remote_field_versions(remote_fts, now)
+        if resolved_field_skewed:
+            remote["_field_ts"] = remote_fts
+        if (resolved_row_skewed or resolved_field_skewed) and not _clock_skew_warned:
+            _log.warning(
+                "Clock skew detected in resolved status for remote task %s; "
+                "clamping future timestamps and logical clocks to now.",
+                tid,
+            )
+            _clock_skew_warned = True
 
         # Handle tombstones — only merge status field
         if remote.get("_tombstone"):
@@ -5012,6 +5206,17 @@ def merge_import_tasks(
                 tombstone_wins = _field_version_sort_key(
                     remote_ts, remote_by, remote_order
                 ) > _field_version_sort_key(local_ts, local_by, local_order)
+                raw_local_status = raw_local_status_versions.get(tid)
+                if raw_local_status is not None:
+                    tombstone_wins = tombstone_wins or _field_version_sort_key(
+                        raw_remote_status_version[0],
+                        raw_remote_status_version[1],
+                        raw_remote_status_version[2],
+                    ) > _field_version_sort_key(
+                        raw_local_status[0],
+                        raw_local_status[1],
+                        raw_local_status[2],
+                    )
 
                 # Fallback: if field timestamps are equal, tombstone wins
                 # when its updated_at is newer (archival may not update field_versions)
@@ -5062,6 +5267,7 @@ def merge_import_tasks(
                         updated_by=remote_by or MACHINE_ID,
                         updated_order=remote_order,
                         source_event_id=remote_event_id,
+                        column_flags=field_version_column_flags,
                     )
                     updated_fields += 1
             else:
@@ -5112,6 +5318,7 @@ def merge_import_tasks(
                         updated_by=fby,
                         updated_order=forder,
                         source_event_id=fevent,
+                        column_flags=field_version_column_flags,
                     )
                 new_count += 1
             continue
@@ -5359,6 +5566,7 @@ def merge_import_tasks(
                         else None,
                         updated_order=remote_order,
                         source_event_id=remote_event_id,
+                        column_flags=field_version_column_flags,
                     )
                     if local_val != remote_val:
                         fields_to_update[field] = remote_val
@@ -5514,6 +5722,7 @@ def merge_import_tasks(
                     updated_by=fby,
                     updated_order=forder,
                     source_event_id=fevent,
+                    column_flags=field_version_column_flags,
                 )
             new_count += 1
 

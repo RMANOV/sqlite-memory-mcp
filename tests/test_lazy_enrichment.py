@@ -52,6 +52,7 @@ def conn():
             predicate TEXT NOT NULL,
             object_text TEXT NOT NULL,
             confidence REAL NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 1,
             status TEXT NOT NULL DEFAULT 'candidate',
             promoted_to_fact_id TEXT NULL,
             created_at TEXT NOT NULL,
@@ -150,9 +151,28 @@ class TestInlineExtraction:
         # Second mention of same claim should boost confidence
         extract_inline_claims(conn, eid, obs2_id, "MyApp uses Redis for caching.")
         claim2 = conn.execute(
-            "SELECT confidence FROM lazy_claims WHERE subject = 'MyApp' AND object_text LIKE '%Redis for caching%'"
+            "SELECT confidence, hit_count FROM lazy_claims "
+            "WHERE subject = 'MyApp' AND object_text LIKE '%Redis for caching%'"
         ).fetchone()
         assert claim2["confidence"] > conf1
+        assert claim2["hit_count"] == 2
+
+    def test_repeated_evidence_reaches_auto_promotion_threshold(self, conn):
+        eid = _add_entity(conn, "EvidenceApp")
+        text = "EvidenceApp uses Redis for caching."
+
+        for index in range(4):
+            obs_id = _add_obs(conn, eid, f"evidence observation {index}")
+            extract_inline_claims(conn, eid, obs_id, text)
+
+        claim = conn.execute(
+            "SELECT confidence, hit_count, status, promoted_to_fact_id "
+            "FROM lazy_claims WHERE subject = 'EvidenceApp'"
+        ).fetchone()
+        assert claim["hit_count"] == 4
+        assert claim["confidence"] >= 0.85
+        assert claim["status"] == "promoted"
+        assert claim["promoted_to_fact_id"]
 
     def test_rejection_penalty(self, conn):
         eid = _add_entity(conn, "TestTool")
@@ -271,12 +291,18 @@ class TestContradictions:
 
         # Insert contradicting claims: "X uses Y" and "X replaces Y"
         conn.execute(
-            "INSERT INTO lazy_claims VALUES ('c1', ?, ?, 'Widget', 'uses', 'Library', 0.7, "
+            "INSERT INTO lazy_claims (claim_id, entity_id, observation_id, subject, "
+            "predicate, object_text, confidence, status, promoted_to_fact_id, "
+            "created_at, updated_at) VALUES "
+            "('c1', ?, ?, 'Widget', 'uses', 'Library', 0.7, "
             "'candidate', NULL, '2026-03-01', '2026-03-01')",
             (eid, obs_id),
         )
         conn.execute(
-            "INSERT INTO lazy_claims VALUES ('c2', ?, ?, 'Widget', 'replaces', 'Library', 0.6, "
+            "INSERT INTO lazy_claims (claim_id, entity_id, observation_id, subject, "
+            "predicate, object_text, confidence, status, promoted_to_fact_id, "
+            "created_at, updated_at) VALUES "
+            "('c2', ?, ?, 'Widget', 'replaces', 'Library', 0.6, "
             "'candidate', NULL, '2026-03-01', '2026-03-01')",
             (eid, obs_id),
         )
@@ -289,12 +315,18 @@ class TestContradictions:
         obs_id = _add_obs(conn, eid, "Test")
 
         conn.execute(
-            "INSERT INTO lazy_claims VALUES ('nc1', ?, ?, 'App', 'uses', 'Redis', 0.7, "
+            "INSERT INTO lazy_claims (claim_id, entity_id, observation_id, subject, "
+            "predicate, object_text, confidence, status, promoted_to_fact_id, "
+            "created_at, updated_at) VALUES "
+            "('nc1', ?, ?, 'App', 'uses', 'Redis', 0.7, "
             "'candidate', NULL, '2026-03-01', '2026-03-01')",
             (eid, obs_id),
         )
         conn.execute(
-            "INSERT INTO lazy_claims VALUES ('nc2', ?, ?, 'App', 'replaces', 'Memcached', 0.6, "
+            "INSERT INTO lazy_claims (claim_id, entity_id, observation_id, subject, "
+            "predicate, object_text, confidence, status, promoted_to_fact_id, "
+            "created_at, updated_at) VALUES "
+            "('nc2', ?, ?, 'App', 'replaces', 'Memcached', 0.6, "
             "'candidate', NULL, '2026-03-01', '2026-03-01')",
             (eid, obs_id),
         )
@@ -324,13 +356,19 @@ class TestPromoteReady:
 
         # Insert claim above threshold
         conn.execute(
-            "INSERT INTO lazy_claims VALUES ('batch1', ?, ?, 'BatchEntity', 'uses', 'FastAPI', "
+            "INSERT INTO lazy_claims (claim_id, entity_id, observation_id, subject, "
+            "predicate, object_text, confidence, status, promoted_to_fact_id, "
+            "created_at, updated_at) VALUES "
+            "('batch1', ?, ?, 'BatchEntity', 'uses', 'FastAPI', "
             "0.9, 'candidate', NULL, '2026-03-01', '2026-03-01')",
             (eid, obs_id),
         )
         # Insert claim below threshold
         conn.execute(
-            "INSERT INTO lazy_claims VALUES ('batch2', ?, ?, 'BatchEntity', 'is', 'framework', "
+            "INSERT INTO lazy_claims (claim_id, entity_id, observation_id, subject, "
+            "predicate, object_text, confidence, status, promoted_to_fact_id, "
+            "created_at, updated_at) VALUES "
+            "('batch2', ?, ?, 'BatchEntity', 'is', 'framework', "
             "0.3, 'candidate', NULL, '2026-03-01', '2026-03-01')",
             (eid, obs_id),
         )

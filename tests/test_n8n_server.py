@@ -26,6 +26,7 @@ import sqlite3
 import sys
 
 import pytest
+from fastmcp import Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -91,8 +92,20 @@ def n8n(tmp_path, monkeypatch):
     return mod
 
 
+async def _list_tools(mcp):
+    """List tools through the supported in-memory FastMCP client transport."""
+    async with Client(mcp) as client:
+        return await client.list_tools()
+
+
+async def _call_tool(mcp, name: str, arguments: dict):
+    """Invoke a tool through the supported in-memory FastMCP client transport."""
+    async with Client(mcp) as client:
+        return await client.call_tool(name, arguments)
+
+
 def _list_tool_names(mcp) -> set[str]:
-    return {t.name for t in asyncio.run(mcp.list_tools())}
+    return {t.name for t in asyncio.run(_list_tools(mcp))}
 
 
 # ── Allowlist / surface ─────────────────────────────────────────────────────
@@ -124,9 +137,9 @@ def test_denied_tool_call_is_rejected(n8n):
     """Calling a non-allowlisted (denied) tool fails — it is not on the surface."""
     mcp = n8n.build_n8n_server(BEARER)
     with pytest.raises(Exception):
-        asyncio.run(mcp.call_tool("delete_entities", {"entityNames": ["x"]}))
+        asyncio.run(_call_tool(mcp, "delete_entities", {"entityNames": ["x"]}))
     with pytest.raises(Exception):
-        asyncio.run(mcp.call_tool("promote_candidate", {}))
+        asyncio.run(_call_tool(mcp, "promote_candidate", {}))
 
 
 # ── Fail-closed bearer auth ─────────────────────────────────────────────────
@@ -193,9 +206,7 @@ def _http_status(app, headers, payload):
 def test_http_rejects_missing_bearer(n8n):
     """No Authorization header -> 401."""
     app = n8n.build_n8n_server(BEARER).http_app()
-    status = _http_status(
-        app, {}, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-    )
+    status = _http_status(app, {}, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert status == 401
 
 
@@ -293,9 +304,9 @@ def test_no_host_env_var_is_read_in_source(n8n):
             is_env_read = False
             if isinstance(func, ast.Attribute) and func.attr in ("get", "getenv"):
                 target = func.value
-                if (
-                    isinstance(target, ast.Attribute) and target.attr == "environ"
-                ) or (isinstance(target, ast.Name) and target.id == "os"):
+                if (isinstance(target, ast.Attribute) and target.attr == "environ") or (
+                    isinstance(target, ast.Name) and target.id == "os"
+                ):
                     is_env_read = True
             if is_env_read and node.args and isinstance(node.args[0], ast.Constant):
                 key = node.args[0].value
@@ -320,7 +331,8 @@ def test_append_happy_path_and_durable_origin_tagging(n8n):
     """One append: entity created, entity.origin stamped, audit event recorded."""
     mcp = n8n.build_n8n_server(BEARER)
     result = asyncio.run(
-        mcp.call_tool(
+        _call_tool(
+            mcp,
             "create_entities",
             {
                 "entities": [
@@ -368,17 +380,22 @@ def test_read_happy_path(n8n):
     """One read: appended entity is visible through read_graph."""
     mcp = n8n.build_n8n_server(BEARER)
     asyncio.run(
-        mcp.call_tool(
+        _call_tool(
+            mcp,
             "create_entities",
             {
                 "entities": [
-                    {"name": "Readable-Entity", "entityType": "note", "observations": []}
+                    {
+                        "name": "Readable-Entity",
+                        "entityType": "note",
+                        "observations": [],
+                    }
                 ],
                 "source": "wf-read",
             },
         )
     )
-    result = asyncio.run(mcp.call_tool("read_graph", {"offset": 0, "limit": 50}))
+    result = asyncio.run(_call_tool(mcp, "read_graph", {"offset": 0, "limit": 50}))
     assert "Readable-Entity" in str(result.structured_content)
 
 
@@ -387,7 +404,8 @@ def test_all_write_tools_audit_uniformly(n8n):
     mcp = n8n.build_n8n_server(BEARER)
     # seed an entity for add_observations / create_relations
     asyncio.run(
-        mcp.call_tool(
+        _call_tool(
+            mcp,
             "create_entities",
             {
                 "entities": [
@@ -399,13 +417,18 @@ def test_all_write_tools_audit_uniformly(n8n):
         )
     )
     asyncio.run(
-        mcp.call_tool(
+        _call_tool(
+            mcp,
             "add_observations",
-            {"observations": [{"entityName": "A", "contents": ["obs1"]}], "source": "wf"},
+            {
+                "observations": [{"entityName": "A", "contents": ["obs1"]}],
+                "source": "wf",
+            },
         )
     )
     asyncio.run(
-        mcp.call_tool(
+        _call_tool(
+            mcp,
             "create_relations",
             {
                 "relations": [{"from": "A", "to": "B", "relationType": "links_to"}],
@@ -414,12 +437,12 @@ def test_all_write_tools_audit_uniformly(n8n):
         )
     )
     create_res = asyncio.run(
-        mcp.call_tool("create_task_or_note", {"title": "T1", "source": "wf"})
+        _call_tool(mcp, "create_task_or_note", {"title": "T1", "source": "wf"})
     )
     task_id = json.loads(create_res.structured_content["result"])["task_id"]
     asyncio.run(
-        mcp.call_tool(
-            "update_task", {"task_id": task_id, "status": "done", "source": "wf"}
+        _call_tool(
+            mcp, "update_task", {"task_id": task_id, "status": "done", "source": "wf"}
         )
     )
 

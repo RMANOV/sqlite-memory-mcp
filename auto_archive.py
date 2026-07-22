@@ -8,13 +8,13 @@ Usage:
 import argparse
 import sqlite3
 
-from db_utils import DB_PATH, apply_task_mutation, get_conn, now_iso
+from db_utils import DB_PATH, TaskDAO, get_conn
 
 
 def dry_run(conn: sqlite3.Connection, days: int) -> None:
     rows = conn.execute(
         "SELECT id, title, status, updated_at FROM tasks "
-        "WHERE status = 'done' "
+        "WHERE status = 'done' AND type = 'task' "
         "AND updated_at < datetime('now', ? || ' days')",
         (f"-{days}",),
     ).fetchall()
@@ -31,23 +31,8 @@ def dry_run(conn: sqlite3.Connection, days: int) -> None:
 
 
 def archive(conn: sqlite3.Connection, days: int) -> None:
-    iso_now = now_iso()
-    rows = conn.execute(
-        "SELECT id FROM tasks WHERE status = 'done' "
-        "AND updated_at < datetime('now', ? || ' days')",
-        (f"-{days}",),
-    ).fetchall()
-    archived = 0
-    for row in rows:
-        result = apply_task_mutation(
-            conn,
-            row["id"],
-            {"status": "archived"},
-            timestamp=iso_now,
-            tool_name="auto_archive.archive",
-        )
-        archived += int(result.get("updated", 0))
-    print(f"Archived {archived} tasks (older than {days} days).")
+    archived_ids = TaskDAO.archive_done(conn, days)
+    print(f"Archived {len(archived_ids)} tasks (older than {days} days).")
 
 
 def main() -> None:

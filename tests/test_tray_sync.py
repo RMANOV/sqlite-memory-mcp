@@ -261,42 +261,6 @@ def test_sync_bridge_skips_when_thread_already_running(bridge_env):
     assert window.status.messages[-1][0] == "Sync already running"
 
 
-def test_bridge_git_pull_uses_fetch_and_ff_only_without_autostash(monkeypatch):
-    calls = []
-
-    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
-        calls.append(args)
-        if args == ("fetch", "origin", "main"):
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args == ("rev-parse", "HEAD"):
-            return SimpleNamespace(returncode=0, stdout="local\n", stderr="")
-        if args == ("rev-parse", "origin/main"):
-            return SimpleNamespace(returncode=0, stdout="remote\n", stderr="")
-        if args == ("merge-base", "HEAD", "origin/main"):
-            return SimpleNamespace(returncode=0, stdout="local\n", stderr="")
-        if args == ("merge", "--ff-only", "origin/main"):
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(f"unexpected git call: {args}")
-
-    monkeypatch.setattr(
-        sys.modules["db_utils"],
-        "git_retry",
-        fake_git_retry,
-    )
-
-    result = tray_sync._bridge_git_pull("bridge")
-
-    assert result.returncode == 0
-    assert ("pull", "--rebase", "--autostash") not in calls
-    assert calls == [
-        ("fetch", "origin", "main"),
-        ("rev-parse", "HEAD"),
-        ("rev-parse", "origin/main"),
-        ("merge-base", "HEAD", "origin/main"),
-        ("merge", "--ff-only", "origin/main"),
-    ]
-
-
 def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     captured = {}
     refreshes = []
@@ -306,14 +270,6 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
         )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
-    heads = ["old-head", "new-head"]
-    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: heads.pop(0))
-    monkeypatch.setattr(
-        tray_sync,
-        "_bridge_git_pull",
-        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
-
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
     window._db_refresh_debounce = SimpleNamespace(
@@ -336,20 +292,18 @@ def test_periodic_pull_uses_pull_only_mode(bridge_env, monkeypatch):
     assert refreshes == ["signal"]
 
 
-def test_periodic_pull_skips_heavy_import_when_git_head_unchanged(
+def test_periodic_pull_delegates_no_change_check_to_locked_worker(
     bridge_env, monkeypatch
 ):
+    captured = {}
     refreshes = []
     bridge_sync_worker = SimpleNamespace(
-        main=lambda **kwargs: pytest.fail("heavy worker should not run")
+        main=lambda **kwargs: (
+            captured.update(kwargs)
+            or {"imported_new": 0, "imported_updated": 0, "pushed": False}
+        )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
-    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: "same-head")
-    monkeypatch.setattr(
-        tray_sync,
-        "_bridge_git_pull",
-        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
 
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
@@ -369,6 +323,7 @@ def test_periodic_pull_skips_heavy_import_when_git_head_unchanged(
 
     window._periodic_pull()
 
+    assert captured["pull_only"] is True
     assert refreshes == []
 
 
@@ -389,14 +344,6 @@ def test_bootstrap_pull_imports_remote_changes_when_git_head_changes(
         )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
-    heads = ["old-head", "new-head"]
-    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: heads.pop(0))
-    monkeypatch.setattr(
-        tray_sync,
-        "_bridge_git_pull",
-        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
-
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
     window._db_refresh_debounce = SimpleNamespace(
@@ -421,23 +368,18 @@ def test_bootstrap_pull_imports_remote_changes_when_git_head_changes(
     assert refreshes == ["signal"]
 
 
-def test_bootstrap_pull_skips_heavy_import_when_git_head_unchanged(
+def test_bootstrap_pull_delegates_no_change_check_to_locked_worker(
     bridge_env, monkeypatch
 ):
-    """Bootstrap still avoids the heavy import worker when nothing arrived
-    (HEAD unchanged) — the import only runs when the pull advanced HEAD."""
+    """Bootstrap never mutates git outside the worker's repo lock."""
+    captured = {}
     bridge_sync_worker = SimpleNamespace(
-        main=lambda **kwargs: pytest.fail(
-            "bootstrap must not import when HEAD is unchanged"
+        main=lambda **kwargs: (
+            captured.update(kwargs)
+            or {"imported_new": 0, "imported_updated": 0, "pushed": False}
         )
     )
     monkeypatch.setitem(sys.modules, "bridge_sync_worker", bridge_sync_worker)
-    monkeypatch.setattr(tray_sync, "_bridge_head", lambda repo_dir: "same-head")
-    monkeypatch.setattr(
-        tray_sync,
-        "_bridge_git_pull",
-        lambda repo_dir: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
 
     window = _DummyWindow(bridge_env)
     window.status = _CaptureStatus()
@@ -452,6 +394,8 @@ def test_bootstrap_pull_skips_heavy_import_when_git_head_unchanged(
     )
 
     window._periodic_pull(initiator="bootstrap")
+
+    assert captured["pull_only"] is True
 
 
 def test_request_db_refresh_from_worker_falls_back_to_timer(bridge_env):
@@ -611,13 +555,25 @@ def test_db_dir_change_with_watch_path_delta_rearms_auto_sync_timer():
         _refresh_db_watch_paths=lambda: True,
         _sync_run_active=False,
         _sync_cooldown_until=0.0,
-        _auto_sync_timer=SimpleNamespace(start=lambda: starts.append("auto-sync")),
+        _arm_auto_sync=lambda initiator: starts.append(initiator),
     )
 
     task_tray.FullWindow._on_db_dir_changed(dummy, "ignored")
 
     assert refreshes == ["refresh"]
-    assert starts == ["auto-sync"]
+    assert starts == ["db_dir_watch_update"]
+
+
+def test_full_window_inherits_db_watch_handlers_from_bridge_mixin():
+    assert "_on_db_changed" not in task_tray.FullWindow.__dict__
+    assert "_on_db_dir_changed" not in task_tray.FullWindow.__dict__
+    assert "_refresh_db_watch_paths" not in task_tray.FullWindow.__dict__
+    assert task_tray.FullWindow._on_db_changed is BridgeSyncMixin._on_db_changed
+    assert task_tray.FullWindow._on_db_dir_changed is BridgeSyncMixin._on_db_dir_changed
+    assert (
+        task_tray.FullWindow._refresh_db_watch_paths
+        is BridgeSyncMixin._refresh_db_watch_paths
+    )
 
 
 def test_initial_auto_sync_only_arms_while_pending():

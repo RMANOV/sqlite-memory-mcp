@@ -477,6 +477,51 @@ def test_archive_done_skips_notes_type(conn):
     assert "old_note" not in archived  # archive_done only targets type='task'
 
 
+def test_upsert_field_versions_probes_optional_columns_once_per_batch(conn):
+    _make_task(conn, "batch-probe", "Batch probe")
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        upsert_field_versions(
+            conn,
+            "batch-probe",
+            ("title", "status", "priority"),
+            record_events=False,
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    probes = [
+        sql
+        for sql in statements
+        if sql.casefold().startswith("pragma table_info('task_field_versions')")
+    ]
+    assert len(probes) == 4
+
+
+def test_bump_overdue_priority_dry_run_and_live_skip_notes(conn):
+    old_due = (datetime.now(timezone.utc) - timedelta(days=2)).date().isoformat()
+    _make_task(conn, "overdue_task", "Overdue task", due_date=old_due, priority="low")
+    _make_task(
+        conn,
+        "overdue_note",
+        "Overdue note",
+        type="note",
+        due_date=old_due,
+        priority="low",
+    )
+
+    candidates = TaskDAO.bump_overdue_priority(conn, "high", dry_run=True)
+    assert [candidate["id"] for candidate in candidates] == ["overdue_task"]
+    assert TaskDAO.get_by_id(conn, "overdue_task")["priority"] == "low"
+
+    bumped = TaskDAO.bump_overdue_priority(conn, "high")
+
+    assert [candidate["id"] for candidate in bumped] == ["overdue_task"]
+    assert TaskDAO.get_by_id(conn, "overdue_task")["priority"] == "high"
+    assert TaskDAO.get_by_id(conn, "overdue_note")["priority"] == "low"
+
+
 # ── promote_pending_public ────────────────────────────────────────────────
 
 

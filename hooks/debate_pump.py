@@ -37,6 +37,10 @@ def _default_repo() -> Path:
 
 REPO = Path(os.environ.get("DEBATE_REPO", str(_default_repo())))
 IS_WINDOWS = sys.platform == "win32"
+for _import_root in (HOOK_DIR, REPO):
+    _import_path = str(_import_root)
+    if _import_path not in sys.path:
+        sys.path.insert(0, _import_path)
 _ROLE_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
 _HUMAN_ROLES = {"HUMAN", "OPERATOR"}
 DB_PATH = Path(
@@ -508,7 +512,6 @@ def _count_launched(dispatch_result: dict[str, Any] | None) -> int:
 
 
 def _dispatch_row(row: sqlite3.Row, suppressed_roles: set[str]) -> int:
-    sys.path.insert(0, str(HOOK_DIR))
     import debate_wake
 
     os.environ.setdefault("DEBATE_WAKE_ACTION", "agent")
@@ -584,7 +587,6 @@ def _reclaim_stale_message_claims(
 ) -> None:
     if stale_seconds <= 0:
         return
-    sys.path.insert(0, str(REPO))
     from db_utils import get_conn_immediate
     from debate import reclaim_stale_message_claims
 
@@ -669,6 +671,15 @@ def _machine_live_worker_count(topics: list[str]) -> int:
     return len(live)
 
 
+def _safe_machine_live_worker_count(topics: list[str]) -> int:
+    """Return the durable census without letting a transient read kill the pump."""
+    try:
+        return _machine_live_worker_count(topics)
+    except Exception as exc:
+        _log("machine_live_worker_count_failed", error=repr(exc))
+        return len(CHILDREN)
+
+
 def _live_worker_session_ids(topic_id: str) -> set[str]:
     """Resolve live derived workers from their durable real-spawn receipts."""
     con = sqlite3.connect(DB_PATH)
@@ -715,7 +726,6 @@ def _recover_stale_worker_claims(
 ) -> None:
     if stale_seconds <= 0:
         return
-    sys.path.insert(0, str(REPO))
     from db_utils import get_conn_immediate
     from debate import recover_stale_worker_claims
 
@@ -797,7 +807,6 @@ def _reap_children() -> None:
 def _current_auto_budget() -> Any | None:
     if os.environ.get("DEBATE_RESOURCE_BUDGET", "auto") == "off":
         return None
-    sys.path.insert(0, str(HOOK_DIR))
     from debate_resource_budget import current_debate_resource_budget
 
     return current_debate_resource_budget()
@@ -805,7 +814,6 @@ def _current_auto_budget() -> Any | None:
 
 def _protocol_maintenance(topics: list[str]) -> dict[str, list[dict[str, Any]]]:
     """Apply timeout and same-role recovery transitions in one DB commit."""
-    sys.path.insert(0, str(REPO))
     from debate_protocol_v1 import sweep_missing_roles, transition_expired_protocols
 
     con = sqlite3.connect(DB_PATH, isolation_level=None)
@@ -872,7 +880,6 @@ def _adaptive_scheduler_decision(
     resource_blocked: bool = False,
     resource_interval: float = 0.0,
 ) -> dict[str, Any]:
-    sys.path.insert(0, str(REPO))
     from debate_protocol_v1 import adaptive_wait_decision
 
     return adaptive_wait_decision(
@@ -893,7 +900,6 @@ def _persist_scheduler_decision(
     live_workers: int,
     resource_tier: str,
 ) -> None:
-    sys.path.insert(0, str(REPO))
     from debate_protocol_v1 import record_scheduler_decision
 
     con = sqlite3.connect(DB_PATH)
@@ -957,6 +963,22 @@ def _cap_positive(base: int, cap: int) -> int:
     return min(base, cap)
 
 
+def _clamp_wake_budget(configured: int, resource_cap: int) -> int:
+    """Apply a transient resource cap without ratcheting the base downward."""
+    return min(max(0, configured), max(0, resource_cap))
+
+
+def _operator_wake_disabled() -> bool:
+    """Read the emergency wake kill-switch before any scan-side DB work."""
+    path = Path(
+        os.environ.get(
+            "DEBATE_WAKE_DISABLE_FILE",
+            os.path.expanduser("~/.claude/memory/debate_wake.disable"),
+        )
+    )
+    return path.exists()
+
+
 def _handle_signal(_signum: int, _frame: Any) -> None:
     global STOP
     STOP = True
@@ -1001,7 +1023,6 @@ def _wait_or_stop(seconds: float) -> bool:
     """
     if IS_WINDOWS:
         try:
-            sys.path.insert(0, str(REPO))
             from debate_wake_signal import wait_for_wake_or_stop
         except Exception as exc:
             _log("windows_wait_adapter_failed", error=repr(exc))
@@ -1128,7 +1149,6 @@ def main() -> int:
         # both pass it. CreateMutexW is atomic; the loser exits. The
         # advisory heartbeat check stays as a cheap fast-path log.
         try:
-            sys.path.insert(0, str(REPO))
             from debate_wake_signal import acquire_pump_singleton
 
             if not acquire_pump_singleton():
@@ -1157,6 +1177,9 @@ def main() -> int:
         max_concurrent_workers or 0,
     )
     os.environ.setdefault("DEBATE_WAKE_BUDGET", str(default_wake_budget))
+    configured_wake_budget = max(
+        0, int(os.environ.get("DEBATE_WAKE_BUDGET", str(default_wake_budget)))
+    )
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
@@ -1205,6 +1228,12 @@ def main() -> int:
     while not STOP:
         _reap_children()
         _write_heartbeat(last_ts, last_msg_id)
+        if _operator_wake_disabled():
+            _log("pump_paused_by_operator_disable")
+            if args.once:
+                break
+            _wait_or_stop(max(30.0, args.interval))
+            continue
         try:
             maintenance = _protocol_maintenance(topics)
             if maintenance["timed_out"] or maintenance["role_recoveries"]:
@@ -1239,7 +1268,7 @@ def main() -> int:
             )
             last_worker_recovery_at = time.monotonic()
         rows: list[sqlite3.Row] = []
-        baseline_live_workers = max(len(CHILDREN), 0)
+        baseline_live_workers = _safe_machine_live_worker_count(topics)
         throttled = False
         dispatch_failed = False
         scan_failed = False
@@ -1299,14 +1328,7 @@ def main() -> int:
                     auto_budget.max_concurrent_workers,
                 )
                 os.environ["DEBATE_WAKE_BUDGET"] = str(
-                    min(
-                        int(
-                            os.environ.get(
-                                "DEBATE_WAKE_BUDGET", str(default_wake_budget)
-                            )
-                        ),
-                        max(0, auto_budget.wake_budget),
-                    )
+                    _clamp_wake_budget(configured_wake_budget, auto_budget.wake_budget)
                 )
                 if not effective_action_kinds or effective_limit <= 0:
                     _log(
@@ -1357,13 +1379,9 @@ def main() -> int:
             dispatched_rows = 0
             launched_this_scan = 0
             partial_pending = False
-            # Baseline machine-wide live worker count (Windows: reconciles a
-            # restarted pump's empty CHILDREN with workers that outlived the
-            # previous instance). Computed once per scan; workers launched
-            # during this scan are tracked by launched_this_scan + CHILDREN.
-            baseline_live_workers = (
-                _machine_live_worker_count(topics) if IS_WINDOWS else 0
-            )
+            # Machine-wide receipts reconcile a restarted pump's empty
+            # CHILDREN set with workers that outlived it on every platform.
+            # Workers launched during this scan are tracked by CHILDREN.
             for row in rows:
                 _reap_children()
                 live_children = max(len(CHILDREN), baseline_live_workers)

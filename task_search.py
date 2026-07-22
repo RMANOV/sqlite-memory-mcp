@@ -10,6 +10,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 
 _SMARTKEY_AVAILABLE = False
 try:
@@ -50,6 +51,48 @@ _WORD_RE = re.compile(r"[a-zA-Z0-9\u0400-\u04FF]+")
 # Pre-compiled patterns for hyphen/underscore normalization in search
 _NORMALIZE_RE = re.compile(r"[-_]+")
 _SPLIT_RE = re.compile(r"[\s\-_]+")
+
+_INDEX_FIELDS = (
+    "id",
+    "title",
+    "description",
+    "notes",
+    "project",
+    "section",
+    "status",
+    "priority",
+    "due_date",
+    "type",
+    "updated_at",
+)
+
+
+def build_bounded_index_rows(
+    *groups: list[dict],
+    limit: int = 300,
+    text_chars: int = 800,
+) -> list[dict]:
+    """Return a deduplicated, bounded projection safe for a resident index."""
+    bounded_limit = max(1, int(limit))
+    bounded_text = max(1, int(text_chars))
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for task in group:
+            task_id = task.get("id")
+            if not task_id or task_id in seen:
+                continue
+            seen.add(task_id)
+            row = {}
+            for field in _INDEX_FIELDS:
+                value = task.get(field)
+                if isinstance(value, str) and len(value) > bounded_text:
+                    value = value[:bounded_text]
+                row[field] = value
+            rows.append(row)
+            if len(rows) >= bounded_limit:
+                return rows
+    return rows
 
 
 def _tokenize(text: str) -> list[str]:
@@ -129,6 +172,9 @@ class TaskSearchEngine:
         self._inverted: dict[str, set[str]] = {}  # word -> {task_id, ...}
         self._task_map: dict[str, dict] = {}  # id -> task dict
         self._task_fingerprint: tuple | None = None
+        self._state_lock = threading.RLock()
+        self._engine_call_lock = threading.RLock()
+        self._rebuild_generation = 0
 
         if _SMARTKEY_AVAILABLE:
             self._engine = PySmartKeyEngine.from_config(_ENGINE_CONFIG)
@@ -136,24 +182,31 @@ class TaskSearchEngine:
 
     @property
     def available(self) -> bool:
-        return self._engine is not None
+        with self._state_lock:
+            return self._engine is not None
 
     def rebuild_index(self, tasks: list[dict]) -> None:
-        """Tokenize task titles, build inverted index, load trie."""
+        """Build an immutable index snapshot, then publish it atomically."""
         fp = tuple((t["id"], t.get("updated_at", "")) for t in tasks)
-        if fp == self._task_fingerprint:
+        with self._state_lock:
+            if fp == self._task_fingerprint:
+                return
+            self._rebuild_generation += 1
+            generation = self._rebuild_generation
+            engine_enabled = self._engine is not None
+
+        task_map = {t["id"]: t for t in tasks}
+        if not engine_enabled:
+            with self._state_lock:
+                if generation != self._rebuild_generation:
+                    return
+                self._task_fingerprint = fp
+                self._task_map = task_map
+                self._inverted = {}
             return
-        self._task_fingerprint = fp
 
-        # Build task map
-        self._task_map = {t["id"]: t for t in tasks}
-
-        if not self._engine:
-            return
-
-        # Rebuild engine (new instance to clear old trie)
-        self._engine = PySmartKeyEngine.from_config(_ENGINE_CONFIG)
-        self._engine.import_personal(self._cvm_path)
+        engine = PySmartKeyEngine.from_config(_ENGINE_CONFIG)
+        engine.import_personal(self._cvm_path)
 
         # Collect word -> set of task IDs (inverted index)
         word_tasks: dict[str, set[str]] = {}
@@ -176,8 +229,6 @@ class TaskSearchEngine:
             for w in words:
                 word_tasks.setdefault(w, set()).add(tid)
 
-        self._inverted = word_tasks
-
         # Load words into trie with IDF-weighted frequency
         n = len(tasks) or 1
         for word, task_ids in word_tasks.items():
@@ -185,7 +236,15 @@ class TaskSearchEngine:
             # IDF score: rarer words get higher frequency in trie
             idf = math.log(n / df) + 1.0
             freq = max(1, int(idf * 100))
-            self._engine.load_word(word, freq)
+            engine.load_word(word, freq)
+
+        with self._state_lock:
+            if generation != self._rebuild_generation:
+                return
+            self._task_fingerprint = fp
+            self._task_map = task_map
+            self._inverted = word_tasks
+            self._engine = engine
 
     def search(
         self,
@@ -203,7 +262,12 @@ class TaskSearchEngine:
         if not query:
             return tasks[:limit]
 
-        if not self._engine:
+        with self._state_lock:
+            engine = self._engine
+            inverted = self._inverted
+            task_map = self._task_map
+
+        if not engine:
             fts_results = None
             vec_results = []
             if conn is not None:
@@ -244,10 +308,10 @@ class TaskSearchEngine:
         task_hits: dict[str, int] = {}  # count of matched query words per task
         task_id_set = {t["id"] for t in tasks}  # only score tasks in current view
 
-        for qw in query_words:
-            # SmartKey predict returns (word, score, confidence)
-            predictions = self._engine.predict(qw, [], 20)
+        with self._engine_call_lock:
+            prediction_groups = [engine.predict(qw, [], 20) for qw in query_words]
 
+        for predictions in prediction_groups:
             # Deduplicate: keep best confidence per matched word
             best: dict[str, float] = {}
             for word, _score, confidence in predictions:
@@ -257,7 +321,7 @@ class TaskSearchEngine:
 
             # Resolve matched words to task IDs via inverted index
             for matched_word, confidence in best.items():
-                matching_ids = self._inverted.get(matched_word, set())
+                matching_ids = inverted.get(matched_word, set())
                 for tid in matching_ids & task_id_set:
                     task_scores[tid] = task_scores.get(tid, 0) + confidence
                     task_hits[tid] = task_hits.get(tid, 0) + 1
@@ -276,7 +340,7 @@ class TaskSearchEngine:
 
         # Sort by score descending
         ranked_ids = sorted(task_scores, key=lambda tid: -task_scores[tid])[:limit]
-        return [self._task_map[tid] for tid in ranked_ids if tid in self._task_map]
+        return [task_map[tid] for tid in ranked_ids if tid in task_map]
 
     @staticmethod
     def _fts5_search(
@@ -329,21 +393,30 @@ class TaskSearchEngine:
 
     def record_open(self, task: dict) -> None:
         """Record that a task was opened (boosts future ranking via CVM)."""
-        if not self._engine:
+        with self._state_lock:
+            engine = self._engine
+        if not engine:
             return
         title = task.get("title") or ""
-        for word in _tokenize(title):
-            self._engine.learn(word)
+        with self._engine_call_lock:
+            for word in _tokenize(title):
+                engine.learn(word)
 
     def save(self) -> None:
         """Persist CVM personal profile to disk."""
-        if self._engine:
-            self._engine.export_personal(self._cvm_path)
+        with self._state_lock:
+            engine = self._engine
+        if engine:
+            with self._engine_call_lock:
+                engine.export_personal(self._cvm_path)
 
     def load(self) -> None:
         """Load CVM personal profile from disk."""
-        if self._engine:
-            self._engine.import_personal(self._cvm_path)
+        with self._state_lock:
+            engine = self._engine
+        if engine:
+            with self._engine_call_lock:
+                engine.import_personal(self._cvm_path)
 
 
 def merge_tasks_entities(task_results, entity_results, entity_weight=0.7, k=60):

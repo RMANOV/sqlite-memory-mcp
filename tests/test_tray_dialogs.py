@@ -40,8 +40,11 @@ class _FakeTaskDb:
 
 
 class _FakeTraySearchEngine:
+    def __init__(self):
+        self.indexed = []
+
     def rebuild_index(self, tasks):
-        pass
+        self.indexed = tasks
 
     def search(self, query, tasks, limit=20, conn=None, use_vector=False):
         return []
@@ -51,6 +54,8 @@ class _FakeTrayPopupDb(_FakeTaskDb):
     def __init__(self):
         self.search_engine = _FakeTraySearchEngine()
         self.created = []
+        self.active = []
+        self.done = []
 
     def promote_due_today(self):
         return []
@@ -59,10 +64,10 @@ class _FakeTrayPopupDb(_FakeTaskDb):
         return []
 
     def get_all_active(self):
-        return []
+        return self.active
 
     def get_done_tasks(self):
-        return []
+        return self.done
 
     def search_entities_fast(self, query, limit=5):
         return []
@@ -196,22 +201,14 @@ def test_task_reader_title_and_body_copy_exact_mixed_text_without_mutation(qapp)
     assert dlg._body_label.textInteractionFlags() & required == required
 
     dlg._title_label.setFocus()
-    QTest.keyClick(
-        dlg._title_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
-    )
-    QTest.keyClick(
-        dlg._title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
-    )
+    QTest.keyClick(dlg._title_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(dlg._title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert qapp.clipboard().text() == title
 
     dlg._body_label.setFocus()
-    QTest.keyClick(
-        dlg._body_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
-    )
-    QTest.keyClick(
-        dlg._body_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
-    )
+    QTest.keyClick(dlg._body_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(dlg._body_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert qapp.clipboard().text() == description
     assert task == before
@@ -245,25 +242,21 @@ def test_reminder_copy_shortcuts_are_read_only_and_buttons_still_work(qapp):
     dlg.show()
     dlg.activateWindow()
     qapp.processEvents()
-    title_label = next(label for label in labels if label.text() == "Напомняне mixed 42")
+    title_label = next(
+        label for label in labels if label.text() == "Напомняне mixed 42"
+    )
     title_label.setSelection(0, len("Напомняне"))
     title_label.setFocus()
-    QTest.keyClick(
-        title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
-    )
+    QTest.keyClick(title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert qapp.clipboard().text() == "Напомняне"
 
     qapp.clipboard().setText("unchanged until copy")
-    QTest.keyClick(
-        title_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
-    )
+    QTest.keyClick(title_label, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert qapp.clipboard().text() == "unchanged until copy"
     assert all(label.selectedText() == label.text() for label in labels)
-    QTest.keyClick(
-        title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
-    )
+    QTest.keyClick(title_label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert qapp.clipboard().text() == dlg._copy_payload
     assert snoozed == []
@@ -362,6 +355,73 @@ def test_tray_popup_add_form_can_create_note_with_reminder(qapp):
     assert kwargs["reminder_at"].endswith("+00:00")
     assert popup._add_reminder_enabled.isChecked() is False
     popup.close()
+
+
+def test_tray_popup_search_uses_bounded_lightweight_index(qapp, monkeypatch):
+    monkeypatch.setattr(tray_dialogs, "_POPUP_SEARCH_INDEX_LIMIT", 2)
+    monkeypatch.setattr(tray_dialogs, "_POPUP_INDEX_TEXT_CHARS", 5)
+    db = _FakeTrayPopupDb()
+    db.active = [
+        {"id": "a", "title": "needle", "description": "0123456789"},
+        {"id": "b", "title": "needle two", "notes": "abcdefghij"},
+        {"id": "c", "title": "needle three"},
+    ]
+    popup = tray_dialogs.TrayPopup(db, lambda: None)
+    popup._search_text = "needle"
+
+    popup.refresh()
+
+    assert [row["id"] for row in db.search_engine.indexed] == ["a", "b"]
+    assert db.search_engine.indexed[0]["description"] == "01234"
+    assert db.search_engine.indexed[1]["notes"] == "abcde"
+    popup.close()
+
+
+def test_entity_dialogs_use_shared_light_theme(qapp, monkeypatch):
+    monkeypatch.setattr(tray_dialogs, "_theme_name", "light")
+    monkeypatch.setattr(
+        tray_dialogs.EntityDetailDialog, "_load_data", lambda self: None
+    )
+
+    link_dialog = tray_dialogs.EntityLinkDialog(_FakeTaskDb(), "task-1")
+    detail_dialog = tray_dialogs.EntityDetailDialog(_FakeTaskDb(), 1)
+
+    expected = tray_dialogs._build_entity_dialog_style()
+    assert link_dialog.styleSheet() == expected
+    assert detail_dialog.styleSheet() == expected
+    assert tray_dialogs._T()["bg"] in expected
+    assert "#0d1117" not in expected
+
+    link_dialog.close()
+    detail_dialog.close()
+
+
+def test_entity_detail_rich_text_uses_active_theme(qapp, monkeypatch):
+    monkeypatch.setattr(tray_dialogs, "_theme_name", "light")
+    monkeypatch.setattr(
+        tray_dialogs.EntityDetailDialog, "_load_data", lambda self: None
+    )
+    dialog = tray_dialogs.EntityDetailDialog(_FakeTaskDb(), 1)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT, entity_type TEXT);"
+        "CREATE TABLE observations (id INTEGER PRIMARY KEY, entity_id INTEGER, "
+        "content TEXT, created_at TEXT);"
+        "CREATE TABLE relations (from_id INTEGER, to_id INTEGER, relation_type TEXT);"
+        "INSERT INTO entities VALUES (1, 'Entity A', 'concept');"
+        "INSERT INTO observations VALUES (1, 1, 'Theme-aware fact', '2026-07-22');"
+    )
+
+    dialog._load_data_inner(conn)
+    html = dialog._content.text()
+
+    assert tray_dialogs._T()["text"] in html
+    assert tray_dialogs._T()["bg2"] in html
+    assert "#e6edf3" not in html
+    assert "#161b22" not in html
+    conn.close()
+    dialog.close()
 
 
 def test_task_reader_dialog_renders_notes_section(qapp, monkeypatch):

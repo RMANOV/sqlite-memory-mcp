@@ -55,6 +55,8 @@ _MAX_ITEMS_BY_TYPE = {
     "chunk": 6,
 }
 _MAX_CHUNKS_PER_GROUP = 3
+_MAX_FACT_CANDIDATES = 1000
+_SQLITE_IN_CHUNK_SIZE = 500
 _CHUNK_TRUST_BY_STATE = {
     "enrichable": 0.35,
     "uncertain": 0.22,
@@ -391,7 +393,10 @@ def _find_relevant_entities(
             if fts_rows and vec_rows:
                 fts_rows = rrf_merge(fts_rows, vec_rows)
             elif vec_rows:
-                fts_rows = vec_rows
+                # Normalize vector-only hits to the FTS row contract.  Raw
+                # vector rows have ``distance`` but no ``rank`` and would
+                # otherwise crash the common reranker.
+                fts_rows = rrf_merge([], vec_rows)
     except ImportError:
         pass
 
@@ -606,11 +611,15 @@ def build_context_pack(
         fact_cols.append("valid_to")
     if _sqlite_has_column(conn, "canonical_facts", "contradiction_count"):
         fact_cols.append("contradiction_count")
-    facts = conn.execute(
+    fact_rows = conn.execute(
         f"SELECT {', '.join(fact_cols)} FROM canonical_facts "
-        "ORDER BY confidence DESC, updated_at DESC, fact_id"
+        "ORDER BY confidence DESC, updated_at DESC, fact_id LIMIT ?",
+        (_MAX_FACT_CANDIDATES,),
     ).fetchall()
-    for fact_row in facts:
+
+    facts: list[dict[str, Any]] = []
+    fact_ids_needing_provenance: list[str] = []
+    for fact_row in fact_rows:
         f = dict(fact_row)
         if f.get("valid_to"):
             continue
@@ -618,17 +627,29 @@ def build_context_pack(
         if contradiction_count > 0:
             # Retrieval contract: unresolved contradictions are not canonical.
             continue
-        has_fact_provenance = False
-        if _sqlite_table_exists(conn, "provenance_links"):
-            has_fact_provenance = (
-                conn.execute(
-                    "SELECT 1 FROM provenance_links "
-                    "WHERE subject_kind = 'fact' AND subject_ref = ? LIMIT 1",
-                    (f["fact_id"],),
-                ).fetchone()
-                is not None
-            )
-        if not f.get("source_claim_id") and not has_fact_provenance:
+        facts.append(f)
+        if not f.get("source_claim_id"):
+            fact_ids_needing_provenance.append(str(f["fact_id"]))
+
+    fact_ids_with_provenance: set[str] = set()
+    if fact_ids_needing_provenance and _sqlite_table_exists(conn, "provenance_links"):
+        for offset in range(0, len(fact_ids_needing_provenance), _SQLITE_IN_CHUNK_SIZE):
+            fact_id_batch = fact_ids_needing_provenance[
+                offset : offset + _SQLITE_IN_CHUNK_SIZE
+            ]
+            placeholders = ",".join("?" for _ in fact_id_batch)
+            provenance_rows = conn.execute(
+                "SELECT DISTINCT subject_ref FROM provenance_links "
+                f"WHERE subject_kind = 'fact' AND subject_ref IN ({placeholders})",
+                fact_id_batch,
+            ).fetchall()
+            fact_ids_with_provenance.update(str(row[0]) for row in provenance_rows)
+
+    for f in facts:
+        if (
+            not f.get("source_claim_id")
+            and str(f["fact_id"]) not in fact_ids_with_provenance
+        ):
             continue
         rel = _task_match(
             f["subject"],
@@ -859,16 +880,15 @@ def build_context_pack(
                 strategy=advanced_strategy,
             )
             selected = selection["selected"]
-            tokens_used = selection["tokens_used"]
             selection_meta = selection["metadata"]
         except (sqlite3.OperationalError, ValueError, KeyError) as exc:
             logger.warning(
                 "Advanced context selector failed, using greedy fallback: %s", exc
             )
-            selected, tokens_used, selection_meta = _greedy_select_items(items, budget)
+            selected, _, selection_meta = _greedy_select_items(items, budget)
             selection_meta["selector_error"] = str(exc)
     else:
-        selected, tokens_used, selection_meta = _greedy_select_items(items, budget)
+        selected, _, selection_meta = _greedy_select_items(items, budget)
 
     visible_selected = list(selected)
     if policy["suppress_chunks_if_core_signal"] and any(
@@ -876,6 +896,7 @@ def build_context_pack(
     ):
         # Reader/executor views should not mix solid signal with loose fragment dumps.
         visible_selected = [item for item in selected if item["type"] != "chunk"]
+    visible_tokens_used = sum(int(item["tokens"]) for item in visible_selected)
 
     total_weight = sum(max(item["score"], 0.001) for item in visible_selected) or 1.0
     relevance_score = (
@@ -1035,7 +1056,7 @@ def build_context_pack(
         "pack_id": pack_id,
         "pack_type": pack_type,
         "token_budget": budget,
-        "token_usage": tokens_used,
+        "token_usage": visible_tokens_used,
         "items_included": len(selected),
         "preview_items_included": len(visible_selected),
         "task_scoped": is_task_scoped,

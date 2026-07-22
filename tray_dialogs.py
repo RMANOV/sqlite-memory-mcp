@@ -29,6 +29,7 @@ from db_utils import (
     now_iso,
     priority_sort_key,
 )
+from task_search import build_bounded_index_rows
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -113,6 +114,8 @@ _UI_COLS = "id, title, description, notes, status, section, priority, due_date, 
 
 # Auto-refresh interval for TrayPopup and FullWindow refresh timers
 _REFRESH_INTERVAL_MS = 30_000
+_POPUP_SEARCH_INDEX_LIMIT = 300
+_POPUP_INDEX_TEXT_CHARS = 800
 
 
 # ── Clipboard helpers ────────────────────────────────────────────────
@@ -427,7 +430,9 @@ def _build_list_style():
 def _build_debate_reader_style():
     """Build the selectable debate reader from the active tray appearance."""
     t, fs, fw = _T(), _font_size, _fw()
-    return _build_dialog_style() + f"""
+    return (
+        _build_dialog_style()
+        + f"""
         QDialog {{ background: {t["bg"]}; color: {t["text"]};
                    font-size: {fs}px; font-weight: {fw}; }}
         QTabWidget::pane {{
@@ -446,6 +451,7 @@ def _build_debate_reader_style():
             selection-color: #ffffff;
         }}
     """
+    )
 
 
 def _build_popup_style():
@@ -506,6 +512,26 @@ def _build_dialog_style():
         QMenu {{ background: {t["bg2"]}; color: {t["text"]}; border: 1px solid {t["border"]}; }}
         QMenu::item:selected {{ background: {t["accent"]}; color: #ffffff; }}
     """
+
+
+def _build_entity_dialog_style():
+    """Extend the shared dialog theme for entity lists and rich readers."""
+    t, fs = _T(), _font_size
+    return (
+        _build_dialog_style()
+        + f"""
+        QScrollArea {{ background: {t["bg"]}; border: none; }}
+        QListWidget {{ background: {t["bg2"]}; color: {t["text"]};
+                       border: 1px solid {t["border"]}; border-radius: 4px;
+                       font-size: {fs}px; }}
+        QListWidget::item {{ padding: 6px 8px; }}
+        QListWidget::item:selected {{ background: {t["accent"]}; color: #ffffff; }}
+        QFrame[frameShape="4"] {{ color: {t["border"]}; }}
+        QPushButton#entity-primary {{ background: {t["accent"]}; color: #ffffff;
+                                      border-color: {t["accent"]}; }}
+        QPushButton#entity-primary:hover {{ background: {t["accent_hover"]}; }}
+    """
+    )
 
 
 def _build_reader_style():
@@ -704,10 +730,7 @@ def _build_rich_tooltip(task):
     if task.get("_ready_next_action"):
         parts.append(f"Next action: {task['_ready_next_action']}")
     if task.get("_ready_blockers"):
-        blocker_labels = [
-            str(b.get("category") or b)
-            for b in task["_ready_blockers"]
-        ]
+        blocker_labels = [str(b.get("category") or b) for b in task["_ready_blockers"]]
         parts.append(f"Blockers: {', '.join(blocker_labels)}")
     if task.get("_ready_stale_warning"):
         parts.append(f"Stale warning: {task['_ready_stale_warning']}")
@@ -1062,7 +1085,13 @@ class TrayPopup(QWidget):
         if q:
             # Search ALL tasks (same as FullWindow) via SmartKey engine
             all_tasks = self.db.get_all_active() + self.db.get_done_tasks()
-            self._search_engine.rebuild_index(all_tasks)
+            self._search_engine.rebuild_index(
+                build_bounded_index_rows(
+                    all_tasks,
+                    limit=_POPUP_SEARCH_INDEX_LIMIT,
+                    text_chars=_POPUP_INDEX_TEXT_CHARS,
+                )
+            )
             tasks = self._search_engine.search(
                 q, all_tasks, limit=20, conn=None, use_vector=False
             )
@@ -1673,7 +1702,9 @@ class EditTaskDialog(QDialog):
         now = QDateTime.currentDateTime()
         self.reminder_enabled.setChecked(True)
         if minutes == -1:
-            self.reminder_edit.setDateTime(QDateTime(now.date().addDays(1), QTime(9, 0)))
+            self.reminder_edit.setDateTime(
+                QDateTime(now.date().addDays(1), QTime(9, 0))
+            )
         elif minutes == -2:
             days_until_monday = (8 - now.date().dayOfWeek()) % 7
             if days_until_monday == 0:
@@ -1852,6 +1883,7 @@ class EntityLinkDialog(QDialog):
         self.setWindowTitle("Link to Entity")
         self.setMinimumSize(500, 450)
         self.setModal(True)
+        self.setStyleSheet(_build_entity_dialog_style())
         self._build_ui()
         self._load_current_links()
 
@@ -1864,10 +1896,6 @@ class EntityLinkDialog(QDialog):
         layout.addWidget(QLabel("<b>Current Links:</b>"))
         self._current_list = QListWidget()
         self._current_list.setMaximumHeight(120)
-        self._current_list.setStyleSheet(
-            "QListWidget { border: 1px solid #555; border-radius: 4px; }"
-            "QListWidget::item { padding: 4px 8px; }"
-        )
         layout.addWidget(self._current_list)
 
         self._unlink_btn = QPushButton("Unlink Selected")
@@ -1882,49 +1910,29 @@ class EntityLinkDialog(QDialog):
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color: #555;")
         layout.addWidget(sep)
 
         # Search section
         layout.addWidget(QLabel("<b>Search Entities:</b>"))
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText("Type to search entities...")
-        self._search_input.setStyleSheet(
-            "QLineEdit { padding: 6px 10px; border: 1px solid #666; "
-            "border-radius: 4px; font-size: 13px; }"
-        )
         self._search_input.textChanged.connect(self._on_search_changed)
         layout.addWidget(self._search_input)
 
         self._results_list = QListWidget()
-        self._results_list.setStyleSheet(
-            "QListWidget { border: 1px solid #555; border-radius: 4px; }"
-            "QListWidget::item { padding: 6px 8px; }"
-            "QListWidget::item:selected { background: #1a3a5c; color: white; }"
-        )
         layout.addWidget(self._results_list)
 
         # Buttons
         btn_layout = QHBoxLayout()
         self._link_btn = QPushButton("Link Selected")
+        self._link_btn.setObjectName("entity-primary")
         self._link_btn.setEnabled(False)
-        self._link_btn.setStyleSheet(
-            "QPushButton { background: #1a3a5c; color: white; padding: 8px 20px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #254d73; }"
-            "QPushButton:disabled { background: #555; }"
-        )
         self._link_btn.clicked.connect(self._on_link)
         self._results_list.itemSelectionChanged.connect(
             lambda: self._link_btn.setEnabled(bool(self._results_list.selectedItems()))
         )
 
         close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(
-            "QPushButton { padding: 8px 20px; border: 1px solid #666; "
-            "border-radius: 4px; }"
-            "QPushButton:hover { background: #333; }"
-        )
         close_btn.clicked.connect(self.accept)
 
         btn_layout.addStretch()
@@ -2035,11 +2043,7 @@ class EntityDetailDialog(QDialog):
         self.setWindowTitle("Entity Detail")
         self.setMinimumSize(520, 420)
         self.resize(600, 520)
-        self.setStyleSheet(
-            "QDialog { background: #0d1117; color: #e6edf3; }"
-            "QScrollArea { border: none; background: #0d1117; }"
-            "QLabel { background: transparent; }"
-        )
+        self.setStyleSheet(_build_entity_dialog_style())
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -2059,11 +2063,6 @@ class EntityDetailDialog(QDialog):
         layout.addWidget(scroll)
 
         close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(
-            "QPushButton { padding: 8px 24px; background: #21262d; color: #e6edf3; "
-            "border: 1px solid #30363d; border-radius: 4px; margin: 8px 20px 12px; }"
-            "QPushButton:hover { background: #30363d; }"
-        )
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
@@ -2085,13 +2084,19 @@ class EntityDetailDialog(QDialog):
         name = _html.escape(ent["name"])
         etype = (ent["entity_type"] or "").lower()
         color = _ENTITY_TYPE_COLORS.get(etype, _ENTITY_DEFAULT_COLOR)
+        theme = _T()
+        text_color = theme["text"]
+        secondary_color = theme["text2"]
+        muted_color = theme["border"]
+        card_color = theme["bg2"]
+        accent_color = theme["accent"]
         badge = (
             f'<span style="background:{color}; color:white; padding:3px 10px; '
             f'border-radius:12px; font-size:11px;">{_html.escape(etype or "entity")}</span>'
         )
 
         html_parts = [
-            f'<h2 style="margin:0 0 8px 0; color:#e6edf3;">{name} {badge}</h2>'
+            f'<h2 style="margin:0 0 8px 0; color:{text_color};">{name} {badge}</h2>'
         ]
 
         # Observations
@@ -2101,17 +2106,17 @@ class EntityDetailDialog(QDialog):
         ).fetchall()
         if obs_rows:
             html_parts.append(
-                '<div style="margin-top:12px; font-weight:bold; color:#8b949e; '
+                f'<div style="margin-top:12px; font-weight:bold; color:{secondary_color}; '
                 'font-size:12px; text-transform:uppercase;">Observations</div>'
             )
             for obs in obs_rows:
                 ts = obs["created_at"] or ""
                 if ts:
-                    ts = f' <span style="color:#484f58; font-size:11px;">{_html.escape(ts[:16])}</span>'
+                    ts = f' <span style="color:{muted_color}; font-size:11px;">{_html.escape(ts[:16])}</span>'
                 html_parts.append(
-                    f'<p style="margin:6px 0; padding:8px 12px; background:#161b22; '
+                    f'<p style="margin:6px 0; padding:8px 12px; background:{card_color}; '
                     f"border-left:3px solid {color}; border-radius:2px; font-size:13px; "
-                    f'color:#c9d1d9;">{_html.escape(obs["content"])}{ts}</p>'
+                    f'color:{text_color};">{_html.escape(obs["content"])}{ts}</p>'
                 )
 
         # Relations
@@ -2125,7 +2130,7 @@ class EntityDetailDialog(QDialog):
         ).fetchall()
         if rel_rows:
             html_parts.append(
-                '<div style="margin-top:16px; font-weight:bold; color:#8b949e; '
+                f'<div style="margin-top:16px; font-weight:bold; color:{secondary_color}; '
                 'font-size:12px; text-transform:uppercase;">Relations</div>'
             )
             for rel in rel_rows:
@@ -2135,9 +2140,9 @@ class EntityDetailDialog(QDialog):
                 fid, tid = rel["from_id"], rel["to_id"]
                 other_id = tid if fid == eid else fid
                 html_parts.append(
-                    f'<p style="margin:4px 0; font-size:13px; color:#c9d1d9;">'
-                    f'{fn} <span style="color:#58a6ff;">─{rt}→</span> {tn} '
-                    f'<a href="entity:{other_id}" style="color:#58a6ff; font-size:11px;">[open]</a></p>'
+                    f'<p style="margin:4px 0; font-size:13px; color:{text_color};">'
+                    f'{fn} <span style="color:{accent_color};">─{rt}→</span> {tn} '
+                    f'<a href="entity:{other_id}" style="color:{accent_color}; font-size:11px;">[open]</a></p>'
                 )
 
         # Extracted Canonical Facts (Intelligence Graph)
@@ -2159,9 +2164,9 @@ class EntityDetailDialog(QDialog):
                     obj = _html.escape(f["object_text"])
                     conf = f["confidence"] * 100
                     html_parts.append(
-                        f'<p style="margin:4px 0; font-size:13px; color:#c9d1d9;">'
-                        f'<span style="color:#7ee787;">⚡</span> {subj} <strong style="color:#a5d6ff;">{pred}</strong> {obj} '
-                        f'<span style="color:#484f58; font-size:11px;">({conf:.0f}% conf)</span></p>'
+                        f'<p style="margin:4px 0; font-size:13px; color:{text_color};">'
+                        f'<span style="color:#7ee787;">⚡</span> {subj} <strong style="color:{accent_color};">{pred}</strong> {obj} '
+                        f'<span style="color:{muted_color}; font-size:11px;">({conf:.0f}% conf)</span></p>'
                     )
         except sqlite3.OperationalError:
             pass
@@ -2174,7 +2179,7 @@ class EntityDetailDialog(QDialog):
             task_rows = []
         if task_rows:
             html_parts.append(
-                '<div style="margin-top:16px; font-weight:bold; color:#8b949e; '
+                f'<div style="margin-top:16px; font-weight:bold; color:{secondary_color}; '
                 'font-size:12px; text-transform:uppercase;">Linked Tasks</div>'
             )
             for t in task_rows:
@@ -2184,7 +2189,7 @@ class EntityDetailDialog(QDialog):
                     if status == "done"
                     else "#d29922"
                     if status == "in_progress"
-                    else "#8b949e"
+                    else secondary_color
                 )
                 s_badge = (
                     f'<span style="background:{s_color}; color:white; padding:1px 6px; '
@@ -2193,9 +2198,9 @@ class EntityDetailDialog(QDialog):
                 title = _html.escape(t.get("title", ""))
                 tid = t.get("id", "")
                 html_parts.append(
-                    f'<p style="margin:4px 0; font-size:13px; color:#c9d1d9;">'
+                    f'<p style="margin:4px 0; font-size:13px; color:{text_color};">'
                     f"{s_badge} {title} "
-                    f'<a href="task:{tid}" style="color:#58a6ff; font-size:11px;">[open]</a></p>'
+                    f'<a href="task:{tid}" style="color:{accent_color}; font-size:11px;">[open]</a></p>'
                 )
 
         self._content.setText("".join(html_parts))

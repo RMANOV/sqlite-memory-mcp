@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Thin MCP server exposing only knowledge collaboration tools.
 
-Shares the same SQLite database as the main sqlite-kb server.
-Exists because Claude Code 2.x has a tool-count limit per MCP server
-(~9 tools visible out of 50), so collab tools are split into a separate server.
+Shares the same SQLite database as the main sqlite-kb server and keeps the
+collaboration surface independently deployable; ``unified_server.py`` also mounts it.
 """
 
 from __future__ import annotations
@@ -99,23 +98,33 @@ def _get_publisher_id(conn, entity_name: str) -> str:
     return os.environ.get("GITHUB_USER", socket.gethostname())
 
 
-def _compute_truth_score(entity_name: str, conn) -> dict[str, Any]:
+def _compute_truth_score(
+    entity_name: str,
+    conn,
+    *,
+    observations: list[str] | None = None,
+    ratings: list[Any] | None = None,
+) -> dict[str, Any]:
     """Compute composite TruthScore for a public entity.
 
     Three tiers: IQ (content quality), Verification, Cross-validation.
     Returns dict with truth_score, confidence, rating_count, content_hash, dimensions.
     """
     # Get current content hash
-    result = _entity_content_hash(conn, entity_name)
-    c_hash = result[0] if result else _content_hash(entity_name, [])
+    if observations is None:
+        result = _entity_content_hash(conn, entity_name)
+        c_hash = result[0] if result else _content_hash(entity_name, [])
+    else:
+        c_hash = _content_hash(entity_name, observations)
 
     # Get ratings for current content version
-    ratings = conn.execute(
-        "SELECT specificity, falsifiability, internal_consistency, novelty, "
-        "verification_outcome, usefulness FROM knowledge_ratings "
-        "WHERE entity_name = ? AND content_hash = ?",
-        (entity_name, c_hash),
-    ).fetchall()
+    if ratings is None:
+        ratings = conn.execute(
+            "SELECT specificity, falsifiability, internal_consistency, novelty, "
+            "verification_outcome, usefulness FROM knowledge_ratings "
+            "WHERE entity_name = ? AND content_hash = ?",
+            (entity_name, c_hash),
+        ).fetchall()
 
     if not ratings:
         return {
@@ -187,6 +196,44 @@ def _compute_truth_score(entity_name: str, conn) -> dict[str, Any]:
             "cross_validation": round(cv, 4),
         },
     }
+
+
+def _batch_truth_scores(
+    conn,
+    rows: list[Any],
+    obs_by_eid: dict[int, list[str]],
+) -> dict[int, dict[str, Any]]:
+    """Compute a search result set with one ratings query and no N+1 reads."""
+    if not rows:
+        return {}
+    names = [row["name"] for row in rows]
+    ph = ",".join("?" * len(names))
+    rating_rows = conn.execute(
+        "SELECT entity_name, content_hash, specificity, falsifiability, "
+        "internal_consistency, novelty, verification_outcome, usefulness "
+        f"FROM knowledge_ratings WHERE entity_name IN ({ph})",
+        names,
+    ).fetchall()
+    ratings_by_name: dict[str, list[Any]] = {}
+    for rating in rating_rows:
+        ratings_by_name.setdefault(rating["entity_name"], []).append(rating)
+
+    scores: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        observations = obs_by_eid.get(row["rowid"], [])
+        current_hash = _content_hash(row["name"], observations)
+        current_ratings = [
+            rating
+            for rating in ratings_by_name.get(row["name"], [])
+            if rating["content_hash"] == current_hash
+        ]
+        scores[row["rowid"]] = _compute_truth_score(
+            row["name"],
+            conn,
+            observations=observations,
+            ratings=current_ratings,
+        )
+    return scores
 
 
 def _check_rating_anomalies(conn, entity_name: str) -> None:
@@ -318,7 +365,7 @@ def manage_collaborators(
             k: v for k, v in updates.items() if k in _COLLABORATOR_ALLOWED_FIELDS
         }
         if not updates:
-            return json.dumps({"error": "No valid fields to update"})
+            return _error("No valid fields to update")
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
             f"UPDATE collaborators SET {set_clause} WHERE github_user = ?",
@@ -839,6 +886,10 @@ def cancel_publish(
 # Tool 6: search_public_knowledge
 # ═══════════════════════════════════════════════════════════════════════════
 
+_TRUTH_CANDIDATE_MIN = 100
+_TRUTH_CANDIDATE_MULTIPLIER = 10
+_TRUTH_CANDIDATE_MAX = 900
+
 
 @mcp.tool()
 def search_public_knowledge(
@@ -855,7 +906,27 @@ def search_public_knowledge(
     Args:
         sort_by: "relevance" (BM25), "truth_score", or "rating_count"
         min_truth_score: Filter out entities below this TruthScore threshold
+
+    Ranking contract:
+        Relevance uses the requested BM25 window directly. TruthScore sorting,
+        rating-count sorting, and minimum-score filtering first enlarge that
+        BM25 window to 10x ``limit`` (minimum 100, maximum 900), compute scores
+        across the bounded candidate pool, then filter/sort and apply ``limit``.
+        TruthScore order is therefore top-N within the disclosed BM25 candidate
+        pool, not an unbounded global scan of every public entity.
     """
+    limit = max(1, min(int(limit), 100))
+    truth_ranked = (
+        sort_by in {"truth_score", "rating_count"} or min_truth_score is not None
+    )
+    candidate_limit = (
+        min(
+            _TRUTH_CANDIDATE_MAX,
+            max(_TRUTH_CANDIDATE_MIN, limit * _TRUTH_CANDIDATE_MULTIPLIER),
+        )
+        if truth_ranked
+        else limit
+    )
     fts_q = _fts_query(query)
     with _get_conn() as conn:
         if entity_type:
@@ -867,7 +938,7 @@ def search_public_knowledge(
                 "WHERE memory_fts MATCH ? AND entities.visibility = 'public' "
                 "AND entities.entity_type = ? "
                 "ORDER BY memory_fts.rank LIMIT ?",
-                (fts_q, entity_type, limit),
+                (fts_q, entity_type, candidate_limit),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -877,7 +948,7 @@ def search_public_knowledge(
                 "JOIN entities ON entities.id = memory_fts.rowid "
                 "WHERE memory_fts MATCH ? AND entities.visibility = 'public' "
                 "ORDER BY memory_fts.rank LIMIT ?",
-                (fts_q, limit),
+                (fts_q, candidate_limit),
             ).fetchall()
 
         # Batch-fetch observations (avoids N+1 per-entity queries)
@@ -895,9 +966,11 @@ def search_public_knowledge(
         else:
             obs_by_eid = {}
 
+        score_by_eid = _batch_truth_scores(conn, rows, obs_by_eid)
+
         results = []
         for r in rows:
-            score_info = _compute_truth_score(r["name"], conn)
+            score_info = score_by_eid[r["rowid"]]
             if (
                 min_truth_score is not None
                 and score_info["truth_score"] < min_truth_score
@@ -916,12 +989,31 @@ def search_public_knowledge(
 
         # Sort results
         if sort_by == "truth_score":
-            results.sort(key=lambda x: x["truthScore"], reverse=True)
+            results.sort(
+                key=lambda x: (x["truthScore"], x["ratingCount"], x["name"]),
+                reverse=True,
+            )
         elif sort_by == "rating_count":
-            results.sort(key=lambda x: x["ratingCount"], reverse=True)
+            results.sort(
+                key=lambda x: (x["ratingCount"], x["truthScore"], x["name"]),
+                reverse=True,
+            )
+        results = results[:limit]
 
     logger.info("search_public_knowledge: query=%r matched=%d", query, len(results))
-    return json.dumps({"entities": results, "query": query, "count": len(results)})
+    return json.dumps(
+        {
+            "entities": results,
+            "query": query,
+            "count": len(results),
+            "ranking_scope": (
+                "bm25_candidate_pool" if truth_ranked else "bm25_requested_window"
+            ),
+            "candidate_pool_size": len(rows),
+            "candidate_pool_limit": candidate_limit,
+            "candidate_pool_exhausted": len(rows) == candidate_limit,
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

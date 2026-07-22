@@ -47,10 +47,16 @@ from schema import init_db  # noqa: E402
 
 
 def _fts(updated_at, updated_by="m", updated_order=0):
-    return {"updated_at": updated_at, "updated_by": updated_by, "updated_order": updated_order}
+    return {
+        "updated_at": updated_at,
+        "updated_by": updated_by,
+        "updated_order": updated_order,
+    }
 
 
-def _task(tid, *, status="active", title="T", tombstone=False, status_fts=None, **extra):
+def _task(
+    tid, *, status="active", title="T", tombstone=False, status_fts=None, **extra
+):
     t = {"id": tid, "status": status, "title": title}
     if tombstone:
         t["_tombstone"] = True
@@ -148,11 +154,20 @@ def test_b_remote_only_tombstone_import():
 def test_c_active_after_delete_does_not_resurrect():
     # ours = active with a STRICTLY NEWER status timestamp/order than theirs.
     ours = _collection(
-        _task("t1", status="in_progress", status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99))
+        _task(
+            "t1",
+            status="in_progress",
+            status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99),
+        )
     )
     # theirs = an older tombstone.
     theirs = _collection(
-        _task("t1", status="archived", tombstone=True, status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+        _task(
+            "t1",
+            status="archived",
+            tombstone=True,
+            status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+        )
     )
     merged = bmd.reconcile_task_collection(ours, theirs)
     t = _by_id(merged)["t1"]
@@ -162,17 +177,45 @@ def test_c_active_after_delete_does_not_resurrect():
 
 def test_c_resurrect_blocked_via_git(git_bridge):
     repo, git = git_bridge
-    _write(repo, "index.json", _collection(_task("t1", status="active",
-            status_fts=_fts("2026-06-01T00:00:00+00:00", "base", 1))))
+    _write(
+        repo,
+        "index.json",
+        _collection(
+            _task(
+                "t1",
+                status="active",
+                status_fts=_fts("2026-06-01T00:00:00+00:00", "base", 1),
+            )
+        ),
+    )
     git("add", "index.json", ".gitattributes")
     git("commit", "-qm", "base")
     git("checkout", "-q", "-b", "win")
-    _write(repo, "index.json", _collection(_task("t1", status="in_progress",
-            status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99))))
+    _write(
+        repo,
+        "index.json",
+        _collection(
+            _task(
+                "t1",
+                status="in_progress",
+                status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99),
+            )
+        ),
+    )
     git("commit", "-qam", "win keeps active, newer ts")
     git("checkout", "-q", "main")
-    _write(repo, "index.json", _collection(_task("t1", status="archived", tombstone=True,
-            status_fts=_fts("2026-06-02T00:00:00+00:00", "fed", 5))))
+    _write(
+        repo,
+        "index.json",
+        _collection(
+            _task(
+                "t1",
+                status="archived",
+                tombstone=True,
+                status_fts=_fts("2026-06-02T00:00:00+00:00", "fed", 5),
+            )
+        ),
+    )
     git("commit", "-qam", "fed deletes")
     git("merge", "win", "-m", "merge")
     t = _by_id(_read(repo, "index.json"))["t1"]
@@ -183,10 +226,17 @@ def test_c_resurrect_blocked_via_git(git_bridge):
 def test_c_tombstone_only_on_ours_side_also_wins():
     # symmetry: tombstone on OUR side, active (newer) on theirs.
     ours = _collection(
-        _task("t1", status="archived", tombstone=True, status_fts=_fts("2026-06-02T00:00:00+00:00", "a", 2))
+        _task(
+            "t1",
+            status="archived",
+            tombstone=True,
+            status_fts=_fts("2026-06-02T00:00:00+00:00", "a", 2),
+        )
     )
     theirs = _collection(
-        _task("t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "b", 99))
+        _task(
+            "t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "b", 99)
+        )
     )
     t = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
     assert t["status"] in TASK_HIDDEN_STATUSES
@@ -195,8 +245,20 @@ def test_c_tombstone_only_on_ours_side_also_wins():
 
 def test_c_status_only_tombstone_no_flag_still_wins():
     # A legacy peer expresses deletion via status alone (no _tombstone flag).
-    ours = _collection(_task("t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99)))
-    theirs = _collection(_task("t1", status="cancelled", status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1)))
+    ours = _collection(
+        _task(
+            "t1",
+            status="active",
+            status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99),
+        )
+    )
+    theirs = _collection(
+        _task(
+            "t1",
+            status="cancelled",
+            status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+        )
+    )
     t = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
     assert t["status"] in TASK_HIDDEN_STATUSES
     assert t.get("_tombstone") is True
@@ -207,8 +269,16 @@ def test_c_status_only_tombstone_no_flag_still_wins():
 
 def test_d_missing_field_ts_handled():
     # Tombstone with NO _field_ts at all, active side with rich metadata.
-    ours = _collection(_task("t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99)))
-    theirs = _collection({"id": "t1", "status": "archived", "_tombstone": True})  # no _field_ts, no updated_at
+    ours = _collection(
+        _task(
+            "t1",
+            status="active",
+            status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99),
+        )
+    )
+    theirs = _collection(
+        {"id": "t1", "status": "archived", "_tombstone": True}
+    )  # no _field_ts, no updated_at
     t = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
     assert t["status"] in TASK_HIDDEN_STATUSES
     assert t.get("_tombstone") is True
@@ -217,8 +287,21 @@ def test_d_missing_field_ts_handled():
 def test_d_clock_skew_future_active_still_loses_to_tombstone():
     # Active side carries an absurd FAR-FUTURE timestamp (clock skew). The
     # tombstone-union ignores timestamps entirely, so it cannot be defeated.
-    ours = _collection(_task("t1", status="active", status_fts=_fts("2099-01-01T00:00:00+00:00", "win", 10**15)))
-    theirs = _collection(_task("t1", status="archived", tombstone=True, status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1)))
+    ours = _collection(
+        _task(
+            "t1",
+            status="active",
+            status_fts=_fts("2099-01-01T00:00:00+00:00", "win", 10**15),
+        )
+    )
+    theirs = _collection(
+        _task(
+            "t1",
+            status="archived",
+            tombstone=True,
+            status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+        )
+    )
     t = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
     assert t["status"] in TASK_HIDDEN_STATUSES
     assert t.get("_tombstone") is True
@@ -246,12 +329,18 @@ def _make_stuck_uu(git_bridge, conflict_name, *, valid_theirs=False):
     git("commit", "-qm", "base")
     git("checkout", "-q", "-b", "other")
     if valid_theirs:
-        _write(repo, conflict_name, _collection(_task("t1", status="archived", tombstone=True)))
+        _write(
+            repo,
+            conflict_name,
+            _collection(_task("t1", status="archived", tombstone=True)),
+        )
     else:
         (repo / conflict_name).write_text("{not valid json", encoding="utf-8")
     git("commit", "-qam", "other changes file")
     git("checkout", "-q", "main")
-    _write(repo, conflict_name, _collection(_task("t1", status="in_progress"), _task("t2")))
+    _write(
+        repo, conflict_name, _collection(_task("t1", status="in_progress"), _task("t2"))
+    )
     git("commit", "-qam", "main changes file")
     return repo, git
 
@@ -302,6 +391,51 @@ def test_e_auto_heal_blocked_when_user_file_also_unmerged(git_bridge):
     assert "README.md" in user
 
 
+def test_corrupt_entities_index_is_regenerated_from_entity_files(tmp_path):
+    repo = tmp_path / "bridge"
+    entities = repo / "entities"
+    entities.mkdir(parents=True)
+    index_path = repo / "entities_index.json"
+    index_path.write_text('{"entities":[]}\n{"entities":[]}', encoding="utf-8")
+    (entities / "7.json").write_text(
+        json_dumps(
+            {
+                "id": 7,
+                "name": "Acme",
+                "entityType": "company",
+                "project": "shared",
+                "observations": [{"content": "one"}, {"content": "two"}],
+                "createdAt": "2026-07-01T00:00:00+00:00",
+                "updatedAt": "2026-07-02T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = bmd.ensure_entities_index_parseable(str(repo))
+
+    assert status == "regenerated"
+    rebuilt = json_loads(index_path.read_text(encoding="utf-8"))
+    assert rebuilt["format"] == "entity_bridge_v1"
+    assert rebuilt["entities"][0]["id"] == 7
+    assert rebuilt["entities"][0]["observation_count"] == 2
+
+
+def test_entities_index_repair_fails_closed_on_corrupt_entity_file(tmp_path):
+    repo = tmp_path / "bridge"
+    entities = repo / "entities"
+    entities.mkdir(parents=True)
+    index_path = repo / "entities_index.json"
+    original = '{"entities":[]}\n{"entities":[]}'
+    index_path.write_text(original, encoding="utf-8")
+    (entities / "7.json").write_text("{bad", encoding="utf-8")
+
+    status = bmd.ensure_entities_index_parseable(str(repo))
+
+    assert status == "failed"
+    assert index_path.read_text(encoding="utf-8") == original
+
+
 def test_e_ensure_ready_heals_real_corrupt_uu(tmp_path):
     import db_utils
 
@@ -309,7 +443,9 @@ def test_e_ensure_ready_heals_real_corrupt_uu(tmp_path):
     repo.mkdir()
 
     def git(*args, check=True):
-        cp = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+        cp = subprocess.run(
+            ["git", *args], cwd=str(repo), capture_output=True, text=True
+        )
         if check and cp.returncode != 0:
             raise AssertionError(f"git {args}: {cp.stderr or cp.stdout}")
         return cp
@@ -330,12 +466,14 @@ def test_e_ensure_ready_heals_real_corrupt_uu(tmp_path):
     git("commit", "-qam", "main new")
     git("merge", "other", "-m", "merge", check=False)  # UU (fail-closed)
     (repo / ".git" / "MERGE_HEAD").unlink(missing_ok=True)
-    assert subprocess.run(["git", "status", "--porcelain"], cwd=str(repo),
-                          capture_output=True, text=True).stdout.startswith("UU")
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(repo), capture_output=True, text=True
+    ).stdout.startswith("UU")
     ok, msg = db_utils.ensure_bridge_repo_ready(str(repo))
     assert ok is True, f"expected auto-heal, got blocked: {msg}"
-    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo),
-                            capture_output=True, text=True).stdout
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(repo), capture_output=True, text=True
+    ).stdout
     assert "UU" not in status  # conflict cleared
 
 
@@ -373,7 +511,11 @@ def test_f_second_git_merge_after_first_is_noop(git_bridge):
     git("add", "index.json", ".gitattributes")
     git("commit", "-qm", "base")
     git("checkout", "-q", "-b", "other")
-    _write(repo, "index.json", _collection(_task("t1"), _task("t2", status="archived", tombstone=True)))
+    _write(
+        repo,
+        "index.json",
+        _collection(_task("t1"), _task("t2", status="archived", tombstone=True)),
+    )
     git("commit", "-qam", "other")
     git("checkout", "-q", "main")
     git("merge", "other", "-m", "merge1")
@@ -413,7 +555,9 @@ def _init_bare_bridge(tmp_path, *, with_existing_attrs=False):
     repo.mkdir()
 
     def git(*args, check=True):
-        cp = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+        cp = subprocess.run(
+            ["git", *args], cwd=str(repo), capture_output=True, text=True
+        )
         if check and cp.returncode != 0:
             raise AssertionError(f"git {args}: {cp.stderr or cp.stdout}")
         return cp
@@ -526,10 +670,27 @@ def test_run_merge_driver_single_task_tombstone(tmp_path):
     ours = tmp_path / "o.json"
     theirs = tmp_path / "t.json"
     base.write_text("{}", encoding="utf-8")
-    ours.write_text(json_dumps(_task("t1", status="active",
-                    status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99))), encoding="utf-8")
-    theirs.write_text(json_dumps(_task("t1", status="archived", tombstone=True,
-                      status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))), encoding="utf-8")
+    ours.write_text(
+        json_dumps(
+            _task(
+                "t1",
+                status="active",
+                status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 99),
+            )
+        ),
+        encoding="utf-8",
+    )
+    theirs.write_text(
+        json_dumps(
+            _task(
+                "t1",
+                status="archived",
+                tombstone=True,
+                status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+            )
+        ),
+        encoding="utf-8",
+    )
     rc = bmd.run_merge_driver(str(base), str(ours), str(theirs), single_task=True)
     assert rc == 0
     result = json_loads(ours.read_text(encoding="utf-8"))
@@ -567,8 +728,12 @@ def _seed_active(db_path, tid, status, updated_at, updated_order, updated_by="wi
             (tid, "T", status, "task", "2026-06-01T00:00:00+00:00", updated_at),
         )
         _store_task_field_version(
-            conn, tid, "status",
-            updated_at=updated_at, updated_by=updated_by, updated_order=updated_order,
+            conn,
+            tid,
+            "status",
+            updated_at=updated_at,
+            updated_by=updated_by,
+            updated_order=updated_order,
         )
 
 
@@ -582,10 +747,17 @@ def test_roundtrip_legacy_active_tombstone_absorbed(task_db):
     # Losing peer holds t1 active with a NEWER legacy status order than the
     # tombstone. The driver-merged tombstone must still be absorbed (archived).
     _seed_active(task_db, "t1", "in_progress", "2026-06-09T00:00:00+00:00", 9)
-    active = _task("t1", status="in_progress",
-                   status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9))
-    tomb = _task("t1", status="archived", tombstone=True,
-                 status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    active = _task(
+        "t1",
+        status="in_progress",
+        status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9),
+    )
+    tomb = _task(
+        "t1",
+        status="archived",
+        tombstone=True,
+        status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+    )
     merged = bmd.reconcile_task_pair(active, tomb)
     with get_conn(task_db) as conn:
         merge_import_tasks(conn, [merged], import_content=True)
@@ -598,10 +770,17 @@ def test_roundtrip_packed_future_active_tombstone_absorbed(task_db):
     # Losing peer holds t1 active with a high PACKED (clock-skewed future) order.
     high = _pack_logical_clock(_iso_to_epoch_ms("2030-01-01T00:00:00+00:00"), 50)
     _seed_active(task_db, "t1", "in_progress", "2030-01-01T00:00:00+00:00", high)
-    active = _task("t1", status="in_progress",
-                   status_fts=_fts("2030-01-01T00:00:00+00:00", "win", high))
-    tomb = _task("t1", status="archived", tombstone=True,
-                 status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    active = _task(
+        "t1",
+        status="in_progress",
+        status_fts=_fts("2030-01-01T00:00:00+00:00", "win", high),
+    )
+    tomb = _task(
+        "t1",
+        status="archived",
+        tombstone=True,
+        status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+    )
     merged = bmd.reconcile_task_pair(active, tomb)
     with get_conn(task_db) as conn:
         merge_import_tasks(conn, [merged], import_content=True)
@@ -613,21 +792,36 @@ def test_roundtrip_packed_future_active_tombstone_absorbed(task_db):
 def test_roundtrip_idempotent_reimport_stays_dead(task_db):
     # Importing the SAME merged tombstone twice keeps the task dead (no churn).
     _seed_active(task_db, "t1", "in_progress", "2026-06-09T00:00:00+00:00", 9)
-    active = _task("t1", status="in_progress",
-                   status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9))
-    tomb = _task("t1", status="archived", tombstone=True,
-                 status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    active = _task(
+        "t1",
+        status="in_progress",
+        status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9),
+    )
+    tomb = _task(
+        "t1",
+        status="archived",
+        tombstone=True,
+        status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+    )
     merged = bmd.reconcile_task_pair(active, tomb)
     with get_conn(task_db) as conn:
         merge_import_tasks(conn, [merged], import_content=True)
-        merge_import_tasks(conn, [bmd.reconcile_task_pair(active, tomb)], import_content=True)
+        merge_import_tasks(
+            conn, [bmd.reconcile_task_pair(active, tomb)], import_content=True
+        )
     assert _db_status(task_db, "t1") in TASK_HIDDEN_STATUSES
 
 
 def test_dominating_status_clock_strictly_outranks_inputs():
-    ours = _task("t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9))
-    theirs = _task("t1", status="archived", tombstone=True,
-                   status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1))
+    ours = _task(
+        "t1", status="active", status_fts=_fts("2026-06-09T00:00:00+00:00", "win", 9)
+    )
+    theirs = _task(
+        "t1",
+        status="archived",
+        tombstone=True,
+        status_fts=_fts("2026-06-01T00:00:00+00:00", "fed", 1),
+    )
     _at, _by, order = bmd._dominating_status_clock(ours, theirs)
     # Must strictly exceed BOTH inputs on the packed sort axis.
     assert order > bmd._packed_order_of(ours, "status")

@@ -281,3 +281,21 @@ def test_find_by_title_eval_corpus_keeps_top1_and_top3_hit_rate(task_env):
     total = len(corpus)
     assert top1_hits == total
     assert top3_hits == total
+
+
+def test_find_by_title_uses_fts_prefilter_for_indexed_phrase(task_env):
+    _seed_lookup_corpus()
+
+    result = json.loads(task_server.find_by_title.fn("Byzantine gossip"))
+
+    assert result["lookup_strategy"] == "fts_prefilter"
+    assert result["matches"][0]["title"] == "Напълно общо заглавие"
+
+
+def test_find_by_title_falls_back_for_unindexed_substring(task_env):
+    task_server.create_task_or_note.fn(title="UnindexedSubstringTarget")
+
+    result = json.loads(task_server.find_by_title.fn("substringtar"))
+
+    assert result["lookup_strategy"] == "full_scan_fallback"
+    assert result["matches"][0]["title"] == "UnindexedSubstringTarget"

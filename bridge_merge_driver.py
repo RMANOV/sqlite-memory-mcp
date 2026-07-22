@@ -560,6 +560,94 @@ def ensure_bridge_merge_protection(repo_dir: str) -> dict[str, Any]:
     }
 
 
+def ensure_entities_index_parseable(repo_dir: str, logger: Any | None = None) -> str:
+    """Repair a union-merged ``entities_index.json`` from entity files.
+
+    ``entities_index.json`` is derived metadata, while ``entities/*.json`` hold
+    the importable entity payloads.  Git's union merge can concatenate two
+    otherwise-valid indexes into invalid JSON without reporting a conflict.
+    Rebuild only when every per-entity source file is parseable and internally
+    consistent; otherwise preserve the corrupt index for diagnosis and let the
+    caller's normal fallback remain authoritative.
+
+    Returns ``"ok"``, ``"regenerated"``, ``"skipped"``, or ``"failed"``.
+    """
+    index_path = Path(repo_dir) / "entities_index.json"
+    if not index_path.exists():
+        return "skipped"
+    try:
+        current = json_loads(index_path.read_text(encoding="utf-8"))
+        if isinstance(current, dict) and isinstance(current.get("entities"), list):
+            return "ok"
+    except (OSError, TypeError, ValueError):
+        pass
+
+    entity_paths = sorted((Path(repo_dir) / "entities").glob("*.json"))
+    if not entity_paths:
+        if logger is not None:
+            logger.warning(
+                "entities_index.json is corrupt and no entity files can rebuild it"
+            )
+        return "failed"
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entity_path in entity_paths:
+        try:
+            entity = json_loads(entity_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError) as exc:
+            if logger is not None:
+                logger.warning(
+                    "entities_index.json repair blocked by corrupt %s: %s",
+                    entity_path.name,
+                    exc,
+                )
+            return "failed"
+        if not isinstance(entity, dict) or entity.get("id") is None:
+            return "failed"
+        entity_id = str(entity["id"])
+        if entity_path.stem != entity_id or entity_id in seen_ids:
+            return "failed"
+        seen_ids.add(entity_id)
+        observations = entity.get("observations")
+        entries.append(
+            {
+                "id": entity["id"],
+                "name": entity.get("name"),
+                "entityType": entity.get("entityType"),
+                "project": entity.get("project"),
+                "visibility": entity.get("visibility"),
+                "createdAt": entity.get("createdAt"),
+                "updatedAt": entity.get("updatedAt"),
+                "observation_count": (
+                    len(observations) if isinstance(observations, list) else 0
+                ),
+            }
+        )
+
+    rebuilt = {
+        "version": 1,
+        "format": "entity_bridge_v1",
+        "pushed_at": now_iso(),
+        "machine_id": MACHINE_ID,
+        "entities": entries,
+    }
+    tmp_path = index_path.with_name(f"{index_path.name}.tmp")
+    try:
+        tmp_path.write_text(json_dumps(rebuilt), encoding="utf-8")
+        tmp_path.replace(index_path)
+    except OSError as exc:
+        if logger is not None:
+            logger.warning("entities_index.json repair write failed: %s", exc)
+        return "failed"
+    if logger is not None:
+        logger.warning(
+            "regenerated corrupt entities_index.json from %d entity files",
+            len(entries),
+        )
+    return "regenerated"
+
+
 # ── stuck-UU (unmerged) auto-heal for generated artifacts ───────────────────
 
 

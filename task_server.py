@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Thin MCP server exposing only task management tools.
 
-Shares the same SQLite database as the main sqlite-kb server.
-Exists because Claude Code 2.x has a tool-count limit per MCP server
-(~9 tools visible out of 50), so task tools are split into a separate server.
+Shares the same SQLite database as the main sqlite-kb server and keeps the task
+surface independently deployable; ``unified_server.py`` also mounts it.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from fastmcp_compat import FastMCP
 
 from db_utils import (
     get_conn as _get_conn,
+    fts_query as _fts_query,
     TaskDAO,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
     TASK_PRIORITIES as _TASK_PRIORITIES,
@@ -32,6 +32,7 @@ from retrieval_contract import (
     classify_lookup_confidence,
     is_visible_lookup_match,
     order_surface_hits,
+    normalize_lookup_text,
     score_lookup_surface,
 )
 from premium_runtime import maybe_mount_premium_extensions
@@ -261,9 +262,7 @@ def upsert_note_by_title_project(
 
     now = _now()
     with _get_conn() as conn:
-        existing = _find_note_by_title_project(
-            conn, title=title, project=project_value
-        )
+        existing = _find_note_by_title_project(conn, title=title, project=project_value)
         if existing:
             if not update_if_found:
                 return json.dumps(
@@ -493,9 +492,7 @@ _QUERY_TASKS_DEFAULT_ORDER = (
 )
 
 
-def _build_query_tasks_order(
-    sort_by: str, sort_order: str
-) -> tuple[str, str | None]:
+def _build_query_tasks_order(sort_by: str, sort_order: str) -> tuple[str, str | None]:
     """Build a validated ORDER BY clause for query_tasks.
 
     Returns (order_clause, error). When sort_by is empty, returns the
@@ -703,6 +700,206 @@ def query_tasks(
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 3b: find_by_title
 # ═══════════════════════════════════════════════════════════════════════════
+
+_LOOKUP_TASK_COLUMNS = (
+    "id, title, description, notes, type, status, section, priority, due_date, "
+    "project, updated_at, created_at"
+)
+_LOOKUP_ENTITY_COLUMNS = "id, name, entity_type, project, updated_at, created_at"
+
+
+def _lookup_prefilter_ids(
+    conn: sqlite3.Connection, query: str, candidate_limit: int
+) -> tuple[list[int], list[int]] | None:
+    """Return broad FTS/project candidates, or None for exact full-scan fallback."""
+    try:
+        fts_q = _fts_query(query)
+        task_ids = {
+            row["rowid"]
+            for row in conn.execute(
+                "SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (fts_q, candidate_limit),
+            )
+        }
+        entity_ids = {
+            row["rowid"]
+            for row in conn.execute(
+                "SELECT rowid FROM memory_fts WHERE memory_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (fts_q, candidate_limit),
+            )
+        }
+
+        # Project is part of the retrieval contract but is not indexed by either
+        # FTS table. Include normalized project phrase hits so the prefilter does
+        # not erase project-only recall (covered by the locked eval corpus).
+        normalized = normalize_lookup_text(query)
+        if normalized and normalized.isascii():
+            project_expr = (
+                "lower(replace(replace(coalesce(project, ''), '-', ' '), '_', ' '))"
+            )
+            task_ids.update(
+                row["rowid"]
+                for row in conn.execute(
+                    f"SELECT rowid FROM tasks WHERE instr({project_expr}, ?) > 0 "
+                    "LIMIT ?",
+                    (normalized, candidate_limit),
+                )
+            )
+            entity_ids.update(
+                row["id"]
+                for row in conn.execute(
+                    f"SELECT id FROM entities WHERE instr({project_expr}, ?) > 0 "
+                    "LIMIT ?",
+                    (normalized, candidate_limit),
+                )
+            )
+    except sqlite3.Error:
+        return None
+    if not task_ids and not entity_ids:
+        return None
+    return sorted(task_ids), sorted(entity_ids)
+
+
+def _lookup_rows(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int,
+    *,
+    force_full_scan: bool = False,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict[int, list[str]], str]:
+    """Load only lookup candidates; retain an exact full-scan fallback."""
+    candidate_ids = None
+    if not force_full_scan:
+        # Stay below SQLite's historical 999 host-parameter ceiling because
+        # candidate IDs are consumed by one IN (...) query per surface.
+        candidate_limit = min(900, max(200, limit * 10))
+        candidate_ids = _lookup_prefilter_ids(conn, query, candidate_limit)
+
+    if candidate_ids is None:
+        task_rows = conn.execute(f"SELECT {_LOOKUP_TASK_COLUMNS} FROM tasks").fetchall()
+        entity_rows = conn.execute(
+            f"SELECT {_LOOKUP_ENTITY_COLUMNS} FROM entities"
+        ).fetchall()
+        strategy = "full_scan_fallback"
+    else:
+        task_ids, entity_ids = candidate_ids
+        if task_ids:
+            ph = ",".join("?" * len(task_ids))
+            task_rows = conn.execute(
+                f"SELECT {_LOOKUP_TASK_COLUMNS} FROM tasks WHERE rowid IN ({ph})",
+                task_ids,
+            ).fetchall()
+        else:
+            task_rows = []
+        if entity_ids:
+            ph = ",".join("?" * len(entity_ids))
+            entity_rows = conn.execute(
+                f"SELECT {_LOOKUP_ENTITY_COLUMNS} FROM entities WHERE id IN ({ph})",
+                entity_ids,
+            ).fetchall()
+        else:
+            entity_rows = []
+        strategy = "fts_prefilter"
+
+    obs_by_entity: dict[int, list[str]] = {}
+    if entity_rows:
+        entity_ids = [row["id"] for row in entity_rows]
+        ph = ",".join("?" * len(entity_ids))
+        for row in conn.execute(
+            f"SELECT entity_id, content FROM observations "
+            f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+            entity_ids,
+        ):
+            obs_by_entity.setdefault(row["entity_id"], []).append(row["content"])
+    return task_rows, entity_rows, obs_by_entity, strategy
+
+
+def _score_task_lookup(row: sqlite3.Row, query: str) -> dict[str, Any] | None:
+    title = row["title"] or ""
+    surface_scores = {
+        surface: score
+        for surface, score in (
+            ("title", score_lookup_surface("title", query, title)),
+            (
+                "description",
+                score_lookup_surface("description", query, row["description"]),
+            ),
+            ("notes", score_lookup_surface("notes", query, row["notes"])),
+            ("project", score_lookup_surface("project", query, row["project"])),
+        )
+        if score > 0
+    }
+    if not surface_scores:
+        return None
+    ordered_hits = order_surface_hits(surface_scores)
+    matched_in = [surface for surface, _ in ordered_hits]
+    return {
+        "kind": "note" if row["type"] == "note" else "task",
+        "id": row["id"],
+        "title": title,
+        "type": row["type"],
+        "status": row["status"],
+        "section": row["section"],
+        "priority": row["priority"],
+        "due_date": row["due_date"],
+        "project": row["project"],
+        "updated_at": row["updated_at"],
+        "created_at": row["created_at"],
+        "score": float(ordered_hits[0][1]),
+        "matched_in": matched_in,
+        "surface_scores": surface_scores,
+        "primary_surface": matched_in[0],
+        "confidence": classify_lookup_confidence(surface_scores),
+        "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
+    }
+
+
+def _score_entity_lookup(
+    row: sqlite3.Row,
+    query: str,
+    observations: list[str],
+) -> dict[str, Any] | None:
+    name = row["name"] or ""
+    obs_text = "\n".join(observations)
+    surface_scores = {
+        surface: score
+        for surface, score in (
+            ("name", score_lookup_surface("name", query, name)),
+            (
+                "observations",
+                score_lookup_surface("observations", query, obs_text),
+            ),
+            ("project", score_lookup_surface("project", query, row["project"])),
+            (
+                "entity_type",
+                score_lookup_surface("entity_type", query, row["entity_type"]),
+            ),
+        )
+        if score > 0
+    }
+    if not surface_scores:
+        return None
+    ordered_hits = order_surface_hits(surface_scores)
+    matched_in = [surface for surface, _ in ordered_hits]
+    return {
+        "kind": "entity",
+        "id": row["id"],
+        "title": name,
+        "entityType": row["entity_type"],
+        "project": row["project"],
+        "updated_at": row["updated_at"],
+        "created_at": row["created_at"],
+        "score": float(ordered_hits[0][1]),
+        "matched_in": matched_in,
+        "surface_scores": surface_scores,
+        "primary_surface": matched_in[0],
+        "confidence": classify_lookup_confidence(surface_scores),
+        "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
+    }
+
+
 @mcp.tool()
 def find_by_title(title_fragment: str, limit: int = 20) -> str:
     """Find tasks, notes, or entities by partial title or remembered phrase.
@@ -726,103 +923,49 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
     matches: list[dict[str, Any]] = []
 
     with _get_conn() as conn:
-        task_rows = conn.execute(
-            "SELECT id, title, description, notes, type, status, section, priority, due_date, project, updated_at, created_at "
-            "FROM tasks"
-        ).fetchall()
-        for row in task_rows:
-            title = row["title"] or ""
-            surface_scores = {
-                surface: score
-                for surface, score in (
-                    ("title", score_lookup_surface("title", query, title)),
-                    (
-                        "description",
-                        score_lookup_surface("description", query, row["description"]),
-                    ),
-                    ("notes", score_lookup_surface("notes", query, row["notes"])),
-                    ("project", score_lookup_surface("project", query, row["project"])),
+        task_rows, entity_rows, obs_by_entity, strategy = _lookup_rows(
+            conn, query, limit
+        )
+        matches.extend(
+            scored
+            for row in task_rows
+            if (scored := _score_task_lookup(row, query)) is not None
+        )
+        matches.extend(
+            scored
+            for row in entity_rows
+            if (
+                scored := _score_entity_lookup(
+                    row, query, obs_by_entity.get(row["id"], [])
                 )
-                if score > 0
-            }
-            if not surface_scores:
-                continue
-            ordered_hits = order_surface_hits(surface_scores)
-            matched_in = [surface for surface, _ in ordered_hits]
-            score = float(ordered_hits[0][1])
-            confidence = classify_lookup_confidence(surface_scores)
-            kind = "note" if row["type"] == "note" else "task"
-            matches.append(
-                {
-                    "kind": kind,
-                    "id": row["id"],
-                    "title": title,
-                    "type": row["type"],
-                    "status": row["status"],
-                    "section": row["section"],
-                    "priority": row["priority"],
-                    "due_date": row["due_date"],
-                    "project": row["project"],
-                    "updated_at": row["updated_at"],
-                    "created_at": row["created_at"],
-                    "score": score,
-                    "matched_in": matched_in,
-                    "surface_scores": surface_scores,
-                    "primary_surface": matched_in[0],
-                    "confidence": confidence,
-                    "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
-                }
             )
+            is not None
+        )
 
-        obs_by_entity: dict[int, list[str]] = {}
-        for row in conn.execute(
-            "SELECT entity_id, content FROM observations ORDER BY entity_id, id"
+        # FTS OR queries can surface only low-signal token collisions. In that
+        # case use the exact historical scan so a strong substring match outside
+        # the bounded candidate pool cannot disappear silently.
+        if strategy == "fts_prefilter" and not any(
+            is_visible_lookup_match(item.get("surface_scores") or {})
+            for item in matches
         ):
-            obs_by_entity.setdefault(row["entity_id"], []).append(row["content"])
-        entity_rows = conn.execute(
-            "SELECT id, name, entity_type, project, updated_at, created_at FROM entities"
-        ).fetchall()
-        for row in entity_rows:
-            name = row["name"] or ""
-            obs_text = "\n".join(obs_by_entity.get(row["id"], []))
-            surface_scores = {
-                surface: score
-                for surface, score in (
-                    ("name", score_lookup_surface("name", query, name)),
-                    (
-                        "observations",
-                        score_lookup_surface("observations", query, obs_text),
-                    ),
-                    ("project", score_lookup_surface("project", query, row["project"])),
-                    (
-                        "entity_type",
-                        score_lookup_surface("entity_type", query, row["entity_type"]),
-                    ),
+            task_rows, entity_rows, obs_by_entity, strategy = _lookup_rows(
+                conn, query, limit, force_full_scan=True
+            )
+            matches = [
+                scored
+                for row in task_rows
+                if (scored := _score_task_lookup(row, query)) is not None
+            ]
+            matches.extend(
+                scored
+                for row in entity_rows
+                if (
+                    scored := _score_entity_lookup(
+                        row, query, obs_by_entity.get(row["id"], [])
+                    )
                 )
-                if score > 0
-            }
-            if not surface_scores:
-                continue
-            ordered_hits = order_surface_hits(surface_scores)
-            matched_in = [surface for surface, _ in ordered_hits]
-            score = float(ordered_hits[0][1])
-            confidence = classify_lookup_confidence(surface_scores)
-            matches.append(
-                {
-                    "kind": "entity",
-                    "id": row["id"],
-                    "title": name,
-                    "entityType": row["entity_type"],
-                    "project": row["project"],
-                    "updated_at": row["updated_at"],
-                    "created_at": row["created_at"],
-                    "score": score,
-                    "matched_in": matched_in,
-                    "surface_scores": surface_scores,
-                    "primary_surface": matched_in[0],
-                    "confidence": confidence,
-                    "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
-                }
+                is not None
             )
 
     matches.sort(
@@ -871,6 +1014,7 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
             "query": query,
             "hidden_low_confidence_count": hidden_low_confidence,
             "ranking_contract_version": RETRIEVAL_CONTRACT_VERSION,
+            "lookup_strategy": strategy,
             "markdown": "\n".join(lines) if matches else "",
             "message": None if matches else "No title matches",
         }
@@ -1002,37 +1146,18 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
     """
     if target_priority not in _TASK_PRIORITIES:
         return json.dumps({"error": f"Invalid priority: {target_priority}"})
-
-    priority_rank = {p: i for i, p in enumerate(_TASK_PRIORITIES)}
-    target_rank = priority_rank[target_priority]
-    lower_priorities = [p for p, r in priority_rank.items() if r < target_rank]
-    if not lower_priorities:
+    if _TASK_PRIORITIES.index(target_priority) == 0:
         return json.dumps({"bumped": 0, "message": "No lower priorities to bump"})
 
-    ph = ",".join("?" * len(lower_priorities))
-    now = _now()
-
     with _get_conn() as conn:
-        affected = conn.execute(
-            f"SELECT id FROM tasks "
-            f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) "
-            f"AND priority IN ({ph})",
-            list(_TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
-        ).fetchall()
-        bumped = 0
-        for row in affected:
-            result = _apply_task_mutation(
-                conn,
-                row["id"],
-                {"priority": target_priority},
-                timestamp=now,
-                tool_name="sqlite-tasks.bump_overdue_priority",
-            )
-            if result.get("updated", 0):
-                bumped += 1
+        bumped = TaskDAO.bump_overdue_priority(
+            conn,
+            target_priority,
+            tool_name="sqlite-tasks.bump_overdue_priority",
+        )
 
-    logger.info("bump_overdue_priority: %d bumped to %s", bumped, target_priority)
-    return json.dumps({"bumped": bumped, "target_priority": target_priority})
+    logger.info("bump_overdue_priority: %d bumped to %s", len(bumped), target_priority)
+    return json.dumps({"bumped": len(bumped), "target_priority": target_priority})
 
 
 def _strip_ready_task_payload(record: dict[str, Any]) -> dict[str, Any]:

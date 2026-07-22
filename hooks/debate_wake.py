@@ -48,7 +48,7 @@ AGENT_LOG_DIR = Path(
         os.path.expanduser("~/.claude/memory/debate_wake_agents"),
     )
 )
-TARGET_TOOL = "mcp__sqlite_intel__debate_post_with_recipients"
+TARGET_TOOL_SUFFIX = "__debate_post_with_recipients"
 POST_SCHEMA_VERSION = "debate_post_with_recipients.v1"
 LOG_MAX_BYTES = int(os.environ.get("DEBATE_WAKE_LOG_MAX_BYTES", str(20 * 1024 * 1024)))
 LOG_KEEP = max(1, int(os.environ.get("DEBATE_WAKE_LOG_KEEP", "3")))
@@ -56,6 +56,11 @@ LOG_KEEP = max(1, int(os.environ.get("DEBATE_WAKE_LOG_KEEP", "3")))
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_target_tool(tool_name: str) -> bool:
+    """Accept the debate post tool under any MCP server prefix."""
+    return not tool_name or tool_name.endswith(TARGET_TOOL_SUFFIX)
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -955,7 +960,7 @@ def _run_hook() -> int:
         return 0
 
     tool_name = str(payload.get("tool_name") or payload.get("toolName") or "")
-    if tool_name and tool_name != TARGET_TOOL:
+    if not _is_target_tool(tool_name):
         return 0
 
     tool_response = _extract_tool_response(payload)

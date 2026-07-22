@@ -60,6 +60,10 @@ caller's `BEGIN IMMEDIATE` transaction, before the message insert:
 6. `ESCALATE` requires a declared human/operator recipient and a structured
    decision question, options, decisive evidence, consequences, unresolved
    point, and exact requested human action.
+7. Reject an exact typed-act replay with `DUPLICATE_ACT`; a retry cannot insert
+   a second message or advance the round. Unresolved challenges remain blockers
+   across round boundaries until a `REBUT` or `CONCEDE` targets them.
+8. `VERIFY` must come from a role outside the two opposing blind roles.
 
 Any validation failure is zero mutation: no message, recipient, state,
 visibility, wake, or audit row is committed.
@@ -67,14 +71,23 @@ visibility, wake, or audit row is committed.
 ## Adjudication, recovery, and scheduling
 
 The judge receives two server-generated normalized projections, AB and BA.
-Matching immutable verdicts stop the protocol; disagreement creates
-`STALEMATE`. The source messages are not reordered or rewritten.
+Their source positions must come from the two configured opposing roles. A
+verdict role must be declared, active, non-human, and outside those opposing
+roles. Matching immutable verdicts stop the protocol; disagreement creates
+`STALEMATE`. Replaying an identical verdict is a state-version no-op. The
+source messages are not reordered or rewritten.
 
 The pump runs phase-timeout and role-ownership sweeps. A missing active binding
 is replaced by a new generation of the same role; quiet bindings are not
 declared dead without objective evidence. Existing PID/create-time worker reap
 and durable trigger replay recover proven-dead hidden workers without advancing
 the cursor or changing semantic role.
+
+Each `debate/v1` derived worker is scoped to exactly its claimed trigger. Its
+signal read replays that trigger even when the parent cursor has already moved
+past it; it cannot read or advance through a sibling worker's later trigger.
+Only a delivered-and-advanced claimed trigger can authorize its one semantic
+response.
 
 Post-commit Windows events are the immediate path. With no event, the scheduler
 uses these deterministic projections:

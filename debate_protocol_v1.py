@@ -136,62 +136,60 @@ def _require_list(payload: dict[str, Any], key: str) -> None:
         )
 
 
+_REQUIRED_STRING_FIELDS: dict[str, tuple[str, ...]] = {
+    "CLAIM": ("summary",),
+    "CHALLENGE": ("target", "challenge_type", "requested_disposition"),
+    "EVIDENCE": (
+        "target",
+        "source_id",
+        "locator",
+        "retrieved_at",
+        "content_hash",
+    ),
+    "REBUT": ("target", "disposition"),
+    "CONCEDE": ("target", "scope", "consequence"),
+    "VERIFY": ("target",),
+    "DISSENT": ("decision_target", "unresolved_point", "strongest_evidence"),
+    "ESCALATE": ("decision_question", "unresolved_point", "exact_human_action"),
+}
+_REQUIRED_LIST_FIELDS: dict[str, tuple[str, ...]] = {
+    "CLAIM": ("assumptions", "evidence_refs"),
+    "REBUT": ("evidence_refs",),
+    "VERIFY": ("checks",),
+    "ESCALATE": ("options", "decisive_evidence", "consequence_by_option"),
+}
+_ENUM_FIELDS: dict[str, tuple[str, frozenset[str], str]] = {
+    "EVIDENCE": (
+        "verification_status",
+        frozenset({"verified", "contested", "unsupported", "unknown"}),
+        "verification_status",
+    ),
+    "VERIFY": (
+        "result",
+        frozenset({"verified", "contested", "unsupported", "unknown"}),
+        "VERIFY.result",
+    ),
+}
+
+
 def normalize_payload(kind: str, payload: Any) -> dict[str, Any]:
     """Validate a kind-specific machine payload and return a clean copy."""
     if kind not in SEMANTIC_KINDS:
         return {}
     value = _json_dict(payload, field="payload_json")
-    if kind == "CLAIM":
-        _require_nonempty_string(value, "summary")
-        _require_list(value, "assumptions")
-        _require_list(value, "evidence_refs")
-    elif kind == "CHALLENGE":
-        _require_nonempty_string(value, "target")
-        _require_nonempty_string(value, "challenge_type")
-        _require_nonempty_string(value, "requested_disposition")
-    elif kind == "EVIDENCE":
-        for key in ("target", "source_id", "locator", "retrieved_at", "content_hash"):
-            _require_nonempty_string(value, key)
-        status = value.get("verification_status")
-        if status not in {"verified", "contested", "unsupported", "unknown"}:
+    for key in _REQUIRED_STRING_FIELDS.get(kind, ()):
+        _require_nonempty_string(value, key)
+    for key in _REQUIRED_LIST_FIELDS.get(kind, ()):
+        _require_list(value, key)
+    enum_contract = _ENUM_FIELDS.get(kind)
+    if enum_contract is not None:
+        key, allowed, label = enum_contract
+        if value.get(key) not in allowed:
             raise ProtocolV1Error(
-                "invalid_payload: verification_status is not canonical",
+                f"invalid_payload: {label} is not canonical",
                 error_type="INVALID_PAYLOAD",
-                details={"field": "verification_status"},
+                details={"field": key},
             )
-    elif kind == "REBUT":
-        _require_nonempty_string(value, "target")
-        _require_nonempty_string(value, "disposition")
-        _require_list(value, "evidence_refs")
-    elif kind == "CONCEDE":
-        for key in ("target", "scope", "consequence"):
-            _require_nonempty_string(value, key)
-    elif kind == "VERIFY":
-        _require_nonempty_string(value, "target")
-        if value.get("result") not in {
-            "verified",
-            "contested",
-            "unsupported",
-            "unknown",
-        }:
-            raise ProtocolV1Error(
-                "invalid_payload: VERIFY.result is not canonical",
-                error_type="INVALID_PAYLOAD",
-                details={"field": "result"},
-            )
-        _require_list(value, "checks")
-    elif kind == "DISSENT":
-        for key in ("decision_target", "unresolved_point", "strongest_evidence"):
-            _require_nonempty_string(value, key)
-    elif kind == "ESCALATE":
-        for key in (
-            "decision_question",
-            "unresolved_point",
-            "exact_human_action",
-        ):
-            _require_nonempty_string(value, key)
-        for key in ("options", "decisive_evidence", "consequence_by_option"):
-            _require_list(value, key)
     return value
 
 
@@ -351,6 +349,38 @@ def assert_fresh_read(
     ).fetchone()
     cursor_ts = cursor["last_processed_ts"] if cursor else None
     cursor_id = (cursor["last_processed_msg_id"] or "") if cursor else ""
+    worker = conn.execute(
+        "SELECT trigger_msg_id FROM debate_worker_claims "
+        "WHERE topic_id=? AND role=? AND worker_session_id=? AND state='active'",
+        (topic_id, role, session_id),
+    ).fetchone()
+    if worker is not None:
+        trigger = conn.execute(
+            "SELECT msg_id,ts,role,kind FROM debate_messages WHERE msg_id=? "
+            "AND topic_id=?",
+            (worker["trigger_msg_id"], topic_id),
+        ).fetchone()
+        if (
+            trigger is None
+            or cursor_ts is None
+            or (cursor_ts, cursor_id)
+            < (
+                trigger["ts"],
+                trigger["msg_id"],
+            )
+        ):
+            details = (
+                dict(trigger)
+                if trigger is not None
+                else {"msg_id": worker["trigger_msg_id"]}
+            )
+            details["author_session_id"] = session_id
+            raise ProtocolV1Error(
+                f"STALE_READ: unread claimed trigger {worker['trigger_msg_id']}",
+                error_type="STALE_READ",
+                details=details,
+            )
+        return session_id
     params: list[Any] = [topic_id, role, session_id, role]
     after = ""
     if cursor_ts:
@@ -391,6 +421,187 @@ _TARGET_PARENT_KINDS: dict[str, set[str]] = {
 
 def _has_human_recipient(recipients: Iterable[str]) -> bool:
     return any(_HUMAN_RECIPIENT_RE.fullmatch(str(value or "")) for value in recipients)
+
+
+def _validate_semantic_role(*, kind: str, role: str, blind_roles: set[str]) -> None:
+    if kind == "VERIFY" and role in blind_roles:
+        raise ProtocolV1Error(
+            "VERIFY requires a role independent from the opposing positions",
+            error_type="ROLE_NOT_ALLOWED",
+            details={"role": role, "kind": kind},
+        )
+
+
+def _reject_duplicate_dissent(
+    conn: sqlite3.Connection, *, topic_id: str, role: str
+) -> None:
+    duplicate = conn.execute(
+        "SELECT 1 FROM debate_messages WHERE topic_id=? AND role=? "
+        "AND protocol_version=? AND kind='DISSENT' LIMIT 1",
+        (topic_id, role, PROTOCOL_VERSION),
+    ).fetchone()
+    if duplicate is not None:
+        raise ProtocolV1Error(
+            "only one DISSENT per semantic role is allowed",
+            error_type="DISSENT_DUPLICATE",
+        )
+
+
+def _validate_round_cap(*, state: dict[str, Any], kind: str) -> None:
+    round_no = int(state["round_no"])
+    max_rounds = int(state["max_rounds"])
+    if round_no > max_rounds and kind not in {"DISSENT", "ESCALATE"}:
+        raise ProtocolV1Error(
+            "server round cap exceeded",
+            error_type="ROUND_CAP",
+            details={"round_no": round_no, "max_rounds": max_rounds},
+        )
+
+
+def _validate_phase_kind(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    kind: str,
+    state: dict[str, Any],
+) -> None:
+    phase = str(state["phase"])
+    if phase == "BLIND_CLAIM":
+        if kind != "CLAIM" or role not in set(state["blind_roles"]):
+            raise ProtocolV1Error(
+                "blind commit barrier accepts only initial CLAIMs",
+                error_type="BLIND_NOT_RELEASED",
+                details={"phase": phase, "blind_roles": state["blind_roles"]},
+            )
+        duplicate = conn.execute(
+            "SELECT 1 FROM debate_blind_commits WHERE topic_id=? AND role=?",
+            (topic_id, role),
+        ).fetchone()
+        if duplicate is not None:
+            raise ProtocolV1Error(
+                "role already committed its initial CLAIM",
+                error_type="BLIND_CLAIM_DUPLICATE",
+                details={"role": role},
+            )
+    elif phase == "DEBATE" and kind not in {*DEBATE_TURN_KINDS, "ESCALATE"}:
+        raise ProtocolV1Error(
+            f"kind {kind} is not allowed during DEBATE",
+            error_type="WRONG_PHASE",
+            details={"phase": phase},
+        )
+    elif phase == "ADJUDICATE" and kind != "ESCALATE":
+        raise ProtocolV1Error(
+            "ADJUDICATE accepts judge operations or ESCALATE only",
+            error_type="WRONG_PHASE",
+            details={"phase": phase},
+        )
+    elif phase == "STALEMATE":
+        if kind not in {"DISSENT", "ESCALATE"}:
+            raise ProtocolV1Error(
+                "protocol is in STALEMATE",
+                error_type="PROTOCOL_STALEMATE",
+                details={"stalemate_reason": state.get("stalemate_reason")},
+            )
+        if kind == "DISSENT":
+            _reject_duplicate_dissent(conn, topic_id=topic_id, role=role)
+    elif phase in {"ESCALATED", "STOPPED"}:
+        raise ProtocolV1Error(
+            f"protocol phase {phase} is terminal for posts",
+            error_type="PROTOCOL_TERMINAL",
+            details={"phase": phase},
+        )
+    _validate_round_cap(state=state, kind=kind)
+
+
+def _reject_duplicate_act(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    kind: str,
+    reply_to: str | None,
+    normalized_json: str,
+) -> None:
+    existing = conn.execute(
+        "SELECT msg_id FROM debate_messages WHERE topic_id=? AND role=? "
+        "AND kind=? AND protocol_version=? AND reply_to IS ? AND payload_json=? "
+        "LIMIT 1",
+        (topic_id, role, kind, PROTOCOL_VERSION, reply_to, normalized_json),
+    ).fetchone()
+    if existing is not None:
+        raise ProtocolV1Error(
+            "exact semantic act already exists",
+            error_type="DUPLICATE_ACT",
+            details={"msg_id": existing["msg_id"]},
+        )
+
+
+def _validate_target(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    kind: str,
+    reply_to: str | None,
+    payload: dict[str, Any],
+) -> None:
+    if kind not in TARGET_REQUIRED_KINDS:
+        return
+    if not reply_to:
+        raise ProtocolV1Error(
+            f"{kind} requires reply_to",
+            error_type="INVALID_TARGET",
+        )
+    parent = conn.execute(
+        "SELECT topic_id,kind FROM debate_messages WHERE msg_id=?", (reply_to,)
+    ).fetchone()
+    if parent is None or parent["topic_id"] != topic_id:
+        raise ProtocolV1Error(
+            "target must exist in the same topic",
+            error_type="INVALID_TARGET",
+            details={"reply_to": reply_to},
+        )
+    if parent["kind"] not in _TARGET_PARENT_KINDS[kind]:
+        raise ProtocolV1Error(
+            f"{kind} cannot target {parent['kind']}",
+            error_type="INVALID_TARGET",
+            details={"reply_to": reply_to, "parent_kind": parent["kind"]},
+        )
+    target_key = "decision_target" if kind == "DISSENT" else "target"
+    if str(payload.get(target_key)) != reply_to:
+        raise ProtocolV1Error(
+            f"payload.{target_key} must equal reply_to",
+            error_type="INVALID_TARGET",
+            details={"reply_to": reply_to, "payload_target": payload.get(target_key)},
+        )
+
+
+def _validate_escalation(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    kind: str,
+    recipients: Sequence[str],
+    protocol_generation: int,
+) -> None:
+    if kind != "ESCALATE":
+        return
+    if not _has_human_recipient(recipients):
+        raise ProtocolV1Error(
+            "ESCALATE requires a human recipient",
+            error_type="HUMAN_RECIPIENT_REQUIRED",
+        )
+    existing = conn.execute(
+        "SELECT msg_id FROM debate_human_packets WHERE topic_id=? "
+        "AND protocol_generation=?",
+        (topic_id, protocol_generation),
+    ).fetchone()
+    if existing is not None:
+        raise ProtocolV1Error(
+            "ESCALATE packet already exists for this protocol generation",
+            error_type="ESCALATE_DUPLICATE",
+            details={"msg_id": existing["msg_id"]},
+        )
 
 
 def preflight_post(
@@ -439,9 +650,12 @@ def preflight_post(
             error_type="INVALID_BODY_MODE",
         )
     normalized = normalize_payload(kind, payload)
+    normalized_json = json.dumps(
+        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     phase = str(state["phase"])
     round_no = int(state["round_no"])
-    max_rounds = int(state["max_rounds"])
+    _validate_semantic_role(kind=kind, role=role, blind_roles=set(state["blind_roles"]))
 
     if kind in DEBATE_TURN_KINDS:
         assert_fresh_read(
@@ -450,130 +664,36 @@ def preflight_post(
             role=role,
             author_session_id=author_session_id,
         )
-
-    if phase == "BLIND_CLAIM":
-        if kind != "CLAIM" or role not in set(state["blind_roles"]):
-            raise ProtocolV1Error(
-                "blind commit barrier accepts only initial CLAIMs",
-                error_type="BLIND_NOT_RELEASED",
-                details={"phase": phase, "blind_roles": state["blind_roles"]},
-            )
-        duplicate = conn.execute(
-            "SELECT 1 FROM debate_blind_commits WHERE topic_id=? AND role=?",
-            (topic_id, role),
-        ).fetchone()
-        if duplicate is not None:
-            raise ProtocolV1Error(
-                "role already committed its initial CLAIM",
-                error_type="BLIND_CLAIM_DUPLICATE",
-                details={"role": role},
-            )
-    elif phase == "DEBATE":
-        if kind not in DEBATE_TURN_KINDS and kind != "ESCALATE":
-            raise ProtocolV1Error(
-                f"kind {kind} is not allowed during DEBATE",
-                error_type="WRONG_PHASE",
-                details={"phase": phase},
-            )
-    elif phase == "ADJUDICATE":
-        if kind != "ESCALATE":
-            raise ProtocolV1Error(
-                "ADJUDICATE accepts judge operations or ESCALATE only",
-                error_type="WRONG_PHASE",
-                details={"phase": phase},
-            )
-    elif phase == "STALEMATE":
-        if kind not in {"DISSENT", "ESCALATE"}:
-            raise ProtocolV1Error(
-                "protocol is in STALEMATE",
-                error_type="PROTOCOL_STALEMATE",
-                details={"stalemate_reason": state.get("stalemate_reason")},
-            )
-        if kind == "DISSENT":
-            duplicate = conn.execute(
-                "SELECT 1 FROM debate_messages WHERE topic_id=? AND role=? "
-                "AND protocol_version=? AND kind='DISSENT' LIMIT 1",
-                (topic_id, role, PROTOCOL_VERSION),
-            ).fetchone()
-            if duplicate is not None:
-                raise ProtocolV1Error(
-                    "only one DISSENT per semantic role is allowed",
-                    error_type="DISSENT_DUPLICATE",
-                )
-    elif phase in {"ESCALATED", "STOPPED"}:
-        raise ProtocolV1Error(
-            f"protocol phase {phase} is terminal for posts",
-            error_type="PROTOCOL_TERMINAL",
-            details={"phase": phase},
-        )
-
-    if round_no > max_rounds and kind not in {"DISSENT", "ESCALATE"}:
-        raise ProtocolV1Error(
-            "server round cap exceeded",
-            error_type="ROUND_CAP",
-            details={"round_no": round_no, "max_rounds": max_rounds},
-        )
-
-    if kind in TARGET_REQUIRED_KINDS:
-        if not reply_to:
-            raise ProtocolV1Error(
-                f"{kind} requires reply_to",
-                error_type="INVALID_TARGET",
-            )
-        parent = conn.execute(
-            "SELECT topic_id,kind FROM debate_messages WHERE msg_id=?",
-            (reply_to,),
-        ).fetchone()
-        if parent is None or parent["topic_id"] != topic_id:
-            raise ProtocolV1Error(
-                "target must exist in the same topic",
-                error_type="INVALID_TARGET",
-                details={"reply_to": reply_to},
-            )
-        allowed = _TARGET_PARENT_KINDS[kind]
-        if parent["kind"] not in allowed:
-            raise ProtocolV1Error(
-                f"{kind} cannot target {parent['kind']}",
-                error_type="INVALID_TARGET",
-                details={"reply_to": reply_to, "parent_kind": parent["kind"]},
-            )
-        target_key = "decision_target" if kind == "DISSENT" else "target"
-        if str(normalized.get(target_key)) != reply_to:
-            raise ProtocolV1Error(
-                f"payload.{target_key} must equal reply_to",
-                error_type="INVALID_TARGET",
-                details={
-                    "reply_to": reply_to,
-                    "payload_target": normalized.get(target_key),
-                },
-            )
-
-    if kind == "ESCALATE" and not _has_human_recipient(recipients):
-        raise ProtocolV1Error(
-            "ESCALATE requires a human recipient",
-            error_type="HUMAN_RECIPIENT_REQUIRED",
-        )
-    if kind == "ESCALATE":
-        existing = conn.execute(
-            "SELECT msg_id FROM debate_human_packets WHERE topic_id=? "
-            "AND protocol_generation=?",
-            (topic_id, int(state["transition_version"])),
-        ).fetchone()
-        if existing is not None:
-            raise ProtocolV1Error(
-                "ESCALATE packet already exists for this protocol generation",
-                error_type="ESCALATE_DUPLICATE",
-                details={"msg_id": existing["msg_id"]},
-            )
+    _validate_phase_kind(conn, topic_id=topic_id, role=role, kind=kind, state=state)
+    _reject_duplicate_act(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        kind=kind,
+        reply_to=reply_to,
+        normalized_json=normalized_json,
+    )
+    _validate_target(
+        conn,
+        topic_id=topic_id,
+        kind=kind,
+        reply_to=reply_to,
+        payload=normalized,
+    )
+    _validate_escalation(
+        conn,
+        topic_id=topic_id,
+        kind=kind,
+        recipients=recipients,
+        protocol_generation=int(state["transition_version"]),
+    )
 
     return {
         "protocol_version": PROTOCOL_VERSION,
         "round_no": round_no,
         "body_mode": mode,
         "payload": normalized,
-        "payload_json": json.dumps(
-            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ),
+        "payload_json": normalized_json,
         "phase_before": phase,
     }
 
@@ -631,11 +751,11 @@ def record_post(
         unresolved = conn.execute(
             "SELECT COUNT(*) FROM debate_messages c "
             "WHERE c.topic_id=? AND c.protocol_version=? "
-            "AND c.round_no=? AND c.kind='CHALLENGE' "
+            "AND c.kind='CHALLENGE' "
             "AND NOT EXISTS (SELECT 1 FROM debate_messages d "
             " WHERE d.topic_id=c.topic_id AND d.reply_to=c.msg_id "
             " AND d.kind IN ('REBUT','CONCEDE'))",
-            (topic_id, PROTOCOL_VERSION, current_round),
+            (topic_id, PROTOCOL_VERSION),
         ).fetchone()[0]
         result = semantic["payload"].get("result")
         if result == "verified" and unresolved == 0:
@@ -754,7 +874,7 @@ def prepare_order_swap(
             error_type="WRONG_PHASE",
         )
     rows = conn.execute(
-        "SELECT msg_id,topic_id,kind,body,payload_json FROM debate_messages "
+        "SELECT msg_id,topic_id,role,kind,body,payload_json FROM debate_messages "
         "WHERE topic_id=? AND msg_id IN (?,?)",
         (topic_id, left_msg_id, right_msg_id),
     ).fetchall()
@@ -772,6 +892,13 @@ def prepare_order_swap(
             "order-swap accepts only CLAIM or REBUT positions",
             error_type="INVALID_TARGET",
             details={"invalid_kinds": sorted(invalid_kinds)},
+        )
+    position_roles = {str(row["role"]) for row in rows}
+    if position_roles != set(state["blind_roles"]):
+        raise ProtocolV1Error(
+            "order-swap positions must come from the two opposing roles",
+            error_type="INVALID_TARGET",
+            details={"position_roles": sorted(position_roles)},
         )
     positions = {
         left_msg_id: _normalized_position(by_id[left_msg_id]),
@@ -832,6 +959,44 @@ def prepare_order_swap(
     return {"topic_id": topic_id, "projections": projections}
 
 
+def _validate_judge_role(
+    conn: sqlite3.Connection, *, topic_id: str, judge_role: str
+) -> None:
+    topic = conn.execute(
+        "SELECT d.roles_json,p.blind_roles_json FROM debates d "
+        "JOIN debate_protocol_state p ON p.topic_id=d.topic_id "
+        "WHERE d.topic_id=?",
+        (topic_id,),
+    ).fetchone()
+    try:
+        roster = json.loads(topic["roles_json"]) if topic is not None else []
+        blind_roles = (
+            set(json.loads(topic["blind_roles_json"])) if topic is not None else set()
+        )
+    except (TypeError, json.JSONDecodeError):
+        roster = []
+        blind_roles = set()
+    declared = {
+        str(entry.get("role") if isinstance(entry, dict) else entry) for entry in roster
+    }
+    active = conn.execute(
+        "SELECT 1 FROM debate_role_bindings WHERE topic_id=? AND role=? "
+        "AND state='active'",
+        (topic_id, judge_role),
+    ).fetchone()
+    if (
+        judge_role not in declared
+        or judge_role in blind_roles
+        or _HUMAN_RECIPIENT_RE.fullmatch(str(judge_role or ""))
+        or active is None
+    ):
+        raise ProtocolV1Error(
+            "judge role must be an active, declared, non-opposing machine role",
+            error_type="JUDGE_ROLE_UNAVAILABLE",
+            details={"judge_role": judge_role},
+        )
+
+
 def record_order_swap_verdict(
     conn: sqlite3.Connection,
     *,
@@ -885,6 +1050,7 @@ def record_order_swap_verdict(
                 "AB and BA verdicts require the same judge role",
                 error_type="JUDGE_ROLE_MISMATCH",
             )
+        _validate_judge_role(conn, topic_id=str(row["topic_id"]), judge_role=judge_role)
         conn.execute(
             "UPDATE debate_judge_projections SET verdict_json=?,judge_role=?,decided_at=? "
             "WHERE projection_id=?",
@@ -903,21 +1069,33 @@ def record_order_swap_verdict(
             verdicts[0]["winner_msg_id"] == verdicts[1]["winner_msg_id"]
             and verdicts[0]["decision"] == verdicts[1]["decision"]
         )
+        expected_phase = "STOPPED" if stable else "STALEMATE"
         if stable:
-            conn.execute(
+            transition = conn.execute(
                 "UPDATE debate_protocol_state SET phase='STOPPED',"
                 "transition_version=transition_version+1,phase_deadline_at=NULL,updated_at=? "
-                "WHERE topic_id=?",
+                "WHERE topic_id=? AND phase='ADJUDICATE'",
                 (now, row["topic_id"]),
             )
         else:
-            conn.execute(
+            transition = conn.execute(
                 "UPDATE debate_protocol_state SET phase='STALEMATE',"
                 "stalemate_reason='judge_order_swap_disagreement',"
                 "transition_version=transition_version+1,phase_deadline_at=NULL,updated_at=? "
-                "WHERE topic_id=?",
+                "WHERE topic_id=? AND phase='ADJUDICATE'",
                 (now, row["topic_id"]),
             )
+        if transition.rowcount != 1:
+            current = get_protocol_state(conn, str(row["topic_id"]))
+            if current is None or current.get("phase") != expected_phase:
+                raise ProtocolV1Error(
+                    "judge terminal transition lost its phase compare-and-swap",
+                    error_type="PROTOCOL_STATE_CONFLICT",
+                    details={
+                        "expected_phase": expected_phase,
+                        "actual_phase": current.get("phase") if current else None,
+                    },
+                )
     return {
         "projection_id": projection_id,
         "topic_id": row["topic_id"],
@@ -1026,27 +1204,30 @@ def sweep_missing_roles(
                     "automatic same-role recovery: missing active binding",
                 ),
             )
-            if last is not None:
-                cursor = conn.execute(
-                    "SELECT last_processed_msg_id,last_processed_ts "
-                    "FROM debate_signal_state WHERE topic_id=? AND role=? "
-                    "AND session_id=?",
-                    (topic["topic_id"], role, last["session_id"]),
-                ).fetchone()
-                if cursor is not None:
-                    conn.execute(
-                        "INSERT INTO debate_signal_state "
-                        "(session_id,role,topic_id,last_processed_msg_id,"
-                        "last_processed_ts,last_check_at) VALUES (?,?,?,?,?,?)",
-                        (
-                            session_id,
-                            role,
-                            topic["topic_id"],
-                            cursor["last_processed_msg_id"],
-                            cursor["last_processed_ts"],
-                            now,
-                        ),
-                    )
+            cursor = conn.execute(
+                "SELECT s.last_processed_msg_id,s.last_processed_ts "
+                "FROM debate_signal_state s JOIN debate_role_bindings b "
+                "ON b.topic_id=s.topic_id AND b.role=s.role "
+                "AND b.session_id=s.session_id "
+                "WHERE s.topic_id=? AND s.role=? "
+                "AND s.last_processed_ts IS NOT NULL "
+                "ORDER BY s.last_processed_ts DESC,s.last_processed_msg_id DESC LIMIT 1",
+                (topic["topic_id"], role),
+            ).fetchone()
+            if cursor is not None:
+                conn.execute(
+                    "INSERT INTO debate_signal_state "
+                    "(session_id,role,topic_id,last_processed_msg_id,"
+                    "last_processed_ts,last_check_at) VALUES (?,?,?,?,?,?)",
+                    (
+                        session_id,
+                        role,
+                        topic["topic_id"],
+                        cursor["last_processed_msg_id"],
+                        cursor["last_processed_ts"],
+                        now,
+                    ),
+                )
             recovery_id = f"{topic['topic_id']}:{role}:{generation}"
             conn.execute(
                 "INSERT OR IGNORE INTO debate_role_recovery_log "

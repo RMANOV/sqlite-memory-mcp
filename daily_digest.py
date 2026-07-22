@@ -117,7 +117,8 @@ def run_digest(
     if note_rows:
         lines.append(f"### NOTES ({len(note_rows)})")
         for n in note_rows:
-            prio = f"[{n['priority'].upper()}] " if n["priority"] != "medium" else ""
+            priority = n["priority"] or "medium"
+            prio = f"[{priority.upper()}] " if priority != "medium" else ""
             lines.append(f"- {prio}{n['title']}")
         lines.append("")
 

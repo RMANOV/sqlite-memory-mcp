@@ -15,13 +15,16 @@ Covers:
 import os
 import sys
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from db_utils import (
+    _decode_logical_clock,
     _field_version_sort_key,
     _pack_logical_clock,
+    _store_task_field_version,
     merge_import_tasks,
     now_iso,
     upsert_field_versions,
@@ -155,6 +158,34 @@ def test_new_task_inserted(conn):
     assert row["title"] == "New from remote"
     assert row["status"] == "in_progress"
     assert row["priority"] == "high"
+
+
+def test_bridge_import_probes_field_version_columns_once_per_batch(conn):
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        merge_import_tasks(
+            conn,
+            [
+                {
+                    "id": "task-batch-probe",
+                    "title": "Batch probe",
+                    "status": "not_started",
+                    "type": "task",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ],
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    probes = [
+        sql
+        for sql in statements
+        if sql.casefold().startswith("pragma table_info('task_field_versions')")
+    ]
+    assert len(probes) == 4
 
 
 # ── Test 2: Field update — remote newer wins ──────────────────────────────
@@ -416,6 +447,154 @@ def test_clock_skew_still_merges(conn):
 
     assert new_count == 1
     assert _task(conn, tid) is not None
+
+
+@pytest.mark.parametrize("field_version_format", ["list", "dict"])
+def test_clock_skew_clamps_field_timestamp_and_packed_order(conn, field_version_format):
+    _ensure_field_event_columns(conn)
+    future_ts = "2099-12-31T23:59:59+00:00"
+    future_order = _pack_logical_clock(
+        int(datetime.fromisoformat(future_ts).timestamp() * 1000), 7
+    )
+    field_version = (
+        [future_ts, "future-peer", future_order, None]
+        if field_version_format == "list"
+        else {
+            "updated_at": future_ts,
+            "updated_by": "future-peer",
+            "updated_order": future_order,
+        }
+    )
+    task_id = f"task-future-{field_version_format}"
+    remote = {
+        "id": task_id,
+        "title": "Future metadata",
+        "status": "not_started",
+        "type": "task",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "_field_ts": {"title": field_version},
+    }
+
+    merge_import_tasks(conn, [remote])
+
+    stored = conn.execute(
+        "SELECT updated_at, updated_order FROM task_field_versions "
+        "WHERE task_id = ? AND field_name = 'title'",
+        (task_id,),
+    ).fetchone()
+    cutoff = datetime.now(timezone.utc) + timedelta(seconds=5)
+    assert datetime.fromisoformat(stored["updated_at"]) <= cutoff
+    physical_ms, counter = _decode_logical_clock(stored["updated_order"])
+    assert physical_ms <= int(cutoff.timestamp() * 1000)
+    assert counter == 7
+
+
+def test_clock_skew_reclamps_status_rebuilt_from_event_head(conn):
+    _ensure_field_event_columns(conn)
+    task_id = "task-future-event-head"
+    past_ts = "2026-01-01T00:00:00+00:00"
+    future_ts = "2099-12-31T23:59:59+00:00"
+    future_order = _pack_logical_clock(
+        int(datetime.fromisoformat(future_ts).timestamp() * 1000), 11
+    )
+    remote = {
+        "id": task_id,
+        "title": "Future status event",
+        "status": "not_started",
+        "type": "task",
+        "created_at": past_ts,
+        "updated_at": past_ts,
+        "_field_ts": {
+            "status": {
+                "updated_at": past_ts,
+                "updated_by": "future-peer",
+                "new_value": "not_started",
+            }
+        },
+    }
+    remote_events = [
+        {
+            "event_id": "future-status-event",
+            "aggregate_kind": "task",
+            "aggregate_id": task_id,
+            "field_name": "status",
+            "machine_id": "future-peer",
+            "logical_clock": future_order,
+            "event_ts": future_ts,
+            "new_value": "done",
+        }
+    ]
+
+    merge_import_tasks(conn, [remote], remote_events=remote_events)
+
+    task = _task(conn, task_id)
+    stored = conn.execute(
+        "SELECT updated_at, updated_order FROM task_field_versions "
+        "WHERE task_id = ? AND field_name = 'status'",
+        (task_id,),
+    ).fetchone()
+    cutoff = datetime.now(timezone.utc) + timedelta(seconds=5)
+    assert task["status"] == "done"
+    assert datetime.fromisoformat(task["updated_at"]) <= cutoff
+    assert datetime.fromisoformat(stored["updated_at"]) <= cutoff
+    physical_ms, counter = _decode_logical_clock(stored["updated_order"])
+    assert physical_ms <= int(cutoff.timestamp() * 1000)
+    assert counter == 11
+
+
+def test_clock_skew_preserves_tombstone_dominance_across_hlc_counter_carry(conn):
+    _ensure_field_event_columns(conn)
+    task_id = "task-future-counter-carry"
+    future_ts = "2030-01-01T00:00:00+00:00"
+    local_order = _pack_logical_clock(
+        int(datetime.fromisoformat(future_ts).timestamp() * 1000), 65_535
+    )
+    _insert_task(
+        conn,
+        task_id,
+        status="in_progress",
+        updated_at=future_ts,
+    )
+    _store_task_field_version(
+        conn,
+        task_id,
+        "status",
+        updated_at=future_ts,
+        updated_by="active-peer",
+        updated_order=local_order,
+    )
+    remote = {
+        "id": task_id,
+        "title": "Dominating tombstone",
+        "status": "archived",
+        "type": "task",
+        "_tombstone": True,
+        "updated_at": future_ts,
+        "_field_ts": {
+            "status": {
+                "updated_at": future_ts,
+                "updated_by": "tombstone-merge",
+                "updated_order": local_order + 1,
+                "value": "archived",
+            }
+        },
+    }
+
+    merge_import_tasks(conn, [remote])
+
+    task = _task(conn, task_id)
+    stored = conn.execute(
+        "SELECT updated_order FROM task_field_versions "
+        "WHERE task_id = ? AND field_name = 'status'",
+        (task_id,),
+    ).fetchone()
+    physical_ms, _counter = _decode_logical_clock(stored["updated_order"])
+    cutoff_ms = int(
+        (datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp() * 1000
+    )
+    assert task["status"] == "archived"
+    assert physical_ms <= cutoff_ms
 
 
 # ── Test 7: NULL-fill ─────────────────────────────────────────────────────
