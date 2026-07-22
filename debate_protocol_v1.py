@@ -1262,9 +1262,11 @@ def adaptive_wait_decision(
     live_workers: int,
     worker_capacity: int,
     retry_attempt: int = 0,
+    idle_sweep_attempt: int = 0,
     resource_blocked: bool = False,
     resource_interval: float = 0.0,
     idle_sweep_seconds: float = 30.0,
+    max_idle_sweep_seconds: float = 300.0,
 ) -> dict[str, Any]:
     """Pure deterministic scheduler policy used by the resident pump."""
     if resource_blocked:
@@ -1284,8 +1286,11 @@ def adaptive_wait_decision(
         return {"interval_seconds": 1.0, "reason": "capacity_wait"}
     if live_workers > 0:
         return {"interval_seconds": 1.0, "reason": "active_worker_lease"}
+    base_idle = max(1.0, float(idle_sweep_seconds))
+    max_idle = max(base_idle, float(max_idle_sweep_seconds))
+    idle_interval = min(max_idle, base_idle * (2 ** max(0, idle_sweep_attempt)))
     return {
-        "interval_seconds": max(1.0, float(idle_sweep_seconds)),
+        "interval_seconds": idle_interval,
         "reason": "idle_crash_replay_sweep",
     }
 

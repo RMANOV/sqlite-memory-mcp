@@ -37,9 +37,7 @@ def debate_db(tmp_path, monkeypatch):
     # (explicit db_path => tmp only, never the live DB, and never
     # ensure_db_initialized). This exercises the production nested-tx +
     # caller-context-manager contract instead of a hand-rolled raw ctx.
-    monkeypatch.setattr(
-        intel_server, "_get_conn", lambda: db_utils.get_conn(db_path)
-    )
+    monkeypatch.setattr(intel_server, "_get_conn", lambda: db_utils.get_conn(db_path))
     monkeypatch.setattr(
         intel_server,
         "_get_conn_immediate",
@@ -53,7 +51,7 @@ def _roles_json() -> str:
         [
             {"role": "CONDUCTOR", "session_id": "codex-cond20260531"},
             {"role": "ADVOCATE", "session_id": "codex-adv20260531"},
-            {"role": "EXECUTOR", "session_id": "codex-exec20260531"},
+            {"role": "EXECUTOR_1", "session_id": "codex-exec20260531"},
         ]
     )
 
@@ -158,9 +156,7 @@ def test_debate_init_new_topic_denies_when_gate_enabled_without_entitlement(
     )
 
 
-def test_debate_init_existing_topic_idempotence_is_not_gated(
-    debate_db, monkeypatch
-):
+def test_debate_init_existing_topic_idempotence_is_not_gated(debate_db, monkeypatch):
     created = _debate_init("PREMIUM_GATE_EXISTING")
     assert created["topic_id"] == "PREMIUM_GATE_EXISTING"
     _enable_debate_gate(monkeypatch)
@@ -171,9 +167,7 @@ def test_debate_init_existing_topic_idempotence_is_not_gated(
     assert "error_type" not in out
 
 
-def test_debate_existing_topic_post_and_signal_stay_ungated(
-    debate_db, monkeypatch
-):
+def test_debate_existing_topic_post_and_signal_stay_ungated(debate_db, monkeypatch):
     created = _debate_init("PREMIUM_GATE_ROUTING")
     assert created["topic_id"] == "PREMIUM_GATE_ROUTING"
     _enable_debate_gate(monkeypatch)
@@ -194,15 +188,15 @@ def test_debate_existing_topic_post_and_signal_stay_ungated(
             role="ADVOCATE",
             priority="M",
             kind="A",
-            body="ADVOCATE -> EXECUTOR answer",
-            addressed_to_csv="EXECUTOR",
+            body="ADVOCATE -> EXECUTOR_1 answer",
+            addressed_to_csv="EXECUTOR_1",
             reply_to=q["msg_id"],
         )
     )
     pending = json.loads(
         intel_server.debate_signal_check(
             session_id="codex-exec20260531",
-            role="EXECUTOR",
+            role="EXECUTOR_1",
             topic_id="PREMIUM_GATE_ROUTING",
             limit=20,
         )
@@ -217,12 +211,12 @@ def test_debate_existing_topic_post_and_signal_stay_ungated(
     read_out = json.loads(
         intel_server.debate_read(
             topic_id="PREMIUM_GATE_ROUTING",
-            role="EXECUTOR",
+            role="EXECUTOR_1",
             limit=50,
         )
     )
     assert read_out.get("error_type") != "premium_gate_denied"
-    # EXECUTOR is a seeded binding, so the read succeeds and sees the routed msg.
+    # EXECUTOR_1 is a seeded binding, so the read succeeds and sees the routed msg.
     assert "error_type" not in read_out
     assert a["msg_id"] in {m["msg_id"] for m in read_out["messages"]}
 
@@ -231,9 +225,7 @@ def test_debate_existing_topic_post_and_signal_stay_ungated(
         "topic_id": "PREMIUM_GATE_ROUTING",
         "schema_version": a["schema_version"],
     }
-    wake_out = json.loads(
-        intel_server.debate_wake_dry_run(json.dumps(wake_response))
-    )
+    wake_out = json.loads(intel_server.debate_wake_dry_run(json.dumps(wake_response)))
     assert wake_out.get("error_type") != "premium_gate_denied"
     # Real schema-matching response => wake resolves the EXECUTOR target and
     # the dry run succeeds (no premium gating in the wake path at all).
@@ -266,9 +258,7 @@ def test_debate_bind_role_existing_topic_never_gated(debate_db, monkeypatch):
     assert out.get("role") == "ADVOCATE"
 
 
-def test_debate_init_new_topic_allowed_with_valid_entitlement(
-    debate_db, monkeypatch
-):
+def test_debate_init_new_topic_allowed_with_valid_entitlement(debate_db, monkeypatch):
     _grant_valid_debate_entitlement(monkeypatch)
 
     out = _debate_init("PREMIUM_GATE_ENTITLED")
@@ -303,9 +293,7 @@ def test_debate_init_new_topic_allowed_with_valid_entitlement(
     )
 
 
-def test_debate_init_new_topic_fail_opens_when_evaluator_raises(
-    debate_db, monkeypatch
-):
+def test_debate_init_new_topic_fail_opens_when_evaluator_raises(debate_db, monkeypatch):
     # When the evaluator itself raises (not a clean deny verdict), the wrapper's
     # anti-lockout except branch must fail OPEN so the live protocol cannot brick
     # itself, and record a DISTINCT runtime-error audit row.

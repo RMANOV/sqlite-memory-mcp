@@ -100,7 +100,8 @@ def test_unknown_temperature_lands_in_guarded_tier_not_block():
     budget = drb.compute_debate_resource_budget(snapshot)
     assert budget.allow_agent is True, "unknown temp must not block"
     assert budget.max_concurrent_workers >= 1
-    assert budget.tier in {"low", "guarded"}  # guarded concurrency, never 'blocked'
+    assert budget.tier == "guarded"
+    assert budget.max_concurrent_workers == 2
 
 
 # --- Pump identity: pid + create_time (PID reuse protection) ----------------
@@ -490,7 +491,7 @@ def test_task_xml_encodes_spec_constraints():
     assert "<RunLevel>LeastPrivilege</RunLevel>" in xml
     assert "<RestartOnFailure>" in xml
     assert "pythonw.exe" in xml
-    assert "--max-concurrent-workers 1" in xml.replace('"', "")
+    assert "--max-concurrent-workers 2" in xml.replace('"', "")
     assert str(dow.ROOT) in xml  # working directory is the repo
 
 

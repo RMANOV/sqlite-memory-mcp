@@ -36,15 +36,17 @@ HEARTBEAT_PATH = Path(
 DISABLE_FILE = Path(os.path.expanduser("~/.claude/memory/debate_wake.disable"))
 SLEEP_FILE = Path(os.path.expanduser("~/.claude/memory/debate_wake.sleep_until"))
 HEARTBEAT_FRESH_SECONDS = 90
-# Machine-specific initial worker cap (task 0d806934): backlog waits, is not lost.
+# Two independent executor lanes may run together; the resource governor can
+# still lower this cap under real memory/load pressure.  Serializing at 1 made
+# correctly addressed EXECUTOR_1 / EXECUTOR_2 work wait behind each other.
 # action-kind explicitly includes PING (advocate BLOCK high-risk): the pump
 # default omits it, and the governor's action_kinds intersection can only
 # subtract — so without listing it here an explicit H/PING wake is dropped.
 PUMP_ARGS = [
     "--max-concurrent-workers",
-    "1",
+    "2",
     "--max-workers-per-scan",
-    "1",
+    "2",
     "--mcp-prefix",
     "mcp__sqlite_unified__",
     "--action-kind",

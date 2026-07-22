@@ -2,10 +2,11 @@
 
 ## Goal
 
-Keep autonomous debate wake delivery supervised and diagnosable. The fast path
-is still client hooks, but `sqlite-memory-debate-pump.service` is the resident
-catch-all for Codex posts, missed hooks, stale claims, and backlogged addressed
-messages.
+Keep autonomous debate wake delivery supervised and diagnosable. The primary
+path is a post-commit kernel event into the resident pump; durable
+`debate_delivery_queue` rows identify the exact addressed work. Client hooks and
+adaptive replay sweeps cover mixed-version clients, missed events, stale claims,
+and crash recovery.
 
 This wake/pump path is deliberately **operator-supervised and
 resource-governed**: delivery is gated by the local machine's current condition,
@@ -44,13 +45,18 @@ required either way:
 
 - runs hidden at user logon via `pythonw.exe`, working directory = repo,
   `MultipleInstances=IgnoreNew`, automatic restart on failure;
-- initial machine cap `--max-concurrent-workers 1` (backlog waits, is never
-  lost) and `--mcp-prefix mcp__sqlite_unified__` for spawned claude workers;
+- initial machine cap `--max-concurrent-workers 2` (the resource governor may
+  lower it; backlog waits and is never lost) and
+  `--mcp-prefix mcp__sqlite_unified__` for spawned claude workers;
 - **post-commit wake**: `debate_post` / `debate_post_with_recipients` fire the
   named kernel event `Local\SqliteMemoryDebateWakeV1` strictly AFTER the DB
-  commit. The pump blocks on that event (`WaitForMultipleObjects`) with a
-  bounded ~30s timeout sweep, so a crash between commit and signal is always
-  replayed from the durable rows; the event itself is only a latency hint;
+  commit. The pump blocks on that event (`WaitForMultipleObjects`), so ordinary
+  delivery does not wait for a timer. An adaptive 30s → 60s → 120s → 240s →
+  300s timeout sweep replays a crash between commit and signal; the sweep is a
+  recovery watchdog, never the normal delivery mechanism;
+- **target isolation**: every new official executor role is a numbered address
+  (`EXECUTOR_1`, `EXECUTOR_2`, ...); the DB permits exactly one active owner per
+  `(topic, role)` and exactly one active role per `(topic, session_id)`;
 - **graceful stop**: `debate_ops.py stop` sets
   `Local\SqliteMemoryDebatePumpStopV1`; the pump exits after the current scan
   without killing in-flight workers (`schtasks /End` only as fallback);
