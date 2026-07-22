@@ -814,6 +814,20 @@ CREATE TABLE IF NOT EXISTS debate_message_recipients (
 CREATE INDEX IF NOT EXISTS idx_dmr_recipient
     ON debate_message_recipients(recipient);
 
+-- Durable targeted-delivery queue.  Kept separate from
+-- debate_message_recipients so pre-event clients that use positional
+-- INSERT(msg_id, recipient, recipient_mode) remain wire-compatible.
+CREATE TABLE IF NOT EXISTS debate_delivery_queue (
+    msg_id       TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    recipient    TEXT NOT NULL,
+    enqueued_at  TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (msg_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_ddq_pending
+    ON debate_delivery_queue(enqueued_at, msg_id)
+    WHERE completed_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS debate_signal_state (
     session_id            TEXT NOT NULL,
     role                  TEXT NOT NULL,
@@ -863,6 +877,9 @@ CREATE TABLE IF NOT EXISTS debate_role_bindings (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drb_one_active
     ON debate_role_bindings(topic_id, role)
+    WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_drb_one_active_session
+    ON debate_role_bindings(topic_id, session_id)
     WHERE state = 'active';
 CREATE INDEX IF NOT EXISTS idx_drb_session
     ON debate_role_bindings(session_id);
@@ -1899,6 +1916,18 @@ _MIGRATIONS = [
         "debate_message_recipients.recipient_mode column (v3.10)",
     ),
     (
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='debate_delivery_queue'",
+        "CREATE TABLE debate_delivery_queue ("
+        "msg_id TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE, "
+        "recipient TEXT NOT NULL, enqueued_at TEXT NOT NULL, completed_at TEXT, "
+        "PRIMARY KEY (msg_id, recipient)); "
+        "CREATE INDEX idx_ddq_pending "
+        "ON debate_delivery_queue(enqueued_at, msg_id) "
+        "WHERE completed_at IS NULL",
+        "debate_delivery_queue table and pending index (event delivery)",
+    ),
+    (
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_dmr_mode'",
         "CREATE INDEX idx_dmr_mode ON debate_message_recipients(recipient_mode)",
         "idx_dmr_mode index (v3.10)",
@@ -1931,6 +1960,14 @@ _MIGRATIONS = [
             ON debate_role_bindings(topic_id, state);
         """,
         "debate_role_bindings table and indexes (v3.10)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_drb_one_active_session'",
+        "CREATE UNIQUE INDEX idx_drb_one_active_session "
+        "ON debate_role_bindings(topic_id, session_id) "
+        "WHERE state = 'active'",
+        "one active role per topic/session index (event delivery)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='debate_wake_log'",

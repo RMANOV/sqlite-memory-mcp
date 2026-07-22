@@ -216,7 +216,8 @@ def test_resource_budget_treats_unknown_temperature_as_soft_signal():
     )
 
     assert budget.allow_agent is True
-    assert budget.tier == "low"
+    assert budget.tier == "guarded"
+    assert budget.max_concurrent_workers == 2
     assert budget.reason == "temperature_unknown"
 
 
@@ -440,6 +441,7 @@ def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tm
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.delenv("DEBATE_WAKE_BUDGET", raising=False)
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_fetch_pending_deliveries", lambda *args: [])
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 1)
     # Synthetic rows are not inserted into DB_PATH; the terminal gate would
     # otherwise treat the unknown msg as terminal and skip dispatch. This
@@ -566,6 +568,7 @@ def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(
 
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_fetch_pending_deliveries", lambda *args: [])
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 1)
     monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
@@ -644,6 +647,7 @@ def test_debate_pump_keeps_cursor_on_partially_dispatched_multi_recipient_messag
 
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_fetch_pending_deliveries", lambda *args: [])
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 3)
     # Not terminal → after dispatching, the just-dispatched (in-flight)
     # trigger holds the cursor until a later scan proves it terminal.
@@ -697,6 +701,7 @@ def test_debate_pump_advances_cursor_after_last_recipient_is_handled(
 
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setattr(module, "_fetch_new", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(module, "_fetch_pending_deliveries", lambda *args: [])
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 0)
     # Last recipient handled → the trigger is terminal → cursor advances
     # past it (new contract: advance only on a proven-terminal trigger).
@@ -726,3 +731,131 @@ def test_debate_pump_advances_cursor_after_last_recipient_is_handled(
 
     assert module.main() == 0
     assert saved == [("2026-05-20T00:00:01Z", "m1")]
+
+
+def test_targeted_event_dispatch_skips_older_inflight_trigger(monkeypatch, tmp_path):
+    module = _load_hook_module(
+        "debate_pump_targeted_no_hol_test", "hooks/debate_pump.py"
+    )
+    module.LOG_PATH = tmp_path / "pump.jsonl"
+    module.STATE_PATH = tmp_path / "pump_state.json"
+    module.STOP = False
+    rows = [
+        {"msg_id": "old", "topic_id": "T", "ts": "2026-07-22T10:00:00Z"},
+        {"msg_id": "new", "topic_id": "T", "ts": "2026-07-22T10:00:01Z"},
+    ]
+    dispatches = []
+
+    monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
+    monkeypatch.setattr(module, "_fetch_pending_deliveries", lambda *args: rows)
+    monkeypatch.setattr(module, "_fetch_new", lambda *args: [])
+    monkeypatch.setattr(module, "_fetch_released_blind_replay", lambda *args: [])
+    monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args: False)
+    monkeypatch.setattr(
+        module,
+        "_estimate_worker_demand",
+        lambda msg_id, _suppressed: 0 if msg_id == "old" else 1,
+    )
+    monkeypatch.setattr(module, "_reap_children", lambda: None)
+    monkeypatch.setattr(module, "_machine_live_worker_count", lambda *args: 0)
+    monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "_protocol_maintenance",
+        lambda *args: {"timed_out": [], "role_recoveries": []},
+    )
+    monkeypatch.setattr(module, "_save_state", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "_dispatch_row",
+        lambda row, _suppressed: dispatches.append(row["msg_id"]) or 1,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate_pump.py",
+            "--once",
+            "--since",
+            "2026-07-22T09:59:00Z",
+            "--max-workers-per-scan",
+            "2",
+            "--max-concurrent-workers",
+            "2",
+            "--message-claim-reclaim-seconds",
+            "0",
+        ],
+    )
+
+    assert module.main() == 0
+    assert dispatches == ["new"]
+
+
+def test_pending_delivery_queue_is_durable_and_cursor_independent(tmp_path):
+    module = _load_hook_module(
+        "debate_pump_targeted_queue_test", "hooks/debate_pump.py"
+    )
+    module.DB_PATH = tmp_path / "memory.db"
+    con = sqlite3.connect(module.DB_PATH)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE debates(topic_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+            CREATE TABLE debate_messages(
+                msg_id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                kind TEXT NOT NULL
+            );
+            CREATE TABLE debate_message_recipients(
+                msg_id TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                recipient_mode TEXT NOT NULL,
+                PRIMARY KEY(msg_id, recipient)
+            );
+            CREATE TABLE debate_delivery_queue(
+                msg_id TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY(msg_id, recipient)
+            );
+            INSERT INTO debates VALUES('T','ACTIVE');
+            INSERT INTO debate_messages VALUES(
+                'old','T','2026-07-22T10:00:00Z','H','Q'
+            );
+            INSERT INTO debate_messages VALUES(
+                'new','T','2026-07-22T10:00:01Z','H','Q'
+            );
+            INSERT INTO debate_messages VALUES(
+                'legacy','T','2026-07-22T10:00:02Z','H','Q'
+            );
+            INSERT INTO debate_message_recipients VALUES('old','EXECUTOR_1','normal');
+            INSERT INTO debate_message_recipients VALUES('new','EXECUTOR_2','normal');
+            INSERT INTO debate_message_recipients VALUES('legacy','ADVOCATE','normal');
+            INSERT INTO debate_delivery_queue VALUES(
+                'old','EXECUTOR_1','2026-07-22T10:00:00Z',NULL
+            );
+            INSERT INTO debate_delivery_queue VALUES(
+                'new','EXECUTOR_2','2026-07-22T10:00:01Z',NULL
+            );
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    queued = module._fetch_pending_deliveries([], ["Q"], 1)
+    assert [row["msg_id"] for row in queued] == ["new", "legacy", "old"]
+    assert module._complete_pending_deliveries("new") == 1
+    queued_after_ack = module._fetch_pending_deliveries([], ["Q"], 10)
+    assert [row["msg_id"] for row in queued_after_ack] == ["old", "legacy"]
+    assert (
+        module._complete_pending_deliveries(
+            "legacy", enqueued_at="2026-07-22T10:00:02Z"
+        )
+        == 1
+    )
+    queued_after_legacy_ack = module._fetch_pending_deliveries([], ["Q"], 10)
+    assert [row["msg_id"] for row in queued_after_legacy_ack] == ["old"]

@@ -173,7 +173,7 @@ def test_add_role_writes_audit_fields_on_binding_row(topic):
     add_role_to_debate(
         conn,
         topic_id=t,
-        role="EXECUTOR2",
+        role="EXECUTOR_2",
         session_id="codex-exec2",
         reason="add backup executor lane",
         bound_by_role="CONDUCTOR",
@@ -182,7 +182,7 @@ def test_add_role_writes_audit_fields_on_binding_row(topic):
         "SELECT reason, bound_by_role, generation, created_at, state "
         "FROM debate_role_bindings "
         "WHERE topic_id = ? AND role = ? AND session_id = ?",
-        (t, "EXECUTOR2", "codex-exec2"),
+        (t, "EXECUTOR_2", "codex-exec2"),
     ).fetchone()
     # The binding row IS the audit artifact (no separate audit table).
     assert row["reason"] == "add backup executor lane"
@@ -190,6 +190,47 @@ def test_add_role_writes_audit_fields_on_binding_row(topic):
     assert row["generation"] == 1
     assert row["created_at"]
     assert row["state"] == "active"
+
+
+def test_one_session_cannot_own_two_active_roles(topic):
+    conn, t = topic
+    add_role_to_debate(
+        conn,
+        topic_id=t,
+        role="ADVOCATE",
+        session_id="cc-adv1",
+        reason="seed advocate",
+    )
+    with pytest.raises(DebateError) as exc_info:
+        bind_role_session(
+            conn,
+            topic_id=t,
+            role="ADVOCATE",
+            session_id="codex-exec1",
+            reason="invalid alias collision",
+            replace_active=True,
+        )
+    assert exc_info.value.error_type == "binding_duplicate_active_session"
+
+
+def test_addressed_post_enqueues_durable_targeted_delivery(topic):
+    conn, t = topic
+    posted = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="STATUS",
+        body="wake the executor now",
+        addressed_to=["EXECUTOR"],
+    )
+    queued = conn.execute(
+        "SELECT enqueued_at, completed_at "
+        "FROM debate_delivery_queue WHERE msg_id = ? AND recipient = ?",
+        (posted["msg_id"], "EXECUTOR"),
+    ).fetchone()
+    assert queued["enqueued_at"] == posted["ts"]
+    assert queued["completed_at"] is None
 
 
 def test_add_role_idempotent_when_same_session_already_owns(topic):
@@ -460,9 +501,7 @@ def test_add_role_reattaches_new_session_when_declared_role_has_no_active_owner(
     row = conn.execute(
         "SELECT roles_json FROM debates WHERE topic_id = ?", (t,)
     ).fetchone()
-    exec_entries = [
-        r for r in json.loads(row["roles_json"]) if r["role"] == "EXECUTOR"
-    ]
+    exec_entries = [r for r in json.loads(row["roles_json"]) if r["role"] == "EXECUTOR"]
     assert len(exec_entries) == 1
 
 
@@ -583,9 +622,7 @@ def test_backcompat_original_roles_and_bindings_intact_after_add(topic):
 def wrapper_db(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)
-    monkeypatch.setattr(
-        intel_server, "_get_conn", lambda: db_utils.get_conn(db_path)
-    )
+    monkeypatch.setattr(intel_server, "_get_conn", lambda: db_utils.get_conn(db_path))
     monkeypatch.setattr(
         intel_server,
         "_get_conn_immediate",
@@ -604,7 +641,7 @@ def wrapper_db(tmp_path, monkeypatch):
         roles_json=json.dumps(
             [
                 {"role": "CONDUCTOR", "session_id": "codex-cond20260531"},
-                {"role": "EXECUTOR", "session_id": "codex-exec20260531"},
+                {"role": "EXECUTOR_1", "session_id": "codex-exec20260531"},
             ]
         ),
         created_by_role="CONDUCTOR",

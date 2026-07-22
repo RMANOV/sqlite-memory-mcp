@@ -193,30 +193,31 @@ These are standing role duties (operator mandate, 2026-06-20), part of the
 canonical protocol — not optional courtesies. They define *who watches the
 channel, how often, who answers whom, and who translates for the human.*
 
-### All roles — check in, then follow at adaptive intervals
+### All roles — check in, then wait on addressed events
 
-Every role (`CONDUCTOR`, `ADVOCATE`, and every `EXECUTOR`) must **announce itself
+Every role (`CONDUCTOR`, `ADVOCATE`, and every numbered `EXECUTOR_n`) must **announce itself
 in the debate on entry** — a one-line role/binding `STATUS` so the channel knows
-who is live — and then **follow the topic at adaptive polling intervals**. No role
-goes dark while a topic is open. *Adaptive* means the cadence tracks the work, not
-a fixed timer:
+who is live. After that, the normal path is **event-driven**: commit an addressed
+message, persist its delivery row in the same transaction, signal the resident
+pump, and claim exactly once for the addressed role/session. Roles do not poll as
+their primary wake mechanism.
 
-- **Tighten** (short interval) when there is open `H`/`Q` work, a pending gate, a
-  blocked lane, `decision_needed=true`, or active executor work in flight.
-- **Loosen** (long interval) when the topic is quiet, all lanes are `STOP_*`, or
-  work is parked on an external dependency. Loosening past a few minutes is
-  cheaper than tight idle polling — match the interval to how fast the watched
-  state can actually change.
+- The server-side crash-replay sweep backs off adaptively while idle (30s to
+  300s) and resets when work or a retry appears. Kernel events interrupt that
+  wait immediately.
+- Client `/loop` instructions may remain as a coarse backup watchdog for a dead
+  pump or lost event. They must check the durable claim/reply state and never
+  duplicate work already owned by a live worker.
 - A role with genuinely nothing to add completes its wake with
-  `debate_worker_no_action` rather than posting noise — but it keeps watching at
-  the loosened cadence.
+  `debate_worker_no_action` rather than posting noise.
 
-### CONDUCTOR + ADVOCATE — poll, answer, control, and log everything
+### CONDUCTOR + ADVOCATE — receive, answer, control, and log everything
 
 `CONDUCTOR` and `ADVOCATE` are the supervisory loop. Beyond the all-roles duty
 they must:
 
-- **Poll** the debate at adaptive intervals (per above).
+- **Receive addressed events immediately**; use the backup watchdog only to
+  recover a failed delivery path.
 - **Answer the executors** — every executor `Q` / report addressed to them gets a
   reply: a gate verdict, an in-bounds ruling, next-step direction, or an explicit
   `[DEFERRED:...]`. No executor is left hanging.
@@ -332,10 +333,11 @@ Three roles, one weekend topic, full lifecycle in 12 calls.
 debate_init(
     topic_id="WEEKEND_CODE_RED_2026_05_09",
     title="GBrain release; ship debate v2 by Sunday",
-    roles_json='[{"role":"CONDUCTOR","session_id":"sess-c"},'
-               ' {"role":"EXECUTOR","session_id":"sess-e"},'
-               ' {"role":"ADVOCATE","session_id":"sess-a"}]',
+    roles_json='[{"role":"CONDUCTOR","session_id":"codex-conductor"},'
+               ' {"role":"EXECUTOR_1","session_id":"codex-executor"},'
+               ' {"role":"ADVOCATE","session_id":"codex-advocate"}]',
     created_by_role="CONDUCTOR",
+    metadata_json='{"priority_lane":"P2","priority_reason":"release review"}',
 )
 
 # CONDUCTOR moves topic to ACTIVE
@@ -346,35 +348,37 @@ debate_state(
 )
 
 # ADVOCATE files a high-priority Q
-debate_post(
+debate_post_with_recipients(
     topic_id="WEEKEND_CODE_RED_2026_05_09",
     role="ADVOCATE",
     priority="H", kind="Q",
     body="cursor model robust under timestamp collisions?",
+    addressed_to_csv="EXECUTOR_1",
 )
 # returns {msg_id: "ab12cd34", ts: "2026-05-09T17:55Z", topic_state: "ACTIVE"}
 
-# EXECUTOR reads (cursor resolves from EXECUTOR watermark)
+# EXECUTOR_1 reads (cursor resolves from EXECUTOR_1 watermark)
 debate_read(
     topic_id="WEEKEND_CODE_RED_2026_05_09",
-    role="EXECUTOR",
+    role="EXECUTOR_1",
 )
 # returns {messages: [...], topic_state: "ACTIVE",
 #          last_msg_id_returned: "ab12cd34", count: 1, truncated: false, ...}
 
-# EXECUTOR answers reply_to=Q.msg_id
-debate_post(
+# EXECUTOR_1 answers reply_to=Q.msg_id
+debate_post_with_recipients(
     topic_id="WEEKEND_CODE_RED_2026_05_09",
-    role="EXECUTOR",
+    role="EXECUTOR_1",
     priority="H", kind="A",
     body="compound (ts, msg_id) cursor lands in fixup commit c5458b5",
     reply_to="ab12cd34",
+    addressed_to_csv="ADVOCATE",
 )
 
-# EXECUTOR advances watermark to the latest msg_id seen
+# EXECUTOR_1 advances watermark to the latest msg_id seen
 debate_post(
     topic_id="WEEKEND_CODE_RED_2026_05_09",
-    role="EXECUTOR",
+    role="EXECUTOR_1",
     priority="INFO", kind="WATERMARK",
     body="ab12cd34",
 )
@@ -412,7 +416,7 @@ If a question goes unanswered for too long or a deadline lapses:
 ```python
 debate_escalate(
     topic_id="WEEKEND_CODE_RED_2026_05_09",
-    role="EXECUTOR",
+    role="EXECUTOR_1",
     reason="resolve_by deadline missed",
     target_role="HUMAN",
 )
@@ -426,7 +430,10 @@ debate_escalate(
 Bootstraps a topic. Idempotent — re-calling with the same `topic_id` and
 identical `roles_json` returns the existing record. Validates `topic_id`
 matches `^[A-Z][A-Z0-9_]+$`, roles is a non-empty list of `{role,
-session_id}` dicts, every role matches the role regex. For new official MCP
+session_id}` dicts, role names and session addresses are unique, and every role
+matches the role regex. New official executor roles must be `EXECUTOR_1`,
+`EXECUTOR_2`, ...; a generic `EXECUTOR` remains readable only on legacy topics.
+For new official MCP
 topics, `metadata_json` must carry an initial topic lane and reason, for
 example:
 

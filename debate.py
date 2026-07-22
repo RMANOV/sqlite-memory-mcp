@@ -40,6 +40,7 @@ from debate_protocol_v1 import (
 
 TOPIC_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
 ROLE_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
+NUMBERED_EXECUTOR_ROLE_RE = re.compile(r"^EXECUTOR_[1-9][0-9]*$")
 # v3.9.3 widening (msg:34adcb3e amendment 1B): accept both 8-char
 # (legacy v3.9.0–v3.9.2 rows) and 12-char (new writes) hex msg_ids.
 # secrets.token_hex(6) → 48-bit entropy ≈ 16 M generations before 50 %
@@ -223,6 +224,41 @@ def validate_role(role: str) -> None:
         raise DebateError(f"invalid_role: {role!r} must match {ROLE_RE.pattern}")
 
 
+def validate_numbered_executor_role(role: str) -> None:
+    """Executor lanes are distinct addresses, never a shared generic role."""
+    validate_role(role)
+    if role.startswith("EXECUTOR") and not NUMBERED_EXECUTOR_ROLE_RE.fullmatch(role):
+        raise DebateError(
+            f"executor_role_must_be_numbered: {role!r}; use EXECUTOR_1, "
+            "EXECUTOR_2, ...",
+            error_type="executor_role_not_numbered",
+        )
+
+
+def _validate_unique_roster(
+    roles: list[dict[str, Any]], *, require_numbered_executors: bool
+) -> None:
+    seen_roles: set[str] = set()
+    seen_sessions: set[str] = set()
+    for entry in roles:
+        role = str(entry["role"])
+        session_id = str(entry["session_id"])
+        if role in seen_roles:
+            raise DebateError(
+                f"duplicate_role_in_roster: {role}",
+                error_type="roster_duplicate_role",
+            )
+        if session_id in seen_sessions:
+            raise DebateError(
+                f"duplicate_session_in_roster: {session_id}",
+                error_type="roster_duplicate_session",
+            )
+        if require_numbered_executors:
+            validate_numbered_executor_role(role)
+        seen_roles.add(role)
+        seen_sessions.add(session_id)
+
+
 def validate_msg_id(msg_id: str) -> None:
     if not isinstance(msg_id, str) or not MSG_ID_RE.fullmatch(msg_id):
         raise DebateError(f"invalid_msg_id: {msg_id!r} must match {MSG_ID_RE.pattern}")
@@ -324,6 +360,7 @@ def init_debate(
     resolve_by: str | None = None,
     metadata: dict[str, Any] | None = None,
     require_priority: bool = False,
+    require_numbered_executors: bool = False,
     protocol_version: str | None = None,
     blind_roles: list[str] | None = None,
     max_rounds: int = 3,
@@ -348,6 +385,7 @@ def init_debate(
         validate_role(role)
         if not isinstance(session_id, str) or not session_id:
             raise DebateError(f"invalid_roles_entry: role {role} missing session_id")
+    _validate_unique_roster(roles, require_numbered_executors=False)
     if resolve_by is not None:
         validate_iso_utc(resolve_by)
     if protocol_version not in (None, "", DEBATE_PROTOCOL_V1):
@@ -385,6 +423,10 @@ def init_debate(
                     _raise_protocol_error(exc)
             return out
         raise DebateError(f"topic_exists_with_different_roles: {topic_id}")
+
+    if require_numbered_executors:
+        for entry in roles:
+            validate_numbered_executor_role(str(entry["role"]))
 
     now = now_iso()
     metadata = _normalize_initial_topic_priority_metadata(
@@ -1920,6 +1962,12 @@ def post_message(
                 "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'normal')",
                 (msg_id, recipient),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO debate_delivery_queue "
+                "(msg_id, recipient, enqueued_at, completed_at) "
+                "VALUES (?, ?, ?, NULL)",
+                (msg_id, recipient, ts),
+            )
 
     new_state = debate["state"]
     if kind == "STATE" and new_state_target is not None:
@@ -2265,6 +2313,18 @@ def bind_role_session(
     retired_worker_claims = 0
 
     if state == "active":
+        session_owner = conn.execute(
+            "SELECT role, session_id FROM debate_role_bindings "
+            "WHERE topic_id = ? AND session_id = ? AND state = 'active' "
+            "ORDER BY generation DESC LIMIT 1",
+            (topic_id, session_id),
+        ).fetchone()
+        if session_owner is not None and session_owner["role"] != role:
+            raise DebateError(
+                f"duplicate_active_session: session {session_id} already owns "
+                f"role {session_owner['role']} in {topic_id}",
+                error_type="binding_duplicate_active_session",
+            )
         if existing_active is not None and existing_active["session_id"] != session_id:
             if not replace_active:
                 raise DebateError(
@@ -2515,6 +2575,8 @@ def add_role_to_debate(
         )
 
     already_declared = role_in_debate(debate["roles"], role)
+    if not already_declared:
+        validate_numbered_executor_role(role)
     if already_declared:
         existing_active = _active_binding(conn, topic_id, role)
         if (
@@ -3462,12 +3524,23 @@ def debate_post_with_recipients(
             "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'normal')",
             (msg_id, recipient),
         )
+        conn.execute(
+            "INSERT INTO debate_delivery_queue "
+            "(msg_id, recipient, enqueued_at, completed_at) "
+            "VALUES (?, ?, ?, NULL)",
+            (msg_id, recipient, post_result["ts"]),
+        )
     for recipient in diagnostic_deduped:
         conn.execute(
             "INSERT INTO debate_message_recipients "
-            "(msg_id, recipient, recipient_mode) "
-            "VALUES (?, ?, 'diagnostic')",
+            "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'diagnostic')",
             (msg_id, recipient),
+        )
+        conn.execute(
+            "INSERT INTO debate_delivery_queue "
+            "(msg_id, recipient, enqueued_at, completed_at) "
+            "VALUES (?, ?, ?, NULL)",
+            (msg_id, recipient, post_result["ts"]),
         )
 
     result = {

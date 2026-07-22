@@ -1043,3 +1043,12 @@ def test_timeout_role_sweep_and_adaptive_scheduler_are_server_deterministic(conn
         "interval_seconds": 30.0,
         "reason": "idle_crash_replay_sweep",
     }
+    assert [
+        adaptive_wait_decision(
+            queue_depth=0,
+            live_workers=0,
+            worker_capacity=2,
+            idle_sweep_attempt=n,
+        )["interval_seconds"]
+        for n in range(5)
+    ] == [30.0, 60.0, 120.0, 240.0, 300.0]

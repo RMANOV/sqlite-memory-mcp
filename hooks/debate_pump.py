@@ -256,6 +256,129 @@ def _fetch_new(
         con.close()
 
 
+def _fetch_pending_deliveries(
+    topics: list[str], kinds: list[str], limit: int
+) -> list[sqlite3.Row]:
+    """Read the durable recipient queue independently of the legacy cursor.
+
+    The post transaction inserts ``debate_delivery_queue`` rows for every
+    addressed recipient before commit.  The kernel event only says "work
+    changed"; this queue says exactly which committed messages are pending.
+    Reading it before the cursor path prevents an older in-flight or
+    temporarily-unbound trigger from hiding a newly addressed message
+    (head-of-line blocking).
+
+    Newest addressed rows are returned first even when their posting MCP process
+    predates the queue table and therefore left no delivery row.
+    This compatibility fast path means existing agent sessions need no restart.
+    A small oldest queued slice is appended for starvation-free crash recovery.
+    Claim/wake uniqueness remains the dispatch idempotency authority.
+    """
+    if limit <= 0:
+        return []
+    topic_sql, topic_params = _topic_clause(topics)
+    kind_sql, kind_params = _kind_clause(kinds)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        has_delivery_queue = (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='debate_delivery_queue'"
+            ).fetchone()
+            is not None
+        )
+        if not has_delivery_queue:
+            return []  # mixed-version upgrade window
+        has_blind_table = (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='debate_blind_commits'"
+            ).fetchone()
+            is not None
+        )
+        blind_sql = (
+            "AND NOT EXISTS (SELECT 1 FROM debate_blind_commits bc "
+            " WHERE bc.msg_id=m.msg_id AND bc.released_at IS NULL) "
+            if has_blind_table
+            else ""
+        )
+        pending_select_sql = (
+            "SELECT DISTINCT m.msg_id, m.topic_id, m.ts, q.enqueued_at "
+            "FROM debate_messages m "
+            "JOIN debates d ON d.topic_id = m.topic_id "
+            "JOIN debate_delivery_queue q ON q.msg_id = m.msg_id "
+            "WHERE q.completed_at IS NULL "
+            "AND d.state IN ('INIT','ACTIVE') "
+            f"{blind_sql} {topic_sql} {kind_sql} "
+        )
+        params = [*topic_params, *kind_params]
+        newest_queued = con.execute(
+            pending_select_sql + "ORDER BY q.enqueued_at DESC, m.msg_id DESC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+        latest_addressed = con.execute(
+            "SELECT DISTINCT m.msg_id, m.topic_id, m.ts, NULL AS enqueued_at "
+            "FROM debate_messages m "
+            "JOIN debates d ON d.topic_id = m.topic_id "
+            "JOIN debate_message_recipients r ON r.msg_id = m.msg_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM debate_delivery_queue q "
+            " WHERE q.msg_id=m.msg_id AND q.recipient=r.recipient) "
+            "AND d.state IN ('INIT','ACTIVE') "
+            f"{blind_sql} {topic_sql} {kind_sql} "
+            "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+            [*params, max(limit, 64)],
+        ).fetchall()
+        fairness_limit = min(16, max(1, limit // 4))
+        oldest = con.execute(
+            pending_select_sql + "ORDER BY q.enqueued_at ASC, m.msg_id ASC LIMIT ?",
+            [*params, fairness_limit],
+        ).fetchall()
+        seen: set[str] = set()
+        out: list[sqlite3.Row] = []
+        for row in [*newest_queued, *latest_addressed, *oldest]:
+            msg_id = str(row["msg_id"])
+            if msg_id not in seen:
+                seen.add(msg_id)
+                out.append(row)
+        return out
+    finally:
+        con.close()
+
+
+def _complete_pending_deliveries(msg_id: str, *, enqueued_at: str | None = None) -> int:
+    """Acknowledge the durable queue only after the trigger is terminal."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        has_delivery_queue = (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='debate_delivery_queue'"
+            ).fetchone()
+            is not None
+        )
+        if not has_delivery_queue:
+            return 0
+        queued_at = enqueued_at or _now()
+        con.execute(
+            "INSERT OR IGNORE INTO debate_delivery_queue "
+            "(msg_id, recipient, enqueued_at, completed_at) "
+            "SELECT msg_id, recipient, ?, NULL "
+            "FROM debate_message_recipients WHERE msg_id = ?",
+            (queued_at, msg_id),
+        )
+        cur = con.execute(
+            "UPDATE debate_delivery_queue "
+            "SET completed_at = COALESCE(completed_at, ?) "
+            "WHERE msg_id = ? AND completed_at IS NULL",
+            (_now(), msg_id),
+        )
+        con.commit()
+        return int(cur.rowcount)
+    finally:
+        con.close()
+
+
 def _filter_targets(out: dict[str, Any], suppressed_roles: set[str]) -> dict[str, Any]:
     if not suppressed_roles:
         return out
@@ -877,6 +1000,7 @@ def _adaptive_scheduler_decision(
     live_workers: int,
     worker_capacity: int,
     retry_attempt: int,
+    idle_sweep_attempt: int = 0,
     resource_blocked: bool = False,
     resource_interval: float = 0.0,
 ) -> dict[str, Any]:
@@ -887,9 +1011,11 @@ def _adaptive_scheduler_decision(
         live_workers=live_workers,
         worker_capacity=worker_capacity,
         retry_attempt=retry_attempt,
+        idle_sweep_attempt=idle_sweep_attempt,
         resource_blocked=resource_blocked,
         resource_interval=resource_interval,
         idle_sweep_seconds=WINDOWS_SWEEP_SECONDS,
+        max_idle_sweep_seconds=WINDOWS_MAX_SWEEP_SECONDS,
     )
 
 
@@ -1010,6 +1136,9 @@ def _another_pump_is_live() -> bool:
 
 
 WINDOWS_SWEEP_SECONDS = float(os.environ.get("DEBATE_PUMP_WINDOWS_SWEEP_SECONDS", "30"))
+WINDOWS_MAX_SWEEP_SECONDS = float(
+    os.environ.get("DEBATE_PUMP_WINDOWS_MAX_SWEEP_SECONDS", "300")
+)
 
 
 def _wait_or_stop(seconds: float) -> bool:
@@ -1031,7 +1160,9 @@ def _wait_or_stop(seconds: float) -> bool:
         # (signal handlers, tests) stays interruptible too: a wake/stop
         # event still cuts the wait to near-zero, and a STOP_EVENT set
         # between slices is honored within ~250ms.
-        deadline = time.monotonic() + min(max(0.2, seconds), WINDOWS_SWEEP_SECONDS)
+        deadline = time.monotonic() + min(
+            max(0.2, seconds), max(WINDOWS_SWEEP_SECONDS, WINDOWS_MAX_SWEEP_SECONDS)
+        )
         while True:
             if STOP_EVENT.is_set():
                 return True
@@ -1223,6 +1354,7 @@ def main() -> int:
     last_claim_reclaim_at = 0.0
     last_worker_recovery_at = 0.0
     scheduler_retry_attempt = 0
+    idle_sweep_attempt = 0
     last_scheduler_signature: tuple[object, ...] | None = None
 
     while not STOP:
@@ -1272,6 +1404,7 @@ def main() -> int:
         throttled = False
         dispatch_failed = False
         scan_failed = False
+        eligible_queue_depth = 0
         resource_tier = ""
         effective_max_concurrent_workers = max_concurrent_workers
         try:
@@ -1354,6 +1487,11 @@ def main() -> int:
                     _wait_or_stop(float(decision["interval_seconds"]))
                     continue
 
+            targeted_rows = _fetch_pending_deliveries(
+                topics,
+                effective_action_kinds,
+                effective_limit,
+            )
             regular_rows = _fetch_new(
                 last_ts,
                 last_msg_id,
@@ -1367,15 +1505,35 @@ def main() -> int:
                 topics,
                 effective_limit,
             )
-            seen_ids: set[str] = set()
+            rows_by_id: dict[str, dict[str, Any]] = {}
             rows = []
-            for source_rows, replay in ((replay_rows, True), (regular_rows, False)):
+            for source_rows, targeted, replay, cursor_eligible in (
+                (targeted_rows, True, False, False),
+                (replay_rows, False, True, False),
+                (regular_rows, False, False, True),
+            ):
                 for source_row in source_rows:
                     msg_id = str(source_row["msg_id"])
-                    if msg_id in seen_ids:
+                    existing = rows_by_id.get(msg_id)
+                    if existing is not None:
+                        existing["_targeted_delivery"] = bool(
+                            existing.get("_targeted_delivery") or targeted
+                        )
+                        existing["_blind_replay"] = bool(
+                            existing.get("_blind_replay") or replay
+                        )
+                        existing["_cursor_eligible"] = bool(
+                            existing.get("_cursor_eligible") or cursor_eligible
+                        )
                         continue
-                    seen_ids.add(msg_id)
-                    rows.append({**dict(source_row), "_blind_replay": replay})
+                    item = {
+                        **dict(source_row),
+                        "_targeted_delivery": targeted,
+                        "_blind_replay": replay,
+                        "_cursor_eligible": cursor_eligible,
+                    }
+                    rows_by_id[msg_id] = item
+                    rows.append(item)
             dispatched_rows = 0
             launched_this_scan = 0
             partial_pending = False
@@ -1388,7 +1546,17 @@ def main() -> int:
                 msg_id = row["msg_id"]
                 # Terminal → advance the cursor past it and keep scanning.
                 if _trigger_is_terminal(msg_id, suppressed_roles):
-                    if not row.get("_blind_replay"):
+                    if row.get("_targeted_delivery"):
+                        completed = _complete_pending_deliveries(
+                            msg_id, enqueued_at=str(row.get("ts") or _now())
+                        )
+                        if completed:
+                            _log(
+                                "pump_targeted_delivery_completed",
+                                msg_id=msg_id,
+                                recipients=completed,
+                            )
+                    if row.get("_cursor_eligible") and not row.get("_blind_replay"):
                         last_ts = row["ts"]
                         last_msg_id = msg_id
                         _save_state(last_ts, last_msg_id)
@@ -1412,7 +1580,7 @@ def main() -> int:
                         last_ts=last_ts,
                         last_msg_id=last_msg_id,
                     )
-                    break
+                    continue
                 reason = _throttle_reason(
                     estimated_worker_demand=estimated_worker_demand,
                     launched_this_scan=launched_this_scan,
@@ -1422,6 +1590,7 @@ def main() -> int:
                 )
                 if reason is not None:
                     throttled = True
+                    eligible_queue_depth += 1
                     _log(
                         "pump_dispatch_throttled",
                         reason=reason,
@@ -1437,14 +1606,20 @@ def main() -> int:
                     )
                     break
                 try:
-                    launched_this_scan += _dispatch_row(row, suppressed_roles)
+                    launched = _dispatch_row(row, suppressed_roles)
+                    launched_this_scan += launched
                     dispatched_rows += 1
+                    if launched < estimated_worker_demand:
+                        eligible_queue_depth += 1
                 except Exception as exc:
                     dispatch_failed = True
+                    eligible_queue_depth += 1
                     _log("dispatch_failed", msg_id=msg_id, error=repr(exc))
                     break
-                # Just dispatched → in-flight, not terminal → hold the cursor
-                # here and re-evaluate on the next scan.
+                # Just dispatched → in-flight, not terminal. Keep its durable
+                # queue row pending, but continue to independent messages while
+                # capacity remains. The unique worker claim prevents duplicate
+                # execution for this (topic, role, trigger).
                 partial_pending = True
                 _log(
                     "pump_dispatched_hold_cursor",
@@ -1455,7 +1630,7 @@ def main() -> int:
                     last_ts=last_ts,
                     last_msg_id=last_msg_id,
                 )
-                break
+                continue
             if rows:
                 _log(
                     "scan_batch",
@@ -1467,6 +1642,7 @@ def main() -> int:
                     live_children=len(CHILDREN),
                     effective_action_kinds=effective_action_kinds,
                     effective_limit=effective_limit,
+                    eligible_queue_depth=eligible_queue_depth,
                     last_ts=last_ts,
                     last_msg_id=last_msg_id,
                 )
@@ -1477,23 +1653,36 @@ def main() -> int:
             break
         if scan_failed or dispatch_failed or throttled:
             scheduler_retry_attempt = min(scheduler_retry_attempt + 1, 5)
+            idle_sweep_attempt = 0
         else:
             scheduler_retry_attempt = 0
+            if (
+                eligible_queue_depth > 0
+                or max(len(CHILDREN), baseline_live_workers) > 0
+            ):
+                idle_sweep_attempt = 0
         live_workers = max(len(CHILDREN), baseline_live_workers)
         decision = _adaptive_scheduler_decision(
-            queue_depth=len(rows),
+            queue_depth=eligible_queue_depth,
             live_workers=live_workers,
             worker_capacity=effective_max_concurrent_workers,
             retry_attempt=scheduler_retry_attempt,
+            idle_sweep_attempt=idle_sweep_attempt,
         )
         last_scheduler_signature = _emit_scheduler_decision(
             decision,
-            queue_depth=len(rows),
+            queue_depth=eligible_queue_depth,
             live_workers=live_workers,
             resource_tier=resource_tier,
             previous_signature=last_scheduler_signature,
         )
         _wait_or_stop(float(decision["interval_seconds"]))
+        if (
+            eligible_queue_depth == 0
+            and live_workers == 0
+            and scheduler_retry_attempt == 0
+        ):
+            idle_sweep_attempt = min(idle_sweep_attempt + 1, 8)
 
     _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)

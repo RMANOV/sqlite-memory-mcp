@@ -1197,7 +1197,8 @@ def debate_init(
     Args:
         topic_id: matches ^[A-Z][A-Z0-9_]+$.
         title: non-empty.
-        roles_json: JSON array of {role, session_id} dicts.
+        roles_json: JSON array of unique {role, session_id} dicts. New executor
+            addresses must be numbered: EXECUTOR_1, EXECUTOR_2, ...
         created_by_role: role posting the init.
         resolve_by: optional ISO 8601 UTC deadline.
         metadata_json: JSON object. New official topics must include either
@@ -1241,6 +1242,7 @@ def debate_init(
                 resolve_by=resolve_by or None,
                 metadata=metadata,
                 require_priority=True,
+                require_numbered_executors=True,
                 protocol_version=protocol_version or None,
                 blind_roles=blind_roles if protocol_version else None,
                 max_rounds=max_rounds,
@@ -1805,7 +1807,11 @@ def debate_binding_list(conn, topic_id: str) -> str:
 
 # Tool 36: debate_bind_role (v3.10 role/session lifecycle)
 @mcp.tool()
-@_db_tool(write=True, error_mapper=_debate_error_response)
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
 def debate_bind_role(
     conn,
     topic_id: str,
@@ -1842,7 +1848,11 @@ def debate_bind_role(
 
 # Tool 36b: debate_add_role (flexible roster — add a role after debate_init)
 @mcp.tool()
-@_db_tool(write=True, error_mapper=_debate_error_response)
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
 def debate_add_role(
     conn,
     topic_id: str,
@@ -1883,7 +1893,11 @@ def debate_add_role(
 
 # Tool 37: debate_rotate_binding (v3.10 role/session lifecycle)
 @mcp.tool()
-@_db_tool(write=True, error_mapper=_debate_error_response)
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
 def debate_rotate_binding(
     conn,
     topic_id: str,

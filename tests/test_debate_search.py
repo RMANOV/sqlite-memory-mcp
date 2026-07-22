@@ -35,9 +35,7 @@ from schema import init_db  # noqa: E402
 def wrapper_db(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)
-    monkeypatch.setattr(
-        intel_server, "_get_conn", lambda: db_utils.get_conn(db_path)
-    )
+    monkeypatch.setattr(intel_server, "_get_conn", lambda: db_utils.get_conn(db_path))
     monkeypatch.setattr(
         intel_server,
         "_get_conn_immediate",
@@ -51,11 +49,13 @@ def wrapper_db(tmp_path, monkeypatch):
     roles_json = json.dumps(
         [
             {"role": "CONDUCTOR", "session_id": "codex-cond20260531"},
-            {"role": "EXECUTOR", "session_id": "codex-exec20260531"},
+            {"role": "EXECUTOR_1", "session_id": "codex-exec20260531"},
         ]
     )
-    for topic_id, title in (("SRCH1", "search topic one"),
-                            ("SRCH2", "search topic two")):
+    for topic_id, title in (
+        ("SRCH1", "search topic one"),
+        ("SRCH2", "search topic two"),
+    ):
         out = json.loads(
             intel_server.debate_init(
                 topic_id=topic_id,
@@ -63,8 +63,7 @@ def wrapper_db(tmp_path, monkeypatch):
                 roles_json=roles_json,
                 created_by_role="CONDUCTOR",
                 metadata_json=json.dumps(
-                    {"priority_lane": "P2",
-                     "priority_reason": "debate_search B5 test"}
+                    {"priority_lane": "P2", "priority_reason": "debate_search B5 test"}
                 ),
             )
         )
@@ -72,12 +71,21 @@ def wrapper_db(tmp_path, monkeypatch):
     return db_path
 
 
-def _post(topic_id: str, body: str, *, role: str = "EXECUTOR",
-          kind: str = "STATUS", priority: str = "INFO") -> dict:
+def _post(
+    topic_id: str,
+    body: str,
+    *,
+    role: str = "EXECUTOR_1",
+    kind: str = "STATUS",
+    priority: str = "INFO",
+) -> dict:
     out = json.loads(
         intel_server.debate_post(
-            topic_id=topic_id, role=role,
-            priority=priority, kind=kind, body=body,
+            topic_id=topic_id,
+            role=role,
+            priority=priority,
+            kind=kind,
+            body=body,
         )
     )
     assert "error_type" not in out, out
@@ -130,8 +138,16 @@ def test_search_returns_debate_read_column_shape(wrapper_db):
     assert out["count"] == 1
     msg = out["messages"][0]
     expected_keys = {
-        "msg_id", "topic_id", "role", "ts", "priority",
-        "kind", "reply_to", "standing", "body", "created_at",
+        "msg_id",
+        "topic_id",
+        "role",
+        "ts",
+        "priority",
+        "kind",
+        "reply_to",
+        "standing",
+        "body",
+        "created_at",
     }
     assert set(msg.keys()) == expected_keys
     assert msg["msg_id"] == posted["msg_id"]

@@ -349,7 +349,6 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
 
     if (
         (temp is not None and temp >= 80)
-        or (temp is None)
         or (snapshot.mem_total_mib > 0 and mem_available_pct < 0.18)
         or (
             snapshot.swap_total_mib > 0
@@ -376,7 +375,7 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
     if (
         (temp is not None and temp < 70)
         and snapshot.mem_available_mib >= 12288
-        and snapshot.swap_free_mib >= 4096
+        and (snapshot.swap_total_mib == 0 or snapshot.swap_free_mib >= 4096)
         and snapshot.memory_full_avg10 < 0.5
         and load_per_cpu < 1.5
         and snapshot.live_agent_count < 4
@@ -394,16 +393,23 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
             snapshot=snapshot,
         )
 
+    guarded_workers = (
+        2
+        if snapshot.mem_available_mib >= 8192
+        and load_per_cpu < 2
+        and snapshot.live_agent_count < live_agent_constrained
+        else 1
+    )
     return DebateResourceBudget(
         allow_agent=True,
-        wake_budget=1,
-        max_workers_per_scan=1,
-        max_concurrent_workers=1,
+        wake_budget=guarded_workers,
+        max_workers_per_scan=guarded_workers,
+        max_concurrent_workers=guarded_workers,
         interval_seconds=15,
         limit=5,
         action_kinds=("Q", "DECISION", "PING", *PROTOCOL_V1_ACTION_KINDS),
         tier="guarded",
-        reason="moderate_machine_state",
+        reason=";".join(soft_reasons) or "moderate_machine_state",
         snapshot=snapshot,
     )
 
