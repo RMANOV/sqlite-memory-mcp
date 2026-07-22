@@ -11,15 +11,10 @@ import sys
 from db_utils import (
     DB_PATH,
     PRIORITY_RANK,
-    TASK_ACTIVE_EXCLUSIONS,
     TASK_PRIORITIES,
-    apply_task_mutation,
+    TaskDAO,
     get_conn,
-    now_iso,
 )
-
-# Pre-built SQL fragment for active-task exclusion filter
-_EXCL_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
 
 
 def run(db_path: str, target_priority: str, dry_run: bool) -> int:
@@ -38,48 +33,27 @@ def run(db_path: str, target_priority: str, dry_run: bool) -> int:
         print(f"No priorities lower than '{target_priority}' — nothing to bump.")
         return 0
 
-    ph = ",".join("?" * len(lower_priorities))
-
     with get_conn(db_path) as conn:
+        candidates = TaskDAO.bump_overdue_priority(
+            conn,
+            target_priority,
+            dry_run=dry_run,
+            tool_name="overdue_bump.run",
+        )
         if dry_run:
-            rows = conn.execute(
-                f"SELECT id, title, priority, due_date FROM tasks "
-                f"WHERE due_date < date('now') "
-                f"AND status NOT IN ({_EXCL_PH}) "
-                f"AND priority IN ({ph})",
-                list(TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
-            ).fetchall()
-            if not rows:
+            if not candidates:
                 print("Dry run: no overdue tasks would be bumped.")
             else:
                 print(
-                    f"Dry run: {len(rows)} task(s) would be bumped to '{target_priority}':"
+                    f"Dry run: {len(candidates)} task(s) would be bumped to '{target_priority}':"
                 )
-                for row in rows:
+                for row in candidates:
                     print(
                         f"  [{row['id']}] {row['title']!r}  "
                         f"priority={row['priority']}  due={row['due_date']}"
                     )
         else:
-            now = now_iso()
-            rows = conn.execute(
-                f"SELECT id FROM tasks "
-                f"WHERE due_date < date('now') "
-                f"AND status NOT IN ({_EXCL_PH}) "
-                f"AND priority IN ({ph})",
-                list(TASK_ACTIVE_EXCLUSIONS) + lower_priorities,
-            )
-            bumped = 0
-            for row in rows.fetchall():
-                result = apply_task_mutation(
-                    conn,
-                    row["id"],
-                    {"priority": target_priority},
-                    timestamp=now,
-                    tool_name="overdue_bump.run",
-                )
-                bumped += int(result.get("updated", 0))
-            print(f"Bumped {bumped} task(s) to '{target_priority}'.")
+            print(f"Bumped {len(candidates)} task(s) to '{target_priority}'.")
 
     return 0
 

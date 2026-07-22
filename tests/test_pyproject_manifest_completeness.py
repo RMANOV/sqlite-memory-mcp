@@ -47,6 +47,10 @@ def _load_manifest() -> dict:
         return tomllib.load(fh)
 
 
+def test_python_requirement_matches_stdlib_tomllib_runtime():
+    assert _load_manifest()["project"]["requires-python"] == ">=3.11"
+
+
 def _toplevel_py_files() -> set[str]:
     """All importable top-level ``.py`` module bases in the repo.
 

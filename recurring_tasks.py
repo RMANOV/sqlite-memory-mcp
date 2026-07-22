@@ -14,7 +14,7 @@ import json
 import sqlite3
 import sys
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from db_utils import (
     DB_PATH,
@@ -198,7 +198,7 @@ def build_new_task(source: sqlite3.Row, due: str, timestamp: str, today: date) -
 
 
 def process_recurring(conn: sqlite3.Connection, dry_run: bool) -> list[dict]:
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     timestamp = now_iso()
 
     done_tasks = get_recurring_done_tasks(conn)

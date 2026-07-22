@@ -575,6 +575,7 @@ CREATE TABLE IF NOT EXISTS lazy_claims (
     predicate           TEXT NOT NULL,
     object_text         TEXT NOT NULL,
     confidence          REAL NOT NULL,
+    hit_count           INTEGER NOT NULL DEFAULT 1,
     status              TEXT NOT NULL DEFAULT 'candidate',
     promoted_to_fact_id TEXT NULL,
     created_at          TEXT NOT NULL,
@@ -1415,7 +1416,7 @@ _MIGRATIONS = [
         "CREATE TABLE context_chunks ("
         "chunk_id TEXT PRIMARY KEY, session_id TEXT NULL, entity_id TEXT NULL, "
         "source_type TEXT NOT NULL, source_ref TEXT NOT NULL, source_hash TEXT NOT NULL, "
-        "title TEXT NULL, body TEXT NOT NULL, language TEXT DEFAULT 'bg', "
+        "title TEXT NULL, body TEXT NOT NULL, language TEXT DEFAULT NULL, "
         "state TEXT NOT NULL DEFAULT 'no_enrich', enrich_policy TEXT NOT NULL DEFAULT 'manual', "
         "materiality_score REAL DEFAULT 0.0, last_human_update_at TEXT NULL, "
         "last_ai_attempt_at TEXT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -1576,10 +1577,16 @@ _MIGRATIONS = [
         "observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE, "
         "subject TEXT NOT NULL, predicate TEXT NOT NULL, "
         "object_text TEXT NOT NULL, confidence REAL NOT NULL, "
+        "hit_count INTEGER NOT NULL DEFAULT 1, "
         "status TEXT NOT NULL DEFAULT 'candidate', "
         "promoted_to_fact_id TEXT NULL, "
         "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
         "lazy_claims table (v3.1.0)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('lazy_claims') WHERE name='hit_count'",
+        "ALTER TABLE lazy_claims ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 1",
+        "lazy_claims.hit_count column (evidence accumulation)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lc_entity'",
@@ -2223,7 +2230,9 @@ def _repair_memory_fts_triggers(conn: sqlite3.Connection) -> None:
             "CREATE TRIGGER memory_fts_au AFTER UPDATE ON entities BEGIN "
             "DELETE FROM memory_fts WHERE rowid = old.rowid; "
             "INSERT INTO memory_fts(rowid, name, entity_type, observations_text) "
-            "VALUES (new.rowid, new.name, new.entity_type, ''); END"
+            "SELECT new.rowid, new.name, new.entity_type, "
+            "COALESCE(GROUP_CONCAT(o.content, ' '), '') "
+            "FROM (SELECT 1) LEFT JOIN observations o ON o.entity_id = new.id; END"
         ),
     }
     for name, expected_sql in expected.items():
@@ -2248,7 +2257,9 @@ def _repair_memory_fts_triggers(conn: sqlite3.Connection) -> None:
                 CREATE TRIGGER memory_fts_au AFTER UPDATE ON entities BEGIN
                     DELETE FROM memory_fts WHERE rowid = old.rowid;
                     INSERT INTO memory_fts(rowid, name, entity_type, observations_text)
-                    VALUES (new.rowid, new.name, new.entity_type, '');
+                    SELECT new.rowid, new.name, new.entity_type,
+                           COALESCE(GROUP_CONCAT(o.content, ' '), '')
+                    FROM (SELECT 1) LEFT JOIN observations o ON o.entity_id = new.id;
                 END
                 """
             )
@@ -2445,8 +2456,9 @@ def init_db(db_path: str | None = None) -> None:
     """
     _path = db_path or DB_PATH
     Path(_path).parent.mkdir(parents=True, exist_ok=True)
-    raw = sqlite3.connect(_path, isolation_level=None)
+    raw = sqlite3.connect(_path, isolation_level=None, timeout=30)
     raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA busy_timeout=30000")
     raw.execute("BEGIN EXCLUSIVE;")
     try:
         for stmt in _split_schema_sql(_SCHEMA_SQL):

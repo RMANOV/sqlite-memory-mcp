@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import sys
-from datetime import date
+from datetime import datetime, timezone
 
 import pytest
 
@@ -207,4 +207,4 @@ def test_process_recurring_updates_source_recurring_version_and_timestamp(conn):
     assert version_row["old_value"] == raw
     assert version_row["new_value"] == source_row["recurring"]
     assert source_row["updated_at"] == version_row["updated_at"]
-    assert date.today().isoformat() in source_row["recurring"]
+    assert datetime.now(timezone.utc).date().isoformat() in source_row["recurring"]
