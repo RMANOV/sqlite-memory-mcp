@@ -29,7 +29,7 @@ from db_utils import (
     now_iso,
     priority_sort_key,
 )
-from task_search import build_bounded_index_rows
+from task_search import EntitySearchController, build_bounded_index_rows
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -928,10 +928,71 @@ class _CalendarShowFilter(QObject):
         return False
 
 
+class _DialogHostMixin:
+    """Shared deferred-dialog lifecycle for popup and task-list surfaces."""
+
+    def _dialog_parent(self):
+        return None
+
+    def _before_dialog_open(self):
+        return None
+
+    def _on_reader_open(self, task):
+        return None
+
+    def _track_dialog(self, dlg):
+        self._open_dialogs.append(dlg)
+
+        def _cleanup(*_args):
+            self._open_dialogs = [d for d in self._open_dialogs if d is not dlg]
+
+        dlg.destroyed.connect(_cleanup)
+
+    def _show_dialog_deferred(self, factory, *, label: str):
+        """Open outside the active Qt input event to avoid tray crashes."""
+
+        def _open():
+            try:
+                self._before_dialog_open()
+                dlg = factory()
+                if dlg is None:
+                    return
+                dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                self._track_dialog(dlg)
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+            except _DIALOG_OPEN_ERRORS as exc:
+                logger.error("Failed to open %s: %s", label, exc, exc_info=True)
+
+        QTimer.singleShot(0, _open)
+
+    def _open_reader(self, task_id):
+        task = TaskDAO.get_by_id(self.db._conn, task_id, columns=_UI_COLS)
+        if not task:
+            task = next((t for t in self._tasks if t["id"] == task_id), None)
+        if not task:
+            logger.warning("Task reader open skipped; task not found: %s", task_id)
+            return
+        self._on_reader_open(task)
+        self._show_dialog_deferred(
+            lambda task=task: TaskReaderDialog(task, self.db, self._dialog_parent()),
+            label=f"task reader for {task_id}",
+        )
+
+    def _open_entity_detail(self, entity_id: int):
+        self._show_dialog_deferred(
+            lambda entity_id=entity_id: EntityDetailDialog(
+                self.db, entity_id, self._dialog_parent()
+            ),
+            label=f"entity detail for {entity_id}",
+        )
+
+
 # ── TrayPopup ───────────────────────────────────────────────────────
 
 
-class TrayPopup(QWidget):
+class TrayPopup(_DialogHostMixin, QWidget):
     """Compact popup showing top suggested tasks."""
 
     _entity_search_done = pyqtSignal(list, int)  # (entity_results, seq_id)
@@ -946,9 +1007,16 @@ class TrayPopup(QWidget):
         self.db = db
         self.on_open_full = on_open_full
         self._tasks = []
-        self._entity_seq_id = 0
         self._open_dialogs = []
         self._entity_search_done.connect(self._on_entity_results)
+        self._entity_search = EntitySearchController(
+            lambda query, limit: self.db.search_entities_fast(query, limit=limit),
+            self._entity_search_done.emit,
+            limit=5,
+            on_error=lambda exc: logger.error(
+                "Tray entity search failed: %s", exc, exc_info=True
+            ),
+        )
         self.setFixedWidth(380)
         self.setMaximumHeight(500)
         self.setStyleSheet(self._stylesheet())
@@ -1099,16 +1167,9 @@ class TrayPopup(QWidget):
             merged = [{**t, "_is_entity": False} for t in tasks]
 
             # Async entity search (with vector — always on)
-            self._entity_seq_id += 1
-            _seq = self._entity_seq_id
-            _q = q
-
-            def _entity_worker(seq_id=_seq, query=_q):
-                results = self.db.search_entities_fast(query, limit=5)
-                self._entity_search_done.emit(results, seq_id)
-
-            threading.Thread(target=_entity_worker, daemon=True).start()
+            self._entity_search.request(q)
         else:
+            self._entity_search.cancel()
             tasks = self.db.get_suggested_tasks(limit=8)
             merged = None  # no search — use smart grouping
 
@@ -1190,7 +1251,7 @@ class TrayPopup(QWidget):
 
     def _on_entity_results(self, entities: list, seq_id: int):
         """Inject async entity results into existing task layout."""
-        if seq_id != self._entity_seq_id:
+        if not self._entity_search.is_current(seq_id):
             return
         if not entities or not self._search_text:
             return
@@ -1271,53 +1332,8 @@ class TrayPopup(QWidget):
         else:
             self.db.update_task(task_id, status="not_started")
 
-    def _track_dialog(self, dlg):
-        self._open_dialogs.append(dlg)
-
-        def _cleanup(*_args):
-            self._open_dialogs = [d for d in self._open_dialogs if d is not dlg]
-
-        dlg.destroyed.connect(_cleanup)
-
-    def _show_dialog_deferred(self, factory, *, label: str):
-        """Open dialogs after the tray input cycle to avoid Windows COM crashes."""
-
-        def _open():
-            try:
-                self.hide()
-                dlg = factory()
-                if dlg is None:
-                    return
-                dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-                self._track_dialog(dlg)
-                dlg.show()
-                dlg.raise_()
-                dlg.activateWindow()
-            except _DIALOG_OPEN_ERRORS as exc:
-                logger.error(
-                    "Failed to open %s from popup: %s",
-                    label,
-                    exc,
-                    exc_info=True,
-                )
-
-        QTimer.singleShot(0, _open)
-
-    def _open_reader(self, task_id):
-        task = TaskDAO.get_by_id(self.db._conn, task_id, columns=_UI_COLS)
-        if not task:
-            task = next((t for t in self._tasks if t["id"] == task_id), None)
-        if task:
-            self._show_dialog_deferred(
-                lambda task=task: TaskReaderDialog(task, self.db, None),
-                label=f"task reader for {task_id}",
-            )
-
-    def _open_entity_detail(self, entity_id: int):
-        self._show_dialog_deferred(
-            lambda entity_id=entity_id: EntityDetailDialog(self.db, entity_id, None),
-            label=f"entity detail for {entity_id}",
-        )
+    def _before_dialog_open(self):
+        self.hide()
 
     def _toggle_add_form(self):
         visible = not self._add_form.isVisible()
@@ -3257,7 +3273,7 @@ class ReminderPopupDialog(QDialog):
 # ── TaskListWidget ───────────────────────────────────────────────────
 
 
-class TaskListWidget(QListWidget):
+class TaskListWidget(_DialogHostMixin, QListWidget):
     """Custom list widget for tasks with checkbox + priority badge."""
 
     def __init__(self, db, parent=None):
@@ -3478,53 +3494,9 @@ class TaskListWidget(QListWidget):
             return None
         return host if isinstance(host, QWidget) else None
 
-    def _track_dialog(self, dlg):
-        self._open_dialogs.append(dlg)
-
-        def _cleanup(*_args):
-            self._open_dialogs = [d for d in self._open_dialogs if d is not dlg]
-
-        dlg.destroyed.connect(_cleanup)
-
-    def _show_dialog_deferred(self, factory, *, label: str):
-        """Open dialogs outside the immediate Qt input signal to avoid tray crashes."""
-
-        def _open():
-            try:
-                dlg = factory()
-                if dlg is None:
-                    return
-                dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-                self._track_dialog(dlg)
-                dlg.show()
-                dlg.raise_()
-                dlg.activateWindow()
-            except _DIALOG_OPEN_ERRORS as exc:
-                logger.error("Failed to open %s: %s", label, exc, exc_info=True)
-
-        QTimer.singleShot(0, _open)
-
-    def _open_reader(self, task_id):
-        task = TaskDAO.get_by_id(self.db._conn, task_id, columns=_UI_COLS)
-        if not task:
-            task = next((t for t in self._tasks if t["id"] == task_id), None)
-        if not task:
-            logger.warning("Double-click open skipped; task not found: %s", task_id)
-            return
+    def _on_reader_open(self, task):
         if hasattr(self, "_search_engine"):
             self._search_engine.record_open(task)
-        self._show_dialog_deferred(
-            lambda task=task: TaskReaderDialog(task, self.db, self._dialog_parent()),
-            label=f"task reader for {task_id}",
-        )
-
-    def _open_entity_detail(self, entity_id: int):
-        self._show_dialog_deferred(
-            lambda entity_id=entity_id: EntityDetailDialog(
-                self.db, entity_id, self._dialog_parent()
-            ),
-            label=f"entity detail for {entity_id}",
-        )
 
     def _open_premium_detail(self, record):
         self._show_dialog_deferred(

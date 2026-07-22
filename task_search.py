@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import threading
+from collections.abc import Callable
 
 _SMARTKEY_AVAILABLE = False
 try:
@@ -93,6 +94,76 @@ def build_bounded_index_rows(
             if len(rows) >= bounded_limit:
                 return rows
     return rows
+
+
+class EntitySearchController:
+    """Coalesce background entity searches and identify stale results."""
+
+    def __init__(
+        self,
+        search: Callable[[str, int], list[dict]],
+        emit: Callable[[list[dict], int], None],
+        *,
+        limit: int,
+        on_error: Callable[[Exception], None] | None = None,
+    ):
+        self._search = search
+        self._emit = emit
+        self._limit = max(1, int(limit))
+        self._on_error = on_error
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._pending: tuple[int, str] | None = None
+        self._running = False
+
+    @property
+    def sequence(self) -> int:
+        with self._lock:
+            return self._sequence
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._running
+
+    def is_current(self, sequence: int) -> bool:
+        return sequence == self.sequence
+
+    def cancel(self) -> int:
+        """Invalidate in-flight results and discard work not yet started."""
+        with self._lock:
+            self._sequence += 1
+            self._pending = None
+            return self._sequence
+
+    def request(self, query: str) -> int:
+        """Queue the latest query and ensure exactly one worker is draining it."""
+        with self._lock:
+            self._sequence += 1
+            sequence = self._sequence
+            self._pending = (sequence, query)
+            if self._running:
+                return sequence
+            self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+        return sequence
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                pending = self._pending
+                self._pending = None
+                if pending is None:
+                    self._running = False
+                    return
+            sequence, query = pending
+            try:
+                results = self._search(query, self._limit)
+            except Exception as exc:  # UI background boundary: report, never wedge
+                if self._on_error is not None:
+                    self._on_error(exc)
+                results = []
+            self._emit(results, sequence)
 
 
 def _tokenize(text: str) -> list[str]:
