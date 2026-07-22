@@ -77,6 +77,14 @@ def test_debate_wake_accepts_claude_runtime_alias():
     assert cmd[0] == "claude"
 
 
+def test_debate_wake_accepts_post_tool_under_any_mcp_prefix():
+    module = _load_hook_module("debate_wake_prefix_test", "hooks/debate_wake.py")
+
+    assert module._is_target_tool("mcp__sqlite_unified__debate_post_with_recipients")
+    assert module._is_target_tool("mcp__sqlite_intel__debate_post_with_recipients")
+    assert not module._is_target_tool("mcp__sqlite_unified__debate_post")
+
+
 def test_resource_budget_blocks_supercritical_heat_and_large_agent_set():
     module = _load_hook_module(
         "debate_resource_budget_blocked_test", "hooks/debate_resource_budget.py"
@@ -370,6 +378,7 @@ def test_resource_budget_live_agent_count_ignores_sqlite_memory_sidecars(
         "103": "/home/rmanov/.npm-global/lib/node_modules/@openai/codex/vendor/codex",
         "104": "claude",
         "105": "/home/rmanov/.local/share/claude/versions/2.1.150 --chrome-native-host",
+        "106": "python3 /home/rmanov/.claude/mcp_servers/maintenance.py",
     }
     for pid, cmd in commands.items():
         d = proc / pid
@@ -377,6 +386,45 @@ def test_resource_budget_live_agent_count_ignores_sqlite_memory_sidecars(
         (d / "cmdline").write_bytes(cmd.replace(" ", "\0").encode())
 
     assert module._count_live_agents(proc) == 2
+
+
+def test_debate_pump_resource_cap_does_not_ratchet_base_budget():
+    module = _load_hook_module(
+        "debate_pump_budget_ratchet_test", "hooks/debate_pump.py"
+    )
+
+    assert module._clamp_wake_budget(3, 1) == 1
+    assert module._clamp_wake_budget(3, 3) == 3
+
+
+def test_debate_pump_live_worker_census_failure_is_nonfatal(monkeypatch, tmp_path):
+    module = _load_hook_module(
+        "debate_pump_census_failure_test", "hooks/debate_pump.py"
+    )
+    module.LOG_PATH = tmp_path / "pump.jsonl"
+    module.CHILDREN.clear()
+    monkeypatch.setattr(
+        module,
+        "_machine_live_worker_count",
+        lambda _topics: (_ for _ in ()).throw(sqlite3.OperationalError("locked")),
+    )
+
+    assert module._safe_machine_live_worker_count([]) == 0
+    assert "machine_live_worker_count_failed" in module.LOG_PATH.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_debate_pump_reads_operator_disable_before_scan(monkeypatch, tmp_path):
+    module = _load_hook_module(
+        "debate_pump_operator_disable_test", "hooks/debate_pump.py"
+    )
+    disable_file = tmp_path / "debate_wake.disable"
+    monkeypatch.setenv("DEBATE_WAKE_DISABLE_FILE", str(disable_file))
+
+    assert module._operator_wake_disabled() is False
+    disable_file.write_text("disabled", encoding="utf-8")
+    assert module._operator_wake_disabled() is True
 
 
 def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tmp_path):

@@ -418,6 +418,47 @@ def test_released_blind_worker_reads_exact_trigger_behind_parent_cursor(conn):
     assert response["worker_claim"]["state"] == "completed"
 
 
+def test_worker_can_advance_legacy_trigger_addressed_only_to_parent_session(conn):
+    topic = _topic(conn, "S7_PARENT_ADDRESS")
+    trigger = post_message(
+        conn,
+        topic_id=topic,
+        role="CONDUCTOR",
+        priority="H",
+        kind="PING",
+        body="direct parent-session trigger",
+    )
+    conn.execute(
+        "INSERT INTO debate_message_recipients "
+        "(msg_id,recipient,recipient_mode) VALUES (?,?,'normal')",
+        (trigger["msg_id"], "codex-advocate"),
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=topic,
+        role="ADVOCATE",
+        parent_session_id="codex-advocate",
+        trigger_msg_id=trigger["msg_id"],
+    )
+    worker_session_id = claim["worker_session_id"]
+
+    inbox = debate_signal_check(
+        conn,
+        session_id=worker_session_id,
+        role="ADVOCATE",
+        topic_id=topic,
+    )
+    assert [item["msg_id"] for item in inbox["pending"]] == [trigger["msg_id"]]
+    advanced = debate_signal_advance(
+        conn,
+        session_id=worker_session_id,
+        role="ADVOCATE",
+        topic_id=topic,
+        last_processed_msg_id=trigger["msg_id"],
+    )
+    assert advanced["last_processed_msg_id"] == trigger["msg_id"]
+
+
 def test_protocol_topic_rejects_legacy_conversation_kind(conn):
     topic = _topic(conn)
     with pytest.raises(DebateError) as caught:
@@ -840,6 +881,18 @@ def test_order_swap_stable_verdict_stops_protocol(conn):
     )
     assert replay["stable"] is True
     assert replay["protocol_state"] == stopped_state
+    conn.execute(
+        "UPDATE debate_protocol_state SET phase='STALEMATE' WHERE topic_id=?",
+        (topic,),
+    )
+    with pytest.raises(ProtocolV1Error) as lost_cas:
+        record_order_swap_verdict(
+            conn,
+            projection_id=projections[1]["projection_id"],
+            judge_role="JUDGE",
+            verdict={"winner_msg_id": left["msg_id"], "decision": "accept A"},
+        )
+    assert lost_cas.value.error_type == "PROTOCOL_STATE_CONFLICT"
 
 
 def test_order_swap_disagreement_replay_is_stalemate_noop(conn):

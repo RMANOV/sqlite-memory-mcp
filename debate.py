@@ -1401,15 +1401,17 @@ def _complete_worker_claim_if_terminal(
     role: str,
     worker_session_id: str,
     now: str,
+    claim: sqlite3.Row | None = None,
 ) -> dict[str, Any] | None:
     if not is_worker_session_id(worker_session_id):
         return None
-    claim = _validate_worker_claim_for_signal(
-        conn,
-        topic_id=topic_id,
-        role=role,
-        worker_session_id=worker_session_id,
-    )
+    if claim is None:
+        claim = _validate_worker_claim_for_signal(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            worker_session_id=worker_session_id,
+        )
     if claim["state"] != "active":
         return _claim_row_dict(claim)
     ack = _terminal_reply_for_trigger(
@@ -3524,16 +3526,19 @@ def _signal_recipients_for_binding(
     topic_id: str,
     role: str,
     session_id: str,
+    worker_claim: sqlite3.Row | None = None,
 ) -> list[str]:
     if is_worker_session_id(session_id):
-        claim = _validate_worker_claim_for_signal(
-            conn,
-            topic_id=topic_id,
-            role=role,
-            worker_session_id=session_id,
-        )
+        claim = worker_claim
+        if claim is None:
+            claim = _validate_worker_claim_for_signal(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                worker_session_id=session_id,
+            )
         if claim["state"] == "active":
-            return [role, session_id]
+            return [role, str(claim["parent_session_id"])]
         return []
 
     binding_count = _binding_count(conn, topic_id, role)
@@ -3744,7 +3749,11 @@ def debate_signal_check(
             cursor_from_state = True
 
     signal_recipients = _signal_recipients_for_binding(
-        conn, topic_id=topic_id, role=role, session_id=session_id
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=session_id,
+        worker_claim=worker_claim,
     )
     if not signal_recipients:
         return {
@@ -3968,7 +3977,11 @@ def debate_signal_advance(
         )
 
     signal_recipients = _signal_recipients_for_binding(
-        conn, topic_id=topic_id, role=role, session_id=session_id
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=session_id,
+        worker_claim=worker_claim,
     )
     if signal_recipients:
         recipient_placeholders = ",".join("?" for _ in signal_recipients)
@@ -4043,12 +4056,13 @@ def debate_signal_advance(
         "last_check_at = excluded.last_check_at",
         (session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
     )
-    worker_claim = _complete_worker_claim_if_terminal(
+    completed_worker_claim = _complete_worker_claim_if_terminal(
         conn,
         topic_id=topic_id,
         role=role,
         worker_session_id=session_id,
         now=now,
+        claim=worker_claim,
     )
 
     out = {
@@ -4059,8 +4073,8 @@ def debate_signal_advance(
         "last_processed_ts": ref["ts"],
         "last_check_at": now,
     }
-    if worker_claim is not None:
-        out["worker_claim"] = worker_claim
+    if completed_worker_claim is not None:
+        out["worker_claim"] = completed_worker_claim
     return out
 
 

@@ -1069,21 +1069,33 @@ def record_order_swap_verdict(
             verdicts[0]["winner_msg_id"] == verdicts[1]["winner_msg_id"]
             and verdicts[0]["decision"] == verdicts[1]["decision"]
         )
+        expected_phase = "STOPPED" if stable else "STALEMATE"
         if stable:
-            conn.execute(
+            transition = conn.execute(
                 "UPDATE debate_protocol_state SET phase='STOPPED',"
                 "transition_version=transition_version+1,phase_deadline_at=NULL,updated_at=? "
                 "WHERE topic_id=? AND phase='ADJUDICATE'",
                 (now, row["topic_id"]),
             )
         else:
-            conn.execute(
+            transition = conn.execute(
                 "UPDATE debate_protocol_state SET phase='STALEMATE',"
                 "stalemate_reason='judge_order_swap_disagreement',"
                 "transition_version=transition_version+1,phase_deadline_at=NULL,updated_at=? "
                 "WHERE topic_id=? AND phase='ADJUDICATE'",
                 (now, row["topic_id"]),
             )
+        if transition.rowcount != 1:
+            current = get_protocol_state(conn, str(row["topic_id"]))
+            if current is None or current.get("phase") != expected_phase:
+                raise ProtocolV1Error(
+                    "judge terminal transition lost its phase compare-and-swap",
+                    error_type="PROTOCOL_STATE_CONFLICT",
+                    details={
+                        "expected_phase": expected_phase,
+                        "actual_phase": current.get("phase") if current else None,
+                    },
+                )
     return {
         "projection_id": projection_id,
         "topic_id": row["topic_id"],

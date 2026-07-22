@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import time
+from xml.sax.saxutils import escape
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -157,8 +158,9 @@ def _schtasks(args: list[str]) -> dict[str, object]:
 
 def _task_xml() -> str:
     """Task Scheduler XML: the CLI cannot express IgnoreNew + RestartOnFailure."""
-    pythonw = _pythonw()
-    arguments = " ".join([f'"{PUMP_SCRIPT}"', *PUMP_ARGS])
+    pythonw = escape(str(_pythonw()))
+    arguments = escape(" ".join([f'"{PUMP_SCRIPT}"', *PUMP_ARGS]))
+    working_directory = escape(str(ROOT))
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -196,7 +198,7 @@ def _task_xml() -> str:
     <Exec>
       <Command>{pythonw}</Command>
       <Arguments>{arguments}</Arguments>
-      <WorkingDirectory>{ROOT}</WorkingDirectory>
+      <WorkingDirectory>{working_directory}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>

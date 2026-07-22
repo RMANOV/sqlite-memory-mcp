@@ -127,12 +127,6 @@ def _count_live_agents(proc: Path = Path("/proc")) -> int:
         pids = [p for p in proc.iterdir() if p.name.isdigit()]
     except Exception:
         return 0
-    agent_needles = (
-        "claude -p",
-        "claude",
-        "codex exec",
-        "/@openai/codex",
-    )
     sidecar_needles = (
         "--chrome-native-host",
         "node /home/rmanov/.npm-global/bin/codex",
@@ -147,22 +141,25 @@ def _count_live_agents(proc: Path = Path("/proc")) -> int:
     )
     for pid in pids:
         try:
-            cmdline = (
-                (pid / "cmdline")
-                .read_bytes()
-                .replace(b"\0", b" ")
-                .decode("utf-8", errors="replace")
-            )
+            argv = [
+                value.decode("utf-8", errors="replace")
+                for value in (pid / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
         except Exception:
             continue
+        cmdline = " ".join(argv)
         if any(needle in cmdline for needle in sidecar_needles):
             continue
-        if any(needle in cmdline for needle in agent_needles):
+        try:
+            process_name = (pid / "comm").read_text(encoding="utf-8").strip()
+        except Exception:
+            process_name = ""
+        if _is_agent_process(process_name, argv):
             count += 1
     return count
 
 
-_WINDOWS_AGENT_NEEDLES = ("claude", "codex")
 _WINDOWS_SIDECAR_NEEDLES = (
     "daemon",  # claude transient daemon + spare-pool supervisor
     "--bg-pty-host",
@@ -171,6 +168,14 @@ _WINDOWS_SIDECAR_NEEDLES = (
     "debate_pump.py",
     "pythonw",
 )
+
+
+def _is_agent_process(process_name: str, argv: list[str]) -> bool:
+    """Classify by executable identity, never by arbitrary path arguments."""
+    names = {str(process_name or "").lower()}
+    if argv:
+        names.add(Path(argv[0]).name.lower())
+    return any(name.startswith(("claude", "codex")) for name in names if name)
 
 
 def _windows_count_live_agents() -> int:
@@ -187,16 +192,15 @@ def _windows_count_live_agents() -> int:
     count = 0
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
-            cmdline = " ".join(
-                proc.info["cmdline"] or [proc.info["name"] or ""]
-            ).lower()
+            argv = proc.info["cmdline"] or []
+            cmdline = " ".join(argv or [proc.info["name"] or ""]).lower()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         if not cmdline:
             continue
         if any(needle in cmdline for needle in _WINDOWS_SIDECAR_NEEDLES):
             continue
-        if any(needle in cmdline for needle in _WINDOWS_AGENT_NEEDLES):
+        if _is_agent_process(proc.info["name"] or "", argv):
             count += 1
     return count
 
