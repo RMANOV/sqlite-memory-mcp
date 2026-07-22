@@ -1031,6 +1031,7 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     conn.close()
 
     git_calls = []
+    peer_calls = []
 
     def fake_git_run(repo_dir, *args, timeout=30):
         git_calls.append(args)
@@ -1050,6 +1051,19 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
     )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "publish_peer_payloads",
+        lambda path, tasks: (
+            peer_calls.append((path, tasks))
+            or {"assigned_task_recipients": 1, "knowledge_shared": 2}
+        ),
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "create_public_release",
+        lambda entities, tasks, machine: "public-v-test",
+    )
 
     result = bridge_sync_worker.main(
         force=True, bridge_repo=str(bridge_dir), db_path=db_path
@@ -1064,6 +1078,10 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert not any(
         args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls
     )
+    assert peer_calls and peer_calls[0][0] == db_path
+    assert result["assigned_task_recipients"] == 1
+    assert result["knowledge_shared"] == 2
+    assert result["github_release"] == "public-v-test"
 
 
 def test_bridge_sync_worker_git_add_failure_fails_closed_without_commit_or_push(

@@ -36,6 +36,7 @@ py-modules = [
     "advanced_context",
     "auto_archive",
     "bridge_merge_driver",
+    "bridge_peer_sync",
     "bridge_server",
     "bridge_sync_worker",
     "claim_confidence",
