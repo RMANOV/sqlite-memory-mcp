@@ -618,9 +618,7 @@ def _load_remote_json(
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if not url.lower().startswith("https://"):
-        raise PremiumRuntimeError(
-            f"Remote premium fetch requires HTTPS: {url!r}"
-        )
+        raise PremiumRuntimeError(f"Remote premium fetch requires HTTPS: {url!r}")
     request = urllib.request.Request(
         url,
         headers={
@@ -1097,9 +1095,7 @@ def _load_cached_control_plane_policy(
         try:
             payload = json_loads(row["payload_json"])
         except Exception:
-            logger.warning(
-                "control_plane_cache_unreadable scope=%s", row["scope_key"]
-            )
+            logger.warning("control_plane_cache_unreadable scope=%s", row["scope_key"])
             continue
         sig_ok, sig_reason = _verify_signed_payload(payload, public_key_value)
         if not sig_ok:
@@ -1144,6 +1140,18 @@ def _resolve_control_plane_policy(
 ) -> dict[str, Any]:
     source_ref = "missing"
     load_reason = ""
+    if config.get("allow_cached_control_plane", True):
+        cached_policy = _load_cached_control_plane_policy(
+            conn, customer_id=customer_id, config=config
+        )
+        if cached_policy and _policy_cache_is_usable(cached_policy, config=config):
+            return {
+                "status": "cached",
+                "policy": cached_policy,
+                "source_ref": str(cached_policy.get("_cache_source_ref") or "cache"),
+                "reason": "control_plane_cached",
+            }
+
     try:
         live_policy, source_ref = _load_control_plane_document(config)
     except Exception as exc:
@@ -1169,18 +1177,6 @@ def _resolve_control_plane_policy(
                 "reason": "control_plane_live",
             }
         load_reason = sig_reason
-
-    if config.get("allow_cached_control_plane", True):
-        cached_policy = _load_cached_control_plane_policy(
-            conn, customer_id=customer_id, config=config
-        )
-        if cached_policy and _policy_cache_is_usable(cached_policy, config=config):
-            return {
-                "status": "cached",
-                "policy": cached_policy,
-                "source_ref": str(cached_policy.get("_cache_source_ref") or "cache"),
-                "reason": load_reason or "control_plane_cached",
-            }
 
     if config.get("control_plane_required", False):
         return {
@@ -1352,6 +1348,7 @@ def evaluate_feature_gate(
     tool_name: str | None = None,
     actor_id: str | None = None,
     payload: dict[str, Any] | None = None,
+    include_runtime_context: bool = False,
 ) -> dict[str, Any]:
     """Evaluate whether a premium feature may run on this machine.
 
@@ -1632,6 +1629,11 @@ def evaluate_feature_gate(
         "protection_phase": protection_phase,
         "installation_fingerprint": installation_fingerprint,
     }
+    if include_runtime_context:
+        verdict["_runtime_context"] = {
+            "manifest": dict(validated_manifest) if validated_manifest else None,
+            "control_policy": dict(control_policy) if control_policy else None,
+        }
     if config.get("record_allowed_events", True):
         _write_gate_audit(
             conn,
@@ -1924,6 +1926,7 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
             tool_name=f"{server_name}.premium_runtime",
             actor_id=server_name,
             payload=payload,
+            include_runtime_context=True,
         )
         if not verdict.get("allowed"):
             logger.warning(
@@ -1933,34 +1936,16 @@ def maybe_mount_premium_extensions(mcp: Any, *, server_name: str) -> dict[str, A
             )
             return {"status": "denied", **verdict}
 
-    manifest_payload: dict[str, Any] | None = None
-    control_policy_payload: dict[str, Any] | None = None
-    try:
-        manifest_payload, _manifest_source = _load_artifact_manifest(config)
-    except Exception:
-        manifest_payload = None
-    with _get_conn() as conn:
-        control_resolution = _resolve_control_plane_policy(
-            conn,
-            config=config,
-            customer_id=str(verdict.get("customer_id") or "") or None,
-        )
-    if isinstance(control_resolution.get("policy"), dict):
-        control_policy_payload = dict(control_resolution["policy"])
-    validated_manifest, _manifest_reason, protection_phase = (
-        _validate_artifact_manifest(
-            manifest_payload,
-            config=config,
-            control_policy=control_policy_payload,
-            entrypoint_info=entrypoint_info,
-            customer_id=str(verdict.get("customer_id") or "") or None,
-        )
+    runtime_context = verdict.get("_runtime_context")
+    if not isinstance(runtime_context, dict):
+        runtime_context = {}
+    raw_manifest = runtime_context.get("manifest")
+    raw_control_policy = runtime_context.get("control_policy")
+    validated_manifest = dict(raw_manifest) if isinstance(raw_manifest, dict) else None
+    control_policy_payload = (
+        dict(raw_control_policy) if isinstance(raw_control_policy, dict) else None
     )
-    protection_phase = max(
-        int(protection_phase or 1),
-        int(verdict.get("protection_phase") or 1),
-        1,
-    )
+    protection_phase = max(int(verdict.get("protection_phase") or 1), 1)
     installation_fingerprint = str(verdict.get("installation_fingerprint") or "")
     manifest_id = str(verdict.get("manifest_id") or "")
     if not installation_fingerprint:

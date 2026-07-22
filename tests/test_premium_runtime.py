@@ -885,6 +885,50 @@ def test_evaluate_feature_gate_uses_cached_control_policy(tmp_path, monkeypatch)
     assert verdict["control_plane_status"] == "cached"
 
 
+def test_valid_control_plane_cache_skips_live_fetch(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    policy = {
+        "policy_id": "policy-cache-first",
+        "customer_id": "cust-cache-first",
+        "cache_ttl_seconds": 3600,
+        "signature": {"alg": "ed25519", "value": "unused"},
+    }
+    config = {
+        **premium_runtime._DEFAULT_CONFIG,
+        "allow_cached_control_plane": True,
+    }
+    monkeypatch.setattr(
+        premium_runtime,
+        "_verify_signed_payload",
+        lambda payload, public_key_value: (True, "signature_valid"),
+    )
+    live_calls = []
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_control_plane_document",
+        lambda cfg: live_calls.append(cfg) or ({"policy_id": "live"}, "live"),
+    )
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        premium_runtime._cache_control_plane_policy(
+            conn,
+            policy=policy,
+            source_ref="test:cache",
+            config=config,
+        )
+        resolution = premium_runtime._resolve_control_plane_policy(
+            conn,
+            config=config,
+            customer_id="cust-cache-first",
+        )
+
+    assert resolution["status"] == "cached"
+    assert resolution["policy"]["policy_id"] == "policy-cache-first"
+    assert live_calls == []
+
+
 def test_load_entitlement_supports_remote_url_and_headers(monkeypatch):
     config = {
         **premium_runtime._DEFAULT_CONFIG,
@@ -1077,6 +1121,60 @@ def test_maybe_mount_premium_extensions_passes_mount_context(tmp_path, monkeypat
     assert mcp.protection_phase == 4
 
 
+def test_maybe_mount_reuses_gate_runtime_context(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "memory.db")
+    init_db(db_path)
+    premium_file = tmp_path / "premium_plugin_reuse.py"
+    premium_file.write_text(
+        "def register_premium_extensions(mcp, *, mount_context=None, **kwargs):\n"
+        "    mcp.runtime_config = mount_context.config\n"
+        "    return {'mounted': True}\n",
+        encoding="utf-8",
+    )
+    mcp = DummyMCP()
+    monkeypatch.setenv("SQLITE_MEMORY_PREMIUM_ENTRYPOINT", str(premium_file))
+    monkeypatch.setattr(premium_runtime, "_get_conn", lambda: _conn_ctx(db_path))
+    monkeypatch.setattr(
+        premium_runtime,
+        "evaluate_feature_gate",
+        lambda conn, **kwargs: {
+            "allowed": True,
+            "decision": "allowed",
+            "reason": "entitlement_valid",
+            "feature_id": "private_extension_runtime",
+            "manifest_id": "manifest-reuse",
+            "protection_phase": 3,
+            "installation_fingerprint": "sha256:reuse",
+            "_runtime_context": {
+                "manifest": {"manifest_id": "manifest-reuse"},
+                "control_policy": {"policy_id": "policy-reuse"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_load_artifact_manifest",
+        lambda config: pytest.fail("mount must reuse the gate manifest"),
+    )
+    monkeypatch.setattr(
+        premium_runtime,
+        "_resolve_control_plane_policy",
+        lambda *args, **kwargs: pytest.fail("mount must reuse the gate policy"),
+    )
+
+    result = premium_runtime.maybe_mount_premium_extensions(
+        mcp, server_name="sqlite-unified"
+    )
+
+    assert result["status"] == "loaded"
+    assert mcp.runtime_config["_premium_artifact_manifest"]["manifest_id"] == (
+        "manifest-reuse"
+    )
+    assert mcp.runtime_config["_premium_control_policy"]["policy_id"] == (
+        "policy-reuse"
+    )
+
+
 # ── Real-crypto invariants (no mocked signatures) ─────────────────────────────
 
 
@@ -1100,7 +1198,9 @@ def _sign_payload(payload: dict, private_key) -> dict:
     import base64
 
     signed = {k: v for k, v in payload.items() if k != "signature"}
-    signature_bytes = private_key.sign(premium_runtime._canonical_signed_payload(signed))
+    signature_bytes = private_key.sign(
+        premium_runtime._canonical_signed_payload(signed)
+    )
     signed["signature"] = {
         "alg": "ed25519",
         "value": base64.b64encode(signature_bytes).decode("ascii"),
@@ -1219,7 +1319,9 @@ def test_cache_rollback_guard_rejects_older_policy(tmp_path):
         assert row["policy_id"] == "policy-newer"
 
 
-def test_cached_control_policy_tamper_rejected_via_real_signature(tmp_path, monkeypatch):
+def test_cached_control_policy_tamper_rejected_via_real_signature(
+    tmp_path, monkeypatch
+):
     """Direct DB tamper of cached policy must be rejected on read (C1)."""
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)

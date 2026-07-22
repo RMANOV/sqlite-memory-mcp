@@ -30,6 +30,30 @@ def test_tray_search_index_rows_are_bounded_and_trimmed(monkeypatch):
     assert indexed[1]["notes"] == "abcde"
 
 
+def test_full_window_search_index_rebuild_is_lazy_and_idempotent(monkeypatch):
+    monkeypatch.setattr(task_tray, "_TRAY_SEARCH_INDEX_LIMIT", 2)
+    calls = []
+    window = SimpleNamespace(
+        _search_index_dirty=True,
+        _raw_cache={
+            "all": [
+                {"id": "a", "title": "alpha"},
+                {"id": "b", "title": "bravo"},
+                {"id": "c", "title": "charlie"},
+            ]
+        },
+        _premium_tray_extension=None,
+        _search_engine=SimpleNamespace(rebuild_index=lambda rows: calls.append(rows)),
+    )
+
+    task_tray.FullWindow._ensure_search_index(window)
+    task_tray.FullWindow._ensure_search_index(window)
+
+    assert len(calls) == 1
+    assert [row["id"] for row in calls[0]] == ["a", "b"]
+    assert window._search_index_dirty is False
+
+
 def test_get_suggested_tasks_caps_none_limit(monkeypatch):
     captured = {}
 
@@ -86,6 +110,13 @@ def test_memory_watchdog_restarts_above_exit_threshold(monkeypatch):
     assert calls == [4096.0]
 
 
+def test_current_rss_uses_windows_api_on_windows(monkeypatch):
+    monkeypatch.setattr(task_tray.os, "name", "nt")
+    monkeypatch.setattr(task_tray, "_windows_rss_mb", lambda: 123.5)
+
+    assert task_tray._current_rss_mb() == 123.5
+
+
 def test_memory_restart_cleans_up_then_quits_if_exec_fails(monkeypatch):
     class Stopper:
         def __init__(self):
@@ -139,7 +170,9 @@ def test_memory_restart_cleans_up_then_quits_if_exec_fails(monkeypatch):
         db=db,
         app=App(),
     )
-    monkeypatch.setattr(task_tray.os, "execv", lambda *args: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(
+        task_tray.os, "execv", lambda *args: (_ for _ in ()).throw(OSError())
+    )
 
     task_tray.TaskTrayApp._restart_due_to_memory(app, 4096.0)
 
