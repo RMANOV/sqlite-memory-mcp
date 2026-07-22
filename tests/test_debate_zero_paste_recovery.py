@@ -27,7 +27,7 @@ for path in (REPO, HOOKS):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from debate import (
+from debate import (  # noqa: E402 - imported after local repo path bootstrap
     bind_role_session,
     claim_worker_session,
     debate_post_with_recipients,
@@ -35,7 +35,7 @@ from debate import (
     prepare_wake_dry_run,
     recover_stale_worker_claims,
 )
-from schema import init_db
+from schema import init_db  # noqa: E402 - imported after local repo path bootstrap
 
 
 @pytest.fixture
@@ -253,7 +253,7 @@ def test_completed_claim_is_terminal(conn, tmp_path, monkeypatch):
 def test_fetch_new_from_epoch_sees_pre_existing_backlog(conn, tmp_path, monkeypatch):
     import debate_pump
 
-    topic = _seed(conn)
+    _seed(conn)
     trigger = _post_addressed(conn)
     monkeypatch.setattr(
         debate_pump, "DB_PATH", os.path.join(str(tmp_path), "zero_paste.db")
