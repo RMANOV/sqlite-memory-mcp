@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -659,28 +660,30 @@ def ensure_db_initialized(db_path: str | None = None) -> str:
 
 
 @contextmanager
-def get_conn(db_path: str | None = None):
-    """Yield a SQLite connection with PRAGMAs set, auto-commit/rollback.
-
-    Uses explicit BEGIN/COMMIT to ensure each context-manager block is atomic.
-    Retries BEGIN up to 3× on SQLITE_BUSY (exponential backoff on top of busy_timeout).
-    """
+def _open_txn(
+    db_path: str | None = None,
+    *,
+    begin_stmt: str = "BEGIN;",
+    timeout: float = 10,
+    pragmas: tuple[str, ...] = _PRAGMAS,
+    checkpoint_after_commit: bool = False,
+):
+    """Open one configured SQLite transaction with shared retry/lifecycle rules."""
     import time as _time
 
     target = db_path or DB_PATH
     if db_path is None:
         ensure_db_initialized(target)
 
-    # Retry connection + BEGIN on SQLITE_BUSY (lock contention with tray/bridge)
-    conn = None
+    conn: sqlite3.Connection | None = None
     for attempt in range(_BUSY_RETRIES):
-        conn = sqlite3.connect(target, isolation_level=None, timeout=10)
+        conn = sqlite3.connect(target, isolation_level=None, timeout=timeout)
         conn.row_factory = sqlite3.Row
-        for pragma in _PRAGMAS:
+        for pragma in pragmas:
             conn.execute(pragma)
         try:
-            conn.execute("BEGIN;")
-            break  # transaction started successfully
+            conn.execute(begin_stmt)
+            break
         except sqlite3.OperationalError as e:
             conn.close()
             conn = None
@@ -689,19 +692,31 @@ def get_conn(db_path: str | None = None):
                 continue
             raise
 
-    # Yield exactly once, outside the retry loop
+    assert conn is not None
     try:
         yield conn
         conn.execute("COMMIT;")
+        if checkpoint_after_commit:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
     except Exception:
         try:
             conn.execute("ROLLBACK;")
         except Exception:
-            pass  # ROLLBACK failed — original exception is more important
+            pass
         raise
     finally:
-        if conn is not None:
-            conn.close()
+        conn.close()
+
+
+@contextmanager
+def get_conn(db_path: str | None = None):
+    """Yield a SQLite connection with PRAGMAs set, auto-commit/rollback.
+
+    Uses explicit BEGIN/COMMIT to ensure each context-manager block is atomic.
+    Retries BEGIN up to 3× on SQLITE_BUSY (exponential backoff on top of busy_timeout).
+    """
+    with _open_txn(db_path) as conn:
+        yield conn
 
 
 @contextmanager
@@ -723,41 +738,8 @@ def get_conn_immediate(db_path: str | None = None):
     the old race risk; the production MCP path always uses this
     wrapper for write tools.
     """
-    import time as _time
-
-    target = db_path or DB_PATH
-    if db_path is None:
-        ensure_db_initialized(target)
-
-    conn = None
-    for attempt in range(_BUSY_RETRIES):
-        conn = sqlite3.connect(target, isolation_level=None, timeout=10)
-        conn.row_factory = sqlite3.Row
-        for pragma in _PRAGMAS:
-            conn.execute(pragma)
-        try:
-            conn.execute("BEGIN IMMEDIATE;")
-            break
-        except sqlite3.OperationalError as e:
-            conn.close()
-            conn = None
-            if "locked" in str(e).lower() and attempt < _BUSY_RETRIES - 1:
-                _time.sleep(_BUSY_BASE_DELAY * (2**attempt))
-                continue
-            raise
-
-    try:
+    with _open_txn(db_path, begin_stmt="BEGIN IMMEDIATE;") as conn:
         yield conn
-        conn.execute("COMMIT;")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK;")
-        except Exception:
-            pass
-        raise
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 @contextmanager
@@ -767,29 +749,20 @@ def bulk_conn(db_path: str | None = None):
     Use for batch imports where throughput matters more than per-row durability.
     WAL checkpoint runs automatically after the transaction commits.
     """
-    target = db_path or DB_PATH
-    if db_path is None:
-        ensure_db_initialized(target)
-    conn = sqlite3.connect(target, isolation_level=None, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")  # faster writes, safe with WAL
-    conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache for bulk ops
-    conn.execute("BEGIN;")
-    try:
+    bulk_pragmas = (
+        "PRAGMA journal_mode=WAL;",
+        "PRAGMA foreign_keys=ON;",
+        "PRAGMA busy_timeout=30000;",
+        "PRAGMA synchronous=NORMAL;",
+        "PRAGMA cache_size=-64000;",
+    )
+    with _open_txn(
+        db_path,
+        timeout=30,
+        pragmas=bulk_pragmas,
+        checkpoint_after_commit=True,
+    ) as conn:
         yield conn
-        conn.execute("COMMIT;")
-        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK;")
-        except Exception:
-            pass
-        raise
-    finally:
-        conn.close()
 
 
 # ── Git helpers ──────────────────────────────────────────────────────────
@@ -2627,17 +2600,46 @@ def tokenize_for_similarity(text: str) -> set[str]:
     return {w for w in words if len(w) >= 3 and w not in STOPWORDS}
 
 
-def fts_query(raw: str) -> str:
+def fts_query(raw: str, *, join: str = "OR") -> str:
     """Sanitize a user query for FTS5 MATCH.
 
     Wraps each token in double quotes to avoid FTS5 syntax errors
-    from special characters, then joins with OR for broad matching.
+    from special characters. ``join`` is restricted to ``OR``/``AND``.
     """
+    operator = join.upper()
+    if operator not in {"OR", "AND"}:
+        raise ValueError("FTS join must be 'OR' or 'AND'")
     tokens = raw.split()
     if not tokens:
         return '""'
     escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
-    return " OR ".join(escaped)
+    return f" {operator} ".join(escaped)
+
+
+def compute_recency_decay(
+    updated_at: str | None,
+    *,
+    half_life_days: float,
+    floor: float = 0.0,
+    missing_score: float = 0.5,
+    reference_time: datetime | None = None,
+) -> float:
+    """Return a bounded exponential recency score with explicit policy knobs."""
+    if not updated_at:
+        return missing_score
+    if half_life_days <= 0:
+        raise ValueError("half_life_days must be positive")
+    try:
+        dt = datetime.fromisoformat(updated_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = reference_time or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+        return max(math.pow(2.0, -age_days / half_life_days), floor)
+    except (ValueError, TypeError):
+        return missing_score
 
 
 # ── Task DAO ──────────────────────────────────────────────────────────────
@@ -2861,6 +2863,60 @@ class TaskDAO:
                     tool_name="db_utils.TaskDAO.archive_done",
                 )
         return ids
+
+    @staticmethod
+    def digest_snapshot(
+        conn: sqlite3.Connection,
+        sections: list[str],
+        *,
+        include_overdue: bool,
+        limit: int,
+    ) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row]]:
+        """Load the canonical task digest rows shared by MCP and CLI surfaces."""
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        description_sql = (
+            "description" if "description" in task_columns else "NULL AS description"
+        )
+        notes_sql = "notes" if "notes" in task_columns else "NULL AS notes"
+        digest_columns = (
+            f"id, title, {description_sql}, {notes_sql}, status, priority, "
+            "section, due_date, project"
+        )
+        active: list[sqlite3.Row] = []
+        if sections:
+            section_ph = ",".join("?" * len(sections))
+            active = conn.execute(
+                f"SELECT {digest_columns} FROM tasks "
+                f"WHERE section IN ({section_ph}) "
+                "AND status IN ('not_started', 'in_progress') "
+                "AND type = 'task' "
+                "ORDER BY CASE section "
+                "WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
+                "WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 "
+                "WHEN 'someday' THEN 4 ELSE 5 END, "
+                f"{build_priority_order_sql()} LIMIT ?",
+                [*sections, limit],
+            ).fetchall()
+
+        overdue: list[sqlite3.Row] = []
+        if include_overdue:
+            exclusions = ",".join("?" * len(TASK_ACTIVE_EXCLUSIONS))
+            overdue = conn.execute(
+                f"SELECT {digest_columns} FROM tasks "
+                "WHERE due_date < date('now') AND type = 'task' "
+                f"AND status NOT IN ({exclusions}) "
+                "ORDER BY due_date ASC LIMIT 10",
+                list(TASK_ACTIVE_EXCLUSIONS),
+            ).fetchall()
+
+        counts = conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM tasks "
+            "WHERE status NOT IN ('archived', 'cancelled') AND type = 'task' "
+            "GROUP BY status"
+        ).fetchall()
+        return active, overdue, counts
 
     @staticmethod
     def bump_overdue_priority(

@@ -236,6 +236,26 @@ def vector_search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list
 # ── Reciprocal Rank Fusion ─────────────────────────────────────────────
 
 
+def _rrf_ranked_items(
+    rankings: tuple[list[Any], ...],
+    *,
+    key_field: str,
+    k: int,
+) -> list[tuple[dict, float]]:
+    """Fuse arbitrary ranked mappings and return copied rows with RRF scores."""
+    scores: dict[Any, float] = {}
+    item_data: dict[Any, dict] = {}
+    for ranking in rankings:
+        for rank, item in enumerate(ranking):
+            key = item[key_field]
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            item_data.setdefault(key, dict(item))
+    return [
+        (item_data[key], score)
+        for key, score in sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+    ]
+
+
 def rrf_merge(
     fts_results: list[Any],
     vec_results: list[dict],
@@ -248,41 +268,20 @@ def rrf_merge(
     Returns combined results ordered by RRF score (descending), formatted
     to match the FTS5 row format expected by rerank_entities().
     """
-    scores: dict[int, float] = {}
-    entity_data: dict[int, dict] = {}
-
-    # FTS5 contributions (fts_results may be sqlite3.Row objects)
-    for rank, item in enumerate(fts_results):
-        eid = item["eid"]
-        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank + 1)
-        entity_data[eid] = {
-            "eid": eid,
-            "name": item["name"],
-            "entity_type": item["entity_type"],
-            "project": item["project"],
-        }
-
-    # Vector contributions
-    for rank, item in enumerate(vec_results):
-        eid = item["eid"]
-        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank + 1)
-        if eid not in entity_data:
-            entity_data[eid] = {
-                "eid": eid,
+    results = []
+    for item, rrf_score in _rrf_ranked_items(
+        (fts_results, vec_results), key_field="eid", k=k
+    ):
+        # Use negative RRF score as rank (matches FTS5 convention: lower = better)
+        results.append(
+            {
+                "eid": item["eid"],
                 "name": item["name"],
                 "entity_type": item["entity_type"],
                 "project": item.get("project"),
+                "rank": -rrf_score,
             }
-
-    # Sort by RRF score descending
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    results = []
-    for eid, rrf_score in ranked:
-        data = entity_data[eid]
-        # Use negative RRF score as rank (matches FTS5 convention: lower = better)
-        data["rank"] = -rrf_score
-        results.append(data)
+        )
     return results
 
 
@@ -389,22 +388,12 @@ def task_rrf_merge(
     Keyed by task UUID (id string), not integer eid.
     Returns combined results ordered by RRF score descending.
     """
-    scores: dict[str, float] = {}
-    task_data: dict[str, dict] = {}
-
-    for rank, item in enumerate(fts_results):
-        tid = item["id"]
-        scores[tid] = scores.get(tid, 0.0) + 1.0 / (k + rank + 1)
-        task_data[tid] = dict(item)
-
-    for rank, item in enumerate(vec_results):
-        tid = item["id"]
-        scores[tid] = scores.get(tid, 0.0) + 1.0 / (k + rank + 1)
-        if tid not in task_data:
-            task_data[tid] = dict(item)
-
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [task_data[tid] for tid, _ in ranked]
+    return [
+        item
+        for item, _score in _rrf_ranked_items(
+            (fts_results, vec_results), key_field="id", k=k
+        )
+    ]
 
 
 def backfill_task_embeddings(conn: sqlite3.Connection) -> int:

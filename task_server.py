@@ -1037,31 +1037,12 @@ def task_digest(
     target_sections = ["today", "inbox", "next"]
 
     with _get_conn() as conn:
-        ph = ",".join("?" * len(target_sections))
-        active = conn.execute(
-            f"SELECT id, title, description, notes, status, priority, section, due_date, project "
-            f"FROM tasks "
-            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') AND type = 'task' "
-            f"ORDER BY CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
-            f"WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
-            f"{build_priority_order_sql()} LIMIT ?",
-            target_sections + [limit],
-        ).fetchall()
-
-        overdue = []
-        if include_overdue:
-            overdue = conn.execute(
-                "SELECT id, title, description, notes, status, priority, section, due_date, project "
-                "FROM tasks "
-                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) AND type = 'task' "
-                "ORDER BY due_date ASC LIMIT 10",
-                list(_TASK_ACTIVE_EXCLUSIONS),
-            ).fetchall()
-
-        counts = conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM tasks "
-            "WHERE status NOT IN ('archived', 'cancelled') GROUP BY status"
-        ).fetchall()
+        active, overdue, counts = TaskDAO.digest_snapshot(
+            conn,
+            target_sections,
+            include_overdue=include_overdue,
+            limit=limit,
+        )
 
     lines = ["## Task Digest"]
     if counts:

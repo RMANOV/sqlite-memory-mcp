@@ -10,15 +10,14 @@ Phase 3 of Intelligence v2:
 from __future__ import annotations
 
 import logging
-import math
-import re
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Any
 
 from advanced_context import (
+    _extract_keywords,
     _keyword_score,
+    _name_overlap_score,
     build_strategy as _build_advanced_strategy,
     compute_strategy_match as _compute_advanced_task_match,
     select_context_items as _select_advanced_items,
@@ -28,6 +27,8 @@ from db_utils import (
     _sqlite_table_exists,
     add_provenance_link,
     effective_fact_confidence,
+    compute_recency_decay,
+    fts_query,
     now_iso,
     upsert_memory_artifact,
 )
@@ -41,7 +42,6 @@ logger = logging.getLogger("sqlite-kb")
 
 # Minimum relevance score — fragments below this threshold are excluded
 _MIN_RELEVANCE_THRESHOLD = 0.18
-_TASK_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-я_./:-]{4,}")
 _RECENCY_HALF_LIFE_DAYS = 21
 _EXECUTOR_MIN_CHUNK_RELEVANCE = 0.45
 _EXECUTOR_MIN_CHUNK_TRUST = 0.30
@@ -144,53 +144,16 @@ def _format_ts(iso_str: str | None) -> str:
         return ""
 
 
-def _extract_task_keywords(text: str) -> list[str]:
-    """Extract robust task keywords, preserving tool-like snake_case identifiers."""
-    if not text:
-        return []
-
-    keywords: list[str] = []
-    seen: set[str] = set()
-    for raw in _TASK_TOKEN_RE.findall(text.lower()):
-        token = raw.strip("._:/-")
-        if len(token) >= 4 and token not in seen:
-            keywords.append(token)
-            seen.add(token)
-        for part in re.split(r"[_./:-]+", token):
-            part = part.strip()
-            if len(part) >= 4 and part not in seen:
-                keywords.append(part)
-                seen.add(part)
-    return keywords[:40]
-
-
-def _entity_name_overlap_score(text: str, name_scores: dict[str, float]) -> float:
-    """Return strongest relevant-entity name match found inside text."""
-    if not text or not name_scores:
-        return 0.0
-    haystack = text.lower()
-    best = 0.0
-    for name, score in name_scores.items():
-        if name and name.lower() in haystack:
-            best = max(best, score)
-    return best
-
-
 def _compute_recency_score(
     iso_str: str | None,
     half_life_days: float = _RECENCY_HALF_LIFE_DAYS,
 ) -> float:
     """Exponential recency score: 1.0 for fresh content, decays with age."""
-    if not iso_str:
-        return 0.5
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age_days = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
-        return math.pow(2.0, -age_days / half_life_days)
-    except (ValueError, TypeError):
-        return 0.5
+    return compute_recency_decay(
+        iso_str,
+        half_life_days=half_life_days,
+        missing_score=0.5,
+    )
 
 
 def _signal_floor(value: float | int | None, floor: float = 0.2) -> float:
@@ -245,7 +208,7 @@ def _make_coverage_keys(
         if len(keys) >= limit:
             return keys[:limit]
     for text in texts:
-        for keyword in _extract_task_keywords(text or ""):
+        for keyword in _extract_keywords(text or "", limit=40):
             marker = f"kw:{keyword}"
             if marker not in seen:
                 keys.append(marker)
@@ -370,8 +333,7 @@ def _find_relevant_entities(
                 id_scores[row["id"]] = 1.0
         return {"by_name": name_scores, "by_id": id_scores}
 
-    escaped = ['"' + w.replace('"', '""') + '"' for w in words[:20]]
-    fts_q = " OR ".join(escaped)
+    fts_q = fts_query(" ".join(words[:20]), join="OR")
 
     try:
         fts_rows = conn.execute(
@@ -537,7 +499,7 @@ def build_context_pack(
     if target_ref:
         try:
             task_query, linked_ids = _build_task_query(conn, target_ref)
-            task_keywords = _extract_task_keywords(task_query)
+            task_keywords = _extract_keywords(task_query, limit=40)
             if task_query or linked_ids:
                 relevant_entities = _find_relevant_entities(
                     conn, task_query, linked_ids, session_id
@@ -581,7 +543,7 @@ def build_context_pack(
         joined = " ".join(t for t in texts if t)
         if joined:
             best = max(best, _keyword_score(joined, task_keywords))
-            best = max(best, _entity_name_overlap_score(joined, relevant_names))
+            best = max(best, _name_overlap_score(joined, relevant_names))
             best = max(
                 best,
                 _compute_advanced_task_match(
