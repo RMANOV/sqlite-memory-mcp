@@ -14,10 +14,66 @@ import bridge_sync_worker
 from bridge_sync_worker import (
     _auto_heal_sync_safety,
     _check_sync_safety,
+    _deploy_pages_privacy_shell,
     _load_bridge_task_snapshots,
+    _pages_publish_dir,
 )
 import db_utils
 from schema import init_db
+
+
+def _write_pages_privacy_shell(bridge_dir):
+    publish_dir = bridge_dir / "pages_public"
+    publish_dir.mkdir()
+    (publish_dir / "index.html").write_text(
+        "<html>privacy-shell-v1</html>", encoding="utf-8"
+    )
+    (publish_dir / "_headers").write_text("/*\n  Cache-Control: no-store\n")
+    return publish_dir
+
+
+def test_pages_publish_dir_is_an_exact_data_free_allowlist(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    publish_dir = _write_pages_privacy_shell(bridge_dir)
+
+    resolved, error = _pages_publish_dir(str(bridge_dir))
+
+    assert resolved == publish_dir
+    assert error is None
+    (publish_dir / "shared.json").write_text("{}", encoding="utf-8")
+    resolved, error = _pages_publish_dir(str(bridge_dir))
+    assert resolved is None
+    assert "unexpected=['shared.json']" in error
+
+
+def test_pages_deploy_never_uses_private_bridge_root(tmp_path, monkeypatch):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    publish_dir = _write_pages_privacy_shell(bridge_dir)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(bridge_sync_worker.subprocess, "run", fake_run)
+
+    result = _deploy_pages_privacy_shell(str(bridge_dir))
+
+    assert result == {"deployed": True, "message": None}
+    assert calls[0][0][3] == str(publish_dir)
+    assert calls[0][0][3] != str(bridge_dir)
+
+
+def test_pages_deploy_fails_closed_without_privacy_shell(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    result = _deploy_pages_privacy_shell(str(bridge_dir))
+
+    assert result["deployed"] is False
+    assert result["blocked_private_source"] is True
 
 
 def test_memory_events_stream_export_is_byte_equivalent_and_atomic(tmp_path):
@@ -1031,6 +1087,7 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     conn.close()
 
     git_calls = []
+    peer_calls = []
 
     def fake_git_run(repo_dir, *args, timeout=30):
         git_calls.append(args)
@@ -1050,6 +1107,19 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
     )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "publish_peer_payloads",
+        lambda path, tasks: (
+            peer_calls.append((path, tasks))
+            or {"assigned_task_recipients": 1, "knowledge_shared": 2}
+        ),
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "create_public_release",
+        lambda entities, tasks, machine: "public-v-test",
+    )
 
     result = bridge_sync_worker.main(
         force=True, bridge_repo=str(bridge_dir), db_path=db_path
@@ -1064,6 +1134,10 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
     assert not any(
         args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls
     )
+    assert peer_calls and peer_calls[0][0] == db_path
+    assert result["assigned_task_recipients"] == 1
+    assert result["knowledge_shared"] == 2
+    assert result["github_release"] == "public-v-test"
 
 
 def test_bridge_sync_worker_git_add_failure_fails_closed_without_commit_or_push(

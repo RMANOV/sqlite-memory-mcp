@@ -10,10 +10,15 @@ import math
 import json
 import logging
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
-from db_utils import TASK_ACTIVE_EXCLUSIONS, parse_iso_date, priority_sort_key
+from db_utils import (
+    TASK_ACTIVE_EXCLUSIONS,
+    compute_recency_decay as _compute_recency_decay,
+    parse_iso_date,
+    priority_sort_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -32,18 +37,16 @@ RERANKING_POOL_SIZE = 100
 # ── Scoring helpers ────────────────────────────────────────────────────────
 
 
-def compute_recency_decay(updated_at: str | None, half_life_days: float = RECENCY_HALF_LIFE_DAYS) -> float:
-    """Exponential decay: 2^(-days / half_life). Returns 1.0 if unparseable."""
-    if not updated_at:
-        return 0.5
-    try:
-        dt = datetime.fromisoformat(updated_at)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
-        return max(math.pow(2, -days / half_life_days), 0.1)
-    except (ValueError, TypeError):
-        return 0.5
+def compute_recency_decay(
+    updated_at: str | None,
+    half_life_days: float = RECENCY_HALF_LIFE_DAYS,
+) -> float:
+    """Layer-1 recency policy backed by the shared decay primitive."""
+    return _compute_recency_decay(
+        updated_at,
+        half_life_days=half_life_days,
+        floor=0.1,
+    )
 
 
 def compute_composite_score(
@@ -213,13 +216,18 @@ def rerank_entities(
             in_active_session=name in active_file_entities,
         )
 
-        scored.append((score, {
-            "eid": eid,
-            "name": name,
-            "entity_type": r["entity_type"],
-            "project": r["project"],
-            "_score": round(score, 6),
-        }))
+        scored.append(
+            (
+                score,
+                {
+                    "eid": eid,
+                    "name": name,
+                    "entity_type": r["entity_type"],
+                    "project": r["project"],
+                    "_score": round(score, 6),
+                },
+            )
+        )
 
     # Sort descending by score, truncate
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -419,7 +427,11 @@ def _ready_reason_codes(
     if _infer_ready_blockers(task):
         codes.append("blocked_by_open_item")
 
-    if _ready_is_reading(task) and not include_readings and "reading_surface" not in codes:
+    if (
+        _ready_is_reading(task)
+        and not include_readings
+        and "reading_surface" not in codes
+    ):
         codes.append("reading_surface")
 
     return [code for code in dict.fromkeys(codes) if code in REASON_CODES]
@@ -436,7 +448,10 @@ def _ready_urgency(
     priority = task.get("priority") or "medium"
     if due is not None and due < today and priority in {"critical", "high"}:
         return "critical", "overdue high-risk item"
-    if "critical_priority" in reason_codes or "external_commitment_risk" in reason_codes:
+    if (
+        "critical_priority" in reason_codes
+        or "external_commitment_risk" in reason_codes
+    ):
         return "high", "critical priority or external commitment"
     if due is not None and due <= today:
         return "high", "due now"
@@ -497,10 +512,18 @@ def _ready_state(
     if "cleanup_candidate" in reason_codes:
         return "cleanup_candidate"
     if blockers:
-        return "waiting" if any(b["category"] == "waiting_on" for b in blockers) else "blocked"
+        return (
+            "waiting"
+            if any(b["category"] == "waiting_on" for b in blockers)
+            else "blocked"
+        )
     if section == "waiting":
         return "waiting"
-    if status == "in_progress" or section == "today" or (due is not None and due <= today):
+    if (
+        status == "in_progress"
+        or section == "today"
+        or (due is not None and due <= today)
+    ):
         return "ready_now"
     if section == "someday" and not _ready_has_explicit_surface(task) and due is None:
         return "excluded"
@@ -710,14 +733,14 @@ def prime_context(
             r for r in records if r["ready_state"] == "cleanup_candidate"
         ][:limit],
         "explicit_exclusions": [
-            build_ready_record(t, include_readings=include_readings, today=effective_today)
+            build_ready_record(
+                t, include_readings=include_readings, today=effective_today
+            )
             for t in tasks
             if (t.get("status") in TASK_ACTIVE_EXCLUSIONS)
         ][:limit],
         "risk_or_escalation_items": [
-            r
-            for r in records
-            if r["urgency"] in {"critical", "high"} or r["blockers"]
+            r for r in records if r["urgency"] in {"critical", "high"} or r["blockers"]
         ][:limit],
         "evidence_refs": [r["provenance"] for r in top],
     }

@@ -74,6 +74,12 @@ def test_slugify_replaces_spaces_and_slashes():
     assert _slugify("") == "entity"
 
 
+def test_slugify_rejects_windows_forbidden_and_device_names():
+    assert _slugify('Tricky: name "with quotes"') == "Tricky-name-with-quotes"
+    assert _slugify("CON") == "_CON"
+    assert _slugify("lpt1.txt") == "_lpt1.txt"
+
+
 def test_slugify_preserves_unicode_letters():
     assert _slugify("Имe") == "Имe"
     assert _slugify("José García") == "José-García"
@@ -252,7 +258,12 @@ def test_export_no_entities_no_files(conn, tmp_path):
 
 
 def _write_brain_file(
-    base, sub: str, slug: str, *, name: str, entity_type: str,
+    base,
+    sub: str,
+    slug: str,
+    *,
+    name: str,
+    entity_type: str,
     observations: list[str] | None = None,
     relations: list[tuple[str, str, str]] | None = None,
     project: str | None = None,
@@ -279,22 +290,37 @@ def _write_brain_file(
 def test_import_creates_entity_with_observations(conn, tmp_path):
     base = tmp_path / "brain"
     _write_brain_file(
-        base, "people", "Alice", name="Alice", entity_type="person",
+        base,
+        "people",
+        "Alice",
+        name="Alice",
+        entity_type="person",
         observations=["loves SQLite", "shipped reflect_v1.0"],
     )
     counts = import_from_gbrain_brain_repo(conn, str(base))
     assert counts["entities_created"] == 1
     assert counts["observations_inserted"] == 2
 
-    eid = conn.execute("SELECT id FROM entities WHERE name = ?", ("Alice",)).fetchone()[0]
-    obs = [r[0] for r in conn.execute("SELECT content FROM observations WHERE entity_id = ?", (eid,))]
+    eid = conn.execute("SELECT id FROM entities WHERE name = ?", ("Alice",)).fetchone()[
+        0
+    ]
+    obs = [
+        r[0]
+        for r in conn.execute(
+            "SELECT content FROM observations WHERE entity_id = ?", (eid,)
+        )
+    ]
     assert sorted(obs) == ["loves SQLite", "shipped reflect_v1.0"]
 
 
 def test_import_resolves_relations_within_input_set(conn, tmp_path):
     base = tmp_path / "brain"
     _write_brain_file(
-        base, "people", "Alice", name="Alice", entity_type="person",
+        base,
+        "people",
+        "Alice",
+        name="Alice",
+        entity_type="person",
         relations=[("works_at", "Acme", "../companies/Acme.md")],
     )
     _write_brain_file(base, "companies", "Acme", name="Acme", entity_type="company")
@@ -307,7 +333,11 @@ def test_import_resolves_relations_within_input_set(conn, tmp_path):
 def test_import_skips_relations_with_missing_target(conn, tmp_path):
     base = tmp_path / "brain"
     _write_brain_file(
-        base, "people", "Alice", name="Alice", entity_type="person",
+        base,
+        "people",
+        "Alice",
+        name="Alice",
+        entity_type="person",
         relations=[("knows", "Ghost", "../topics/Ghost.md")],
     )
     counts = import_from_gbrain_brain_repo(conn, str(base))
@@ -319,7 +349,11 @@ def test_import_skips_relations_with_missing_target(conn, tmp_path):
 def test_import_idempotent_on_existing_entity(conn, tmp_path):
     base = tmp_path / "brain"
     _write_brain_file(
-        base, "topics", "Existing", name="Existing", entity_type="topic",
+        base,
+        "topics",
+        "Existing",
+        name="Existing",
+        entity_type="topic",
         observations=["fact1"],
     )
     counts1 = import_from_gbrain_brain_repo(conn, str(base))
@@ -337,8 +371,12 @@ def test_import_idempotent_on_existing_entity(conn, tmp_path):
 def test_import_skips_malformed_files(conn, tmp_path):
     base = tmp_path / "brain"
     (base / "topics").mkdir(parents=True)
-    (base / "topics" / "no_frontmatter.md").write_text("Just some text", encoding="utf-8")
-    (base / "topics" / "bad_yaml.md").write_text("---\nthis isn't kv\n---\n# X\n", encoding="utf-8")
+    (base / "topics" / "no_frontmatter.md").write_text(
+        "Just some text", encoding="utf-8"
+    )
+    (base / "topics" / "bad_yaml.md").write_text(
+        "---\nthis isn't kv\n---\n# X\n", encoding="utf-8"
+    )
     counts = import_from_gbrain_brain_repo(conn, str(base))
     assert counts["files_skipped"] >= 1
     assert counts["entities_created"] == 0
@@ -346,7 +384,9 @@ def test_import_skips_malformed_files(conn, tmp_path):
 
 def test_import_applies_project_default_when_missing(conn, tmp_path):
     base = tmp_path / "brain"
-    _write_brain_file(base, "topics", "NoProject", name="NoProject", entity_type="topic")
+    _write_brain_file(
+        base, "topics", "NoProject", name="NoProject", entity_type="topic"
+    )
     import_from_gbrain_brain_repo(conn, str(base), project_default="alpha")
     project = conn.execute(
         "SELECT project FROM entities WHERE name = 'NoProject'"
@@ -419,7 +459,8 @@ def test_roundtrip_preserves_unicode_and_special_chars(conn, tmp_path):
         assert row[0] == "Иван 🔥"
         obs = fresh.execute(
             "SELECT content FROM observations WHERE entity_id = "
-            "(SELECT id FROM entities WHERE name = ?)", ("Иван 🔥",)
+            "(SELECT id FROM entities WHERE name = ?)",
+            ("Иван 🔥",),
         ).fetchone()
         assert obs is not None
         assert obs[0] == 'писал е код "the right way"'

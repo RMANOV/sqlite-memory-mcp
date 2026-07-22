@@ -86,7 +86,11 @@ _OPTIONAL_PIPELINE_ERRORS = (
     ValueError,
 )
 
-from task_search import TaskSearchEngine, build_bounded_index_rows
+from task_search import (
+    EntitySearchController,
+    TaskSearchEngine,
+    build_bounded_index_rows,
+)
 
 from db_utils import (
     DB_PATH,
@@ -1050,10 +1054,14 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         self._sort_mode = "priority"
         self._search_text = ""
         self._entity_results: list[dict] = []
-        self._entity_seq_id = 0
-        self._entity_search_lock = threading.Lock()
-        self._entity_search_running = False
-        self._pending_entity_search: tuple[int, str] | None = None
+        self._entity_search = EntitySearchController(
+            lambda query, limit: self.db.search_entities_fast(query, limit=limit),
+            self._entity_search_done.emit,
+            limit=10,
+            on_error=lambda exc: logger.error(
+                "Full-window entity search failed: %s", exc, exc_info=True
+            ),
+        )
         self._pre_search_tab: int | None = None  # tab to restore after search clears
         self._active_filters = {"priority": set(), "due": set(), "project": set()}
         self._excluded_filters = {"priority": set(), "due": set(), "project": set()}
@@ -1827,7 +1835,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _on_entity_results(self, entities: list, seq_id: int):
         """Handle async entity search results. Discard if stale."""
-        if seq_id != self._entity_seq_id:
+        if not self._entity_search.is_current(seq_id):
             return  # stale — user typed new query
         self._entity_results = entities
         # Re-render only the current tab if it shows entities
@@ -1839,36 +1847,11 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
     def _cancel_entity_searches(self):
         """Invalidate in-flight entity searches and clear queued work."""
-        self._entity_seq_id += 1
-        with self._entity_search_lock:
-            self._pending_entity_search = None
+        self._entity_search.cancel()
 
     def _request_entity_search(self, query: str):
         """Coalesce entity searches into a single background worker."""
-        self._entity_seq_id += 1
-        seq_id = self._entity_seq_id
-        with self._entity_search_lock:
-            self._pending_entity_search = (seq_id, query)
-            if self._entity_search_running:
-                return
-            self._entity_search_running = True
-
-        def _entity_worker():
-            while True:
-                with self._entity_search_lock:
-                    pending = self._pending_entity_search
-                    self._pending_entity_search = None
-                if pending is None:
-                    with self._entity_search_lock:
-                        if self._pending_entity_search is None:
-                            self._entity_search_running = False
-                            return
-                    continue
-                worker_seq_id, worker_query = pending
-                results = self.db.search_entities_fast(worker_query, limit=10)
-                self._entity_search_done.emit(results, worker_seq_id)
-
-        threading.Thread(target=_entity_worker, daemon=True).start()
+        self._entity_search.request(query)
 
     def _import_remote_entities(self, remote_entities, conn=None):
         """Import entities from remote shared.json that don't exist locally."""

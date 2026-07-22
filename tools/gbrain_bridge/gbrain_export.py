@@ -42,12 +42,23 @@ _ENTITY_TYPE_FOLDERS: dict[str, str] = {
     "team": "companies",
 }
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
 
 def _slugify(name: str) -> str:
-    """Filesystem-safe filename. Preserves Unicode letters/digits."""
-    safe = re.sub(r"[/\\\x00-\x1f]+", "-", name)
+    """Cross-platform-safe filename. Preserves Unicode letters/digits."""
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", name)
     safe = re.sub(r"\s+", "-", safe.strip())
-    safe = re.sub(r"-+", "-", safe).strip("-")
+    safe = re.sub(r"-+", "-", safe).strip("-.")
+    if safe.upper().split(".", 1)[0] in _WINDOWS_RESERVED_NAMES:
+        safe = f"_{safe}"
     return safe or "entity"
 
 
@@ -152,7 +163,12 @@ def export_to_gbrain_brain_repo(
         folder = _folder_for(d.get("entity_type"))
         slug = _slugify(d["name"])
         relpath = f"{folder}/{slug}.md"
-        entity_meta[d["id"]] = {**d, "_folder": folder, "_slug": slug, "_relpath": relpath}
+        entity_meta[d["id"]] = {
+            **d,
+            "_folder": folder,
+            "_slug": slug,
+            "_relpath": relpath,
+        }
         name_to_path[d["name"]] = relpath
 
     obs_counter = 0

@@ -15,10 +15,7 @@ import os
 import sys
 
 from db_utils import DB_PATH as DEFAULT_DB
-from db_utils import TASK_ACTIVE_EXCLUSIONS, build_priority_order_sql, get_conn, now_iso
-
-# Pre-built SQL fragment for active-task exclusion filter
-_EXCL_PH = ",".join("?" for _ in TASK_ACTIVE_EXCLUSIONS)
+from db_utils import TaskDAO, build_priority_order_sql, get_conn, now_iso
 
 
 def run_digest(
@@ -31,36 +28,12 @@ def run_digest(
     """Query the DB and return a markdown digest string."""
 
     with get_conn(db_path) as conn:
-        # Active tasks by section — mirrors server.py task_digest SQL exactly
-        ph = ",".join("?" * len(sections))
-        active = conn.execute(
-            f"SELECT id, title, status, priority, section, due_date, project "
-            f"FROM tasks "
-            f"WHERE section IN ({ph}) AND status IN ('not_started', 'in_progress') AND type = 'task' "
-            f"ORDER BY "
-            f"  CASE section WHEN 'today' THEN 0 WHEN 'inbox' THEN 1 "
-            f"       WHEN 'next' THEN 2 WHEN 'waiting' THEN 3 WHEN 'someday' THEN 4 END, "
-            f"  {build_priority_order_sql()} "
-            f"LIMIT ?",
-            sections + [limit],
-        ).fetchall()
-
-        # Overdue tasks
-        overdue: list = []
-        if include_overdue:
-            overdue = conn.execute(
-                "SELECT id, title, status, priority, section, due_date, project "
-                "FROM tasks "
-                f"WHERE due_date < date('now') AND status NOT IN ({_EXCL_PH}) AND type = 'task' "
-                "ORDER BY due_date ASC LIMIT 10",
-                list(TASK_ACTIVE_EXCLUSIONS),
-            ).fetchall()
-
-        # Status counts (active + done, excluding archived/cancelled)
-        counts = conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM tasks "
-            "WHERE status NOT IN ('archived', 'cancelled') AND type = 'task' GROUP BY status"
-        ).fetchall()
+        active, overdue, counts = TaskDAO.digest_snapshot(
+            conn,
+            sections,
+            include_overdue=include_overdue,
+            limit=limit,
+        )
 
         note_rows: list = []
         if include_notes:

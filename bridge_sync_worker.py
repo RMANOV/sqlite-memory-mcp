@@ -87,7 +87,8 @@ from db_utils import (
     sync_task_attachments_from_remote,
 )
 from bridge_merge_driver import ensure_entities_index_parseable
-from surface_contract import BRIDGE_GIT_STAGE_PATHS
+from bridge_peer_sync import create_public_release, publish_peer_payloads
+from surface_contract import BRIDGE_GIT_STAGE_PATHS, BRIDGE_SHARED_PAYLOAD_KEYS
 
 log = logging.getLogger("bridge_sync_worker")
 
@@ -114,6 +115,9 @@ _NON_FAST_FORWARD_MARKERS = (
     "remote contains work that you do not have locally",
 )
 
+_PAGES_PUBLIC_FILES = frozenset({"index.html", "_headers"})
+_PAGES_PRIVACY_MARKER = "privacy-shell-v1"
+
 
 def _is_non_fast_forward_push_failure(
     result: subprocess.CompletedProcess,
@@ -123,6 +127,73 @@ def _is_non_fast_forward_push_failure(
         return False
     detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
     return any(marker in detail for marker in _NON_FAST_FORWARD_MARKERS)
+
+
+def _pages_publish_dir(bridge_dir: str) -> tuple[Path | None, str | None]:
+    """Resolve the explicit data-free Pages source or fail closed.
+
+    The bridge root contains private task, entity, attachment, and memory
+    transports.  It is never a valid Cloudflare Pages publish directory.
+    """
+    publish_dir = Path(bridge_dir) / "pages_public"
+    if not publish_dir.is_dir():
+        return None, f"Pages privacy shell missing: {publish_dir}"
+    files: set[str] = set()
+    for path in publish_dir.rglob("*"):
+        if path.is_symlink():
+            return None, f"Pages privacy shell contains a symlink: {path.name}"
+        if path.is_file():
+            files.add(path.relative_to(publish_dir).as_posix())
+    unexpected = sorted(files - _PAGES_PUBLIC_FILES)
+    missing = sorted(_PAGES_PUBLIC_FILES - files)
+    if unexpected or missing:
+        return (
+            None,
+            "Pages privacy shell allowlist mismatch: "
+            f"missing={missing}, unexpected={unexpected}",
+        )
+    try:
+        index_text = (publish_dir / "index.html").read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"Pages privacy shell is unreadable: {exc}"
+    if _PAGES_PRIVACY_MARKER not in index_text:
+        return None, "Pages privacy shell marker is missing"
+    return publish_dir, None
+
+
+def _deploy_pages_privacy_shell(bridge_dir: str) -> dict:
+    publish_dir, validation_error = _pages_publish_dir(bridge_dir)
+    if publish_dir is None:
+        return {
+            "deployed": False,
+            "blocked_private_source": True,
+            "message": validation_error,
+        }
+    try:
+        result = subprocess.run(
+            [
+                "wrangler",
+                "pages",
+                "deploy",
+                str(publish_dir),
+                "--project-name=memory-bridge",
+                "--branch=main",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            **_NOWIN,
+        )
+    except FileNotFoundError:
+        return {"deployed": False, "message": "wrangler not found"}
+    except subprocess.TimeoutExpired:
+        return {"deployed": False, "message": "CF Pages deploy timed out"}
+    if result.returncode != 0:
+        return {
+            "deployed": False,
+            "message": f"CF Pages deploy failed: {_git_detail(result)}",
+        }
+    return {"deployed": True, "message": None}
 
 
 def _recover_non_fast_forward_push(bridge_dir: str) -> tuple[bool, str]:
@@ -558,11 +629,15 @@ def _import_remote_entities(conn: sqlite3.Connection, entities: list) -> int:
     return imported
 
 
-def _export_entities(conn: sqlite3.Connection) -> tuple[list, set]:
+def _export_entities(
+    conn: sqlite3.Connection,
+    project_prefix: str = "shared",
+) -> tuple[list, set]:
     """Export shared entities + observations. Returns (entities_list, entity_ids)."""
     rows = conn.execute(
         "SELECT id, name, entity_type, project, created_at, updated_at "
-        "FROM entities WHERE project LIKE 'shared%' ORDER BY name"
+        "FROM entities WHERE project LIKE ? ORDER BY name",
+        (f"{project_prefix}%",),
     ).fetchall()
     entities, ids = [], set()
     for e in rows:
@@ -739,6 +814,7 @@ def main(
     force: bool = False,
     pull_only: bool = False,
     ui_profile: dict | None = None,
+    entity_project_prefix: str = "shared",
 ) -> dict:
     """Run full bridge sync: pull → LWW merge → export → push.
 
@@ -795,6 +871,7 @@ def main(
             pull_only=pull_only,
             ui_profile=ui_profile,
             machine_id=machine_id,
+            entity_project_prefix=entity_project_prefix,
         )
     finally:
         repo_lock.release()
@@ -809,10 +886,13 @@ def _main_locked(
     pull_only: bool,
     ui_profile: dict | None,
     machine_id: str,
+    entity_project_prefix: str = "shared",
 ) -> dict:
     """Run sync with process/thread locks already held."""
     _db_path = db_path
     export_started_at = now_iso()
+    promoted_entities = 0
+    promoted_tasks = 0
 
     if not pull_only:
         identity = ensure_bridge_git_identity(bridge_dir)
@@ -843,20 +923,23 @@ def _main_locked(
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
             ).isoformat()
-            promote_pending_public_entities(conn, cutoff, export_started_at)
+            promoted_entities = promote_pending_public_entities(
+                conn, cutoff, export_started_at
+            )
             rows = conn.execute(
                 "SELECT id FROM tasks WHERE visibility='pending_public' "
                 "AND publish_requested_at <= ?",
                 (cutoff,),
             ).fetchall()
             for row in rows:
-                apply_task_mutation(
+                result = apply_task_mutation(
                     conn,
                     row["id"],
                     {"visibility": "public"},
                     timestamp=export_started_at,
                     tool_name="bridge_sync_worker.promote_pending_public",
                 )
+                promoted_tasks += int(result.get("updated", 0))
 
     # Phase 2: Git fetch/fast-forward (no transaction held).
     # Avoid pull --rebase: generated bridge exports conflict frequently and a
@@ -1116,7 +1199,7 @@ def _main_locked(
     extended_memory: dict[str, list] = {}
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 20, "Exporting entities...")
-        entities_out, entity_ids = _export_entities(conn)
+        entities_out, entity_ids = _export_entities(conn, entity_project_prefix)
         _progress(progress_callback, 30, "Exporting relations...")
         relations_out = _export_relations(conn, entity_ids)
         _progress(progress_callback, 40, "Exporting tasks...")
@@ -1137,6 +1220,10 @@ def _main_locked(
         pub_entities, pub_tasks = _export_public_knowledge(conn)
         _progress(progress_callback, 55, "Exporting knowledge ratings...")
         kr_out = _export_knowledge_ratings(conn)
+        collaborator_rows = conn.execute(
+            "SELECT github_user FROM collaborators ORDER BY added_at"
+        ).fetchall()
+        collaborators = [row["github_user"] for row in collaborator_rows]
         _progress(progress_callback, 58, "Exporting memory ledger...")
         # memory_events is hundreds of MB on the live ledger. Stream it to the
         # same atomic JSON transport file instead of retaining 453k dicts plus
@@ -1154,9 +1241,14 @@ def _main_locked(
         "version": 4,
         "pushed_at": now_iso(),
         "machine_id": machine_id,
+        "owner": os.environ.get("GITHUB_USER", machine_id),
         "entities": [],  # backward compat — per-entity files are authoritative
         "relations": relations_out,
         "tasks": tasks_out,
+        "team_manifest": {
+            "collaborators": collaborators,
+            "display_name": os.environ.get("GITHUB_USER", machine_id),
+        },
     }
     # v5: write extended memory to separate files (keeps shared.json under CF Pages 25 MB limit)
     write_extended_memory_files(
@@ -1193,6 +1285,11 @@ def _main_locked(
 
             if "ui_profiles" in existing:
                 payload["ui_profiles"] = dict(existing["ui_profiles"])
+            for key, value in existing.items():
+                if key not in BRIDGE_SHARED_PAYLOAD_KEYS and isinstance(
+                    value, (list, dict)
+                ):
+                    payload[key] = value
         except (json.JSONDecodeError, OSError):
             pass
     if ui_profile is not None:
@@ -1201,10 +1298,24 @@ def _main_locked(
 
     _progress(progress_callback, 70, "Writing shared.json...")
     payload_json = _json_dumps(payload)
-    tmp_shared_path = _tmp_write_path(shared_path)
-    tmp_shared_path.write_text(payload_json, encoding="utf-8")
-    os.replace(tmp_shared_path, shared_path)
-    _write_shared_js(shared_path, payload_json)
+    try:
+        tmp_shared_path = _tmp_write_path(shared_path)
+        tmp_shared_path.write_text(payload_json, encoding="utf-8")
+        os.replace(tmp_shared_path, shared_path)
+        _write_shared_js(shared_path, payload_json)
+    except OSError as exc:
+        message = f"generated bridge file write failed: {exc}"
+        log.error(message)
+        _progress(progress_callback, -1, f"BLOCKED: {message}")
+        return {
+            "entities": len(entities_out),
+            "tasks": len(payload["tasks"]),
+            "pushed": False,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+            "generated_file_failed": True,
+            "message": message,
+        }
     # Render-only Kanban payload (preview); failure here must NOT block transport/push.
     try:
         write_kanban_payload(bridge_dir, payload)
@@ -1214,6 +1325,7 @@ def _main_locked(
         )
 
     n_ent = len(entities_out)
+    n_obs = sum(len(entity.get("observations", [])) for entity in entities_out)
     n_tasks = len(payload["tasks"])
 
     _progress(progress_callback, 80, "git add...")
@@ -1317,41 +1429,60 @@ def _main_locked(
             )
             mark_tombstones_pushed(conn, exported_task_ids, payload["pushed_at"])
 
+    peer_result: dict = {}
+    github_release: str | None = None
+    if pushed:
+        try:
+            peer_result = publish_peer_payloads(_db_path, tasks_out)
+        except Exception as exc:  # noqa: BLE001 - optional peer delivery
+            log.warning("Optional peer publishing failed: %s", exc)
+        try:
+            github_release = create_public_release(pub_entities, pub_tasks, machine_id)
+        except Exception as exc:  # noqa: BLE001 - optional release metadata
+            log.warning("Optional public-knowledge release failed: %s", exc)
+
     # Deploy to Cloudflare Pages (auto-update after push)
     deployed = False
+    deployment_result: dict = {}
     if pushed and os.environ.get("CLOUDFLARE_API_TOKEN"):
         _progress(progress_callback, 97, "CF Pages deploy...")
-        try:
-            deploy_result = subprocess.run(
-                [
-                    "wrangler",
-                    "pages",
-                    "deploy",
-                    bridge_dir,
-                    "--project-name=memory-bridge",
-                    "--branch=main",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                **_NOWIN,
+        deployment_result = _deploy_pages_privacy_shell(bridge_dir)
+        deployed = bool(deployment_result["deployed"])
+        if not deployed:
+            log.error(
+                "CF Pages deploy blocked or failed: %s", deployment_result["message"]
             )
-            deployed = deploy_result.returncode == 0
-            if not deployed:
-                log.warning("CF Pages deploy failed: %s", deploy_result.stderr)
-        except FileNotFoundError:
-            log.warning("wrangler not found — skipping CF Pages deploy")
-        except subprocess.TimeoutExpired:
-            log.warning("CF Pages deploy timed out")
 
     _progress(progress_callback, 100, "Done")
-    return {
+    response = {
         "entities": n_ent,
+        "observations": n_obs,
+        "relations": len(relations_out),
         "tasks": n_tasks,
         "pushed": pushed,
         "deployed": deployed,
         "imported_new": new_t,
         "imported_updated": upd_t,
         "non_fast_forward_recovered": non_fast_forward_recovered,
+        "promoted_to_public": {
+            "entities": promoted_entities,
+            "tasks": promoted_tasks,
+        },
         "message": push_message if not pushed else None,
     }
+    if peer_result.get("assigned_task_recipients"):
+        response["assigned_task_recipients"] = peer_result["assigned_task_recipients"]
+    if peer_result.get("knowledge_shared"):
+        response["knowledge_shared"] = peer_result["knowledge_shared"]
+    if pub_entities or pub_tasks:
+        response["public_knowledge"] = {
+            "entities": len(pub_entities),
+            "tasks": len(pub_tasks),
+        }
+    if github_release:
+        response["github_release"] = github_release
+    if deployment_result.get("blocked_private_source"):
+        response["deployment_blocked_private_source"] = True
+    if deployment_result.get("message"):
+        response["deployment_message"] = deployment_result["message"]
+    return response

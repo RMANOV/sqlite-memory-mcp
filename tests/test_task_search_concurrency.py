@@ -66,3 +66,39 @@ def test_rebuild_publishes_complete_snapshot_atomically(tmp_path, monkeypatch):
     assert not worker.is_alive()
     assert search._task_fingerprint != old_fingerprint
     assert [row["id"] for row in search.search("newword", new_tasks)] == ["new"]
+
+
+def test_entity_search_controller_coalesces_and_marks_stale_results():
+    first_started = threading.Event()
+    release_first = threading.Event()
+    latest_emitted = threading.Event()
+    calls = []
+    emitted = []
+
+    def search(query, limit):
+        calls.append((query, limit))
+        if query == "old":
+            first_started.set()
+            assert release_first.wait(5)
+        return [{"name": query}]
+
+    def emit(rows, sequence):
+        emitted.append((rows, sequence))
+        if rows[0]["name"] == "new":
+            latest_emitted.set()
+
+    controller = task_search.EntitySearchController(
+        search,
+        emit,
+        limit=7,
+    )
+    old_sequence = controller.request("old")
+    assert first_started.wait(5)
+    new_sequence = controller.request("new")
+    release_first.set()
+    assert latest_emitted.wait(5)
+
+    assert calls == [("old", 7), ("new", 7)]
+    assert not controller.is_current(old_sequence)
+    assert controller.is_current(new_sequence)
+    assert [rows[0]["name"] for rows, _sequence in emitted] == ["old", "new"]
