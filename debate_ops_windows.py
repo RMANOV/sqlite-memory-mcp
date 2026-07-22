@@ -147,6 +147,16 @@ def _spawn_pump_now() -> dict[str, object]:
     return {"spawned_pid": proc.pid}
 
 
+def _wait_for_pump_running(timeout_seconds: float = 10.0) -> dict[str, object]:
+    """Wait for a real heartbeat instead of treating process creation as ready."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    state = pump_state()
+    while state.get("state") != "running" and time.monotonic() < deadline:
+        time.sleep(0.25)
+        state = pump_state()
+    return state
+
+
 def _schtasks(args: list[str]) -> dict[str, object]:
     cmd = ["schtasks", *args]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -296,14 +306,22 @@ def cmd_install(*, start: bool = True) -> int:
 
 
 def cmd_start() -> int:
+    current = pump_state()
+    if current.get("state") == "running":
+        print(
+            json.dumps(
+                {"task": TASK_NAME, "start": "already_running", "pump_state": current},
+                indent=2,
+            )
+        )
+        return 0
     out = _schtasks(["/Run", "/TN", TASK_NAME])
     payload: dict[str, object] = {"task": TASK_NAME, "run": out}
     if out.get("returncode"):
         payload["fallback"] = _spawn_pump_now()
-        time.sleep(2.0)
-    payload["pump_state"] = pump_state()
+    payload["pump_state"] = _wait_for_pump_running()
     print(json.dumps(payload, indent=2))
-    return 0 if not out.get("returncode") or "fallback" in payload else 1
+    return 0 if payload["pump_state"].get("state") == "running" else 1
 
 
 def cmd_stop(*, timeout_seconds: float = 20.0) -> int:
@@ -311,6 +329,22 @@ def cmd_stop(*, timeout_seconds: float = 20.0) -> int:
 
     In-flight workers survive either path (own process group, no console).
     """
+    # Capture the exact process identity before signaling.  A clean pump removes
+    # its heartbeat just before interpreter exit; using only the current file
+    # state can therefore report "stopped" while that process still owns the
+    # singleton mutex, making an immediate restart lose a timing race.
+    target_heartbeat = _read_heartbeat()
+    target_live = bool(target_heartbeat and _heartbeat_pid_live(target_heartbeat))
+    if not target_live:
+        state = pump_state()
+        print(
+            json.dumps(
+                {"task": TASK_NAME, "stopped": "already_stopped", "pump_state": state},
+                indent=2,
+            )
+        )
+        return 0
+
     graceful = False
     try:
         sys.path.insert(0, str(ROOT))
@@ -321,8 +355,8 @@ def cmd_stop(*, timeout_seconds: float = 20.0) -> int:
         graceful = False
     deadline = time.monotonic() + max(1.0, timeout_seconds)
     while time.monotonic() < deadline:
-        state = pump_state()
-        if not state.get("pid_live"):
+        if not _heartbeat_pid_live(target_heartbeat):
+            state = pump_state()
             print(
                 json.dumps(
                     {"task": TASK_NAME, "stopped": "graceful", "pump_state": state},
