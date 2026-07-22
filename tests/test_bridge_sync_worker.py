@@ -14,10 +14,66 @@ import bridge_sync_worker
 from bridge_sync_worker import (
     _auto_heal_sync_safety,
     _check_sync_safety,
+    _deploy_pages_privacy_shell,
     _load_bridge_task_snapshots,
+    _pages_publish_dir,
 )
 import db_utils
 from schema import init_db
+
+
+def _write_pages_privacy_shell(bridge_dir):
+    publish_dir = bridge_dir / "pages_public"
+    publish_dir.mkdir()
+    (publish_dir / "index.html").write_text(
+        "<html>privacy-shell-v1</html>", encoding="utf-8"
+    )
+    (publish_dir / "_headers").write_text("/*\n  Cache-Control: no-store\n")
+    return publish_dir
+
+
+def test_pages_publish_dir_is_an_exact_data_free_allowlist(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    publish_dir = _write_pages_privacy_shell(bridge_dir)
+
+    resolved, error = _pages_publish_dir(str(bridge_dir))
+
+    assert resolved == publish_dir
+    assert error is None
+    (publish_dir / "shared.json").write_text("{}", encoding="utf-8")
+    resolved, error = _pages_publish_dir(str(bridge_dir))
+    assert resolved is None
+    assert "unexpected=['shared.json']" in error
+
+
+def test_pages_deploy_never_uses_private_bridge_root(tmp_path, monkeypatch):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    publish_dir = _write_pages_privacy_shell(bridge_dir)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(bridge_sync_worker.subprocess, "run", fake_run)
+
+    result = _deploy_pages_privacy_shell(str(bridge_dir))
+
+    assert result == {"deployed": True, "message": None}
+    assert calls[0][0][3] == str(publish_dir)
+    assert calls[0][0][3] != str(bridge_dir)
+
+
+def test_pages_deploy_fails_closed_without_privacy_shell(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    result = _deploy_pages_privacy_shell(str(bridge_dir))
+
+    assert result["deployed"] is False
+    assert result["blocked_private_source"] is True
 
 
 def test_memory_events_stream_export_is_byte_equivalent_and_atomic(tmp_path):

@@ -115,6 +115,9 @@ _NON_FAST_FORWARD_MARKERS = (
     "remote contains work that you do not have locally",
 )
 
+_PAGES_PUBLIC_FILES = frozenset({"index.html", "_headers"})
+_PAGES_PRIVACY_MARKER = "privacy-shell-v1"
+
 
 def _is_non_fast_forward_push_failure(
     result: subprocess.CompletedProcess,
@@ -124,6 +127,73 @@ def _is_non_fast_forward_push_failure(
         return False
     detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
     return any(marker in detail for marker in _NON_FAST_FORWARD_MARKERS)
+
+
+def _pages_publish_dir(bridge_dir: str) -> tuple[Path | None, str | None]:
+    """Resolve the explicit data-free Pages source or fail closed.
+
+    The bridge root contains private task, entity, attachment, and memory
+    transports.  It is never a valid Cloudflare Pages publish directory.
+    """
+    publish_dir = Path(bridge_dir) / "pages_public"
+    if not publish_dir.is_dir():
+        return None, f"Pages privacy shell missing: {publish_dir}"
+    files: set[str] = set()
+    for path in publish_dir.rglob("*"):
+        if path.is_symlink():
+            return None, f"Pages privacy shell contains a symlink: {path.name}"
+        if path.is_file():
+            files.add(path.relative_to(publish_dir).as_posix())
+    unexpected = sorted(files - _PAGES_PUBLIC_FILES)
+    missing = sorted(_PAGES_PUBLIC_FILES - files)
+    if unexpected or missing:
+        return (
+            None,
+            "Pages privacy shell allowlist mismatch: "
+            f"missing={missing}, unexpected={unexpected}",
+        )
+    try:
+        index_text = (publish_dir / "index.html").read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"Pages privacy shell is unreadable: {exc}"
+    if _PAGES_PRIVACY_MARKER not in index_text:
+        return None, "Pages privacy shell marker is missing"
+    return publish_dir, None
+
+
+def _deploy_pages_privacy_shell(bridge_dir: str) -> dict:
+    publish_dir, validation_error = _pages_publish_dir(bridge_dir)
+    if publish_dir is None:
+        return {
+            "deployed": False,
+            "blocked_private_source": True,
+            "message": validation_error,
+        }
+    try:
+        result = subprocess.run(
+            [
+                "wrangler",
+                "pages",
+                "deploy",
+                str(publish_dir),
+                "--project-name=memory-bridge",
+                "--branch=main",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            **_NOWIN,
+        )
+    except FileNotFoundError:
+        return {"deployed": False, "message": "wrangler not found"}
+    except subprocess.TimeoutExpired:
+        return {"deployed": False, "message": "CF Pages deploy timed out"}
+    if result.returncode != 0:
+        return {
+            "deployed": False,
+            "message": f"CF Pages deploy failed: {_git_detail(result)}",
+        }
+    return {"deployed": True, "message": None}
 
 
 def _recover_non_fast_forward_push(bridge_dir: str) -> tuple[bool, str]:
@@ -1373,30 +1443,15 @@ def _main_locked(
 
     # Deploy to Cloudflare Pages (auto-update after push)
     deployed = False
+    deployment_result: dict = {}
     if pushed and os.environ.get("CLOUDFLARE_API_TOKEN"):
         _progress(progress_callback, 97, "CF Pages deploy...")
-        try:
-            deploy_result = subprocess.run(
-                [
-                    "wrangler",
-                    "pages",
-                    "deploy",
-                    bridge_dir,
-                    "--project-name=memory-bridge",
-                    "--branch=main",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                **_NOWIN,
+        deployment_result = _deploy_pages_privacy_shell(bridge_dir)
+        deployed = bool(deployment_result["deployed"])
+        if not deployed:
+            log.error(
+                "CF Pages deploy blocked or failed: %s", deployment_result["message"]
             )
-            deployed = deploy_result.returncode == 0
-            if not deployed:
-                log.warning("CF Pages deploy failed: %s", deploy_result.stderr)
-        except FileNotFoundError:
-            log.warning("wrangler not found — skipping CF Pages deploy")
-        except subprocess.TimeoutExpired:
-            log.warning("CF Pages deploy timed out")
 
     _progress(progress_callback, 100, "Done")
     response = {
@@ -1426,4 +1481,8 @@ def _main_locked(
         }
     if github_release:
         response["github_release"] = github_release
+    if deployment_result.get("blocked_private_source"):
+        response["deployment_blocked_private_source"] = True
+    if deployment_result.get("message"):
+        response["deployment_message"] = deployment_result["message"]
     return response
