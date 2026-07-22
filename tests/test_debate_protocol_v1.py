@@ -12,6 +12,8 @@ import pytest
 
 from debate import (
     DebateError,
+    bind_role_session,
+    claim_worker_session,
     debate_post_with_recipients,
     debate_signal_advance,
     debate_signal_check,
@@ -22,6 +24,7 @@ from debate import (
     seed_initial_role_bindings,
 )
 from debate_protocol_v1 import (
+    ProtocolV1Error,
     adaptive_wait_decision,
     get_protocol_state,
     prepare_order_swap,
@@ -273,6 +276,12 @@ def test_blind_commit_has_no_read_or_signal_leak_then_releases(conn):
         target_role="ADVOCATE",
     )
     assert first["msg_id"] not in {m["msg_id"] for m in hybrid["results"]}
+    global_hybrid = search_debate_context(
+        conn,
+        query="secret first",
+        target_role="ADVOCATE",
+    )
+    assert first["msg_id"] not in {m["msg_id"] for m in global_hybrid["results"]}
     wake = prepare_wake_dry_run(
         conn,
         tool_response={**first, "schema_version": "debate_post_with_recipients.v1"},
@@ -328,6 +337,85 @@ def test_released_blind_projection_replays_claim_passed_by_global_cursor(conn):
     pump.DB_PATH = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     rows = pump._fetch_released_blind_replay(ping["ts"], ping["msg_id"], [topic], 10)
     assert [row["msg_id"] for row in rows] == [first["msg_id"]]
+
+
+def test_released_blind_worker_reads_exact_trigger_behind_parent_cursor(conn):
+    topic = _topic(conn, "S7_WORKER_REPLAY")
+    first = _claim(conn, topic, "EXECUTOR", "ADVOCATE", "first hidden")
+    ping = debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="CONDUCTOR",
+        priority="H",
+        kind="PING",
+        body="bootstrap independent advocate claim",
+        addressed_to=["ADVOCATE"],
+    )
+    inbox = debate_signal_check(
+        conn,
+        session_id="codex-advocate",
+        role="ADVOCATE",
+        topic_id=topic,
+    )
+    assert [item["msg_id"] for item in inbox["pending"]] == [ping["msg_id"]]
+    debate_signal_advance(
+        conn,
+        session_id="codex-advocate",
+        role="ADVOCATE",
+        topic_id=topic,
+        last_processed_msg_id=ping["msg_id"],
+    )
+    _claim(conn, topic, "ADVOCATE", "EXECUTOR", "second releases barrier")
+
+    claim = claim_worker_session(
+        conn,
+        topic_id=topic,
+        role="ADVOCATE",
+        parent_session_id="codex-advocate",
+        trigger_msg_id=first["msg_id"],
+    )
+    worker_session_id = claim["worker_session_id"]
+    with pytest.raises(DebateError) as wrong_trigger:
+        debate_signal_advance(
+            conn,
+            session_id=worker_session_id,
+            role="ADVOCATE",
+            topic_id=topic,
+            last_processed_msg_id=ping["msg_id"],
+        )
+    assert wrong_trigger.value.error_type == "worker_trigger_scope"
+    worker_inbox = debate_signal_check(
+        conn,
+        session_id=worker_session_id,
+        role="ADVOCATE",
+        topic_id=topic,
+    )
+    assert [item["msg_id"] for item in worker_inbox["pending"]] == [first["msg_id"]]
+    debate_signal_advance(
+        conn,
+        session_id=worker_session_id,
+        role="ADVOCATE",
+        topic_id=topic,
+        last_processed_msg_id=first["msg_id"],
+    )
+    response = debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="ADVOCATE",
+        priority="M",
+        kind="CHALLENGE",
+        body="challenge the exact replayed claim",
+        addressed_to=["EXECUTOR"],
+        reply_to=first["msg_id"],
+        protocol_version="debate/v1",
+        payload_json={
+            "target": first["msg_id"],
+            "challenge_type": "logic",
+            "requested_disposition": "rebut",
+        },
+        author_session_id=worker_session_id,
+    )
+    assert response["worker_claim"]["state"] == "completed"
 
 
 def test_protocol_topic_rejects_legacy_conversation_kind(conn):
@@ -412,6 +500,152 @@ def test_stale_read_guard_uses_compound_session_cursor(conn):
     assert posted["round_no"] == 1
 
 
+def test_exact_verify_retry_is_rejected_without_round_drift(conn):
+    topic = _topic(conn, "S7_VERIFY_RETRY")
+    left, _right = _release(conn, topic)
+    payload = {"target": left["msg_id"], "result": "contested", "checks": ["x"]}
+    debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="JUDGE",
+        priority="M",
+        kind="VERIFY",
+        body="contested",
+        addressed_to=["CONDUCTOR"],
+        reply_to=left["msg_id"],
+        protocol_version="debate/v1",
+        payload_json=payload,
+        author_session_id="cc-judge",
+    )
+    before = get_protocol_state(conn, topic)
+    message_count = conn.execute(
+        "SELECT COUNT(*) FROM debate_messages WHERE topic_id=?", (topic,)
+    ).fetchone()[0]
+    with pytest.raises(DebateError) as duplicate:
+        debate_post_with_recipients(
+            conn,
+            topic_id=topic,
+            role="JUDGE",
+            priority="M",
+            kind="VERIFY",
+            body="same machine act retried",
+            addressed_to=["CONDUCTOR"],
+            reply_to=left["msg_id"],
+            protocol_version="debate/v1",
+            payload_json=payload,
+            author_session_id="cc-judge",
+        )
+    assert duplicate.value.error_type == "DUPLICATE_ACT"
+    assert get_protocol_state(conn, topic) == before
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM debate_messages WHERE topic_id=?", (topic,)
+        ).fetchone()[0]
+        == message_count
+    )
+
+
+def test_opposing_role_cannot_self_authorize_verify_transition(conn):
+    topic = _topic(conn, "S7_VERIFY_ROLE")
+    left, _right = _release(conn, topic)
+    before = get_protocol_state(conn, topic)
+    with pytest.raises(DebateError) as forbidden:
+        debate_post_with_recipients(
+            conn,
+            topic_id=topic,
+            role="ADVOCATE",
+            priority="M",
+            kind="VERIFY",
+            body="self-authorized verification",
+            addressed_to=["CONDUCTOR"],
+            reply_to=left["msg_id"],
+            protocol_version="debate/v1",
+            payload_json={
+                "target": left["msg_id"],
+                "result": "verified",
+                "checks": ["self"],
+            },
+            author_session_id="codex-advocate",
+        )
+    assert forbidden.value.error_type == "ROLE_NOT_ALLOWED"
+    assert get_protocol_state(conn, topic) == before
+
+
+def test_unresolved_challenge_from_prior_round_blocks_adjudication(conn):
+    topic = _topic(conn, "S7_OLD_CHALLENGE")
+    left, _right = _release(conn, topic)
+    challenge = debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="ADVOCATE",
+        priority="M",
+        kind="CHALLENGE",
+        body="unresolved round-one challenge",
+        addressed_to=["EXECUTOR"],
+        reply_to=left["msg_id"],
+        protocol_version="debate/v1",
+        payload_json={
+            "target": left["msg_id"],
+            "challenge_type": "evidence",
+            "requested_disposition": "rebut",
+        },
+        author_session_id="codex-advocate",
+    )
+    for result in ("contested", "verified"):
+        debate_post_with_recipients(
+            conn,
+            topic_id=topic,
+            role="JUDGE",
+            priority="M",
+            kind="VERIFY",
+            body=f"{result}, but the challenge remains",
+            addressed_to=["CONDUCTOR"],
+            reply_to=left["msg_id"],
+            protocol_version="debate/v1",
+            payload_json={"target": left["msg_id"], "result": result, "checks": ["x"]},
+            author_session_id="cc-judge",
+        )
+    state = get_protocol_state(conn, topic)
+    assert state["phase"] == "DEBATE"
+    assert state["round_no"] == 3
+
+    rebut = debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="EXECUTOR",
+        priority="M",
+        kind="REBUT",
+        body="resolve the old challenge",
+        addressed_to=["ADVOCATE"],
+        reply_to=challenge["msg_id"],
+        protocol_version="debate/v1",
+        payload_json={
+            "target": challenge["msg_id"],
+            "disposition": "rebutted",
+            "evidence_refs": ["source-1"],
+        },
+        author_session_id="cc-executor",
+    )
+    final = debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="JUDGE",
+        priority="M",
+        kind="VERIFY",
+        body="all challenges resolved",
+        addressed_to=["CONDUCTOR"],
+        reply_to=rebut["msg_id"],
+        protocol_version="debate/v1",
+        payload_json={
+            "target": rebut["msg_id"],
+            "result": "verified",
+            "checks": ["x"],
+        },
+        author_session_id="cc-judge",
+    )
+    assert final["protocol_state"]["phase"] == "ADJUDICATE"
+
+
 def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
     topic = _topic(conn)
     left, _right = _release(conn, topic)
@@ -430,7 +664,7 @@ def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
             payload_json={
                 "target": left["msg_id"],
                 "result": "contested",
-                "checks": ["deterministic"],
+                "checks": [f"deterministic-round-{expected_round}"],
             },
             author_session_id="cc-judge",
         )
@@ -519,6 +753,7 @@ def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
 def test_order_swap_stable_verdict_stops_protocol(conn):
     topic = _topic(conn, "S7_JUDGE")
     left, right = _release(conn, topic)
+    same_side = _claim(conn, topic, "EXECUTOR", "ADVOCATE", "alternate A")
     verified = debate_post_with_recipients(
         conn,
         topic_id=topic,
@@ -533,6 +768,14 @@ def test_order_swap_stable_verdict_stops_protocol(conn):
         author_session_id="cc-judge",
     )
     assert verified["protocol_state"]["phase"] == "ADJUDICATE"
+    with pytest.raises(ProtocolV1Error) as same_role_positions:
+        prepare_order_swap(
+            conn,
+            topic_id=topic,
+            left_msg_id=left["msg_id"],
+            right_msg_id=same_side["msg_id"],
+        )
+    assert same_role_positions.value.error_type == "INVALID_TARGET"
     projections = prepare_order_swap(
         conn,
         topic_id=topic,
@@ -557,6 +800,14 @@ def test_order_swap_stable_verdict_stops_protocol(conn):
             right_msg_id=left["msg_id"],
         )
     assert projection_conflict.value.error_type == "JUDGE_PROJECTION_CONFLICT"
+    with pytest.raises(ProtocolV1Error) as unknown_judge:
+        record_order_swap_verdict(
+            conn,
+            projection_id=projections[0]["projection_id"],
+            judge_role="INTRUDER",
+            verdict={"winner_msg_id": left["msg_id"], "decision": "accept A"},
+        )
+    assert unknown_judge.value.error_type == "JUDGE_ROLE_UNAVAILABLE"
     first = record_order_swap_verdict(
         conn,
         projection_id=projections[0]["projection_id"],
@@ -580,6 +831,63 @@ def test_order_swap_stable_verdict_stops_protocol(conn):
     )
     assert second["stable"] is True
     assert second["protocol_state"]["phase"] == "STOPPED"
+    stopped_state = second["protocol_state"]
+    replay = record_order_swap_verdict(
+        conn,
+        projection_id=projections[1]["projection_id"],
+        judge_role="JUDGE",
+        verdict={"winner_msg_id": left["msg_id"], "decision": "accept A"},
+    )
+    assert replay["stable"] is True
+    assert replay["protocol_state"] == stopped_state
+
+
+def test_order_swap_disagreement_replay_is_stalemate_noop(conn):
+    topic = _topic(conn, "S7_JUDGE_DISAGREE")
+    left, right = _release(conn, topic)
+    debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="JUDGE",
+        priority="M",
+        kind="VERIFY",
+        body="verified",
+        addressed_to=["CONDUCTOR"],
+        reply_to=left["msg_id"],
+        protocol_version="debate/v1",
+        payload_json={"target": left["msg_id"], "result": "verified", "checks": ["x"]},
+        author_session_id="cc-judge",
+    )
+    projections = prepare_order_swap(
+        conn,
+        topic_id=topic,
+        left_msg_id=left["msg_id"],
+        right_msg_id=right["msg_id"],
+    )["projections"]
+    record_order_swap_verdict(
+        conn,
+        projection_id=projections[0]["projection_id"],
+        judge_role="JUDGE",
+        verdict={"winner_msg_id": left["msg_id"], "decision": "accept A"},
+    )
+    second_verdict = {"winner_msg_id": right["msg_id"], "decision": "accept B"}
+    second = record_order_swap_verdict(
+        conn,
+        projection_id=projections[1]["projection_id"],
+        judge_role="JUDGE",
+        verdict=second_verdict,
+    )
+    assert second["stable"] is False
+    assert second["protocol_state"]["phase"] == "STALEMATE"
+    stalemate_state = second["protocol_state"]
+    replay = record_order_swap_verdict(
+        conn,
+        projection_id=projections[1]["projection_id"],
+        judge_role="JUDGE",
+        verdict=second_verdict,
+    )
+    assert replay["stable"] is False
+    assert replay["protocol_state"] == stalemate_state
 
 
 def test_timeout_role_sweep_and_adaptive_scheduler_are_server_deterministic(conn):
@@ -623,6 +931,48 @@ def test_timeout_role_sweep_and_adaptive_scheduler_are_server_deterministic(conn
         (topic,),
     ).fetchone()
     assert tuple(copied_cursor) == (state_msg["msg_id"], state_msg["ts"])
+    worker_only = debate_post_with_recipients(
+        conn,
+        topic_id=topic,
+        role="CONDUCTOR",
+        priority="M",
+        kind="PING",
+        body="worker-only cursor must not become the recovered role cursor",
+        addressed_to=["ADVOCATE"],
+    )
+    conn.execute(
+        "INSERT INTO debate_signal_state "
+        "(session_id,role,topic_id,last_processed_msg_id,last_processed_ts,last_check_at) "
+        "VALUES ('codex-auto_ADVOCATE_g2-W1','ADVOCATE',?,?,?,?)",
+        (
+            topic,
+            worker_only["msg_id"],
+            worker_only["ts"],
+            "2026-01-01T00:00:00Z",
+        ),
+    )
+    manual = bind_role_session(
+        conn,
+        topic_id=topic,
+        role="ADVOCATE",
+        session_id="codex-manual_advocate",
+        reason="manual replacement without a signal check",
+        replace_active=True,
+    )
+    assert manual["generation"] == 3
+    conn.execute(
+        "UPDATE debate_role_bindings SET state='retired',retired_at='2026-01-02T00:00:00Z' "
+        "WHERE topic_id=? AND role='ADVOCATE' AND session_id='codex-manual_advocate'",
+        (topic,),
+    )
+    second_actions = sweep_missing_roles(conn, topic_ids=[topic])
+    assert second_actions[0]["session_id"] == "codex-auto_ADVOCATE_g4"
+    inherited_cursor = conn.execute(
+        "SELECT last_processed_msg_id,last_processed_ts FROM debate_signal_state "
+        "WHERE topic_id=? AND role='ADVOCATE' AND session_id='codex-auto_ADVOCATE_g4'",
+        (topic,),
+    ).fetchone()
+    assert tuple(inherited_cursor) == (state_msg["msg_id"], state_msg["ts"])
     assert adaptive_wait_decision(queue_depth=1, live_workers=0, worker_capacity=2) == {
         "interval_seconds": 0.0,
         "reason": "eligible_backlog",

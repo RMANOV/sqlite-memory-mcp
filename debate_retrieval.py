@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
-from debate_protocol_v1 import visible_message_ids
+from debate_protocol_v1 import visibility_sql
 
 
 RRF_K = 60
@@ -108,18 +108,23 @@ def _fts_path(
     tokens: Sequence[str],
     topic_ids: Sequence[str],
     candidate_msg_ids: Sequence[str],
+    viewer_role: str = "",
     limit: int,
 ) -> list[dict[str, Any]]:
     if not tokens:
         return []
     topic_sql, topic_params = _where_in("topic_id", topic_ids)
     candidate_sql, candidate_params = _where_in("msg_id", candidate_msg_ids)
+    visible_sql, visible_params = visibility_sql(
+        alias="debate_messages_fts", viewer_role=viewer_role
+    )
     try:
         rows = conn.execute(
             "WITH hits AS ("
             " SELECT msg_id, bm25(debate_messages_fts, 0.0, 0.0, 0.35, 0.2, 1.0) AS lexical_rank"
             " FROM debate_messages_fts"
             " WHERE debate_messages_fts MATCH ?"
+            f" AND {visible_sql}"
             f" {topic_sql} {candidate_sql}"
             " ORDER BY lexical_rank ASC, msg_id ASC LIMIT ?"
             ") "
@@ -130,7 +135,13 @@ def _fts_path(
             " FROM hits h JOIN debate_messages m ON m.msg_id = h.msg_id"
             " LEFT JOIN debate_message_recipients r ON r.msg_id = m.msg_id"
             " GROUP BY m.msg_id ORDER BY h.lexical_rank ASC, m.ts DESC, m.msg_id DESC",
-            [_fts_query(tokens), *topic_params, *candidate_params, limit],
+            [
+                _fts_query(tokens),
+                *visible_params,
+                *topic_params,
+                *candidate_params,
+                limit,
+            ],
         ).fetchall()
     except sqlite3.OperationalError as exc:
         # Legacy/partial installs still have the literal path.  init_db repairs
@@ -146,19 +157,21 @@ def _literal_candidates(
     *,
     topic_ids: Sequence[str],
     candidate_msg_ids: Sequence[str],
+    viewer_role: str,
     scan_limit: int,
 ) -> list[dict[str, Any]]:
     topic_sql, topic_params = _where_in("m.topic_id", topic_ids)
     candidate_sql, candidate_params = _where_in("m.msg_id", candidate_msg_ids)
+    visible_sql, visible_params = visibility_sql(alias="m", viewer_role=viewer_role)
     rows = conn.execute(
         "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind,"
         " m.reply_to, m.standing, COALESCE(m.vehicle,'analysis') AS vehicle,"
         " m.body, m.created_at, GROUP_CONCAT(DISTINCT r.recipient) AS recipients"
         " FROM debate_messages m"
         " LEFT JOIN debate_message_recipients r ON r.msg_id = m.msg_id"
-        f" WHERE 1=1 {topic_sql} {candidate_sql}"
+        f" WHERE {visible_sql} {topic_sql} {candidate_sql}"
         " GROUP BY m.msg_id ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
-        [*topic_params, *candidate_params, scan_limit],
+        [*visible_params, *topic_params, *candidate_params, scan_limit],
     ).fetchall()
     return [_row_payload(row) for row in rows]
 
@@ -193,6 +206,7 @@ def _structural_candidates(
     query: str,
     topic_ids: Sequence[str],
     candidate_msg_ids: Sequence[str],
+    viewer_role: str,
     limit: int,
 ) -> list[dict[str, Any]]:
     """Resolve exact structural identifiers without a recent-row scan.
@@ -206,6 +220,7 @@ def _structural_candidates(
         return []
     topic_sql, topic_params = _where_in("m.topic_id", topic_ids)
     candidate_sql, candidate_params = _where_in("m.msg_id", candidate_msg_ids)
+    visible_sql, visible_params = visibility_sql(alias="m", viewer_role=viewer_role)
     remaining = max(1, int(limit))
     ids: list[str] = []
     seen: set[str] = set()
@@ -224,8 +239,8 @@ def _structural_candidates(
                     break
 
     value_placeholders = ",".join("?" for _ in values)
-    filters = f" {topic_sql} {candidate_sql}"
-    filter_params = [*topic_params, *candidate_params]
+    filters = f" AND {visible_sql} {topic_sql} {candidate_sql}"
+    filter_params = [*visible_params, *topic_params, *candidate_params]
     for column in ("m.msg_id", "m.reply_to", "m.topic_id"):
         collect(
             f"SELECT m.msg_id FROM debate_messages m "
@@ -440,40 +455,6 @@ def _search_debate_context_impl(
     effective_snippet = max(120, min(int(snippet_bytes or 120), 1200))
     clean_topics = _dedupe(topic_ids)
     clean_candidates = _dedupe(candidate_msg_ids)
-    # During the blind-commit window all retrieval projections must share the
-    # same visibility barrier as debate_read/signal/tray.  Materialize an
-    # allow-list only while an unreleased commit exists; normal retrieval keeps
-    # its indexed, unbounded-by-SQL-variable fast path.
-    if clean_topics:
-        hidden_exists = conn.execute(
-            "SELECT 1 FROM debate_blind_commits "
-            f"WHERE released_at IS NULL AND topic_id IN ({','.join('?' for _ in clean_topics)}) "
-            "LIMIT 1",
-            clean_topics,
-        ).fetchone()
-        if hidden_exists is not None:
-            visible = set(
-                visible_message_ids(
-                    conn,
-                    topic_ids=clean_topics,
-                    viewer_role=target_role,
-                    control_plane=False,
-                )
-            )
-            if clean_candidates:
-                clean_candidates = [mid for mid in clean_candidates if mid in visible]
-            else:
-                clean_candidates = sorted(visible)
-            if not clean_candidates:
-                return {
-                    "query": query,
-                    "topic_ids": clean_topics,
-                    "candidate_count": 0,
-                    "paths": {"fts_bm25": 0, "literal_metadata": 0},
-                    "merge": "weighted_rrf",
-                    "count": 0,
-                    "results": [],
-                }
     tokens = query_tokens(query)
 
     fts_rows = _fts_path(
@@ -481,6 +462,7 @@ def _search_debate_context_impl(
         tokens=tokens,
         topic_ids=clean_topics,
         candidate_msg_ids=clean_candidates,
+        viewer_role=target_role,
         limit=effective_path_limit,
     )
     structural_pool = _structural_candidates(
@@ -488,12 +470,14 @@ def _search_debate_context_impl(
         query=query,
         topic_ids=clean_topics,
         candidate_msg_ids=clean_candidates,
+        viewer_role=target_role,
         limit=effective_path_limit,
     )
     recent_literal_pool = _literal_candidates(
         conn,
         topic_ids=clean_topics,
         candidate_msg_ids=clean_candidates,
+        viewer_role=target_role,
         scan_limit=min(2000, max(200, effective_path_limit * 20)),
     )
     structural_ranks = {

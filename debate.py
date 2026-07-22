@@ -3481,7 +3481,13 @@ def debate_post_with_recipients(
         "vehicle": post_result["vehicle"],
         "schema_version": DEBATE_POST_RESPONSE_SCHEMA_VERSION,
     }
-    for key in ("protocol_version", "round_no", "body_mode", "protocol_state"):
+    for key in (
+        "protocol_version",
+        "round_no",
+        "body_mode",
+        "protocol_state",
+        "worker_claim",
+    ):
         if key in post_result:
             result[key] = post_result[key]
     return result
@@ -3566,6 +3572,15 @@ def _validate_signal_limit(limit: int) -> int:
     return limit
 
 
+def _protocol_v1_enabled(conn: sqlite3.Connection, topic_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM debate_protocol_state WHERE topic_id=?", (topic_id,)
+        ).fetchone()
+        is not None
+    )
+
+
 def _claim_or_filter_nonstanding_decision(
     conn: sqlite3.Connection,
     *,
@@ -3633,6 +3648,11 @@ def debate_signal_check(
     """Return pending messages addressed to (role OR session_id) past
     the caller's compound cursor.
 
+    A derived worker on a debate/v1 topic is a one-trigger execution lane: its
+    authoritative inbox contains only the trigger recorded in its active claim,
+    independent of a newer parent cursor. Legacy workers retain the historical
+    role-inbox behavior.
+
     Per CONDUCTOR canonical msg:c5e91d24 with amendments msg:7831af04
     (limit validation matrix), msg:c798c786 (EXISTS de-dupe so a single
     msg addressed to BOTH role and session_id counts once), and
@@ -3671,6 +3691,12 @@ def debate_signal_check(
             role=role,
             worker_session_id=session_id,
         )
+    protocol_enabled = _protocol_v1_enabled(conn, topic_id)
+    scoped_trigger_msg_id = (
+        str(worker_claim["trigger_msg_id"])
+        if worker_claim is not None and protocol_enabled
+        else None
+    )
 
     cursor_ts: str | None = None
     cursor_msg_id: str = ""
@@ -3708,7 +3734,11 @@ def debate_signal_check(
             cursor_ts = state_row["last_processed_ts"]
             cursor_msg_id = state_row["last_processed_msg_id"] or ""
             cursor_from_state = True
-        elif worker_claim is not None and worker_claim["parent_cursor_ts"]:
+        elif (
+            worker_claim is not None
+            and scoped_trigger_msg_id is None
+            and worker_claim["parent_cursor_ts"]
+        ):
             cursor_ts = worker_claim["parent_cursor_ts"]
             cursor_msg_id = worker_claim["parent_cursor_msg_id"] or ""
             cursor_from_state = True
@@ -3736,6 +3766,9 @@ def debate_signal_check(
         f"WHERE r.msg_id = m.msg_id AND r.recipient IN ({recipient_placeholders}))"
     )
     params.extend(signal_recipients)
+    if scoped_trigger_msg_id is not None:
+        where.append("m.msg_id = ?")
+        params.append(scoped_trigger_msg_id)
     where.append(
         "NOT (m.kind = 'DECISION' AND m.standing = 0 AND EXISTS ("
         " SELECT 1 FROM debate_message_claims c "
@@ -3813,12 +3846,6 @@ def debate_signal_check(
             key=lambda p: VALID_PRIORITY_ORDER.get(p, -1),
         )
 
-    protocol_enabled = (
-        conn.execute(
-            "SELECT 1 FROM debate_protocol_state WHERE topic_id=?", (topic_id,)
-        ).fetchone()
-        is not None
-    )
     if protocol_enabled:
         check_at = now_iso()
         conn.execute(
@@ -3904,6 +3931,26 @@ def debate_signal_advance(
     """
     _validate_signal_caller(session_id, role, topic_id, conn)
     validate_msg_id(last_processed_msg_id)
+    worker_claim: sqlite3.Row | None = None
+    if is_worker_session_id(session_id):
+        worker_claim = _validate_worker_claim_for_signal(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            worker_session_id=session_id,
+        )
+    protocol_enabled = _protocol_v1_enabled(conn, topic_id)
+    if (
+        worker_claim is not None
+        and protocol_enabled
+        and last_processed_msg_id != worker_claim["trigger_msg_id"]
+    ):
+        raise DebateError(
+            "worker_trigger_scope: debate/v1 worker may advance only its "
+            f"claimed trigger {worker_claim['trigger_msg_id']}",
+            error_type="worker_trigger_scope",
+            details={"trigger_msg_id": worker_claim["trigger_msg_id"]},
+        )
 
     visibility_predicate, visibility_params = _protocol_v1_visibility_sql(
         alias="m", viewer_role=role, control_plane=False
@@ -3942,12 +3989,6 @@ def debate_signal_advance(
             error_type="watermark_advance_unaddressed",
         )
 
-    protocol_enabled = (
-        conn.execute(
-            "SELECT 1 FROM debate_protocol_state WHERE topic_id=?", (topic_id,)
-        ).fetchone()
-        is not None
-    )
     if protocol_enabled:
         delivery = conn.execute(
             "SELECT delivered_up_to_msg_id,delivered_up_to_ts "
