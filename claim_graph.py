@@ -579,7 +579,9 @@ def promote_candidate(
         "AND object_text != ? AND COALESCE(valid_to, '') = ''",
         (fact_id, row["subject"], row["predicate"], row["object_text"]),
     ).fetchall()
+    contradiction_fact_ids = {fact_id}
     for comp in competing_rows:
+        contradiction_fact_ids.add(comp["fact_id"])
         add_knowledge_link(
             conn,
             subject_kind="fact",
@@ -600,11 +602,12 @@ def promote_candidate(
             rationale=f"Same subject/predicate, different object after claim {claim_id}",
             created_at=now,
         )
-        conn.execute(
-            "UPDATE canonical_facts SET contradiction_count = contradiction_count + 1 "
-            "WHERE fact_id IN (?, ?)",
-            (fact_id, comp["fact_id"]),
-        )
+    if competing_rows:
+        # knowledge_links is authoritative; derive the cached counts instead
+        # of maintaining a second, drift-prone +1 implementation here.
+        from memory_audit import _refresh_contradiction_counts
+
+        _refresh_contradiction_counts(conn, contradiction_fact_ids)
 
     record_memory_event(
         conn,

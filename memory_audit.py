@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -36,6 +37,14 @@ logger = logging.getLogger("sqlite-kb")
 _AUDIT_VERSION = "memory_audit_v2"
 _RETRIEVAL_CONTRACT_VERSION = "memory_contract_v2"
 _FACT_ACTIONS = ("supersede", "contradict", "invalidate", "revalidate")
+_SOURCE_TIMESTAMP_TABLES = {
+    "fact": ("canonical_facts", "fact_id", "updated_at", "created_at"),
+    "claim": ("candidate_claims", "claim_id", "updated_at", "created_at"),
+    "chunk": ("context_chunks", "chunk_id", "updated_at", "created_at"),
+    "question": ("context_questions", "question_id", "answered_at", "created_at"),
+    "context_pack": ("context_packs", "pack_id", "updated_at", "created_at"),
+}
+_SQLITE_IN_CHUNK_SIZE = 500
 
 
 def _new_id() -> str:
@@ -63,32 +72,51 @@ def _parse_ts(value: str | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _table_timestamp(
-    conn: sqlite3.Connection,
-    table_name: str,
-    id_column: str,
-    row_id: str,
-    *,
-    updated_col: str = "updated_at",
-    fallback_col: str = "created_at",
-) -> str | None:
-    if not _sqlite_table_exists(conn, table_name):
-        return None
-    cols = [updated_col]
-    if fallback_col != updated_col and _sqlite_has_column(
-        conn, table_name, fallback_col
-    ):
-        cols.append(fallback_col)
-    row = conn.execute(
-        f"SELECT {', '.join(cols)} FROM {table_name} WHERE {id_column} = ?",
-        (row_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    for col in cols:
-        if row[col]:
-            return str(row[col])
-    return None
+def _batch_source_timestamps(
+    conn: sqlite3.Connection, provenance_rows: list[dict[str, str]]
+) -> dict[tuple[str, str], str]:
+    """Load provenance source timestamps with one bounded query per source kind."""
+    refs_by_kind: dict[str, set[str]] = defaultdict(set)
+    for row in provenance_rows:
+        source_kind = str(row.get("source_kind") or "")
+        source_ref = str(row.get("source_ref") or "")
+        if source_kind in _SOURCE_TIMESTAMP_TABLES and source_ref:
+            refs_by_kind[source_kind].add(source_ref)
+
+    timestamps: dict[tuple[str, str], str] = {}
+    for source_kind, refs in refs_by_kind.items():
+        table_name, id_column, updated_col, fallback_col = _SOURCE_TIMESTAMP_TABLES[
+            source_kind
+        ]
+        if not _sqlite_table_exists(conn, table_name):
+            continue
+        table_columns = {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info('{table_name}')")
+        }
+        if id_column not in table_columns:
+            continue
+        timestamp_columns = [
+            col for col in (updated_col, fallback_col) if col in table_columns
+        ]
+        if not timestamp_columns:
+            continue
+
+        sorted_refs = sorted(refs)
+        for offset in range(0, len(sorted_refs), _SQLITE_IN_CHUNK_SIZE):
+            ref_batch = sorted_refs[offset : offset + _SQLITE_IN_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in ref_batch)
+            rows = conn.execute(
+                f"SELECT {id_column}, {', '.join(timestamp_columns)} "
+                f"FROM {table_name} WHERE {id_column} IN ({placeholders})",
+                ref_batch,
+            ).fetchall()
+            for row in rows:
+                source_ref = str(row[id_column])
+                for column in timestamp_columns:
+                    if row[column]:
+                        timestamps[(source_kind, source_ref)] = str(row[column])
+                        break
+    return timestamps
 
 
 def _parse_event_value(raw: Any) -> Any:
@@ -539,7 +567,6 @@ def govern_fact(
             rationale=rationale or f"{target_fact_id} contradicts {fact_id}",
             created_at=now,
         )
-        _refresh_contradiction_counts(conn, {fact_id, target_fact_id})
         changed = True
     elif action == "invalidate":
         conn.execute(
@@ -565,7 +592,8 @@ def govern_fact(
     if not changed:
         return {"changed": False}
 
-    _repair_supersede_links(conn)
+    if action == "supersede":
+        _repair_supersede_links(conn)
     _refresh_contradiction_counts(
         conn, {fact_id} | ({target_fact_id} if target_fact_id else set())
     )
@@ -796,6 +824,34 @@ def run_memory_audit(
             conn
         )
 
+    provenance_by_subject: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(
+        list
+    )
+    timestamp_provenance: list[dict[str, str]] = []
+    if _sqlite_table_exists(conn, "provenance_links"):
+        provenance_rows = conn.execute(
+            "SELECT subject_kind, subject_ref, source_kind, source_ref "
+            "FROM provenance_links "
+            "WHERE subject_kind IN ('fact', 'context_pack', 'artifact')"
+        ).fetchall()
+        for row in provenance_rows:
+            item = {
+                "source_kind": str(row["source_kind"]),
+                "source_ref": str(row["source_ref"]),
+            }
+            subject_key = (str(row["subject_kind"]), str(row["subject_ref"]))
+            provenance_by_subject[subject_key].append(item)
+            if row["subject_kind"] in {"context_pack", "artifact"}:
+                timestamp_provenance.append(item)
+    source_timestamps = _batch_source_timestamps(conn, timestamp_provenance)
+
+    candidate_claim_ids: set[str] = set()
+    candidate_claims_exists = _sqlite_table_exists(conn, "candidate_claims")
+    if candidate_claims_exists:
+        candidate_claim_ids = {
+            str(row[0]) for row in conn.execute("SELECT claim_id FROM candidate_claims")
+        }
+
     def add_issue(
         issue_type: str,
         severity: str,
@@ -866,16 +922,7 @@ def run_memory_audit(
         ).fetchall()
         for row in rows:
             fact_id = row["fact_id"]
-            has_provenance = (
-                conn.execute(
-                    "SELECT 1 FROM provenance_links WHERE subject_kind = 'fact' "
-                    "AND subject_ref = ? LIMIT 1",
-                    (fact_id,),
-                ).fetchone()
-                is not None
-                if _sqlite_table_exists(conn, "provenance_links")
-                else False
-            )
+            has_provenance = bool(provenance_by_subject.get(("fact", str(fact_id))))
             if not has_provenance:
                 add_issue(
                     "fact_missing_provenance",
@@ -890,17 +937,8 @@ def run_memory_audit(
                     },
                 )
 
-            if row["source_claim_id"] and _sqlite_table_exists(
-                conn, "candidate_claims"
-            ):
-                claim_exists = (
-                    conn.execute(
-                        "SELECT 1 FROM candidate_claims WHERE claim_id = ? LIMIT 1",
-                        (row["source_claim_id"],),
-                    ).fetchone()
-                    is not None
-                )
-                if not claim_exists:
+            if row["source_claim_id"] and candidate_claims_exists:
+                if str(row["source_claim_id"]) not in candidate_claim_ids:
                     add_issue(
                         "fact_missing_source_claim",
                         "medium",
@@ -942,15 +980,7 @@ def run_memory_audit(
         ).fetchall()
         for row in rows:
             pack_id = row["pack_id"]
-            prov_rows = (
-                conn.execute(
-                    "SELECT source_kind, source_ref FROM provenance_links "
-                    "WHERE subject_kind = 'context_pack' AND subject_ref = ?",
-                    (pack_id,),
-                ).fetchall()
-                if _sqlite_table_exists(conn, "provenance_links")
-                else []
-            )
+            prov_rows = provenance_by_subject.get(("context_pack", str(pack_id)), [])
             if not prov_rows:
                 add_issue(
                     "context_pack_missing_provenance",
@@ -968,27 +998,7 @@ def run_memory_audit(
                 for prov in prov_rows:
                     source_kind = prov["source_kind"]
                     source_ref = prov["source_ref"]
-                    updated_at = None
-                    if source_kind == "fact":
-                        updated_at = _table_timestamp(
-                            conn, "canonical_facts", "fact_id", source_ref
-                        )
-                    elif source_kind == "claim":
-                        updated_at = _table_timestamp(
-                            conn, "candidate_claims", "claim_id", source_ref
-                        )
-                    elif source_kind == "chunk":
-                        updated_at = _table_timestamp(
-                            conn, "context_chunks", "chunk_id", source_ref
-                        )
-                    elif source_kind == "question":
-                        updated_at = _table_timestamp(
-                            conn,
-                            "context_questions",
-                            "question_id",
-                            source_ref,
-                            updated_col="answered_at",
-                        )
+                    updated_at = source_timestamps.get((source_kind, source_ref))
                     updated_dt = _parse_ts(updated_at)
                     if updated_dt and updated_dt > created_at:
                         stale_sources.append(
@@ -1030,15 +1040,7 @@ def run_memory_audit(
         ).fetchall()
         for row in rows:
             artifact_id = row["artifact_id"]
-            prov_rows = (
-                conn.execute(
-                    "SELECT source_kind, source_ref FROM provenance_links "
-                    "WHERE subject_kind = 'artifact' AND subject_ref = ?",
-                    (artifact_id,),
-                ).fetchall()
-                if _sqlite_table_exists(conn, "provenance_links")
-                else []
-            )
+            prov_rows = provenance_by_subject.get(("artifact", str(artifact_id)), [])
             if not prov_rows:
                 add_issue(
                     "artifact_missing_provenance",
@@ -1056,23 +1058,9 @@ def run_memory_audit(
             artifact_dt = _parse_ts(row["updated_at"])
             if artifact_dt:
                 for prov in prov_rows:
-                    updated_at = None
-                    if prov["source_kind"] == "fact":
-                        updated_at = _table_timestamp(
-                            conn, "canonical_facts", "fact_id", prov["source_ref"]
-                        )
-                    elif prov["source_kind"] == "claim":
-                        updated_at = _table_timestamp(
-                            conn, "candidate_claims", "claim_id", prov["source_ref"]
-                        )
-                    elif prov["source_kind"] == "chunk":
-                        updated_at = _table_timestamp(
-                            conn, "context_chunks", "chunk_id", prov["source_ref"]
-                        )
-                    elif prov["source_kind"] == "context_pack":
-                        updated_at = _table_timestamp(
-                            conn, "context_packs", "pack_id", prov["source_ref"]
-                        )
+                    updated_at = source_timestamps.get(
+                        (prov["source_kind"], prov["source_ref"])
+                    )
                     updated_dt = _parse_ts(updated_at)
                     if updated_dt and updated_dt > artifact_dt:
                         stale_sources.append(

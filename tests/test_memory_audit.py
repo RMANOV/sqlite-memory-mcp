@@ -133,6 +133,45 @@ def test_run_memory_audit_detects_claim_missing_evidence(conn):
     assert any(i["issue_type"] == "claim_missing_evidence" for i in issues["issues"])
 
 
+def test_run_memory_audit_batches_provenance_source_timestamps(conn):
+    _insert_fact(conn, "fact-source", object_text="Redis")
+    _add_fact_provenance(conn, "fact-source")
+    conn.execute(
+        "INSERT INTO context_packs ("
+        "pack_id, session_id, entity_id, pack_type, target_ref, input_signature, "
+        "token_budget, body, freshness_score, contract_version, created_at"
+        ") VALUES ('pack-old', NULL, NULL, 'executor', NULL, 'sig', 100, "
+        "'body', 1.0, 'memory_contract_v2', '2026-03-31T08:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO provenance_links ("
+        "provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+        "excerpt, confidence, created_at"
+        ") VALUES ('prov-pack-old', 'context_pack', 'pack-old', 'fact', "
+        "'fact-source', 'source fact', 1.0, '2026-03-31T08:00:00+00:00')"
+    )
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        result = run_memory_audit(conn, repair=False)
+    finally:
+        conn.set_trace_callback(None)
+
+    stale = [
+        issue
+        for issue in result["issues"]
+        if issue["issue_type"] == "context_pack_stale"
+    ]
+    timestamp_reads = [
+        statement
+        for statement in statements
+        if "FROM canonical_facts WHERE fact_id IN (" in statement
+    ]
+    assert stale[0]["subject_ref"] == "pack-old"
+    assert len(timestamp_reads) == 1
+
+
 def test_govern_fact_contradiction_updates_counts_and_replay(conn):
     _insert_fact(conn, "fact-left", object_text="Redis")
     _insert_fact(conn, "fact-right", object_text="PostgreSQL")
