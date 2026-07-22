@@ -1,7 +1,7 @@
 [project]
 name = "sqlite-memory-mcp"
-version = "3.12.7"
-description = "SQLite-backed MCP Memory Server with hybrid search (BM25 + semantic via sqlite-vec), Intelligence v2, causal event ledger, premium runtime boundary, context state machine, knowledge tiers, WAL concurrent safety, cross-machine bridge sync, multi-agent debate protocol with prompt-time inbox signaling, and roughly eighty MCP tool surfaces across split micro-servers"
+version = "3.13.0"
+description = "SQLite-backed MCP Memory Server with hybrid search, Intelligence v2, causal event ledger, premium runtime boundary, WAL concurrency, cross-machine bridge sync, and a deterministic zero-paste debate/v1 protocol with typed server invariants"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=2.0.0"]
 license = "MIT"
@@ -48,9 +48,12 @@ py-modules = [
     "debate",
     "debate_list_widget",
     "debate_ops",
+    "debate_ops_windows",
+    "debate_protocol_v1",
     "debate_prompt_context",
     "debate_read_dao",
     "debate_retrieval",
+    "debate_wake_signal",
     "enrichment_constants",
     "entity_server",
     "fastmcp_compat",

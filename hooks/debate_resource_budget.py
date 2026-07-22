@@ -12,6 +12,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+PROTOCOL_V1_ACTION_KINDS = (
+    "CLAIM",
+    "CHALLENGE",
+    "EVIDENCE",
+    "REBUT",
+    "CONCEDE",
+    "VERIFY",
+    "DISSENT",
+    "ESCALATE",
+)
+
+
 @dataclass(frozen=True)
 class ResourceSnapshot:
     mem_total_mib: int = 0
@@ -325,7 +337,7 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
             max_concurrent_workers=0,
             interval_seconds=60,
             limit=0,
-            action_kinds=("Q", "DECISION", "PING"),
+            action_kinds=("Q", "DECISION", "PING", *PROTOCOL_V1_ACTION_KINDS),
             tier="blocked",
             reason=";".join([*reasons, *soft_reasons]),
             snapshot=snapshot,
@@ -351,7 +363,7 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
             max_concurrent_workers=1,
             interval_seconds=30,
             limit=3,
-            action_kinds=("Q", "DECISION", "PING"),
+            action_kinds=("Q", "DECISION", "PING", *PROTOCOL_V1_ACTION_KINDS),
             tier="low",
             reason=";".join(soft_reasons) or "constrained_machine_state",
             snapshot=snapshot,
@@ -372,7 +384,7 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
             max_concurrent_workers=2,
             interval_seconds=10,
             limit=10,
-            action_kinds=("Q", "DECISION", "A", "PING"),
+            action_kinds=("Q", "DECISION", "A", "PING", *PROTOCOL_V1_ACTION_KINDS),
             tier="normal",
             reason="healthy_machine_state",
             snapshot=snapshot,
@@ -385,7 +397,7 @@ def compute_debate_resource_budget(snapshot: ResourceSnapshot) -> DebateResource
         max_concurrent_workers=1,
         interval_seconds=15,
         limit=5,
-        action_kinds=("Q", "DECISION", "PING"),
+        action_kinds=("Q", "DECISION", "PING", *PROTOCOL_V1_ACTION_KINDS),
         tier="guarded",
         reason="moderate_machine_state",
         snapshot=snapshot,

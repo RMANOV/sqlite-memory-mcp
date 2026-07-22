@@ -15,6 +15,7 @@ Determinism (spec M3): the "now" used by ``recent`` / ``waiting_section_a`` is
 supplied by an injected ``clock`` callable. The acceptance harness injects the
 frozen ``as_of``; there is **no** live ``datetime.now`` on the harness path.
 """
+
 from __future__ import annotations
 
 import os
@@ -148,7 +149,20 @@ class DebateReadDAO:
             "has_tasks": "tasks" in names,
             "has_task_field_versions": "task_field_versions" in names,
             "has_debates_tbl": "debates" in names,
+            "debate_messages": cols("debate_messages"),
+            "has_blind_commits": "debate_blind_commits" in names,
+            "has_human_packets": "debate_human_packets" in names,
+            "has_protocol_state": "debate_protocol_state" in names,
         }
+
+    def _visible_sql(self, alias="m"):
+        """Human/tray visibility: never expose an unreleased blind CLAIM."""
+        if not self._caps.get("has_blind_commits"):
+            return "1=1"
+        return (
+            "NOT EXISTS (SELECT 1 FROM debate_blind_commits bc "
+            f"WHERE bc.msg_id={alias}.msg_id AND bc.released_at IS NULL)"
+        )
 
     def _now(self):
         return self._clock()
@@ -204,7 +218,7 @@ class DebateReadDAO:
         rows = con.execute(
             "SELECT msg_id, role, kind, priority, "
             "COALESCE(ts, created_at) AS ts, reply_to, COALESCE(body,'') AS body "
-            "FROM debate_messages"
+            "FROM debate_messages m WHERE " + self._visible_sql("m")
         ).fetchall()
         byid = {r["msg_id"]: r for r in rows}
         children = {}
@@ -265,7 +279,7 @@ class DebateReadDAO:
                 if not m:
                     continue
                 s = m.start()
-                if _A_REF.search(b[max(0, s - 45):s + 45]):
+                if _A_REF.search(b[max(0, s - 45) : s + 45]):
                     continue
                 fwd_txt = m.group(0)[:60]
             if r["msg_id"] in op_replied:
@@ -287,12 +301,20 @@ class DebateReadDAO:
                     latest = t
             ldt = parse_ts(latest)
             stale = bool(ldt and (now - ldt).days > 5)
-            out.append({
-                "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
-                "priority": r["priority"] or "INFO", "ts": r["ts"],
-                "age": self._rel(r["ts"]), "line": one_line(b), "body": b,
-                "stale": stale, "fwd": fwd_txt,
-            })
+            out.append(
+                {
+                    "msg_id": r["msg_id"],
+                    "role": r["role"],
+                    "kind": r["kind"],
+                    "priority": r["priority"] or "INFO",
+                    "ts": r["ts"],
+                    "age": self._rel(r["ts"]),
+                    "line": one_line(b),
+                    "body": b,
+                    "stale": stale,
+                    "fwd": fwd_txt,
+                }
+            )
 
         # ── Layer 2: live-await (ADOPTION FIX 1) ──────────────────────────
         # Only when live_await; layer-1 output above is byte-identical to board.
@@ -321,7 +343,7 @@ class DebateReadDAO:
                     continue  # (ii) operator-await marker in body
                 # exclude already-given / already-recorded GO in this very body
                 if _A_TAKEN.search(b) or _A_REF.search(
-                    lead[max(0, m.start() - 45):m.start() + 45]
+                    lead[max(0, m.start() - 45) : m.start() + 45]
                 ):
                     continue
                 if r["msg_id"] in op_replied:
@@ -344,21 +366,67 @@ class DebateReadDAO:
                         latest = t
                 ldt = parse_ts(latest)
                 stale = bool(ldt and (now - ldt).days > 5)
-                out.append({
-                    "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
-                    "priority": r["priority"] or "INFO", "ts": r["ts"],
-                    "age": self._rel(r["ts"]), "line": one_line(b), "body": b,
-                    "stale": stale, "fwd": f"live-await: {m.group(0)[:48]}",
-                })
+                out.append(
+                    {
+                        "msg_id": r["msg_id"],
+                        "role": r["role"],
+                        "kind": r["kind"],
+                        "priority": r["priority"] or "INFO",
+                        "ts": r["ts"],
+                        "age": self._rel(r["ts"]),
+                        "line": one_line(b),
+                        "body": b,
+                        "stale": stale,
+                        "fwd": f"live-await: {m.group(0)[:48]}",
+                    }
+                )
 
         out.sort(key=lambda x: x["ts"] or "", reverse=True)
+        # debate/v1 ESCALATE is the authoritative, structured human queue.
+        # It is additive to the legacy heuristic layer while old topics exist.
+        if self._caps.get("has_human_packets"):
+            existing_ids = {item["msg_id"] for item in out}
+            packets = con.execute(
+                "SELECT m.msg_id,m.role,m.kind,m.priority,"
+                "COALESCE(m.ts,m.created_at) AS ts,m.body,p.exact_human_action "
+                "FROM debate_human_packets p JOIN debate_messages m ON m.msg_id=p.msg_id "
+                "WHERE p.state='open' AND "
+                + self._visible_sql("m")
+                + " ORDER BY COALESCE(m.ts,m.created_at) DESC"
+            ).fetchall()
+            for row in packets:
+                if row["msg_id"] in existing_ids:
+                    continue
+                out.append(
+                    {
+                        "msg_id": row["msg_id"],
+                        "role": row["role"],
+                        "kind": row["kind"],
+                        "priority": row["priority"] or "H",
+                        "ts": row["ts"],
+                        "age": self._rel(row["ts"]),
+                        "line": one_line(row["exact_human_action"]),
+                        "body": row["body"] or "",
+                        "stale": False,
+                        "fwd": "typed ESCALATE packet",
+                    }
+                )
+                existing_ids.add(row["msg_id"])
+            out.sort(key=lambda x: x["ts"] or "", reverse=True)
         return out, cand
 
     def waiting_section_b(self):
         """Browser-board section B: relevant open today/next tasks, read-only."""
         required = {
-            "id", "title", "section", "priority", "status", "due_date",
-            "project", "updated_at", "type",
+            "id",
+            "title",
+            "section",
+            "priority",
+            "status",
+            "due_date",
+            "project",
+            "updated_at",
+            "type",
         }
         if not self._caps["has_tasks"] or not required.issubset(self._caps["tasks"]):
             return [], 0
@@ -376,8 +444,7 @@ class DebateReadDAO:
             <= self._caps["task_field_versions"]
         )
         version_select = (
-            ", v.updated_order AS status_order, "
-            "v.source_event_id AS status_event_id"
+            ", v.updated_order AS status_order, v.source_event_id AS status_event_id"
             if has_versions
             else ", 0 AS status_order, NULL AS status_event_id"
         )
@@ -405,21 +472,25 @@ class DebateReadDAO:
                                  WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END
         """
         items = []
-        for row in con.execute(sql, (cutoff.isoformat(), cutoff.isoformat())).fetchall():
-            items.append({
-                "id": row["id"],
-                "title": row["title"],
-                "section": row["section"] or "",
-                "priority": row["priority"] or "",
-                "status": row["status"] or "",
-                "type": row["type"] or "task",
-                "due_date": (row["due_date"] or "")[:10],
-                "project": row["project"] or "",
-                "updated_at": row["updated_at"] or "",
-                "status_order": int(row["status_order"] or 0),
-                "status_event_id": row["status_event_id"] or "",
-                "age": self._rel(row["updated_at"]),
-            })
+        for row in con.execute(
+            sql, (cutoff.isoformat(), cutoff.isoformat())
+        ).fetchall():
+            items.append(
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "section": row["section"] or "",
+                    "priority": row["priority"] or "",
+                    "status": row["status"] or "",
+                    "type": row["type"] or "task",
+                    "due_date": (row["due_date"] or "")[:10],
+                    "project": row["project"] or "",
+                    "updated_at": row["updated_at"] or "",
+                    "status_order": int(row["status_order"] or 0),
+                    "status_event_id": row["status_event_id"] or "",
+                    "age": self._rel(row["updated_at"]),
+                }
+            )
         return items, int(before)
 
     # ---- VIEW 2: recent (board.py:466-521) ----------------------------------
@@ -429,7 +500,15 @@ class DebateReadDAO:
         con = self._conn
         cutoff = self._now().timestamp() - hours * 3600
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
-        kinds = [k for k in (kinds or []) if k] or ["DECISION", "STATE", "STATUS"]
+        kinds = [k for k in (kinds or []) if k] or [
+            "DECISION",
+            "STATE",
+            "STATUS",
+            "VERIFY",
+            "CONCEDE",
+            "DISSENT",
+            "ESCALATE",
+        ]
         qm = ",".join("?" * len(kinds))
         args = list(kinds)
         role_clause = ""
@@ -441,16 +520,24 @@ class DebateReadDAO:
             "SELECT m.msg_id, m.role, m.kind, m.priority, "
             "COALESCE(m.ts, m.created_at) AS ts, m.topic_id, m.body "
             f"FROM debate_messages m WHERE m.kind IN ({qm}){role_clause} "
+            "AND " + self._visible_sql("m") + " "
             "AND COALESCE(m.ts, m.created_at) >= ? ORDER BY ts DESC LIMIT 200"
         )
         items = []
         for r in con.execute(sql, args).fetchall():
-            items.append({
-                "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
-                "priority": r["priority"] or "", "ts": r["ts"],
-                "age": self._rel(r["ts"]), "topic_id": r["topic_id"],
-                "line": one_line(r["body"]), "body": r["body"] or "",
-            })
+            items.append(
+                {
+                    "msg_id": r["msg_id"],
+                    "role": r["role"],
+                    "kind": r["kind"],
+                    "priority": r["priority"] or "",
+                    "ts": r["ts"],
+                    "age": self._rel(r["ts"]),
+                    "topic_id": r["topic_id"],
+                    "line": one_line(r["body"]),
+                    "body": r["body"] or "",
+                }
+            )
         roles = [
             r[0]
             for r in con.execute(
@@ -458,8 +545,13 @@ class DebateReadDAO:
                 "WHERE role IS NOT NULL ORDER BY role"
             ).fetchall()
         ]
-        return {"items": items, "hours": hours, "count": len(items),
-                "roles": roles, "kinds": kinds}
+        return {
+            "items": items,
+            "hours": hours,
+            "count": len(items),
+            "roles": roles,
+            "kinds": kinds,
+        }
 
     # ---- VIEW 3: topics + topic_thread (board.py:524-619) -------------------
     def topics(self):
@@ -469,43 +561,73 @@ class DebateReadDAO:
         counts = {
             r["topic_id"]: r["c"]
             for r in con.execute(
-                "SELECT topic_id, COUNT(*) c FROM debate_messages "
-                "WHERE kind != 'WATERMARK' GROUP BY topic_id"
+                "SELECT m.topic_id, COUNT(*) c FROM debate_messages m "
+                "WHERE m.kind != 'WATERMARK' AND "
+                + self._visible_sql("m")
+                + " GROUP BY m.topic_id"
             ).fetchall()
         }
         last = {
             r["topic_id"]: r["mx"]
             for r in con.execute(
-                "SELECT topic_id, MAX(COALESCE(ts,created_at)) mx "
-                "FROM debate_messages GROUP BY topic_id"
+                "SELECT m.topic_id, MAX(COALESCE(m.ts,m.created_at)) mx "
+                "FROM debate_messages m WHERE "
+                + self._visible_sql("m")
+                + " GROUP BY m.topic_id"
             ).fetchall()
         }
         out, seen = [], set()
+        protocol = {}
+        if self._caps.get("has_protocol_state"):
+            protocol = {
+                row["topic_id"]: dict(row)
+                for row in con.execute(
+                    "SELECT topic_id,protocol_version,phase,round_no,max_rounds,"
+                    "stalemate_reason FROM debate_protocol_state"
+                ).fetchall()
+            }
         if self._caps["has_debates_tbl"]:
             for r in con.execute(
                 "SELECT topic_id, title, state, created_at FROM debates"
             ).fetchall():
                 tid = r["topic_id"]
                 seen.add(tid)
-                out.append({
-                    "topic_id": tid, "title": r["title"] or tid,
-                    "state": r["state"] or "", "count": counts.get(tid, 0),
-                    "last_ts": last.get(tid), "age": self._rel(last.get(tid)),
-                })
+                item = {
+                    "topic_id": tid,
+                    "title": r["title"] or tid,
+                    "state": r["state"] or "",
+                    "count": counts.get(tid, 0),
+                    "last_ts": last.get(tid),
+                    "age": self._rel(last.get(tid)),
+                }
+                if tid in protocol:
+                    item.update(protocol[tid])
+                out.append(item)
         for tid in counts:
             if tid not in seen:
-                out.append({
-                    "topic_id": tid, "title": tid, "state": "",
-                    "count": counts.get(tid, 0), "last_ts": last.get(tid),
+                item = {
+                    "topic_id": tid,
+                    "title": tid,
+                    "state": "",
+                    "count": counts.get(tid, 0),
+                    "last_ts": last.get(tid),
                     "age": self._rel(last.get(tid)),
-                })
-        out.sort(key=lambda x: (x["last_ts"] or ""), reverse=True)
+                }
+                if tid in protocol:
+                    item.update(protocol[tid])
+                out.append(item)
+        out.sort(key=lambda x: x["last_ts"] or "", reverse=True)
         return {"topics": out, "count": len(out)}
 
     def topic_thread(self, topic_id):
         if not topic_id or not self._caps["has_debate"]:
-            return {"topic_id": topic_id, "title": topic_id, "state": "",
-                    "count": 0, "messages": []}
+            return {
+                "topic_id": topic_id,
+                "title": topic_id,
+                "state": "",
+                "count": 0,
+                "messages": [],
+            }
         con = self._conn
         title, state = topic_id, ""
         if self._caps["has_debates_tbl"]:
@@ -515,19 +637,65 @@ class DebateReadDAO:
             if row:
                 title = row["title"] or topic_id
                 state = row["state"] or ""
+        protocol_columns = ""
+        if {
+            "protocol_version",
+            "round_no",
+            "body_mode",
+            "payload_json",
+        } <= self._caps.get("debate_messages", set()):
+            protocol_columns = (
+                ", m.protocol_version, m.round_no, m.body_mode, m.payload_json"
+            )
         rows = con.execute(
-            "SELECT msg_id, role, kind, priority, COALESCE(ts, created_at) AS ts, "
-            "reply_to, body FROM debate_messages WHERE topic_id=? AND kind != 'WATERMARK' "
-            "ORDER BY COALESCE(ts, created_at) ASC",
+            "SELECT m.msg_id, m.role, m.kind, m.priority, COALESCE(m.ts, m.created_at) AS ts, "
+            "m.reply_to, m.body"
+            + protocol_columns
+            + " FROM debate_messages m WHERE m.topic_id=? AND m.kind != 'WATERMARK' AND "
+            + self._visible_sql("m")
+            + " ORDER BY COALESCE(m.ts, m.created_at) ASC",
             (topic_id,),
         ).fetchall()
-        msgs = [{
-            "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
-            "priority": r["priority"] or "", "ts": r["ts"], "age": self._rel(r["ts"]),
-            "reply_to": r["reply_to"], "line": one_line(r["body"]), "body": r["body"] or "",
-        } for r in rows]
-        return {"topic_id": topic_id, "title": title, "state": state,
-                "count": len(msgs), "messages": msgs}
+        msgs = []
+        for r in rows:
+            item = {
+                "msg_id": r["msg_id"],
+                "role": r["role"],
+                "kind": r["kind"],
+                "priority": r["priority"] or "",
+                "ts": r["ts"],
+                "age": self._rel(r["ts"]),
+                "reply_to": r["reply_to"],
+                "line": one_line(r["body"]),
+                "body": r["body"] or "",
+            }
+            if protocol_columns:
+                item.update(
+                    {
+                        "protocol_version": r["protocol_version"],
+                        "round_no": r["round_no"],
+                        "body_mode": r["body_mode"],
+                        "payload_json": r["payload_json"],
+                    }
+                )
+            msgs.append(item)
+        result = {
+            "topic_id": topic_id,
+            "title": title,
+            "state": state,
+            "count": len(msgs),
+            "messages": msgs,
+        }
+        if self._caps.get("has_protocol_state"):
+            protocol = con.execute(
+                "SELECT protocol_version,phase,round_no,max_rounds,"
+                "blind_barrier_state,stalemate_reason,phase_deadline_at "
+                "FROM debate_protocol_state WHERE topic_id=?",
+                (topic_id,),
+            ).fetchone()
+            if protocol:
+                result["protocol_state"] = dict(protocol)
+        return result
 
     # ---- grouped per-source BM25 search (board.py:622-748; M4 verbatim) ------
     def _debate_index(self):
@@ -543,7 +711,8 @@ class DebateReadDAO:
         rows = self._conn.execute(
             "SELECT msg_id, COALESCE(topic_id,''), COALESCE(role,''), "
             "COALESCE(kind,''), COALESCE(ts, created_at, ''), "
-            "COALESCE(priority,''), COALESCE(body,'') FROM debate_messages"
+            "COALESCE(priority,''), COALESCE(body,'') FROM debate_messages m WHERE "
+            + self._visible_sql("m")
         ).fetchall()
         mem.executemany(
             "INSERT INTO d(msg_id,topic_id,role,kind,ts,priority,body) VALUES(?,?,?,?,?,?,?)",
@@ -584,12 +753,19 @@ class DebateReadDAO:
                     except sqlite3.OperationalError:
                         hits = []
             for r in hits:
-                result["debate"].append({
-                    "msg_id": r["msg_id"], "role": r["role"], "kind": r["kind"],
-                    "topic_id": r["topic_id"], "ts": r["ts"], "age": self._rel(r["ts"]),
-                    "snippet": r["snip"] or one_line(r["body"]), "body": r["body"] or "",
-                    "score": round(r["score"], 3),
-                })
+                result["debate"].append(
+                    {
+                        "msg_id": r["msg_id"],
+                        "role": r["role"],
+                        "kind": r["kind"],
+                        "topic_id": r["topic_id"],
+                        "ts": r["ts"],
+                        "age": self._rel(r["ts"]),
+                        "snippet": r["snip"] or one_line(r["body"]),
+                        "body": r["body"] or "",
+                        "score": round(r["score"], 3),
+                    }
+                )
         if self._caps["has_tasks_fts"]:
             result["tasks"] = self._fts_tasks(query, limit)
         if self._caps["has_memory_fts"]:
@@ -604,8 +780,7 @@ class DebateReadDAO:
             <= self._caps["task_field_versions"]
         )
         version_select = (
-            "v.updated_order AS status_order, "
-            "v.source_event_id AS status_event_id,"
+            "v.updated_order AS status_order, v.source_event_id AS status_event_id,"
             if has_versions
             else "0 AS status_order, NULL AS status_event_id,"
         )
@@ -637,14 +812,21 @@ class DebateReadDAO:
             except sqlite3.OperationalError:
                 rows = []
             if rows:
-                return [{
-                    "id": r["id"], "title": r["title"], "type": r["type"],
-                    "section": r["section"], "status": r["status"],
-                    "project": r["project"], "snippet": r["snip"],
-                    "status_order": int(r["status_order"] or 0),
-                    "status_event_id": r["status_event_id"] or "",
-                    "score": round(r["score"], 3),
-                } for r in rows]
+                return [
+                    {
+                        "id": r["id"],
+                        "title": r["title"],
+                        "type": r["type"],
+                        "section": r["section"],
+                        "status": r["status"],
+                        "project": r["project"],
+                        "snippet": r["snip"],
+                        "status_order": int(r["status_order"] or 0),
+                        "status_event_id": r["status_event_id"] or "",
+                        "score": round(r["score"], 3),
+                    }
+                    for r in rows
+                ]
         return []
 
     def _fts_memory(self, query, limit):
@@ -666,9 +848,15 @@ class DebateReadDAO:
             except sqlite3.OperationalError:
                 rows = []
             if rows:
-                return [{
-                    "id": r["eid"], "name": r["name"], "type": r["etype"] or "",
-                    "project": r["project"] or "", "snippet": r["snip"],
-                    "score": round(r["score"], 3),
-                } for r in rows]
+                return [
+                    {
+                        "id": r["eid"],
+                        "name": r["name"],
+                        "type": r["etype"] or "",
+                        "project": r["project"] or "",
+                        "snippet": r["snip"],
+                        "score": round(r["score"], 3),
+                    }
+                    for r in rows
+                ]
         return []

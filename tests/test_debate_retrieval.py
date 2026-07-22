@@ -152,7 +152,9 @@ def test_snippets_are_capped_by_utf8_bytes(retrieval_db):
     try:
         body = "начало " + ("многобайтов текст " * 100) + " край"
         con.execute(
-            "INSERT INTO debate_messages VALUES "
+            "INSERT INTO debate_messages "
+            "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,created_at) "
+            "VALUES "
             "('a00000000013','RETRIEVAL1','EXECUTOR','2026-07-19T08:13:00Z',"
             "'H','STATUS',NULL,'analysis',NULL,?,'2026-07-19T08:13:00Z')",
             (body,),
@@ -170,28 +172,39 @@ def test_fts_triggers_track_insert_update_and_delete(retrieval_db):
     db_path, _spec = retrieval_db
     con = sqlite3.connect(db_path)
     try:
-        assert con.execute(
-            "SELECT count(*) FROM debate_messages_fts WHERE msg_id='a00000000001'"
-        ).fetchone()[0] == 1
+        assert (
+            con.execute(
+                "SELECT count(*) FROM debate_messages_fts WHERE msg_id='a00000000001'"
+            ).fetchone()[0]
+            == 1
+        )
         con.execute(
             "UPDATE debate_messages SET body='changed exact token' "
             "WHERE msg_id='a00000000001'"
         )
         con.commit()
-        assert con.execute(
-            "SELECT count(*) FROM debate_messages_fts "
-            "WHERE debate_messages_fts MATCH 'changed' AND msg_id='a00000000001'"
-        ).fetchone()[0] == 1
+        assert (
+            con.execute(
+                "SELECT count(*) FROM debate_messages_fts "
+                "WHERE debate_messages_fts MATCH 'changed' AND msg_id='a00000000001'"
+            ).fetchone()[0]
+            == 1
+        )
         con.execute("DELETE FROM debate_messages WHERE msg_id='a00000000001'")
         con.commit()
-        assert con.execute(
-            "SELECT count(*) FROM debate_messages_fts WHERE msg_id='a00000000001'"
-        ).fetchone()[0] == 0
+        assert (
+            con.execute(
+                "SELECT count(*) FROM debate_messages_fts WHERE msg_id='a00000000001'"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         con.close()
 
 
-def test_search_runs_on_read_only_query_only_connection_with_bounded_runtime(retrieval_db):
+def test_search_runs_on_read_only_query_only_connection_with_bounded_runtime(
+    retrieval_db,
+):
     db_path, spec = retrieval_db
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
@@ -368,8 +381,16 @@ def test_public_deadline_interruption_propagates(retrieval_db):
 
 
 def test_retrieval_module_has_no_llm_in_loop():
-    source = (Path(__file__).parent.parent / "debate_retrieval.py").read_text(
-        encoding="utf-8"
-    ).casefold()
-    forbidden = ("openai", "anthropic", "litellm", "chat.completions", "responses.create")
+    source = (
+        (Path(__file__).parent.parent / "debate_retrieval.py")
+        .read_text(encoding="utf-8")
+        .casefold()
+    )
+    forbidden = (
+        "openai",
+        "anthropic",
+        "litellm",
+        "chat.completions",
+        "responses.create",
+    )
     assert not any(token in source for token in forbidden)

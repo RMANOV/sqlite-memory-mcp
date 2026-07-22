@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
+from debate_protocol_v1 import visible_message_ids
+
 
 RRF_K = 60
 MAX_QUERY_TOKENS = 16
@@ -76,9 +78,7 @@ def _fts_query(tokens: Sequence[str]) -> str:
 
 
 def _fts_and_query(tokens: Sequence[str]) -> str:
-    return " AND ".join(
-        f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
-    )
+    return " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
 
 
 def _is_missing_fts_error(exc: sqlite3.Error) -> bool:
@@ -98,9 +98,7 @@ def _where_in(column: str, values: Sequence[str]) -> tuple[str, list[str]]:
 def _row_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     recipients = str(item.pop("recipients", "") or "")
-    item["recipients"] = sorted(
-        value for value in recipients.split(",") if value
-    )
+    item["recipients"] = sorted(value for value in recipients.split(",") if value)
     return item
 
 
@@ -283,9 +281,7 @@ def _structural_candidates(
     return [by_id[msg_id] for msg_id in ids if msg_id in by_id]
 
 
-def _literal_score(
-    item: dict[str, Any], query: str, tokens: Sequence[str]
-) -> float:
+def _literal_score(item: dict[str, Any], query: str, tokens: Sequence[str]) -> float:
     if not query and not tokens:
         return 1.0
     # This is deliberately independent from the FTS index.  Exact ids,
@@ -313,7 +309,9 @@ def _literal_score(
         (str(item.get("topic_id") or ""), 16.0),
     )
     score += sum(weight for value, weight in exact_fields if phrase == value.casefold())
-    if phrase and phrase in {str(value).casefold() for value in item.get("recipients") or []}:
+    if phrase and phrase in {
+        str(value).casefold() for value in item.get("recipients") or []
+    }:
         score += 20.0
     if phrase and phrase in folded:
         score += 8.0
@@ -442,6 +440,40 @@ def _search_debate_context_impl(
     effective_snippet = max(120, min(int(snippet_bytes or 120), 1200))
     clean_topics = _dedupe(topic_ids)
     clean_candidates = _dedupe(candidate_msg_ids)
+    # During the blind-commit window all retrieval projections must share the
+    # same visibility barrier as debate_read/signal/tray.  Materialize an
+    # allow-list only while an unreleased commit exists; normal retrieval keeps
+    # its indexed, unbounded-by-SQL-variable fast path.
+    if clean_topics:
+        hidden_exists = conn.execute(
+            "SELECT 1 FROM debate_blind_commits "
+            f"WHERE released_at IS NULL AND topic_id IN ({','.join('?' for _ in clean_topics)}) "
+            "LIMIT 1",
+            clean_topics,
+        ).fetchone()
+        if hidden_exists is not None:
+            visible = set(
+                visible_message_ids(
+                    conn,
+                    topic_ids=clean_topics,
+                    viewer_role=target_role,
+                    control_plane=False,
+                )
+            )
+            if clean_candidates:
+                clean_candidates = [mid for mid in clean_candidates if mid in visible]
+            else:
+                clean_candidates = sorted(visible)
+            if not clean_candidates:
+                return {
+                    "query": query,
+                    "topic_ids": clean_topics,
+                    "candidate_count": 0,
+                    "paths": {"fts_bm25": 0, "literal_metadata": 0},
+                    "merge": "weighted_rrf",
+                    "count": 0,
+                    "results": [],
+                }
     tokens = query_tokens(query)
 
     fts_rows = _fts_path(

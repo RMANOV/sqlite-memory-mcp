@@ -248,7 +248,9 @@ def test_pump_reads_only_init_or_active_topics_and_stop_wait_is_interruptible(
             )
             msg_id = "a00000000001" if state == "ACTIVE" else "b00000000002"
             con.execute(
-                "INSERT INTO debate_messages VALUES (?,?, 'CONDUCTOR',"
+                "INSERT INTO debate_messages "
+                "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,created_at) "
+                "VALUES (?,?, 'CONDUCTOR',"
                 "'2026-07-19T08:01:00Z','H','Q',NULL,'analysis',NULL,?,"
                 "'2026-07-19T08:01:00Z')",
                 (msg_id, topic, topic),

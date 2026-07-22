@@ -38,6 +38,7 @@ def _default_repo() -> Path:
 REPO = Path(os.environ.get("DEBATE_REPO", str(_default_repo())))
 IS_WINDOWS = sys.platform == "win32"
 _ROLE_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
+_HUMAN_ROLES = {"HUMAN", "OPERATOR"}
 DB_PATH = Path(
     os.environ.get("SQLITE_MEMORY_DB", os.path.expanduser("~/.claude/memory/memory.db"))
 )
@@ -68,6 +69,10 @@ STOP_EVENT = threading.Event()
 CHILDREN: set[int] = set()
 LOG_MAX_BYTES = int(os.environ.get("DEBATE_PUMP_LOG_MAX_BYTES", str(20 * 1024 * 1024)))
 LOG_KEEP = max(1, int(os.environ.get("DEBATE_PUMP_LOG_KEEP", "3")))
+DEFAULT_ACTION_KINDS = (
+    "Q,A,DECISION,STATE,PING,CLAIM,CHALLENGE,EVIDENCE,REBUT,"
+    "CONCEDE,VERIFY,DISSENT,ESCALATE"
+)
 
 
 def _split_csv_values(values: list[str] | str | None) -> list[str]:
@@ -217,6 +222,19 @@ def _fetch_new(
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
+        has_blind_table = (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='debate_blind_commits'"
+            ).fetchone()
+            is not None
+        )
+        blind_sql = (
+            "AND NOT EXISTS (SELECT 1 FROM debate_blind_commits bc "
+            " WHERE bc.msg_id=m.msg_id AND bc.released_at IS NULL) "
+            if has_blind_table
+            else ""
+        )
         return con.execute(
             "SELECT DISTINCT m.msg_id, m.topic_id, m.ts "
             "FROM debate_messages m "
@@ -224,6 +242,7 @@ def _fetch_new(
             "JOIN debate_message_recipients r ON r.msg_id = m.msg_id "
             "WHERE (m.ts > ? OR (m.ts = ? AND m.msg_id > ?)) "
             "AND d.state IN ('INIT','ACTIVE') "
+            f"{blind_sql} "
             f"{topic_sql} "
             f"{kind_sql} "
             "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
@@ -274,6 +293,10 @@ def _recipient_bindings(
         recipient = str(row["recipient"] or "").strip()
         if recipient.upper() in suppressed_roles:
             continue
+        if recipient.upper() in _HUMAN_ROLES:
+            # Human work is projected into Task Tray's Waiting on Me tab;
+            # it must never consume a local LLM worker slot.
+            continue
         if row["recipient_mode"] == "normal":
             binding = con.execute(
                 "SELECT session_id FROM debate_role_bindings "
@@ -321,6 +344,8 @@ def _has_unbound_addressed_recipient(
         recipient = str(row["recipient"] or "").strip()
         if recipient.upper() in suppressed_roles:
             continue
+        if recipient.upper() in _HUMAN_ROLES:
+            continue
         if row["recipient_mode"] != "normal":
             continue  # diagnostic/direct-session is not a role-wake target
         if not _ROLE_RE.fullmatch(recipient):
@@ -355,7 +380,8 @@ def _recipient_has_terminal_reply(
         con.execute(
             "SELECT 1 FROM debate_messages "
             "WHERE topic_id = ? AND role = ? AND reply_to = ? "
-            "AND kind IN ('A','STATUS') LIMIT 1",
+            "AND kind IN ('A','STATUS','CLAIM','CHALLENGE','EVIDENCE','REBUT',"
+            "'CONCEDE','VERIFY','DISSENT','ESCALATE') LIMIT 1",
             (topic_id, role, trigger_msg_id),
         ).fetchone()
         is not None
@@ -777,6 +803,152 @@ def _current_auto_budget() -> Any | None:
     return current_debate_resource_budget()
 
 
+def _protocol_maintenance(topics: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Apply timeout and same-role recovery transitions in one DB commit."""
+    sys.path.insert(0, str(REPO))
+    from debate_protocol_v1 import sweep_missing_roles, transition_expired_protocols
+
+    con = sqlite3.connect(DB_PATH, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        timed_out = transition_expired_protocols(con)
+        recovered = sweep_missing_roles(con, topic_ids=topics)
+        con.execute("COMMIT")
+        return {"timed_out": timed_out, "role_recoveries": recovered}
+    except Exception:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def _fetch_released_blind_replay(
+    last_ts: str,
+    last_msg_id: str,
+    topics: list[str],
+    limit: int,
+) -> list[sqlite3.Row]:
+    """Recover blind CLAIMs that became visible after the main cursor passed.
+
+    The global cursor may legitimately process a later bootstrap PING while an
+    earlier independent CLAIM is hidden.  Once the second CLAIM releases the
+    barrier, this projection replays only claims at/before that cursor.  The
+    caller never moves the global cursor when processing these rows.
+    """
+    topic_sql, topic_params = _topic_clause(topics)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        exists = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='debate_blind_commits'"
+        ).fetchone()
+        if exists is None:
+            return []
+        return con.execute(
+            "SELECT DISTINCT m.msg_id,m.topic_id,m.ts "
+            "FROM debate_blind_commits bc "
+            "JOIN debate_messages m ON m.msg_id=bc.msg_id "
+            "JOIN debates d ON d.topic_id=m.topic_id "
+            "WHERE bc.released_at IS NOT NULL "
+            "AND (m.ts < ? OR (m.ts = ? AND m.msg_id <= ?)) "
+            "AND d.state IN ('INIT','ACTIVE') "
+            f"{topic_sql} "
+            "ORDER BY bc.released_at ASC,m.ts ASC,m.msg_id ASC LIMIT ?",
+            [last_ts, last_ts, last_msg_id, *topic_params, limit],
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _adaptive_scheduler_decision(
+    *,
+    queue_depth: int,
+    live_workers: int,
+    worker_capacity: int,
+    retry_attempt: int,
+    resource_blocked: bool = False,
+    resource_interval: float = 0.0,
+) -> dict[str, Any]:
+    sys.path.insert(0, str(REPO))
+    from debate_protocol_v1 import adaptive_wait_decision
+
+    return adaptive_wait_decision(
+        queue_depth=queue_depth,
+        live_workers=live_workers,
+        worker_capacity=worker_capacity,
+        retry_attempt=retry_attempt,
+        resource_blocked=resource_blocked,
+        resource_interval=resource_interval,
+        idle_sweep_seconds=WINDOWS_SWEEP_SECONDS,
+    )
+
+
+def _persist_scheduler_decision(
+    decision: dict[str, Any],
+    *,
+    queue_depth: int,
+    live_workers: int,
+    resource_tier: str,
+) -> None:
+    sys.path.insert(0, str(REPO))
+    from debate_protocol_v1 import record_scheduler_decision
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        record_scheduler_decision(
+            con,
+            interval_seconds=float(decision["interval_seconds"]),
+            reason=str(decision["reason"]),
+            queue_depth=queue_depth,
+            live_workers=live_workers,
+            resource_tier=resource_tier,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _emit_scheduler_decision(
+    decision: dict[str, Any],
+    *,
+    queue_depth: int,
+    live_workers: int,
+    resource_tier: str,
+    previous_signature: tuple[object, ...] | None,
+) -> tuple[object, ...]:
+    signature = (
+        float(decision["interval_seconds"]),
+        str(decision["reason"]),
+        int(queue_depth),
+        int(live_workers),
+        resource_tier,
+    )
+    # Queue/worker counts are part of the durable receipt, but avoid writing
+    # identical decisions on every one-second active-lease tick.
+    if signature != previous_signature:
+        _log(
+            "adaptive_scheduler",
+            interval_seconds=signature[0],
+            reason=signature[1],
+            queue_depth=signature[2],
+            live_workers=signature[3],
+            resource_tier=signature[4],
+        )
+        try:
+            _persist_scheduler_decision(
+                decision,
+                queue_depth=queue_depth,
+                live_workers=live_workers,
+                resource_tier=resource_tier,
+            )
+        except Exception as exc:
+            _log("scheduler_decision_persist_failed", error=repr(exc))
+    return signature
+
+
 def _cap_positive(base: int, cap: int) -> int:
     if cap <= 0:
         return 0
@@ -970,7 +1142,7 @@ def main() -> int:
 
     topics = _split_csv_values(args.topic)
     action_kind_values = args.action_kind or os.environ.get(
-        "DEBATE_PUMP_ACTION_KINDS", "Q,A,DECISION,STATE"
+        "DEBATE_PUMP_ACTION_KINDS", DEFAULT_ACTION_KINDS
     ).split(",")
     suppress_role_values = args.suppress_role or os.environ.get(
         "DEBATE_PUMP_SUPPRESS_ROLES", "CONDUCTOR"
@@ -1027,10 +1199,22 @@ def main() -> int:
     )
     last_claim_reclaim_at = 0.0
     last_worker_recovery_at = 0.0
+    scheduler_retry_attempt = 0
+    last_scheduler_signature: tuple[object, ...] | None = None
 
     while not STOP:
         _reap_children()
         _write_heartbeat(last_ts, last_msg_id)
+        try:
+            maintenance = _protocol_maintenance(topics)
+            if maintenance["timed_out"] or maintenance["role_recoveries"]:
+                _log("protocol_maintenance", **maintenance)
+        except (sqlite3.OperationalError, ImportError) as exc:
+            # Mixed-version upgrade window: old DB/schema keeps the legacy
+            # pump path alive until init_db applies debate/v1 tables.
+            _log("protocol_maintenance_unavailable", error=repr(exc))
+        except Exception as exc:
+            _log("protocol_maintenance_failed", error=repr(exc))
         if (
             args.message_claim_reclaim_seconds > 0
             and time.monotonic() - last_claim_reclaim_at
@@ -1054,8 +1238,14 @@ def main() -> int:
                 minimum_age_seconds=args.worker_claim_recovery_min_age_seconds,
             )
             last_worker_recovery_at = time.monotonic()
+        rows: list[sqlite3.Row] = []
+        baseline_live_workers = max(len(CHILDREN), 0)
+        throttled = False
+        dispatch_failed = False
+        scan_failed = False
+        resource_tier = ""
+        effective_max_concurrent_workers = max_concurrent_workers
         try:
-            loop_interval = max(0.2, args.interval)
             effective_action_kinds = action_kinds
             effective_limit = args.limit
             effective_max_workers_per_scan = max_workers_per_scan
@@ -1067,12 +1257,28 @@ def main() -> int:
                 _log("pump_resource_budget_failed", error=repr(exc))
                 auto_budget = None
             if auto_budget is not None:
+                resource_tier = str(auto_budget.tier)
                 _log("pump_resource_budget", **auto_budget.to_dict())
                 if not auto_budget.allow_agent:
                     _log("pump_paused_by_resource_budget", **auto_budget.to_dict())
                     if args.once:
                         break
-                    _wait_or_stop(max(loop_interval, auto_budget.interval_seconds))
+                    decision = _adaptive_scheduler_decision(
+                        queue_depth=0,
+                        live_workers=max(len(CHILDREN), baseline_live_workers),
+                        worker_capacity=0,
+                        retry_attempt=0,
+                        resource_blocked=True,
+                        resource_interval=auto_budget.interval_seconds,
+                    )
+                    last_scheduler_signature = _emit_scheduler_decision(
+                        decision,
+                        queue_depth=0,
+                        live_workers=max(len(CHILDREN), baseline_live_workers),
+                        resource_tier=resource_tier,
+                        previous_signature=last_scheduler_signature,
+                    )
+                    _wait_or_stop(float(decision["interval_seconds"]))
                     continue
                 effective_action_kinds = [
                     kind
@@ -1102,26 +1308,54 @@ def main() -> int:
                         max(0, auto_budget.wake_budget),
                     )
                 )
-                loop_interval = max(loop_interval, auto_budget.interval_seconds)
                 if not effective_action_kinds or effective_limit <= 0:
                     _log(
                         "pump_paused_by_empty_resource_budget", **auto_budget.to_dict()
                     )
                     if args.once:
                         break
-                    _wait_or_stop(loop_interval)
+                    decision = _adaptive_scheduler_decision(
+                        queue_depth=0,
+                        live_workers=max(len(CHILDREN), baseline_live_workers),
+                        worker_capacity=0,
+                        retry_attempt=0,
+                        resource_blocked=True,
+                        resource_interval=auto_budget.interval_seconds,
+                    )
+                    last_scheduler_signature = _emit_scheduler_decision(
+                        decision,
+                        queue_depth=0,
+                        live_workers=max(len(CHILDREN), baseline_live_workers),
+                        resource_tier=resource_tier,
+                        previous_signature=last_scheduler_signature,
+                    )
+                    _wait_or_stop(float(decision["interval_seconds"]))
                     continue
 
-            rows = _fetch_new(
+            regular_rows = _fetch_new(
                 last_ts,
                 last_msg_id,
                 topics,
                 effective_action_kinds,
                 effective_limit,
             )
+            replay_rows = _fetch_released_blind_replay(
+                last_ts,
+                last_msg_id,
+                topics,
+                effective_limit,
+            )
+            seen_ids: set[str] = set()
+            rows = []
+            for source_rows, replay in ((replay_rows, True), (regular_rows, False)):
+                for source_row in source_rows:
+                    msg_id = str(source_row["msg_id"])
+                    if msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+                    rows.append({**dict(source_row), "_blind_replay": replay})
             dispatched_rows = 0
             launched_this_scan = 0
-            throttled = False
             partial_pending = False
             # Baseline machine-wide live worker count (Windows: reconciles a
             # restarted pump's empty CHILDREN with workers that outlived the
@@ -1136,9 +1370,10 @@ def main() -> int:
                 msg_id = row["msg_id"]
                 # Terminal → advance the cursor past it and keep scanning.
                 if _trigger_is_terminal(msg_id, suppressed_roles):
-                    last_ts = row["ts"]
-                    last_msg_id = msg_id
-                    _save_state(last_ts, last_msg_id)
+                    if not row.get("_blind_replay"):
+                        last_ts = row["ts"]
+                        last_msg_id = msg_id
+                        _save_state(last_ts, last_msg_id)
                     continue
                 # Not terminal. Does it need a NEW worker spawn, or is one
                 # already in-flight? demand counts only recipients with a
@@ -1187,6 +1422,7 @@ def main() -> int:
                     launched_this_scan += _dispatch_row(row, suppressed_roles)
                     dispatched_rows += 1
                 except Exception as exc:
+                    dispatch_failed = True
                     _log("dispatch_failed", msg_id=msg_id, error=repr(exc))
                     break
                 # Just dispatched → in-flight, not terminal → hold the cursor
@@ -1217,10 +1453,29 @@ def main() -> int:
                     last_msg_id=last_msg_id,
                 )
         except Exception as exc:
+            scan_failed = True
             _log("scan_failed", error=repr(exc))
         if args.once:
             break
-        _wait_or_stop(loop_interval)
+        if scan_failed or dispatch_failed or throttled:
+            scheduler_retry_attempt = min(scheduler_retry_attempt + 1, 5)
+        else:
+            scheduler_retry_attempt = 0
+        live_workers = max(len(CHILDREN), baseline_live_workers)
+        decision = _adaptive_scheduler_decision(
+            queue_depth=len(rows),
+            live_workers=live_workers,
+            worker_capacity=effective_max_concurrent_workers,
+            retry_attempt=scheduler_retry_attempt,
+        )
+        last_scheduler_signature = _emit_scheduler_decision(
+            decision,
+            queue_depth=len(rows),
+            live_workers=live_workers,
+            resource_tier=resource_tier,
+            previous_signature=last_scheduler_signature,
+        )
+        _wait_or_stop(float(decision["interval_seconds"]))
 
     _reap_children()
     _log("pump_stop", pid=os.getpid(), last_ts=last_ts, last_msg_id=last_msg_id)

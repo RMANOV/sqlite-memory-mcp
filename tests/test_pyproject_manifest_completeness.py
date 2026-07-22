@@ -76,10 +76,20 @@ def _toplevel_subpackages() -> set[str]:
     a dot.
     """
     cache_or_build = {
-        "__pycache__", "build", "dist", "tests",
-        ".git", ".pytest_cache", ".ruff_cache", ".venv", "venv",
-        "node_modules", ".mypy_cache", ".tox",
-        "press-releases", "docs",  # not Python packages
+        "__pycache__",
+        "build",
+        "dist",
+        "tests",
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".mypy_cache",
+        ".tox",
+        "press-releases",
+        "docs",  # not Python packages
     }
     out: set[str] = set()
     for entry in os.listdir(REPO_ROOT):
@@ -303,12 +313,13 @@ def test_stdio_mcp_entrypoint_starts_without_module_errors(tmp_path, entrypoint)
     ``ModuleNotFoundError`` or any other unhandled Python exception
     when invoked from an arbitrary cwd.
 
-    Per msg:db0b9001: it is a stdio MCP server, so it blocks waiting
-    for protocol messages on stdin and never exits cleanly. The
-    correct probe is: run with a small timeout, then assert the
-    captured stderr does NOT contain ``Traceback`` /
-    ``ModuleNotFoundError``. SIGTERM exit code (124 under coreutils
-    ``timeout``) is the expected outcome.
+    Per msg:db0b9001: it is a stdio MCP server, so it may block waiting
+    for protocol messages on stdin.  The probe is implemented with
+    ``subprocess.Popen`` rather than a platform shell's ``timeout``
+    command: on Windows ``timeout.exe`` is an interactive delay utility,
+    not GNU coreutils, and rejects the executable argument before the
+    MCP server is started.  A bounded Python-side wait keeps this gate
+    portable while preserving the real foreign-cwd entrypoint path.
     """
     # Locate the installed entry-point binary. ``shutil.which`` falls
     # back to ~/.local/bin in user-site installs.
@@ -322,28 +333,41 @@ def test_stdio_mcp_entrypoint_starts_without_module_errors(tmp_path, entrypoint)
             "cover the underlying contract anyway."
         )
 
-    result = subprocess.run(
-        ["timeout", "3", binary],
+    process = subprocess.Popen(
+        [binary],
         cwd=str(tmp_path),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=10,
         # Close stdin immediately so MCP server's stdio transport can
         # detect EOF rather than blocking forever.
         stdin=subprocess.DEVNULL,
     )
-    # Exit code 124 = coreutils ``timeout`` killed the process (TERM).
-    # Exit code 0 = server exited cleanly after stdin EOF (acceptable).
-    # Any OTHER non-zero exit means the server crashed during boot.
-    assert result.returncode in (0, 124, 143, -15), (
-        f"{entrypoint} exited with unexpected code "
-        f"{result.returncode}. stderr:\n{result.stderr}\n"
-        f"stdout:\n{result.stdout}"
-    )
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=3)
+
+    # EOF-aware servers normally exit 0.  A server that deliberately keeps
+    # serving is terminated by this test and is also acceptable; only a
+    # spontaneous non-zero exit represents a boot failure.
+    if not timed_out:
+        assert process.returncode == 0, (
+            f"{entrypoint} exited with unexpected code "
+            f"{process.returncode}. stderr:\n{stderr}\n"
+            f"stdout:\n{stdout}"
+        )
     # The critical assertion: stderr must NOT show any Python import
     # failure. Allowed: FastMCP banner, transport.py info logs, the
     # ``Starting MCP server`` message.
-    combined = (result.stderr or "") + "\n" + (result.stdout or "")
+    combined = (stderr or "") + "\n" + (stdout or "")
     forbidden = ("Traceback", "ModuleNotFoundError", "ImportError")
     hits = [token for token in forbidden if token in combined]
     assert not hits, (
@@ -351,6 +375,6 @@ def test_stdio_mcp_entrypoint_starts_without_module_errors(tmp_path, entrypoint)
         f"{hits} in stderr/stdout. This means a manifest regression "
         f"— a module imported during entrypoint boot is no longer "
         f"reachable via the editable MAPPING.\n\n"
-        f"=== stderr ===\n{result.stderr}\n"
-        f"=== stdout ===\n{result.stdout}"
+        f"=== stderr ===\n{stderr}\n"
+        f"=== stdout ===\n{stdout}"
     )
