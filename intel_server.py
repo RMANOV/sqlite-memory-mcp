@@ -7,7 +7,10 @@ intelligence surface independently deployable; ``unified_server.py`` also mounts
 
 from __future__ import annotations
 
+import inspect
 import json
+from functools import wraps
+from typing import Any, Callable
 
 from fastmcp_compat import FastMCP
 
@@ -126,11 +129,60 @@ mcp = FastMCP(
 )
 
 
+def _default_tool_error(exc: Exception) -> dict[str, str]:
+    return {"error": str(exc)}
+
+
+def _db_tool(
+    *,
+    write: bool = False,
+    error_mapper: Callable[[Exception], str | dict[str, Any]] = _default_tool_error,
+    after_commit: Callable[[], None] | None = None,
+):
+    """Open one managed DB transaction and serialize one MCP tool response.
+
+    The decorated implementation receives ``conn`` as its first parameter;
+    that private parameter is removed from the public FastMCP signature.  The
+    connection factory is resolved at call time so tests and alternate runtime
+    mounts can still replace ``_get_conn`` / ``_get_conn_immediate``.
+    """
+
+    def decorate(func):
+        signature = inspect.signature(func)
+        parameters = tuple(signature.parameters.values())
+        if not parameters or parameters[0].name != "conn":
+            raise TypeError(f"{func.__name__} must declare conn as its first parameter")
+
+        @wraps(func)
+        def wrapped(*args, **kwargs) -> str:
+            try:
+                connection_factory = _get_conn_immediate if write else _get_conn
+                with connection_factory() as conn:
+                    result = func(conn, *args, **kwargs)
+                if after_commit is not None:
+                    after_commit()
+                return json.dumps(result)
+            except Exception as exc:  # noqa: BLE001 - MCP error boundary
+                logger.error("%s failed: %s", func.__name__, exc, exc_info=True)
+                mapped = error_mapper(exc)
+                return mapped if isinstance(mapped, str) else json.dumps(mapped)
+
+        wrapped.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=parameters[1:],
+            return_annotation=str,
+        )
+        return wrapped
+
+    return decorate
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 1: assess_context
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def assess_context(
+    conn,
     chunk_ref: str,
     session_id: str | None = None,
     force: bool = False,
@@ -146,23 +198,18 @@ def assess_context(
         session_id: Optional session context
         force: If True, bypass skip logic and frozen state
     """
-    try:
-        with _get_conn() as conn:
-            result = _assess_context(conn, chunk_ref, session_id, force)
-            logger.info(
-                "assess_context: chunk=%s, state=%s", chunk_ref, result.get("state")
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("assess_context failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _assess_context(conn, chunk_ref, session_id, force)
+    logger.info("assess_context: chunk=%s, state=%s", chunk_ref, result.get("state"))
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 2: queue_clarification
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def queue_clarification(
+    conn,
     chunk_ref: str,
     max_questions: int = 5,
 ) -> str:
@@ -175,25 +222,22 @@ def queue_clarification(
         chunk_ref: ID of the context chunk
         max_questions: Maximum number of questions to generate (1-5)
     """
-    try:
-        with _get_conn() as conn:
-            result = _queue_clarification(conn, chunk_ref, max_questions)
-            logger.info(
-                "queue_clarification: chunk=%s, questions=%d",
-                chunk_ref,
-                len(result.get("questions", [])),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("queue_clarification failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _queue_clarification(conn, chunk_ref, max_questions)
+    logger.info(
+        "queue_clarification: chunk=%s, questions=%d",
+        chunk_ref,
+        len(result.get("questions", [])),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 3: record_human_answer
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def record_human_answer(
+    conn,
     chunk_ref: str,
     answer_text: str,
     question_id: str | None = None,
@@ -208,25 +252,22 @@ def record_human_answer(
         answer_text: Human's answer text
         question_id: Optional specific question to answer (answers all if omitted)
     """
-    try:
-        with _get_conn() as conn:
-            result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
-            logger.info(
-                "record_human_answer: chunk=%s, state=%s",
-                chunk_ref,
-                result.get("state"),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("record_human_answer failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _record_human_answer(conn, chunk_ref, answer_text, question_id)
+    logger.info(
+        "record_human_answer: chunk=%s, state=%s",
+        chunk_ref,
+        result.get("state"),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 4: extract_candidate_claims
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def extract_candidate_claims(
+    conn,
     chunk_ref: str,
     scope_hint: str | None = None,
 ) -> str:
@@ -240,25 +281,22 @@ def extract_candidate_claims(
         chunk_ref: ID of the context chunk to extract from
         scope_hint: Optional scope override (memory|bridge|mapping|validation|export)
     """
-    try:
-        with _get_conn() as conn:
-            result = _extract_claims(conn, chunk_ref, scope_hint)
-            logger.info(
-                "extract_candidate_claims: chunk=%s, claims=%d",
-                chunk_ref,
-                result.get("claims_extracted", 0),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("extract_candidate_claims failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _extract_claims(conn, chunk_ref, scope_hint)
+    logger.info(
+        "extract_candidate_claims: chunk=%s, claims=%d",
+        chunk_ref,
+        result.get("claims_extracted", 0),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 5: promote_candidate
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def promote_candidate(
+    conn,
     claim_id: str,
     mode: str = "human_confirmed",
 ) -> str:
@@ -275,26 +313,23 @@ def promote_candidate(
         claim_id: ID of the candidate claim
         mode: Promotion mode (human_confirmed|multi_evidence|imported)
     """
-    try:
-        with _get_conn() as conn:
-            result = _promote_candidate(conn, claim_id, mode)
-            logger.info(
-                "promote_candidate: claim=%s, mode=%s, status=%s",
-                claim_id,
-                mode,
-                result.get("status"),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("promote_candidate failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _promote_candidate(conn, claim_id, mode)
+    logger.info(
+        "promote_candidate: claim=%s, mode=%s, status=%s",
+        claim_id,
+        mode,
+        result.get("status"),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 6: build_context_pack
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def build_context_pack(
+    conn,
     pack_type: str = "executor",
     target_ref: str | None = None,
     session_id: str | None = None,
@@ -318,25 +353,22 @@ def build_context_pack(
         session_id: Optional session context
         token_budget: Token limit (default from config, typically 4000)
     """
-    try:
-        with _get_conn() as conn:
-            result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
-            logger.info(
-                "build_context_pack: type=%s, tokens=%d",
-                pack_type,
-                result.get("token_usage", 0),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("build_context_pack failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _build_pack(conn, pack_type, target_ref, session_id, token_budget)
+    logger.info(
+        "build_context_pack: type=%s, tokens=%d",
+        pack_type,
+        result.get("token_usage", 0),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 7: explain_impact
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def explain_impact(
+    conn,
     source_kind: str = "chunk",
     source_ref: str = "",
     depth: str = "standard",
@@ -352,87 +384,78 @@ def explain_impact(
         source_ref: ID of the source entity
         depth: Traversal depth (quick=1, standard=3, deep=5)
     """
-    try:
-        with _get_conn() as conn:
-            result = _explain_impact(conn, source_kind, source_ref, depth)
-            logger.info(
-                "explain_impact: %s=%s, depth=%s, impacts=%d",
-                source_kind,
-                source_ref,
-                depth,
-                result.get("total_impacts", 0),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("explain_impact failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _explain_impact(conn, source_kind, source_ref, depth)
+    logger.info(
+        "explain_impact: %s=%s, depth=%s, impacts=%d",
+        source_kind,
+        source_ref,
+        depth,
+        result.get("total_impacts", 0),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 8: audit_memory
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def audit_memory(
+    conn,
     repair: bool = True,
     stale_sync_minutes: int = 120,
 ) -> str:
     """Run the persistent self-repair audit loop over facts, packs, provenance, and sync drift."""
-    try:
-        with _get_conn() as conn:
-            result = _run_memory_audit(
-                conn,
-                repair=repair,
-                stale_sync_minutes=stale_sync_minutes,
-            )
-            logger.info(
-                "audit_memory: open=%d resolved=%d repair=%s",
-                result.get("open_issue_count", 0),
-                result.get("resolved_issue_count", 0),
-                repair,
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("audit_memory failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _run_memory_audit(
+        conn,
+        repair=repair,
+        stale_sync_minutes=stale_sync_minutes,
+    )
+    logger.info(
+        "audit_memory: open=%d resolved=%d repair=%s",
+        result.get("open_issue_count", 0),
+        result.get("resolved_issue_count", 0),
+        repair,
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 9: replay_memory
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def replay_memory(
+    conn,
     aggregate_kind: str = "",
     aggregate_id: str = "",
     limit: int = 100,
     since_ts: str = "",
 ) -> str:
     """Replay append-only memory events for a task/fact/chunk or for the whole ledger."""
-    try:
-        with _get_conn() as conn:
-            result = _replay_memory_events(
-                conn,
-                aggregate_kind=aggregate_kind or None,
-                aggregate_id=aggregate_id or None,
-                limit=limit,
-                since_ts=since_ts or None,
-            )
-            logger.info(
-                "replay_memory: aggregate=%s:%s count=%d",
-                aggregate_kind or "*",
-                aggregate_id or "*",
-                result.get("count", 0),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("replay_memory failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _replay_memory_events(
+        conn,
+        aggregate_kind=aggregate_kind or None,
+        aggregate_id=aggregate_id or None,
+        limit=limit,
+        since_ts=since_ts or None,
+    )
+    logger.info(
+        "replay_memory: aggregate=%s:%s count=%d",
+        aggregate_kind or "*",
+        aggregate_id or "*",
+        result.get("count", 0),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 10: govern_fact
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def govern_fact(
+    conn,
     fact_id: str,
     action: str,
     target_fact_id: str = "",
@@ -440,53 +463,45 @@ def govern_fact(
     effective_at: str = "",
 ) -> str:
     """Apply truth-maintenance to a fact: supersede, contradict, invalidate, or revalidate."""
-    try:
-        with _get_conn() as conn:
-            result = _govern_fact(
-                conn,
-                fact_id,
-                action,
-                target_fact_id=target_fact_id or None,
-                rationale=rationale or None,
-                effective_at=effective_at or None,
-            )
-            logger.info(
-                "govern_fact: fact=%s action=%s changed=%s",
-                fact_id,
-                action,
-                result.get("changed"),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("govern_fact failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _govern_fact(
+        conn,
+        fact_id,
+        action,
+        target_fact_id=target_fact_id or None,
+        rationale=rationale or None,
+        effective_at=effective_at or None,
+    )
+    logger.info(
+        "govern_fact: fact=%s action=%s changed=%s",
+        fact_id,
+        action,
+        result.get("changed"),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 11: list_memory_issues
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
-def list_memory_issues(status: str = "open", limit: int = 100) -> str:
+@_db_tool()
+def list_memory_issues(conn, status: str = "open", limit: int = 100) -> str:
     """List persisted memory audit issues after the latest audit run."""
-    try:
-        with _get_conn() as conn:
-            result = _list_memory_audit_issues(conn, status=status, limit=limit)
-            logger.info(
-                "list_memory_issues: status=%s count=%d",
-                status,
-                result.get("count", 0),
-            )
-            return json.dumps(result)
-    except Exception as exc:
-        logger.error("list_memory_issues failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    result = _list_memory_audit_issues(conn, status=status, limit=limit)
+    logger.info(
+        "list_memory_issues: status=%s count=%d",
+        status,
+        result.get("count", 0),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 12: enrich_context
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
-def enrich_context(depth: str = "quick") -> str:
+@_db_tool()
+def enrich_context(conn, depth: str = "quick") -> str:
     """Compatibility wrapper: enriches context at different depth levels.
 
     Depth levels:
@@ -497,88 +512,83 @@ def enrich_context(depth: str = "quick") -> str:
     Args:
         depth: Enrichment depth (quick|standard|deep)
     """
-    try:
-        config = _load_intel_config()
-        if not config["enabled"]:
-            return json.dumps(
-                {"status": "disabled", "message": "Intelligence v2 is disabled"}
-            )
+    config = _load_intel_config()
+    if not config["enabled"]:
+        return {"status": "disabled", "message": "Intelligence v2 is disabled"}
 
-        results: dict = {"depth": depth, "steps": []}
+    results: dict = {"depth": depth, "steps": []}
 
-        with _get_conn() as conn:
-            # Step 1: Assess all enrichable chunks
-            enrichable = conn.execute(
-                "SELECT chunk_id FROM context_chunks WHERE state = 'enrichable' LIMIT 20"
-            ).fetchall()
-            assessed = []
-            for row in enrichable:
-                r = _assess_context(conn, row["chunk_id"])
-                assessed.append(r.get("chunk_id", "?"))
-            results["steps"].append({"assess": len(assessed)})
+    # Step 1: Assess all enrichable chunks
+    enrichable = conn.execute(
+        "SELECT chunk_id FROM context_chunks WHERE state = 'enrichable' LIMIT 20"
+    ).fetchall()
+    assessed = []
+    for row in enrichable:
+        r = _assess_context(conn, row["chunk_id"])
+        assessed.append(r.get("chunk_id", "?"))
+    results["steps"].append({"assess": len(assessed)})
 
-            # Step 2: Build executor pack
-            pack = _build_pack(conn, "executor")
-            results["steps"].append(
+    # Step 2: Build executor pack
+    pack = _build_pack(conn, "executor")
+    results["steps"].append(
+        {
+            "pack": pack.get("pack_id"),
+            "tokens": pack.get("token_usage", 0),
+            "relevance": pack.get("relevance_score", 0.0),
+            "quality": pack.get("quality_score", 0.0),
+        }
+    )
+    results["pack_body"] = pack.get("body", "")
+    task_pack_stats = _warm_task_packs(conn, pack_type="executor", limit=8)
+    results["steps"].append(task_pack_stats)
+
+    if depth in ("standard", "deep"):
+        # Step 3: Extract claims from enrichable chunks
+        claims_total = 0
+        all_claims: list = []
+        for row in enrichable:
+            cr = _extract_claims(conn, row["chunk_id"])
+            claims_total += cr.get("claims_extracted", 0)
+            all_claims.extend(cr.get("claims", []))
+        results["steps"].append({"claims_extracted": claims_total})
+
+        # Step 3b: Auto-promote high-confidence claims
+        promoted = _auto_promote_layer1(conn, all_claims)
+        results["steps"].append({"claims_promoted": len(promoted)})
+        if promoted:
+            results["promoted_facts"] = [
                 {
-                    "pack": pack.get("pack_id"),
-                    "tokens": pack.get("token_usage", 0),
-                    "relevance": pack.get("relevance_score", 0.0),
-                    "quality": pack.get("quality_score", 0.0),
+                    "subject": p["subject"],
+                    "predicate": p["predicate"],
+                    "object": p["object"],
+                    "fact_id": p["fact_id"],
                 }
-            )
-            results["pack_body"] = pack.get("body", "")
-            task_pack_stats = _warm_task_packs(conn, pack_type="executor", limit=8)
-            results["steps"].append(task_pack_stats)
+                for p in promoted
+            ]
 
-            if depth in ("standard", "deep"):
-                # Step 3: Extract claims from enrichable chunks
-                claims_total = 0
-                all_claims: list = []
-                for row in enrichable:
-                    cr = _extract_claims(conn, row["chunk_id"])
-                    claims_total += cr.get("claims_extracted", 0)
-                    all_claims.extend(cr.get("claims", []))
-                results["steps"].append({"claims_extracted": claims_total})
+    if depth == "deep":
+        # Step 4: Explain impact for recent facts
+        recent = conn.execute(
+            "SELECT fact_id FROM canonical_facts "
+            "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
+        ).fetchall()
+        impacts = []
+        for fact in recent:
+            impact = _explain_impact(conn, "fact", fact["fact_id"])
+            impacts.append(impact.get("total_impacts", 0))
+        results["steps"].append({"impacts_analyzed": len(impacts)})
 
-                # Step 3b: Auto-promote high-confidence claims
-                promoted = _auto_promote_layer1(conn, all_claims)
-                results["steps"].append({"claims_promoted": len(promoted)})
-                if promoted:
-                    results["promoted_facts"] = [
-                        {
-                            "subject": p["subject"],
-                            "predicate": p["predicate"],
-                            "object": p["object"],
-                            "fact_id": p["fact_id"],
-                        }
-                        for p in promoted
-                    ]
-
-            if depth == "deep":
-                # Step 4: Explain impact for recent facts
-                recent = conn.execute(
-                    "SELECT fact_id FROM canonical_facts "
-                    "WHERE updated_at >= datetime('now', '-7 days') LIMIT 10"
-                ).fetchall()
-                impacts = []
-                for f in recent:
-                    imp = _explain_impact(conn, "fact", f["fact_id"])
-                    impacts.append(imp.get("total_impacts", 0))
-                results["steps"].append({"impacts_analyzed": len(impacts)})
-
-        logger.info("enrich_context: depth=%s, steps=%d", depth, len(results["steps"]))
-        return json.dumps(results)
-    except Exception as exc:
-        logger.error("enrich_context failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    logger.info("enrich_context: depth=%s, steps=%d", depth, len(results["steps"]))
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tool 13: reflect_audit (Phase 0.5 — read-only consolidation candidate audit)
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
+@_db_tool()
 def reflect_audit(
+    conn,
     project: str = "",
     stale_days: int = 60,
     abandoned_inbox_days: int = 30,
@@ -605,26 +615,21 @@ def reflect_audit(
         limit_per_category: cap candidates per category (default 20)
         format: "json" (default) or "markdown" (adds rendered report)
     """
-    try:
-        with _get_conn() as conn:
-            report = _audit_reflection_candidates(
-                conn,
-                project=project or None,
-                stale_days=stale_days,
-                abandoned_inbox_days=abandoned_inbox_days,
-                limit_per_category=limit_per_category,
-            )
-            logger.info(
-                "reflect_audit: total=%d project=%s",
-                report["summary"]["total_candidates"],
-                project or "*",
-            )
-            if format == "markdown":
-                report["markdown"] = _format_audit_markdown(report)
-            return json.dumps(report)
-    except Exception as exc:
-        logger.error("reflect_audit failed: %s", exc, exc_info=True)
-        return json.dumps({"error": str(exc)})
+    report = _audit_reflection_candidates(
+        conn,
+        project=project or None,
+        stale_days=stale_days,
+        abandoned_inbox_days=abandoned_inbox_days,
+        limit_per_category=limit_per_category,
+    )
+    logger.info(
+        "reflect_audit: total=%d project=%s",
+        report["summary"]["total_candidates"],
+        project or "*",
+    )
+    if format == "markdown":
+        report["markdown"] = _format_audit_markdown(report)
+    return report
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -649,6 +654,30 @@ def _reflect_error_response(exc: Exception, *, error_type: str | None = None) ->
             {"error": str(exc), "error_type": error_type or "internal_error"}
         )
     return json.dumps({"error": str(exc), "error_type": "internal_error"})
+
+
+def _reflect_transition_error_response(exc: Exception) -> str:
+    if isinstance(exc, _ReflectionStateError):
+        return json.dumps({"error": str(exc), "error_type": "invalid_state_transition"})
+    return _reflect_error_response(exc)
+
+
+def _reflect_run_error_response(exc: Exception) -> str:
+    if isinstance(exc, _ReflectionStateError):
+        message = str(exc)
+        error_type = (
+            "not_found"
+            if message.startswith("run_not_found")
+            else "invalid_state_transition"
+        )
+        return json.dumps({"error": message, "error_type": error_type})
+    return _reflect_error_response(exc)
+
+
+def _reflect_argument_error_response(exc: Exception) -> str:
+    if isinstance(exc, _ReflectionStateError):
+        return json.dumps({"error": str(exc), "error_type": "invalid_argument"})
+    return _reflect_error_response(exc)
 
 
 # Tool 14: reflect_start
@@ -808,140 +837,98 @@ def reflect_start(
 
 # Tool 15: reflect_status
 @mcp.tool()
-def reflect_status(run_id: str) -> str:
+@_db_tool(error_mapper=_reflect_error_response)
+def reflect_status(conn, run_id: str) -> str:
     """Return run state, inputs, and decision counts for a given run_id."""
-    try:
-        with _get_conn() as conn:
-            row = _dao_get_run(conn, run_id)
-            if row is None:
-                return json.dumps(
-                    {"error": f"run_not_found: {run_id}", "error_type": "not_found"}
-                )
-            inputs = _dao_list_inputs(conn, run_id)
-            counts = _dao_candidate_decision_counts(conn, run_id)
-            return json.dumps(
-                {"run": row, "inputs": inputs, "candidate_counts": counts}
-            )
-    except Exception as exc:
-        logger.error("reflect_status failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    row = _dao_get_run(conn, run_id)
+    if row is None:
+        return {"error": f"run_not_found: {run_id}", "error_type": "not_found"}
+    inputs = _dao_list_inputs(conn, run_id)
+    counts = _dao_candidate_decision_counts(conn, run_id)
+    return {"run": row, "inputs": inputs, "candidate_counts": counts}
 
 
 # Tool 16: reflect_history
 @mcp.tool()
+@_db_tool(error_mapper=_reflect_error_response)
 def reflect_history(
+    conn,
     limit: int = 20,
     offset: int = 0,
     include_archived: bool = False,
     status_filter: str = "",
 ) -> str:
     """Paginated newest-first list of reflection runs (Dreams list parity)."""
-    try:
-        with _get_conn() as conn:
-            rows, total = _dao_list_runs(
-                conn,
-                limit=limit,
-                offset=offset,
-                include_archived=include_archived,
-                status_filter=status_filter or None,
-            )
-            return json.dumps(
-                {
-                    "runs": rows,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset,
-                    "include_archived": include_archived,
-                    "status_filter": status_filter or None,
-                }
-            )
-    except _ReflectionStateError as exc:
-        return _reflect_error_response(exc)
-    except Exception as exc:
-        logger.error("reflect_history failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    rows, total = _dao_list_runs(
+        conn,
+        limit=limit,
+        offset=offset,
+        include_archived=include_archived,
+        status_filter=status_filter or None,
+    )
+    return {
+        "runs": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "include_archived": include_archived,
+        "status_filter": status_filter or None,
+    }
 
 
 # Tool 17: reflect_cancel
 @mcp.tool()
-def reflect_cancel(run_id: str) -> str:
+@_db_tool(error_mapper=_reflect_transition_error_response)
+def reflect_cancel(conn, run_id: str) -> str:
     """Cancel a pending or running run. Rejects terminal states."""
-    try:
-        with _get_conn() as conn:
-            _dao_cancel_run(conn, run_id)
-            row = _dao_get_run(conn, run_id)
-            return json.dumps(
-                {"run_id": run_id, "status": row["status"] if row else None}
-            )
-    except _ReflectionStateError as exc:
-        logger.info("reflect_cancel rejected: %s", exc)
-        return json.dumps({"error": str(exc), "error_type": "invalid_state_transition"})
-    except Exception as exc:
-        logger.error("reflect_cancel failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    _dao_cancel_run(conn, run_id)
+    row = _dao_get_run(conn, run_id)
+    return {"run_id": run_id, "status": row["status"] if row else None}
 
 
 # Tool 18: reflect_archive
 @mcp.tool()
-def reflect_archive(run_id: str) -> str:
+@_db_tool(error_mapper=_reflect_transition_error_response)
+def reflect_archive(conn, run_id: str) -> str:
     """Archive a terminal run. Rejects pending/running. Idempotent."""
-    try:
-        with _get_conn() as conn:
-            changed = _dao_archive_run(conn, run_id)
-            row = _dao_get_run(conn, run_id)
-            return json.dumps(
-                {
-                    "run_id": run_id,
-                    "archived_at": row["archived_at"] if row else None,
-                    "newly_archived": changed,
-                }
-            )
-    except _ReflectionStateError as exc:
-        logger.info("reflect_archive rejected: %s", exc)
-        return json.dumps({"error": str(exc), "error_type": "invalid_state_transition"})
-    except Exception as exc:
-        logger.error("reflect_archive failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    changed = _dao_archive_run(conn, run_id)
+    row = _dao_get_run(conn, run_id)
+    return {
+        "run_id": run_id,
+        "archived_at": row["archived_at"] if row else None,
+        "newly_archived": changed,
+    }
 
 
 # Tool 19: reflect_decide
 @mcp.tool()
+@_db_tool(error_mapper=_reflect_error_response)
 def reflect_decide(
+    conn,
     candidate_id: str,
     decision: str,
     decided_by: str = "user",
 ) -> str:
     """Record human accept/reject/defer decision on a candidate."""
     if decision not in _VALID_DECISIONS:
-        return json.dumps(
-            {
-                "error": (
-                    f"unknown decision: {decision}; expected one of "
-                    f"{','.join(_VALID_DECISIONS)}"
-                ),
-                "error_type": "invalid_argument",
-            }
-        )
-    try:
-        with _get_conn() as conn:
-            ok = _dao_decide_candidate(conn, candidate_id, decision, decided_by)
-            if not ok:
-                return json.dumps(
-                    {
-                        "error": f"candidate_not_found: {candidate_id}",
-                        "error_type": "not_found",
-                    }
-                )
-            return json.dumps(
-                {
-                    "candidate_id": candidate_id,
-                    "decision": decision,
-                    "decided_by": decided_by,
-                }
-            )
-    except Exception as exc:
-        logger.error("reflect_decide failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+        return {
+            "error": (
+                f"unknown decision: {decision}; expected one of "
+                f"{','.join(_VALID_DECISIONS)}"
+            ),
+            "error_type": "invalid_argument",
+        }
+    ok = _dao_decide_candidate(conn, candidate_id, decision, decided_by)
+    if not ok:
+        return {
+            "error": f"candidate_not_found: {candidate_id}",
+            "error_type": "not_found",
+        }
+    return {
+        "candidate_id": candidate_id,
+        "decision": decision,
+        "decided_by": decided_by,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -951,7 +938,9 @@ def reflect_decide(
 
 # Tool 20: reflect_apply
 @mcp.tool()
+@_db_tool(error_mapper=_reflect_run_error_response)
 def reflect_apply(
+    conn,
     run_id: str,
     candidate_ids_csv: str = "",
     applied_by: str = "user",
@@ -970,36 +959,25 @@ def reflect_apply(
             ids to apply. Empty string = apply all accepted.
         applied_by: actor recorded on each snapshot row.
     """
-    try:
-        ids: list[str] | None = None
-        if candidate_ids_csv:
-            ids = [s.strip() for s in candidate_ids_csv.split(",") if s.strip()]
-        with _get_conn() as conn:
-            summary = _apply_run(conn, run_id, candidate_ids=ids, applied_by=applied_by)
-            logger.info(
-                "reflect_apply: run=%s applied=%d skipped=%d failed=%d",
-                run_id,
-                summary["applied"],
-                len(summary["skipped"]),
-                len(summary["failed"]),
-            )
-            return json.dumps(summary)
-    except _ReflectionStateError as exc:
-        msg = str(exc)
-        et = (
-            "not_found"
-            if msg.startswith("run_not_found")
-            else "invalid_state_transition"
-        )
-        return json.dumps({"error": msg, "error_type": et})
-    except Exception as exc:
-        logger.error("reflect_apply failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    ids: list[str] | None = None
+    if candidate_ids_csv:
+        ids = [item.strip() for item in candidate_ids_csv.split(",") if item.strip()]
+    summary = _apply_run(conn, run_id, candidate_ids=ids, applied_by=applied_by)
+    logger.info(
+        "reflect_apply: run=%s applied=%d skipped=%d failed=%d",
+        run_id,
+        summary["applied"],
+        len(summary["skipped"]),
+        len(summary["failed"]),
+    )
+    return summary
 
 
 # Tool 21: reflect_review
 @mcp.tool()
+@_db_tool(error_mapper=_reflect_argument_error_response)
 def reflect_review(
+    conn,
     run_id: str,
     decision_filter: str = "",
     candidate_type_filter: str = "",
@@ -1016,63 +994,42 @@ def reflect_review(
         limit: max rows (clamped to 1000).
         offset: pagination cursor.
     """
-    try:
-        with _get_conn() as conn:
-            rows, total = _dao_list_candidates(
-                conn,
-                run_id,
-                decision_filter=decision_filter or None,
-                candidate_type_filter=candidate_type_filter or None,
-                limit=limit,
-                offset=offset,
-            )
-            apply_snaps, _ = _dao_list_apply_snapshots(conn, run_id=run_id, limit=1000)
-            applied_ids = {s["candidate_id"] for s in apply_snaps}
-            for r in rows:
-                r["already_applied"] = r["candidate_id"] in applied_ids
-            return json.dumps(
-                {
-                    "candidates": rows,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset,
-                    "decision_filter": decision_filter or None,
-                    "candidate_type_filter": candidate_type_filter or None,
-                }
-            )
-    except _ReflectionStateError as exc:
-        return json.dumps({"error": str(exc), "error_type": "invalid_argument"})
-    except Exception as exc:
-        logger.error("reflect_review failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    rows, total = _dao_list_candidates(
+        conn,
+        run_id,
+        decision_filter=decision_filter or None,
+        candidate_type_filter=candidate_type_filter or None,
+        limit=limit,
+        offset=offset,
+    )
+    apply_snaps, _ = _dao_list_apply_snapshots(conn, run_id=run_id, limit=1000)
+    applied_ids = {snapshot["candidate_id"] for snapshot in apply_snaps}
+    for row in rows:
+        row["already_applied"] = row["candidate_id"] in applied_ids
+    return {
+        "candidates": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "decision_filter": decision_filter or None,
+        "candidate_type_filter": candidate_type_filter or None,
+    }
 
 
 # Tool 22: reflect_discard
 @mcp.tool()
-def reflect_discard(run_id: str) -> str:
+@_db_tool(error_mapper=_reflect_run_error_response)
+def reflect_discard(conn, run_id: str) -> str:
     """Hard-delete a terminal run; cascades to inputs/candidates/snapshots.
 
     Rejects pending/running with invalid_state_transition (cancel first).
     Returns rows_deleted (0 if not found, 1 on success). FK CASCADE
     handles cleanup of dependent rows in a single transaction.
     """
-    try:
-        with _get_conn() as conn:
-            # db_utils configures foreign_keys before opening the transaction;
-            # changing this PRAGMA after BEGIN would be a documented no-op.
-            rows_deleted = _dao_discard_run(conn, run_id)
-            return json.dumps({"run_id": run_id, "rows_deleted": rows_deleted})
-    except _ReflectionStateError as exc:
-        msg = str(exc)
-        et = (
-            "not_found"
-            if msg.startswith("run_not_found")
-            else "invalid_state_transition"
-        )
-        return json.dumps({"error": msg, "error_type": et})
-    except Exception as exc:
-        logger.error("reflect_discard failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    # db_utils configures foreign_keys before opening the transaction;
+    # changing this PRAGMA after BEGIN would be a documented no-op.
+    rows_deleted = _dao_discard_run(conn, run_id)
+    return {"run_id": run_id, "rows_deleted": rows_deleted}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1080,8 +1037,15 @@ def reflect_discard(run_id: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _filesystem_error_response(exc: Exception) -> str:
+    if isinstance(exc, OSError):
+        return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
+    return _reflect_error_response(exc)
+
+
 @mcp.tool()
-def export_to_gbrain(output_dir: str, project: str = "") -> str:
+@_db_tool(error_mapper=_filesystem_error_response)
+def export_to_gbrain(conn, output_dir: str, project: str = "") -> str:
     """Export entities/observations/relations to GBrain-compatible Markdown.
 
     Writes one .md file per entity under output_dir/{people,companies,topics}/
@@ -1097,27 +1061,19 @@ def export_to_gbrain(output_dir: str, project: str = "") -> str:
     Returns counters: entities_written, relations_written, observations_written,
     files_written. Deterministic; idempotent overwrite of any existing files.
     """
-    try:
-        with _get_conn() as conn:
-            counts = _export_to_gbrain(
-                conn,
-                output_dir,
-                project_filter=project or None,
-            )
-            logger.info(
-                "export_to_gbrain: dir=%s entities=%d files=%d project=%s",
-                output_dir,
-                counts["entities_written"],
-                counts["files_written"],
-                project or "*",
-            )
-            return json.dumps({"output_dir": output_dir, **counts})
-    except OSError as exc:
-        logger.error("export_to_gbrain filesystem error: %s", exc)
-        return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
-    except Exception as exc:
-        logger.error("export_to_gbrain failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    counts = _export_to_gbrain(
+        conn,
+        output_dir,
+        project_filter=project or None,
+    )
+    logger.info(
+        "export_to_gbrain: dir=%s entities=%d files=%d project=%s",
+        output_dir,
+        counts["entities_written"],
+        counts["files_written"],
+        project or "*",
+    )
+    return {"output_dir": output_dir, **counts}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1126,7 +1082,9 @@ def export_to_gbrain(output_dir: str, project: str = "") -> str:
 
 
 @mcp.tool()
+@_db_tool(error_mapper=_filesystem_error_response)
 def import_from_gbrain(
+    conn,
     input_dir: str,
     project_default: str = "",
     skip_if_exists: bool = True,
@@ -1153,27 +1111,19 @@ def import_from_gbrain(
     observations_inserted, relations_inserted, relations_skipped,
     files_parsed, files_skipped.
     """
-    try:
-        with _get_conn() as conn:
-            counts = _import_from_gbrain(
-                conn,
-                input_dir,
-                project_default=project_default or None,
-                skip_if_exists=skip_if_exists,
-            )
-            logger.info(
-                "import_from_gbrain: dir=%s entities_created=%d files_parsed=%d",
-                input_dir,
-                counts["entities_created"],
-                counts["files_parsed"],
-            )
-            return json.dumps({"input_dir": input_dir, **counts})
-    except OSError as exc:
-        logger.error("import_from_gbrain filesystem error: %s", exc)
-        return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
-    except Exception as exc:
-        logger.error("import_from_gbrain failed: %s", exc, exc_info=True)
-        return _reflect_error_response(exc)
+    counts = _import_from_gbrain(
+        conn,
+        input_dir,
+        project_default=project_default or None,
+        skip_if_exists=skip_if_exists,
+    )
+    logger.info(
+        "import_from_gbrain: dir=%s entities_created=%d files_parsed=%d",
+        input_dir,
+        counts["entities_created"],
+        counts["files_parsed"],
+    )
+    return {"input_dir": input_dir, **counts}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1342,7 +1292,13 @@ def _signal_wake_after_commit() -> None:
 
 # Tool 26: debate_post
 @mcp.tool()
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
 def debate_post(
+    conn,
     topic_id: str,
     role: str,
     priority: str,
@@ -1373,37 +1329,28 @@ def debate_post(
             of dispatching a no-edit wake-worker (routed to a
             conductor-approved impl vehicle out-of-band).
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_post_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                priority=priority,
-                kind=kind,
-                body=body,
-                reply_to=reply_to or None,
-                standing=standing,
-                vehicle=vehicle or None,
-                protocol_version=protocol_version or None,
-                body_mode=body_mode or None,
-                payload_json=payload_json or None,
-                author_session_id=author_session_id or None,
-            )
-        # Transaction committed on context exit; only now hint the pump.
-        _signal_wake_after_commit()
-        return json.dumps(out)
-    except _DebateError as exc:
-        logger.info("debate_post rejected: %s", exc)
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_post failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_post_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        priority=priority,
+        kind=kind,
+        body=body,
+        reply_to=reply_to or None,
+        standing=standing,
+        vehicle=vehicle or None,
+        protocol_version=protocol_version or None,
+        body_mode=body_mode or None,
+        payload_json=payload_json or None,
+        author_session_id=author_session_id or None,
+    )
 
 
 # Tool 27: debate_read
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_read(
+    conn,
     topic_id: str,
     role: str,
     since_msg_id: str = "",
@@ -1427,41 +1374,38 @@ def debate_read(
     Default limit=200, cap=1000. Returns truncated + next cursors when
     more messages remain.
     """
-    try:
-        kind_filter = (
-            [k.strip() for k in kind_filter_csv.split(",") if k.strip()]
-            if kind_filter_csv
-            else None
-        )
-        priority_filter = (
-            [p.strip() for p in priority_filter_csv.split(",") if p.strip()]
-            if priority_filter_csv
-            else None
-        )
-        with _get_conn() as conn:
-            out = _debate_read_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                since_msg_id=since_msg_id or None,
-                since_ts=since_ts or None,
-                since_latest_compaction=since_latest_compaction,
-                kind_filter=kind_filter,
-                priority_filter=priority_filter,
-                limit=limit,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_read failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    kind_filter = (
+        [kind.strip() for kind in kind_filter_csv.split(",") if kind.strip()]
+        if kind_filter_csv
+        else None
+    )
+    priority_filter = (
+        [
+            priority.strip()
+            for priority in priority_filter_csv.split(",")
+            if priority.strip()
+        ]
+        if priority_filter_csv
+        else None
+    )
+    return _debate_read_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        since_msg_id=since_msg_id or None,
+        since_ts=since_ts or None,
+        since_latest_compaction=since_latest_compaction,
+        kind_filter=kind_filter,
+        priority_filter=priority_filter,
+        limit=limit,
+    )
 
 
 # Tool 27b: debate_search (B5 — read-only LIKE-over-body, Option A)
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_search(
-    topic_id: str, query: str, limit: int = 50, viewer_role: str = ""
+    conn, topic_id: str, query: str, limit: int = 50, viewer_role: str = ""
 ) -> str:
     """Search a debate topic's messages by substring of ``body``.
 
@@ -1482,66 +1426,57 @@ def debate_search(
     Returns:
         JSON dict ``{"topic_id", "query", "count", "limit", "messages"}``.
     """
-    try:
-        # Clamp limit defensively to 1..500 (treat <=0 / non-int as 1).
-        if not isinstance(limit, int) or limit < 1:
-            effective_limit = 1
-        else:
-            effective_limit = min(limit, 500)
+    # Clamp limit defensively to 1..500 (treat <=0 / non-int as 1).
+    if not isinstance(limit, int) or limit < 1:
+        effective_limit = 1
+    else:
+        effective_limit = min(limit, 500)
 
-        # Escape LIKE wildcards so the query is matched literally. Order
-        # matters: escape the escape char FIRST, then the wildcards.
-        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        pattern = f"%{escaped}%"
+    # Escape LIKE wildcards so the query is matched literally. Order
+    # matters: escape the escape char FIRST, then the wildcards.
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
 
-        _debate_validate_topic_id(topic_id)
-        with _get_conn() as conn:
-            if _debate_get_debate(conn, topic_id) is None:
-                raise _DebateError(f"unknown_topic: {topic_id}")
-            visibility, visibility_params = _debate_visibility_sql(
-                alias="m", viewer_role=viewer_role, control_plane=False
-            )
-            rows = conn.execute(
-                "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
-                "m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
-                "m.body_mode, m.payload_json, m.created_at FROM debate_messages m "
-                "WHERE m.topic_id = ? AND "
-                + visibility
-                + " AND m.body LIKE ? ESCAPE '\\' "
-                "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
-                (topic_id, *visibility_params, pattern, effective_limit),
-            ).fetchall()
-            messages = []
-            for row in rows:
-                item = dict(row)
-                if item.get("protocol_version") is None:
-                    for key in (
-                        "protocol_version",
-                        "round_no",
-                        "body_mode",
-                        "payload_json",
-                    ):
-                        item.pop(key, None)
-                messages.append(item)
-            return json.dumps(
-                {
-                    "topic_id": topic_id,
-                    "query": query,
-                    "count": len(messages),
-                    "limit": effective_limit,
-                    "messages": messages,
-                }
-            )
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_search failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    _debate_validate_topic_id(topic_id)
+    if _debate_get_debate(conn, topic_id) is None:
+        raise _DebateError(f"unknown_topic: {topic_id}")
+    visibility, visibility_params = _debate_visibility_sql(
+        alias="m", viewer_role=viewer_role, control_plane=False
+    )
+    rows = conn.execute(
+        "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
+        "m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
+        "m.body_mode, m.payload_json, m.created_at FROM debate_messages m "
+        "WHERE m.topic_id = ? AND " + visibility + " AND m.body LIKE ? ESCAPE '\\' "
+        "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+        (topic_id, *visibility_params, pattern, effective_limit),
+    ).fetchall()
+    messages = []
+    for row in rows:
+        item = dict(row)
+        if item.get("protocol_version") is None:
+            for key in (
+                "protocol_version",
+                "round_no",
+                "body_mode",
+                "payload_json",
+            ):
+                item.pop(key, None)
+        messages.append(item)
+    return {
+        "topic_id": topic_id,
+        "query": query,
+        "count": len(messages),
+        "limit": effective_limit,
+        "messages": messages,
+    }
 
 
 # Tool 27c: bounded hybrid debate retrieval (FTS5 BM25 + literal/metadata)
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_context_search(
+    conn,
     topic_id: str,
     query: str,
     limit: int = 10,
@@ -1556,82 +1491,67 @@ def debate_context_search(
     active-topic, and body-length signals.  Every result contains a bounded
     snippet plus source ranks and score receipts; the full body is omitted.
     """
-    try:
-        _debate_validate_topic_id(topic_id)
-        with _get_conn() as conn:
-            # Read-only equivalent for the retrieval call.  Schema migration
-            # happens before this wrapper opens; the ranked search itself can
-            # execute no writes even if a future helper accidentally tries.
-            conn.execute("PRAGMA query_only=ON")
-            if _debate_get_debate(conn, topic_id) is None:
-                raise _DebateError(f"unknown_topic: {topic_id}")
-            out = _search_debate_context(
-                conn,
-                query=query,
-                topic_ids=[topic_id],
-                target_role=role,
-                target_session_id=session_id,
-                limit=limit,
-            )
-            out["topic_id"] = topic_id
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_context_search failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    _debate_validate_topic_id(topic_id)
+    # Read-only equivalent for the retrieval call. Schema migration happens
+    # before this wrapper opens; the ranked search itself can execute no writes.
+    conn.execute("PRAGMA query_only=ON")
+    if _debate_get_debate(conn, topic_id) is None:
+        raise _DebateError(f"unknown_topic: {topic_id}")
+    out = _search_debate_context(
+        conn,
+        query=query,
+        topic_ids=[topic_id],
+        target_role=role,
+        target_session_id=session_id,
+        limit=limit,
+    )
+    out["topic_id"] = topic_id
+    return out
 
 
 # debate/v1 §7 control-plane tools.  They expose deterministic projections;
 # they do not ask an agent to infer state from prose.
 @mcp.tool()
-def debate_protocol_state(topic_id: str) -> str:
+@_db_tool(error_mapper=_debate_error_response)
+def debate_protocol_state(conn, topic_id: str) -> str:
     """Return the debate/v1 micro-state for one topic."""
-    try:
-        _debate_validate_topic_id(topic_id)
-        with _get_conn() as conn:
-            state = _debate_protocol_state_dao(conn, topic_id)
-            if state is None:
-                raise _DebateError(
-                    f"protocol_not_configured: {topic_id}",
-                    error_type="PROTOCOL_NOT_CONFIGURED",
-                )
-            return json.dumps(state)
-    except Exception as exc:
-        return _debate_error_response(exc)
+    _debate_validate_topic_id(topic_id)
+    state = _debate_protocol_state_dao(conn, topic_id)
+    if state is None:
+        raise _DebateError(
+            f"protocol_not_configured: {topic_id}",
+            error_type="PROTOCOL_NOT_CONFIGURED",
+        )
+    return state
 
 
 @mcp.tool()
-def debate_judge_prepare(topic_id: str, left_msg_id: str, right_msg_id: str) -> str:
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_judge_prepare(
+    conn, topic_id: str, left_msg_id: str, right_msg_id: str
+) -> str:
     """Create immutable AB and BA judge projections for adjudication."""
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_judge_prepare_dao(
-                conn,
-                topic_id=topic_id,
-                left_msg_id=left_msg_id,
-                right_msg_id=right_msg_id,
-            )
-        return json.dumps(out)
-    except Exception as exc:
-        return _debate_error_response(exc)
+    return _debate_judge_prepare_dao(
+        conn,
+        topic_id=topic_id,
+        left_msg_id=left_msg_id,
+        right_msg_id=right_msg_id,
+    )
 
 
 @mcp.tool()
-def debate_judge_verdict(projection_id: str, judge_role: str, verdict_json: str) -> str:
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_judge_verdict(
+    conn, projection_id: str, judge_role: str, verdict_json: str
+) -> str:
     """Record one immutable judge verdict; AB/BA agreement stops the debate."""
-    try:
-        verdict = json.loads(verdict_json)
-        with _get_conn_immediate() as conn:
-            out = _debate_judge_verdict_dao(
-                conn,
-                projection_id=projection_id,
-                judge_role=judge_role,
-                verdict=verdict,
-            )
-        return json.dumps(out)
-    except Exception as exc:
-        return _debate_error_response(exc)
+    verdict = json.loads(verdict_json)
+    return _debate_judge_verdict_dao(
+        conn,
+        projection_id=projection_id,
+        judge_role=judge_role,
+        verdict=verdict,
+    )
 
 
 @mcp.tool()
@@ -1653,7 +1573,9 @@ def debate_protocol_maintain(topic_ids_csv: str = "") -> str:
 
 # Tool 28: debate_state
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_state(
+    conn,
     topic_id: str,
     role: str,
     new_state: str,
@@ -1663,52 +1585,40 @@ def debate_state(
     RESOLVED requires all open Qs to have a matching A reply (or A body
     starting `[DEFERRED:` to count as resolution-equivalent).
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_transition_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                new_state=new_state,
-                reason=reason or "",
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_state failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_transition_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        new_state=new_state,
+        reason=reason or "",
+    )
 
 
 # Tool 29: debate_escalate
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_escalate(
+    conn,
     topic_id: str,
     role: str,
     reason: str,
     target_role: str = "HUMAN",
 ) -> str:
     """Force-write an H-priority PING tagged for target_role (default HUMAN)."""
-    try:
-        with _get_conn() as conn:
-            out = _debate_escalate_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                reason=reason,
-                target_role=target_role,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_escalate failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_escalate_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        reason=reason,
+        target_role=target_role,
+    )
 
 
 # Tool 30: debate_compact
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_compact(
+    conn,
     topic_id: str,
     role: str,
     body: str,
@@ -1719,27 +1629,21 @@ def debate_compact(
     DECIDE / ACT sections (regex-validated pre-INSERT). since_ts and
     until_ts are optional ISO 8601 UTC bounds for the snapshotted range.
     """
-    try:
-        with _get_conn() as conn:
-            out = _debate_compact(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                body=body,
-                since_ts=since_ts or None,
-                until_ts=until_ts or None,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_compact failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_compact(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        body=body,
+        since_ts=since_ts or None,
+        until_ts=until_ts or None,
+    )
 
 
 # Tool 31: debate_advance_watermark (turn-3 helper, msg:4c8a91be)
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_advance_watermark(
+    conn,
     topic_id: str,
     role: str,
     processed_up_to_msg_id: str,
@@ -1753,25 +1657,23 @@ def debate_advance_watermark(
     Atomically updates debate_watermarks. Reduces caller error surface
     vs constructing the WATERMARK body by hand.
     """
-    try:
-        with _get_conn() as conn:
-            out = _debate_advance_watermark_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                processed_up_to_msg_id=processed_up_to_msg_id,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_advance_watermark failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_advance_watermark_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        processed_up_to_msg_id=processed_up_to_msg_id,
+    )
 
 
 # Tool 32: debate_post_with_recipients (v3.9.2 prompt-time inbox signaling)
 @mcp.tool()
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
 def debate_post_with_recipients(
+    conn,
     topic_id: str,
     role: str,
     priority: str,
@@ -1805,45 +1707,37 @@ def debate_post_with_recipients(
     order. ARCHIVED topics block all kinds (including STATE);
     RESOLVED topics block all non-STATE kinds.
     """
-    try:
-        addressed_to = [r.strip() for r in addressed_to_csv.split(",") if r.strip()]
-        diagnostic_to = [r.strip() for r in diagnostic_to_csv.split(",") if r.strip()]
-        # v3.9.3: BEGIN IMMEDIATE wrapper — write path requires
-        # serialized reads + writes against other writers (msg:34adcb3e
-        # amendment 1A). Race-safety contract is wrapper-scoped.
-        with _get_conn_immediate() as conn:
-            out = _debate_post_with_recipients_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                priority=priority,
-                kind=kind,
-                body=body,
-                addressed_to=addressed_to,
-                diagnostic_to=diagnostic_to,
-                conductor_override_msg_id=conductor_override_msg_id or None,
-                reply_to=reply_to or None,
-                standing=standing,
-                vehicle=vehicle or None,
-                protocol_version=protocol_version or None,
-                body_mode=body_mode or None,
-                payload_json=payload_json or None,
-                author_session_id=author_session_id or None,
-            )
-        # Transaction committed on context exit; only now hint the pump.
-        _signal_wake_after_commit()
-        return json.dumps(out)
-    except _DebateError as exc:
-        logger.info("debate_post_with_recipients rejected: %s", exc)
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_post_with_recipients failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    addressed_to = [
+        item.strip() for item in addressed_to_csv.split(",") if item.strip()
+    ]
+    diagnostic_to = [
+        item.strip() for item in diagnostic_to_csv.split(",") if item.strip()
+    ]
+    return _debate_post_with_recipients_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        priority=priority,
+        kind=kind,
+        body=body,
+        addressed_to=addressed_to,
+        diagnostic_to=diagnostic_to,
+        conductor_override_msg_id=conductor_override_msg_id or None,
+        reply_to=reply_to or None,
+        standing=standing,
+        vehicle=vehicle or None,
+        protocol_version=protocol_version or None,
+        body_mode=body_mode or None,
+        payload_json=payload_json or None,
+        author_session_id=author_session_id or None,
+    )
 
 
 # Tool 33: debate_signal_check (v3.9.2 prompt-time inbox poll)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_signal_check(
+    conn,
     session_id: str,
     role: str,
     topic_id: str,
@@ -1861,31 +1755,22 @@ def debate_signal_check(
     truncated bool + next_cursor for pagination, max_priority for
     short-circuit logic, plus topic_state.
     """
-    try:
-        # v3.11: non-standing DECISION delivery performs atomic one-shot
-        # claim writes, so signal_check now needs BEGIN IMMEDIATE.
-        with _get_conn_immediate() as conn:
-            out = _debate_signal_check_dao(
-                conn,
-                session_id=session_id,
-                role=role,
-                topic_id=topic_id,
-                since_msg_id=since_msg_id or None,
-                since_ts=since_ts or None,
-                limit=limit,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        logger.info("debate_signal_check rejected: %s", exc)
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_signal_check failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_signal_check_dao(
+        conn,
+        session_id=session_id,
+        role=role,
+        topic_id=topic_id,
+        since_msg_id=since_msg_id or None,
+        since_ts=since_ts or None,
+        limit=limit,
+    )
 
 
 # Tool 34: debate_signal_advance (v3.9.2 cursor advance with recipient guard)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_signal_advance(
+    conn,
     session_id: str,
     role: str,
     topic_id: str,
@@ -1901,44 +1786,28 @@ def debate_signal_advance(
     Atomic upsert into debate_signal_state writes BOTH cursor columns
     plus last_check_at.
     """
-    try:
-        # v3.9.3: BEGIN IMMEDIATE wrapper — advance has the same
-        # read-then-write race as post_with_recipients
-        # (msg:34adcb3e amendment 1A).
-        with _get_conn_immediate() as conn:
-            out = _debate_signal_advance_dao(
-                conn,
-                session_id=session_id,
-                role=role,
-                topic_id=topic_id,
-                last_processed_msg_id=last_processed_msg_id,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        logger.info("debate_signal_advance rejected: %s", exc)
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_signal_advance failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_signal_advance_dao(
+        conn,
+        session_id=session_id,
+        role=role,
+        topic_id=topic_id,
+        last_processed_msg_id=last_processed_msg_id,
+    )
 
 
 # Tool 35: debate_binding_list (v3.10 role/session lifecycle)
 @mcp.tool()
-def debate_binding_list(topic_id: str) -> str:
+@_db_tool(error_mapper=_debate_error_response)
+def debate_binding_list(conn, topic_id: str) -> str:
     """List role/session bindings and cursor state for a debate topic."""
-    try:
-        with _get_conn() as conn:
-            return json.dumps(_debate_list_role_bindings_dao(conn, topic_id=topic_id))
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_binding_list failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_list_role_bindings_dao(conn, topic_id=topic_id)
 
 
 # Tool 36: debate_bind_role (v3.10 role/session lifecycle)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_bind_role(
+    conn,
     topic_id: str,
     role: str,
     session_id: str,
@@ -1956,32 +1825,26 @@ def debate_bind_role(
     DECISION msg_id. Duplicate active primary owners are rejected unless
     replace_active is explicitly set for an atomic swap.
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_bind_role_session_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                session_id=session_id,
-                runtime=runtime,
-                state=state,
-                reason=reason,
-                bound_by_role=bound_by_role or None,
-                bound_by_msg_id=bound_by_msg_id or None,
-                replace_active=replace_active,
-                conductor_override_msg_id=conductor_override_msg_id or None,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_bind_role failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_bind_role_session_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=session_id,
+        runtime=runtime,
+        state=state,
+        reason=reason,
+        bound_by_role=bound_by_role or None,
+        bound_by_msg_id=bound_by_msg_id or None,
+        replace_active=replace_active,
+        conductor_override_msg_id=conductor_override_msg_id or None,
+    )
 
 
 # Tool 36b: debate_add_role (flexible roster — add a role after debate_init)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_add_role(
+    conn,
     topic_id: str,
     role: str,
     session_id: str,
@@ -2004,31 +1867,25 @@ def debate_add_role(
     (atomic). To preserve the new owner's read cursor on an exhausted-session
     handoff, prefer ``debate_rotate_binding`` instead.
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_add_role_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                session_id=session_id,
-                runtime=runtime,
-                reason=reason or "debate_add_role flexible roster",
-                bound_by_role=bound_by_role or None,
-                bound_by_msg_id=bound_by_msg_id or None,
-                replace_active=replace_active,
-                conductor_override_msg_id=conductor_override_msg_id or None,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_add_role failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_add_role_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        session_id=session_id,
+        runtime=runtime,
+        reason=reason or "debate_add_role flexible roster",
+        bound_by_role=bound_by_role or None,
+        bound_by_msg_id=bound_by_msg_id or None,
+        replace_active=replace_active,
+        conductor_override_msg_id=conductor_override_msg_id or None,
+    )
 
 
 # Tool 37: debate_rotate_binding (v3.10 role/session lifecycle)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_rotate_binding(
+    conn,
     topic_id: str,
     role: str,
     old_session_id: str,
@@ -2043,81 +1900,63 @@ def debate_rotate_binding(
 
     cursor_mode must be head, copy, or replay. Missing/invalid mode fails.
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_rotate_role_binding_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                old_session_id=old_session_id,
-                new_session_id=new_session_id,
-                runtime=runtime,
-                cursor_mode=cursor_mode,
-                reason=reason,
-                bound_by_role=bound_by_role or None,
-                bound_by_msg_id=bound_by_msg_id or None,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_rotate_binding failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_rotate_role_binding_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        runtime=runtime,
+        cursor_mode=cursor_mode,
+        reason=reason,
+        bound_by_role=bound_by_role or None,
+        bound_by_msg_id=bound_by_msg_id or None,
+    )
 
 
 # Tool 38: debate_close_topic (v3.10 close helper)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_close_topic(
-    topic_id: str, role: str, new_state: str, reason: str = ""
+    conn, topic_id: str, role: str, new_state: str, reason: str = ""
 ) -> str:
     """Close a topic through the authoritative debate_state transition path.
 
     Binding retirement happens in the same transaction as RESOLVED/ARCHIVED.
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_transition_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                new_state=new_state,
-                reason=reason or "",
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_close_topic failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_transition_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        new_state=new_state,
+        reason=reason or "",
+    )
 
 
 # Tool 39: debate_wake_dry_run (v3.10 PostToolUse dry-run)
 @mcp.tool()
-def debate_wake_dry_run(tool_response_json: str, action: str = "dry_run_wake") -> str:
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_wake_dry_run(
+    conn, tool_response_json: str, action: str = "dry_run_wake"
+) -> str:
     """Resolve wake targets and audit them without waking or posting.
 
     Unknown tool_response schema fails closed and writes a schema_mismatch
     audit row. Real wake actions are intentionally out of scope.
     """
-    try:
-        tool_response = json.loads(tool_response_json) if tool_response_json else {}
-        with _get_conn_immediate() as conn:
-            out = _debate_prepare_wake_dry_run_dao(
-                conn,
-                tool_response=tool_response,
-                action=action or "dry_run_wake",
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_wake_dry_run failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    tool_response = json.loads(tool_response_json) if tool_response_json else {}
+    return _debate_prepare_wake_dry_run_dao(
+        conn,
+        tool_response=tool_response,
+        action=action or "dry_run_wake",
+    )
 
 
 # Tool 40: debate_worker_claim (v3.11 wake worker identity)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_worker_claim(
+    conn,
     topic_id: str,
     role: str,
     parent_session_id: str,
@@ -2125,71 +1964,52 @@ def debate_worker_claim(
     details_json: str = "",
 ) -> str:
     """Idempotently allocate/reuse a derived -W<n> worker for one trigger."""
-    try:
-        details = json.loads(details_json) if details_json else None
-        with _get_conn_immediate() as conn:
-            out = _debate_claim_worker_session_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                parent_session_id=parent_session_id,
-                trigger_msg_id=trigger_msg_id,
-                details=details,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_worker_claim failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    details = json.loads(details_json) if details_json else None
+    return _debate_claim_worker_session_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        parent_session_id=parent_session_id,
+        trigger_msg_id=trigger_msg_id,
+        details=details,
+    )
 
 
 # Tool 41: debate_worker_reap (v3.11 worker retention cleanup)
 @mcp.tool()
-def debate_worker_reap(topic_id: str, older_than_ts: str) -> str:
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_worker_reap(conn, topic_id: str, older_than_ts: str) -> str:
     """Retire old completed worker claims and leave audit evidence."""
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_reap_worker_claims_dao(
-                conn,
-                topic_id=topic_id,
-                older_than_ts=older_than_ts,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_worker_reap failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_reap_worker_claims_dao(
+        conn,
+        topic_id=topic_id,
+        older_than_ts=older_than_ts,
+    )
 
 
 # Tool 42: debate_message_claim_reclaim (v3.11.2 one-shot DECISION recovery)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_message_claim_reclaim(
+    conn,
     topic_id: str,
     older_than_ts: str,
     minimum_age_seconds: int = 60,
 ) -> str:
     """Reclaim stale active standing=false DECISION claims with audit rows."""
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_reclaim_message_claims_dao(
-                conn,
-                topic_id=topic_id,
-                older_than_ts=older_than_ts,
-                minimum_age_seconds=minimum_age_seconds,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_message_claim_reclaim failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_reclaim_message_claims_dao(
+        conn,
+        topic_id=topic_id,
+        older_than_ts=older_than_ts,
+        minimum_age_seconds=minimum_age_seconds,
+    )
 
 
 # Tool 43: debate_worker_no_action (v3.11.4 no-op worker completion)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_worker_no_action(
+    conn,
     topic_id: str,
     role: str,
     worker_session_id: str,
@@ -2197,27 +2017,21 @@ def debate_worker_no_action(
     reason: str = "",
 ) -> str:
     """Complete a wake worker claim without posting when no work remains."""
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_worker_no_action_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                worker_session_id=worker_session_id,
-                trigger_msg_id=trigger_msg_id,
-                reason=reason,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_worker_no_action failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_worker_no_action_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        worker_session_id=worker_session_id,
+        trigger_msg_id=trigger_msg_id,
+        reason=reason,
+    )
 
 
 # Tool 43b: reconcile workers whose launcher process exited without a receipt
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_worker_recover_stale(
+    conn,
     topic_id: str,
     older_than_ts: str,
     minimum_age_seconds: int = 120,
@@ -2229,26 +2043,20 @@ def debate_worker_recover_stale(
     list.  A matching terminal A/STATUS completes the claim; otherwise it is
     retired while the parent cursor remains unchanged.
     """
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_recover_worker_claims_dao(
-                conn,
-                topic_id=topic_id,
-                older_than_ts=older_than_ts,
-                minimum_age_seconds=minimum_age_seconds,
-                live_worker_session_ids=set(),
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_worker_recover_stale failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_recover_worker_claims_dao(
+        conn,
+        topic_id=topic_id,
+        older_than_ts=older_than_ts,
+        minimum_age_seconds=minimum_age_seconds,
+        live_worker_session_ids=set(),
+    )
 
 
 # Tool 44: debate_set_topic_priority (CONDUCTOR cross-topic scheduling)
 @mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_set_topic_priority(
+    conn,
     topic_id: str,
     role: str,
     lane: str,
@@ -2257,49 +2065,35 @@ def debate_set_topic_priority(
     blocked_by: str = "",
 ) -> str:
     """Set a CONDUCTOR-owned P0..P7 priority lane in topic metadata."""
-    try:
-        with _get_conn_immediate() as conn:
-            out = _debate_set_topic_priority_dao(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                lane=lane,
-                reason=reason,
-                next_action=next_action,
-                blocked_by=blocked_by,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_set_topic_priority failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    return _debate_set_topic_priority_dao(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        lane=lane,
+        reason=reason,
+        next_action=next_action,
+        blocked_by=blocked_by,
+    )
 
 
 # Tool 45: debate_work_queue (deterministic open-work priority view)
 @mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
 def debate_work_queue(
+    conn,
     states_csv: str = "INIT,ACTIVE",
     topics_csv: str = "",
     limit: int = 50,
 ) -> str:
     """List open debate topics in deterministic CONDUCTOR priority order."""
-    try:
-        states = [s.strip() for s in states_csv.split(",") if s.strip()]
-        topics = [t.strip() for t in topics_csv.split(",") if t.strip()]
-        with _get_conn() as conn:
-            out = _debate_list_open_work_dao(
-                conn,
-                states=states or None,
-                topics=topics or None,
-                limit=limit,
-            )
-            return json.dumps(out)
-    except _DebateError as exc:
-        return _debate_error_response(exc)
-    except Exception as exc:
-        logger.error("debate_work_queue failed: %s", exc, exc_info=True)
-        return _debate_error_response(exc)
+    states = [state.strip() for state in states_csv.split(",") if state.strip()]
+    topics = [topic.strip() for topic in topics_csv.split(",") if topic.strip()]
+    return _debate_list_open_work_dao(
+        conn,
+        states=states or None,
+        topics=topics or None,
+        limit=limit,
+    )
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
