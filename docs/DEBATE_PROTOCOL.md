@@ -1,5 +1,10 @@
 # Debate Protocol v2
 
+> The legacy ledger/lifecycle contract remains supported. New deterministic
+> debates use the versioned `debate/v1` semantic envelope and §7 server
+> invariants documented in
+> [`design/DEBATE_V1_S7_CONTRACT.md`](design/DEBATE_V1_S7_CONTRACT.md).
+
 > Productized inter-session coordination for AI agents. Single channel
 > per debate, atomic message format, role-aware watermarks, explicit
 > lifecycle state machine, escalation hooks, append-only log with

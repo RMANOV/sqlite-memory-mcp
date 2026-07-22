@@ -98,6 +98,15 @@ from debate import (
     worker_no_action as _debate_worker_no_action_dao,
 )
 from debate_retrieval import search_debate_context as _search_debate_context
+from debate_protocol_v1 import (
+    ProtocolV1Error as _ProtocolV1Error,
+    get_protocol_state as _debate_protocol_state_dao,
+    prepare_order_swap as _debate_judge_prepare_dao,
+    record_order_swap_verdict as _debate_judge_verdict_dao,
+    sweep_missing_roles as _debate_role_sweep_dao,
+    transition_expired_protocols as _debate_protocol_timeout_dao,
+    visibility_sql as _debate_visibility_sql,
+)
 from premium_runtime import (
     evaluate_debate_protocol_creation_gate,
     maybe_mount_premium_extensions,
@@ -1191,7 +1200,15 @@ def _debate_error_response(exc: Exception) -> str:
         return type stays ``str`` via ``json.dumps``.
     """
     if isinstance(exc, _DebateError):
-        return json.dumps({"error": str(exc), "error_type": exc.error_type})
+        payload = {"error": str(exc), "error_type": exc.error_type}
+        if getattr(exc, "details", None):
+            payload["details"] = exc.details
+        return json.dumps(payload)
+    if isinstance(exc, _ProtocolV1Error):
+        payload = {"error": str(exc), "error_type": exc.error_type}
+        if exc.details:
+            payload["details"] = exc.details
+        return json.dumps(payload)
     return json.dumps({"error": str(exc), "error_type": "internal_error"})
 
 
@@ -1223,6 +1240,10 @@ def debate_init(
     created_by_role: str,
     resolve_by: str = "",
     metadata_json: str = "",
+    protocol_version: str = "",
+    blind_roles_csv: str = "",
+    max_rounds: int = 3,
+    phase_timeout_seconds: int = 300,
 ) -> str:
     """Bootstrap a new debate. Idempotent on (topic_id, roles).
 
@@ -1236,11 +1257,16 @@ def debate_init(
             conductor_priority.lane or priority_lane (P0..P7) plus a priority
             reason, so human-entered topics are asked for priority or
             CONDUCTOR assesses priority before creation.
+        protocol_version: empty for legacy behavior, or ``debate/v1`` for
+            deterministic §7 server semantics.
+        blind_roles_csv: exactly two declared semantic roles when using
+            debate/v1; their first CLAIMs are mutually hidden until committed.
     """
     try:
         roles = json.loads(roles_json) if roles_json else []
         metadata = json.loads(metadata_json) if metadata_json else None
-        with _get_conn() as conn:
+        blind_roles = [r.strip() for r in blind_roles_csv.split(",") if r.strip()]
+        with _get_conn_immediate() as conn:
             if not _debate_topic_exists(conn, topic_id):
                 gate_verdict = evaluate_debate_protocol_creation_gate(
                     conn,
@@ -1268,6 +1294,10 @@ def debate_init(
                 resolve_by=resolve_by or None,
                 metadata=metadata,
                 require_priority=True,
+                protocol_version=protocol_version or None,
+                blind_roles=blind_roles if protocol_version else None,
+                max_rounds=max_rounds,
+                phase_timeout_seconds=phase_timeout_seconds,
             )
             seeded_bindings = _debate_seed_initial_role_bindings_dao(
                 conn,
@@ -1324,6 +1354,10 @@ def debate_post(
     reply_to: str = "",
     standing: bool | None = None,
     vehicle: str = "",
+    protocol_version: str = "",
+    body_mode: str = "",
+    payload_json: str = "",
+    author_session_id: str = "",
 ) -> str:
     """Append a message to a debate. Validates kind-specific semantics
     BEFORE the INSERT (atomic — failed validation leaves no row).
@@ -1332,7 +1366,8 @@ def debate_post(
         topic_id: existing debate topic.
         role: must appear in declared roles.
         priority: H | M | L | INFO.
-        kind: Q | A | STATUS | DECISION | PING | WATERMARK | STATE | COMPACTION.
+        kind: legacy kind, or CLAIM | CHALLENGE | EVIDENCE | REBUT |
+            CONCEDE | VERIFY | DISSENT | ESCALATE for debate/v1.
         body: non-empty.
         reply_to: optional msg_id in same topic.
         vehicle: optional work classification — analysis | review |
@@ -1353,6 +1388,10 @@ def debate_post(
                 reply_to=reply_to or None,
                 standing=standing,
                 vehicle=vehicle or None,
+                protocol_version=protocol_version or None,
+                body_mode=body_mode or None,
+                payload_json=payload_json or None,
+                author_session_id=author_session_id or None,
             )
         # Transaction committed on context exit; only now hint the pump.
         _signal_wake_after_commit()
@@ -1424,7 +1463,9 @@ def debate_read(
 
 # Tool 27b: debate_search (B5 — read-only LIKE-over-body, Option A)
 @mcp.tool()
-def debate_search(topic_id: str, query: str, limit: int = 50) -> str:
+def debate_search(
+    topic_id: str, query: str, limit: int = 50, viewer_role: str = ""
+) -> str:
     """Search a debate topic's messages by substring of ``body``.
 
     Read-only, parameterized ``LIKE`` over the message body, scoped to a
@@ -1460,14 +1501,31 @@ def debate_search(topic_id: str, query: str, limit: int = 50) -> str:
         with _get_conn() as conn:
             if _debate_get_debate(conn, topic_id) is None:
                 raise _DebateError(f"unknown_topic: {topic_id}")
+            visibility, visibility_params = _debate_visibility_sql(
+                alias="m", viewer_role=viewer_role, control_plane=False
+            )
             rows = conn.execute(
-                "SELECT msg_id, topic_id, role, ts, priority, kind, "
-                "reply_to, standing, body, created_at FROM debate_messages "
-                "WHERE topic_id = ? AND body LIKE ? ESCAPE '\\' "
-                "ORDER BY ts DESC, msg_id DESC LIMIT ?",
-                (topic_id, pattern, effective_limit),
+                "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
+                "m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
+                "m.body_mode, m.payload_json, m.created_at FROM debate_messages m "
+                "WHERE m.topic_id = ? AND "
+                + visibility
+                + " AND m.body LIKE ? ESCAPE '\\' "
+                "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+                (topic_id, *visibility_params, pattern, effective_limit),
             ).fetchall()
-            messages = [dict(r) for r in rows]
+            messages = []
+            for row in rows:
+                item = dict(row)
+                if item.get("protocol_version") is None:
+                    for key in (
+                        "protocol_version",
+                        "round_no",
+                        "body_mode",
+                        "payload_json",
+                    ):
+                        item.pop(key, None)
+                messages.append(item)
             return json.dumps(
                 {
                     "topic_id": topic_id,
@@ -1524,6 +1582,75 @@ def debate_context_search(
         return _debate_error_response(exc)
     except Exception as exc:
         logger.error("debate_context_search failed: %s", exc, exc_info=True)
+        return _debate_error_response(exc)
+
+
+# debate/v1 §7 control-plane tools.  They expose deterministic projections;
+# they do not ask an agent to infer state from prose.
+@mcp.tool()
+def debate_protocol_state(topic_id: str) -> str:
+    """Return the debate/v1 micro-state for one topic."""
+    try:
+        _debate_validate_topic_id(topic_id)
+        with _get_conn() as conn:
+            state = _debate_protocol_state_dao(conn, topic_id)
+            if state is None:
+                raise _DebateError(
+                    f"protocol_not_configured: {topic_id}",
+                    error_type="PROTOCOL_NOT_CONFIGURED",
+                )
+            return json.dumps(state)
+    except Exception as exc:
+        return _debate_error_response(exc)
+
+
+@mcp.tool()
+def debate_judge_prepare(topic_id: str, left_msg_id: str, right_msg_id: str) -> str:
+    """Create immutable AB and BA judge projections for adjudication."""
+    try:
+        with _get_conn_immediate() as conn:
+            out = _debate_judge_prepare_dao(
+                conn,
+                topic_id=topic_id,
+                left_msg_id=left_msg_id,
+                right_msg_id=right_msg_id,
+            )
+        return json.dumps(out)
+    except Exception as exc:
+        return _debate_error_response(exc)
+
+
+@mcp.tool()
+def debate_judge_verdict(projection_id: str, judge_role: str, verdict_json: str) -> str:
+    """Record one immutable judge verdict; AB/BA agreement stops the debate."""
+    try:
+        verdict = json.loads(verdict_json)
+        with _get_conn_immediate() as conn:
+            out = _debate_judge_verdict_dao(
+                conn,
+                projection_id=projection_id,
+                judge_role=judge_role,
+                verdict=verdict,
+            )
+        return json.dumps(out)
+    except Exception as exc:
+        return _debate_error_response(exc)
+
+
+@mcp.tool()
+def debate_protocol_maintain(topic_ids_csv: str = "") -> str:
+    """Run deterministic phase-timeout and missing-role recovery sweeps."""
+    try:
+        topic_ids = [v.strip() for v in topic_ids_csv.split(",") if v.strip()]
+        for topic_id in topic_ids:
+            _debate_validate_topic_id(topic_id)
+        with _get_conn_immediate() as conn:
+            timed_out = _debate_protocol_timeout_dao(conn)
+            recovered = _debate_role_sweep_dao(conn, topic_ids=topic_ids)
+        if recovered:
+            _signal_wake_after_commit()
+        return json.dumps({"timed_out": timed_out, "role_recoveries": recovered})
+    except Exception as exc:
         return _debate_error_response(exc)
 
 
@@ -1659,6 +1786,10 @@ def debate_post_with_recipients(
     reply_to: str = "",
     standing: bool | None = None,
     vehicle: str = "",
+    protocol_version: str = "",
+    body_mode: str = "",
+    payload_json: str = "",
+    author_session_id: str = "",
 ) -> str:
     """Post an addressed message: debate_messages + debate_message_recipients
     in a single atomic transaction.
@@ -1697,6 +1828,10 @@ def debate_post_with_recipients(
                 reply_to=reply_to or None,
                 standing=standing,
                 vehicle=vehicle or None,
+                protocol_version=protocol_version or None,
+                body_mode=body_mode or None,
+                payload_json=payload_json or None,
+                author_session_id=author_session_id or None,
             )
         # Transaction committed on context exit; only now hint the pump.
         _signal_wake_after_commit()

@@ -24,6 +24,15 @@ import sqlite3
 from typing import Any
 
 from db_utils import json_dumps, json_loads, now_iso
+from debate_protocol_v1 import (
+    PROTOCOL_VERSION as DEBATE_PROTOCOL_V1,
+    SEMANTIC_KINDS,
+    ProtocolV1Error,
+    configure_topic as _protocol_v1_configure_topic,
+    preflight_post as _protocol_v1_preflight_post,
+    record_post as _protocol_v1_record_post,
+    visibility_sql as _protocol_v1_visibility_sql,
+)
 
 
 # ── Enums + regex validators ──────────────────────────────────────────
@@ -88,9 +97,17 @@ TOPIC_PRIORITY_LANE_ORDER = {
     for idx, lane in enumerate(VALID_TOPIC_PRIORITY_LANES)
 }
 WORK_KIND_ORDER = {
+    "ESCALATE": 10,
+    "DISSENT": 9,
+    "CHALLENGE": 8,
     "PING": 7,
     "Q": 6,
     "DECISION": 5,
+    "VERIFY": 5,
+    "REBUT": 5,
+    "CONCEDE": 5,
+    "EVIDENCE": 5,
+    "CLAIM": 5,
     "STATE": 4,
     "A": 3,
     "STATUS": 2,
@@ -133,6 +150,7 @@ VALID_KINDS = (
     "WATERMARK",
     "STATE",
     "COMPACTION",
+    *SEMANTIC_KINDS,
 )
 STANDING_SIGNAL_KINDS = ("DECISION", "STATE")
 # ── Vehicle tagging (v3.12, conductor-approved solution #5) ────────────
@@ -177,9 +195,20 @@ class DebateError(ValueError):
     semantics for existing callers.
     """
 
-    def __init__(self, message: str, *, error_type: str = "debate_validation") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "debate_validation",
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.details = details or {}
+
+
+def _raise_protocol_error(exc: ProtocolV1Error) -> None:
+    raise DebateError(str(exc), error_type=exc.error_type, details=exc.details) from exc
 
 
 def validate_topic_id(topic_id: str) -> None:
@@ -295,6 +324,10 @@ def init_debate(
     resolve_by: str | None = None,
     metadata: dict[str, Any] | None = None,
     require_priority: bool = False,
+    protocol_version: str | None = None,
+    blind_roles: list[str] | None = None,
+    max_rounds: int = 3,
+    phase_timeout_seconds: int = 300,
 ) -> dict[str, Any]:
     """Bootstrap a new debate. Idempotent: returns existing row when topic_id
     exists with same roles_json.
@@ -317,6 +350,16 @@ def init_debate(
             raise DebateError(f"invalid_roles_entry: role {role} missing session_id")
     if resolve_by is not None:
         validate_iso_utc(resolve_by)
+    if protocol_version not in (None, "", DEBATE_PROTOCOL_V1):
+        raise DebateError(
+            f"invalid_protocol_version: {protocol_version!r}",
+            error_type="INVALID_PROTOCOL_VERSION",
+        )
+    if protocol_version == DEBATE_PROTOCOL_V1 and blind_roles is None:
+        raise DebateError(
+            "blind_roles required for debate/v1",
+            error_type="INVALID_PROTOCOL_CONFIG",
+        )
 
     existing = conn.execute(
         "SELECT topic_id, title, state, created_at, created_by_role, "
@@ -327,7 +370,20 @@ def init_debate(
     if existing is not None:
         same_roles = json_loads(existing["roles_json"]) == roles
         if same_roles:
-            return _row_to_debate_dict(existing)
+            out = _row_to_debate_dict(existing)
+            if protocol_version == DEBATE_PROTOCOL_V1:
+                try:
+                    out["protocol_state"] = _protocol_v1_configure_topic(
+                        conn,
+                        topic_id=topic_id,
+                        declared_roles=[str(item["role"]) for item in roles],
+                        blind_roles=blind_roles or [],
+                        max_rounds=max_rounds,
+                        phase_timeout_seconds=phase_timeout_seconds,
+                    )
+                except ProtocolV1Error as exc:
+                    _raise_protocol_error(exc)
+            return out
         raise DebateError(f"topic_exists_with_different_roles: {topic_id}")
 
     now = now_iso()
@@ -351,7 +407,7 @@ def init_debate(
             json_dumps(metadata) if metadata is not None else None,
         ),
     )
-    return {
+    out = {
         "topic_id": topic_id,
         "title": title,
         "state": "INIT",
@@ -362,6 +418,19 @@ def init_debate(
         "roles": roles,
         "metadata": metadata,
     }
+    if protocol_version == DEBATE_PROTOCOL_V1:
+        try:
+            out["protocol_state"] = _protocol_v1_configure_topic(
+                conn,
+                topic_id=topic_id,
+                declared_roles=[str(item["role"]) for item in roles],
+                blind_roles=blind_roles or [],
+                max_rounds=max_rounds,
+                phase_timeout_seconds=phase_timeout_seconds,
+            )
+        except ProtocolV1Error as exc:
+            _raise_protocol_error(exc)
+    return out
 
 
 def get_debate(conn: sqlite3.Connection, topic_id: str) -> dict[str, Any] | None:
@@ -656,7 +725,8 @@ def _terminal_reply_for_trigger(
     return conn.execute(
         "SELECT msg_id, ts FROM debate_messages "
         "WHERE topic_id = ? AND role = ? AND reply_to = ? "
-        "AND kind IN ('A', 'STATUS') "
+        "AND kind IN ('A', 'STATUS', 'CLAIM', 'CHALLENGE', 'EVIDENCE', 'REBUT', "
+        "'CONCEDE', 'VERIFY', 'DISSENT', 'ESCALATE') "
         "ORDER BY ts ASC, msg_id ASC LIMIT 1",
         (topic_id, role, trigger_msg_id),
     ).fetchone()
@@ -1576,6 +1646,11 @@ def post_message(
     reply_to: str | None = None,
     standing: bool | None = None,
     vehicle: str | None = None,
+    protocol_version: str | None = None,
+    body_mode: str | None = None,
+    payload_json: Any = None,
+    author_session_id: str | None = None,
+    recipients: list[str] | None = None,
 ) -> dict[str, Any]:
     """Append a message to a debate. Validates topic state, role membership,
     enums, and all kind-specific semantics BEFORE the INSERT (atomicity
@@ -1747,6 +1822,25 @@ def post_message(
             "OBSERVE / ORIENT / DECIDE / ACT in that order"
         )
 
+    # debate/v1 is enforced here, at the only message INSERT choke point.
+    # The preflight is read-only: any rejection therefore produces exactly
+    # zero message, recipient, protocol-state or audit rows.
+    try:
+        semantic = _protocol_v1_preflight_post(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            kind=kind,
+            reply_to=reply_to,
+            payload=payload_json,
+            body_mode=body_mode,
+            protocol_version=protocol_version,
+            author_session_id=author_session_id,
+            recipients=recipients or (),
+        )
+    except ProtocolV1Error as exc:
+        _raise_protocol_error(exc)
+
     msg_id = new_msg_id()
     while conn.execute(
         "SELECT 1 FROM debate_messages WHERE msg_id = ? LIMIT 1", (msg_id,)
@@ -1759,8 +1853,9 @@ def post_message(
 
     conn.execute(
         "INSERT INTO debate_messages (msg_id, topic_id, role, ts, priority, "
-        "kind, standing, vehicle, reply_to, body, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "kind, standing, vehicle, reply_to, body, protocol_version, round_no, "
+        "body_mode, payload_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             msg_id,
             topic_id,
@@ -1772,9 +1867,24 @@ def post_message(
             vehicle_db,
             reply_to,
             body,
+            semantic["protocol_version"] if semantic else None,
+            semantic["round_no"] if semantic else None,
+            semantic["body_mode"] if semantic else None,
+            semantic["payload_json"] if semantic else None,
             ts,
         ),
     )
+    try:
+        protocol_state = _protocol_v1_record_post(
+            conn,
+            topic_id=topic_id,
+            role=role,
+            kind=kind,
+            msg_id=msg_id,
+            semantic=semantic,
+        )
+    except ProtocolV1Error as exc:
+        _raise_protocol_error(exc)
     _complete_nonstanding_decision_claims_for_reply(
         conn,
         topic_id=topic_id,
@@ -1832,12 +1942,30 @@ def post_message(
             (topic_id, role, wm_id, wm_ts, ts),
         )
 
-    return {
+    result = {
         "msg_id": msg_id,
         "ts": ts,
         "topic_state": new_state,
         "vehicle": vehicle_db if vehicle_db is not None else DEFAULT_VEHICLE,
     }
+    if semantic is not None:
+        result.update(
+            {
+                "protocol_version": DEBATE_PROTOCOL_V1,
+                "round_no": semantic["round_no"],
+                "body_mode": semantic["body_mode"],
+                "protocol_state": protocol_state,
+            }
+        )
+        if author_session_id and is_worker_session_id(author_session_id):
+            result["worker_claim"] = _complete_worker_claim_if_terminal(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                worker_session_id=author_session_id,
+                now=ts,
+            )
+    return result
 
 
 def get_watermark(
@@ -1863,6 +1991,7 @@ def read_messages(
     kind_filter: list[str] | None = None,
     priority_filter: list[str] | None = None,
     limit: int | None = None,
+    control_plane: bool = False,
 ) -> dict[str, Any]:
     """Read messages from a topic with compound (ts, msg_id) cursor.
 
@@ -1895,6 +2024,9 @@ def read_messages(
     debate = get_debate(conn, topic_id)
     if debate is None:
         raise DebateError(f"unknown_topic: {topic_id}")
+    visibility_predicate, visibility_params = _protocol_v1_visibility_sql(
+        alias="m", viewer_role=role, control_plane=control_plane
+    )
 
     cursor_ts: str | None = None
     cursor_msg_id: str = ""
@@ -1908,8 +2040,9 @@ def read_messages(
     if since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
-            "SELECT ts, msg_id FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
-            (since_msg_id, topic_id),
+            "SELECT m.ts, m.msg_id FROM debate_messages m "
+            "WHERE m.msg_id = ? AND m.topic_id = ? AND " + visibility_predicate,
+            (since_msg_id, topic_id, *visibility_params),
         ).fetchone()
         if ref is None:
             raise DebateError(
@@ -1929,10 +2062,11 @@ def read_messages(
 
     if cursor_ts is None and since_latest_compaction:
         comp = conn.execute(
-            "SELECT msg_id, ts FROM debate_messages "
-            "WHERE topic_id = ? AND kind = 'COMPACTION' "
-            "ORDER BY ts DESC, msg_id DESC LIMIT 1",
-            (topic_id,),
+            "SELECT m.msg_id, m.ts FROM debate_messages m "
+            "WHERE m.topic_id = ? AND m.kind = 'COMPACTION' AND "
+            + visibility_predicate
+            + " ORDER BY m.ts DESC, m.msg_id DESC LIMIT 1",
+            (topic_id, *visibility_params),
         ).fetchone()
         if comp is not None:
             cursor_ts = comp["ts"]
@@ -1952,8 +2086,9 @@ def read_messages(
             raise DebateError("invalid_limit: must be positive int or None")
         effective_limit = min(limit, MAX_READ_LIMIT)
 
-    where: list[str] = ["topic_id = ?"]
+    where: list[str] = ["m.topic_id = ?", visibility_predicate]
     params: list[Any] = [topic_id]
+    params.extend(visibility_params)
     if cursor_ts is not None:
         # Dual-branch cursor (v3.9.3 msg:946bcff6 amendment 3,
         # read_messages naked-column form). cursor_msg_id is None ONLY
@@ -1963,37 +2098,45 @@ def read_messages(
         # explicit msg_id cursor exists (since_msg_id, watermark,
         # compaction).
         if cursor_msg_id is None:
-            where.append("ts > ?")
+            where.append("m.ts > ?")
             params.extend([cursor_ts])
         else:
-            where.append("(ts > ? OR (ts = ? AND msg_id > ?))")
+            where.append("(m.ts > ? OR (m.ts = ? AND m.msg_id > ?))")
             params.extend([cursor_ts, cursor_ts, cursor_msg_id])
     if kind_filter:
         for k in kind_filter:
             validate_kind(k)
         ph = ",".join("?" * len(kind_filter))
-        where.append(f"kind IN ({ph})")
+        where.append(f"m.kind IN ({ph})")
         params.extend(kind_filter)
     if priority_filter:
         for p in priority_filter:
             validate_priority(p)
         ph = ",".join("?" * len(priority_filter))
-        where.append(f"priority IN ({ph})")
+        where.append(f"m.priority IN ({ph})")
         params.extend(priority_filter)
     where_sql = "WHERE " + " AND ".join(where)
 
     fetch_limit = effective_limit + 1  # one extra row to detect truncation
     rows = conn.execute(
-        f"SELECT msg_id, topic_id, role, ts, priority, kind, reply_to, "
-        f"standing, body, created_at FROM debate_messages {where_sql} "
-        f"ORDER BY ts ASC, msg_id ASC LIMIT ?",
+        f"SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
+        f"m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
+        f"m.body_mode, m.payload_json, m.created_at "
+        f"FROM debate_messages m {where_sql} "
+        f"ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
         [*params, fetch_limit],
     ).fetchall()
 
     truncated = len(rows) > effective_limit
     if truncated:
         rows = rows[:effective_limit]
-    messages = [dict(r) for r in rows]
+    messages = []
+    for row in rows:
+        item = dict(row)
+        if item.get("protocol_version") is None:
+            for key in ("protocol_version", "round_no", "body_mode", "payload_json"):
+                item.pop(key, None)
+        messages.append(item)
     last_msg_id = messages[-1]["msg_id"] if messages else None
     last_ts = messages[-1]["ts"] if messages else None
 
@@ -3194,6 +3337,10 @@ def debate_post_with_recipients(
     reply_to: str | None = None,
     standing: bool | None = None,
     vehicle: str | None = None,
+    protocol_version: str | None = None,
+    body_mode: str | None = None,
+    payload_json: Any = None,
+    author_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomic insert: debate_messages row + per-recipient
     debate_message_recipients rows.
@@ -3300,6 +3447,11 @@ def debate_post_with_recipients(
         reply_to=reply_to,
         standing=standing,
         vehicle=vehicle,
+        protocol_version=protocol_version,
+        body_mode=body_mode,
+        payload_json=payload_json,
+        author_session_id=author_session_id,
+        recipients=[*deduped, *diagnostic_deduped],
     )
     msg_id = post_result["msg_id"]
     for recipient in deduped:
@@ -3316,7 +3468,7 @@ def debate_post_with_recipients(
             (msg_id, recipient),
         )
 
-    return {
+    result = {
         "msg_id": msg_id,
         "ts": post_result["ts"],
         "recipient_count": len(deduped) + len(diagnostic_deduped),
@@ -3329,6 +3481,10 @@ def debate_post_with_recipients(
         "vehicle": post_result["vehicle"],
         "schema_version": DEBATE_POST_RESPONSE_SCHEMA_VERSION,
     }
+    for key in ("protocol_version", "round_no", "body_mode", "protocol_state"):
+        if key in post_result:
+            result[key] = post_result[key]
+    return result
 
 
 def _validate_signal_caller(
@@ -3504,6 +3660,9 @@ def debate_signal_check(
     """
     effective_limit = _validate_signal_limit(limit)
     debate = _validate_signal_caller(session_id, role, topic_id, conn)
+    visibility_predicate, visibility_params = _protocol_v1_visibility_sql(
+        alias="m", viewer_role=role, control_plane=False
+    )
     worker_claim: sqlite3.Row | None = None
     if is_worker_session_id(session_id):
         worker_claim = _validate_worker_claim_for_signal(
@@ -3520,8 +3679,9 @@ def debate_signal_check(
     if since_msg_id is not None:
         validate_msg_id(since_msg_id)
         ref = conn.execute(
-            "SELECT ts, msg_id FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
-            (since_msg_id, topic_id),
+            "SELECT m.ts, m.msg_id FROM debate_messages m "
+            "WHERE m.msg_id = ? AND m.topic_id = ? AND " + visibility_predicate,
+            (since_msg_id, topic_id, *visibility_params),
         ).fetchone()
         if ref is None:
             raise DebateError(
@@ -3567,8 +3727,9 @@ def debate_signal_check(
             "limit": effective_limit,
         }
 
-    where = ["m.topic_id = ?"]
+    where = ["m.topic_id = ?", visibility_predicate]
     params: list[Any] = [topic_id]
+    params.extend(visibility_params)
     recipient_placeholders = ",".join("?" for _ in signal_recipients)
     where.append(
         "EXISTS (SELECT 1 FROM debate_message_recipients r "
@@ -3617,7 +3778,8 @@ def debate_signal_check(
     fetch_limit = effective_limit + 1  # +1 to detect truncation
     rows = conn.execute(
         "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
-        "m.reply_to, m.standing, m.body, m.created_at "
+        "m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
+        "m.body_mode, m.payload_json, m.created_at "
         "FROM debate_messages m "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
@@ -3627,13 +3789,17 @@ def debate_signal_check(
     truncated = len(rows) > effective_limit
     if truncated:
         rows = rows[:effective_limit]
-    pending = [
-        dict(r)
-        for r in rows
-        if _claim_or_filter_nonstanding_decision(
-            conn, msg=r, role=role, session_id=session_id
-        )
-    ]
+    pending = []
+    for row in rows:
+        if not _claim_or_filter_nonstanding_decision(
+            conn, msg=row, role=role, session_id=session_id
+        ):
+            continue
+        item = dict(row)
+        if item.get("protocol_version") is None:
+            for key in ("protocol_version", "round_no", "body_mode", "payload_json"):
+                item.pop(key, None)
+        pending.append(item)
 
     next_cursor: dict[str, str] | None = None
     if truncated and pending:
@@ -3646,6 +3812,45 @@ def debate_signal_check(
             (m["priority"] for m in pending),
             key=lambda p: VALID_PRIORITY_ORDER.get(p, -1),
         )
+
+    protocol_enabled = (
+        conn.execute(
+            "SELECT 1 FROM debate_protocol_state WHERE topic_id=?", (topic_id,)
+        ).fetchone()
+        is not None
+    )
+    if protocol_enabled:
+        check_at = now_iso()
+        conn.execute(
+            "INSERT INTO debate_signal_state "
+            "(session_id,role,topic_id,last_processed_msg_id,last_processed_ts,last_check_at) "
+            "VALUES (?,?,?,NULL,NULL,?) "
+            "ON CONFLICT(session_id,role,topic_id) DO UPDATE SET "
+            "last_check_at=excluded.last_check_at",
+            (session_id, role, topic_id, check_at),
+        )
+        if pending:
+            delivered = max(pending, key=lambda item: (item["ts"], item["msg_id"]))
+            conn.execute(
+                "INSERT INTO debate_signal_deliveries "
+                "(session_id,role,topic_id,delivered_up_to_msg_id,"
+                "delivered_up_to_ts,delivered_at) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(session_id,role,topic_id) DO UPDATE SET "
+                "delivered_up_to_msg_id=excluded.delivered_up_to_msg_id,"
+                "delivered_up_to_ts=excluded.delivered_up_to_ts,"
+                "delivered_at=excluded.delivered_at "
+                "WHERE (excluded.delivered_up_to_ts,excluded.delivered_up_to_msg_id) >= "
+                "(debate_signal_deliveries.delivered_up_to_ts,"
+                " debate_signal_deliveries.delivered_up_to_msg_id)",
+                (
+                    session_id,
+                    role,
+                    topic_id,
+                    delivered["msg_id"],
+                    delivered["ts"],
+                    check_at,
+                ),
+            )
 
     return {
         "pending": pending,
@@ -3700,9 +3905,13 @@ def debate_signal_advance(
     _validate_signal_caller(session_id, role, topic_id, conn)
     validate_msg_id(last_processed_msg_id)
 
+    visibility_predicate, visibility_params = _protocol_v1_visibility_sql(
+        alias="m", viewer_role=role, control_plane=False
+    )
     ref = conn.execute(
-        "SELECT msg_id, ts FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
-        (last_processed_msg_id, topic_id),
+        "SELECT m.msg_id, m.ts FROM debate_messages m "
+        "WHERE m.msg_id = ? AND m.topic_id = ? AND " + visibility_predicate,
+        (last_processed_msg_id, topic_id, *visibility_params),
     ).fetchone()
     if ref is None:
         raise DebateError(
@@ -3732,6 +3941,29 @@ def debate_signal_advance(
             f"hide unprocessed addressed work",
             error_type="watermark_advance_unaddressed",
         )
+
+    protocol_enabled = (
+        conn.execute(
+            "SELECT 1 FROM debate_protocol_state WHERE topic_id=?", (topic_id,)
+        ).fetchone()
+        is not None
+    )
+    if protocol_enabled:
+        delivery = conn.execute(
+            "SELECT delivered_up_to_msg_id,delivered_up_to_ts "
+            "FROM debate_signal_deliveries "
+            "WHERE session_id=? AND role=? AND topic_id=?",
+            (session_id, role, topic_id),
+        ).fetchone()
+        if delivery is None or (ref["ts"], ref["msg_id"]) > (
+            delivery["delivered_up_to_ts"],
+            delivery["delivered_up_to_msg_id"],
+        ):
+            raise DebateError(
+                f"signal_advance_not_delivered: {last_processed_msg_id}",
+                error_type="signal_advance_not_delivered",
+                details={"last_processed_msg_id": last_processed_msg_id},
+            )
 
     # Monotonic compound (ts, msg_id) guard per ADVOCATE turn-18
     # msg:ca22ee19. Plain ON CONFLICT DO UPDATE would let two threads
@@ -3972,6 +4204,24 @@ def prepare_wake_dry_run(
         return {"targets": [], "logs": [log], "suppressed": 0}
 
     topic_id = msg["topic_id"]
+    try:
+        blind_waiting = conn.execute(
+            "SELECT 1 FROM debate_blind_commits WHERE msg_id=? AND released_at IS NULL",
+            (msg_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        blind_waiting = None  # mixed-version upgrade window
+    if blind_waiting is not None:
+        log = _insert_wake_log(
+            conn,
+            trigger_msg_id=msg_id,
+            topic_id=topic_id,
+            recipient="",
+            action=action,
+            result="blind_commit_waiting",
+            details={"protocol_version": DEBATE_PROTOCOL_V1},
+        )
+        return {"targets": [], "logs": [log], "suppressed": 0}
     # ── FAIL-CLOSED VEHICLE ROUTER (v3.12, solution #5) — resolution seam ──
     # Refuse to resolve any wake targets for an implementation-tagged trigger.
     # This is the signal-only counterpart to the hard guard in

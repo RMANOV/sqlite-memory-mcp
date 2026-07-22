@@ -398,6 +398,10 @@ def test_debate_pump_sets_default_wake_budget_from_worker_limits(monkeypatch, tm
     # unit test exercises the dispatch path, so force not-terminal.
     monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
+    # Unit isolation: a real hidden worker may be alive on the Windows host
+    # while this test runs.  The scenario models an empty worker pool, so do
+    # not let machine-wide production state throttle the fake dispatch.
+    monkeypatch.setattr(module, "_machine_live_worker_count", lambda *args: 0)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
     monkeypatch.setattr(module, "_save_state", lambda ts, msg_id: None)
 
@@ -517,6 +521,7 @@ def test_debate_pump_does_not_advance_cursor_after_dispatch_exception(
     monkeypatch.setattr(module, "_estimate_worker_demand", lambda *args, **kwargs: 1)
     monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
+    monkeypatch.setattr(module, "_machine_live_worker_count", lambda *args: 0)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
     monkeypatch.setattr(
         module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id))
@@ -596,6 +601,7 @@ def test_debate_pump_keeps_cursor_on_partially_dispatched_multi_recipient_messag
     # trigger holds the cursor until a later scan proves it terminal.
     monkeypatch.setattr(module, "_trigger_is_terminal", lambda *args, **kwargs: False)
     monkeypatch.setattr(module, "_reap_children", lambda: None)
+    monkeypatch.setattr(module, "_machine_live_worker_count", lambda *args: 0)
     monkeypatch.setattr(module, "_reclaim_stale_message_claims", lambda **kwargs: None)
     monkeypatch.setattr(
         module, "_save_state", lambda ts, msg_id: saved.append((ts, msg_id))

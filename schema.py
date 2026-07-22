@@ -719,7 +719,9 @@ CREATE TABLE IF NOT EXISTS debate_messages (
         CHECK (priority IN ('H', 'M', 'L', 'INFO')),
     kind       TEXT NOT NULL
         CHECK (kind IN ('Q', 'A', 'STATUS', 'DECISION', 'PING',
-                        'WATERMARK', 'STATE', 'COMPACTION')),
+                        'WATERMARK', 'STATE', 'COMPACTION',
+                        'CLAIM', 'CHALLENGE', 'EVIDENCE', 'REBUT',
+                        'CONCEDE', 'VERIFY', 'DISSENT', 'ESCALATE')),
     standing   INTEGER DEFAULT NULL
         CHECK (standing IS NULL OR standing IN (0, 1)),
     vehicle    TEXT DEFAULT NULL
@@ -727,6 +729,13 @@ CREATE TABLE IF NOT EXISTS debate_messages (
                OR vehicle IN ('analysis', 'review', 'implementation')),
     reply_to   TEXT REFERENCES debate_messages(msg_id) ON DELETE SET NULL,
     body       TEXT NOT NULL,
+    protocol_version TEXT DEFAULT NULL
+        CHECK (protocol_version IS NULL OR protocol_version = 'debate/v1'),
+    round_no   INTEGER DEFAULT NULL
+        CHECK (round_no IS NULL OR round_no >= 1),
+    body_mode  TEXT DEFAULT NULL
+        CHECK (body_mode IS NULL OR body_mode IN ('structured', 'live_text')),
+    payload_json TEXT DEFAULT NULL,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_debmsg_topic_ts
@@ -739,7 +748,6 @@ CREATE INDEX IF NOT EXISTS idx_debmsg_topic_role_ts
     ON debate_messages(topic_id, role, ts);
 CREATE INDEX IF NOT EXISTS idx_debmsg_reply_to
     ON debate_messages(reply_to) WHERE reply_to IS NOT NULL;
-
 -- Native, dependency-free debate retrieval.  The prompt/watcher path used to
 -- scan recent rows and inject FIFO bodies, which made a long-lived DAILY topic
 -- both noisy and expensive.  Keep a dedicated FTS5 index so callers can pair
@@ -818,6 +826,19 @@ CREATE INDEX IF NOT EXISTS idx_dss_role_topic
     ON debate_signal_state(role, topic_id);
 CREATE INDEX IF NOT EXISTS idx_dss_last_check
     ON debate_signal_state(last_check_at);
+
+-- Two-phase read receipt for debate/v1: signal_check records the greatest
+-- cursor actually delivered by the server; signal_advance cannot acknowledge
+-- a message that was never returned to that session.
+CREATE TABLE IF NOT EXISTS debate_signal_deliveries (
+    session_id              TEXT NOT NULL,
+    role                    TEXT NOT NULL,
+    topic_id                TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    delivered_up_to_msg_id  TEXT NOT NULL,
+    delivered_up_to_ts      TEXT NOT NULL,
+    delivered_at            TEXT NOT NULL,
+    PRIMARY KEY (session_id, role, topic_id)
+);
 
 -- ── v3.10: role/session lifecycle authority + dry-run wake audit ───────
 -- roles_json remains the declared debate roster. debate_role_bindings is the
@@ -962,6 +983,98 @@ CREATE TABLE IF NOT EXISTS debate_worker_reap_log (
 );
 CREATE INDEX IF NOT EXISTS idx_dwrl_topic_created
     ON debate_worker_reap_log(topic_id, created_at);
+
+-- ── debate/v1 §7 deterministic server invariants (2026-07-22) ───────
+-- This is protocol micro-state, intentionally separate from the durable
+-- topic lifecycle in debates.state.  Every machine-relevant transition is
+-- represented by typed columns/tables; prose is never parsed for control.
+
+CREATE TABLE IF NOT EXISTS debate_protocol_state (
+    topic_id              TEXT PRIMARY KEY REFERENCES debates(topic_id) ON DELETE CASCADE,
+    protocol_version      TEXT NOT NULL CHECK (protocol_version = 'debate/v1'),
+    phase                 TEXT NOT NULL CHECK (phase IN (
+        'BLIND_CLAIM','DEBATE','ADJUDICATE','STALEMATE','ESCALATED','STOPPED')),
+    round_no              INTEGER NOT NULL CHECK (round_no >= 1),
+    max_rounds            INTEGER NOT NULL CHECK (max_rounds BETWEEN 1 AND 10),
+    blind_barrier_state   TEXT NOT NULL CHECK (blind_barrier_state IN (
+        'not_required','waiting','released')),
+    blind_roles_json      TEXT NOT NULL,
+    stalemate_reason      TEXT,
+    transition_version    INTEGER NOT NULL CHECK (transition_version >= 1),
+    phase_deadline_at     TEXT,
+    phase_timeout_seconds INTEGER NOT NULL CHECK (phase_timeout_seconds >= 30),
+    updated_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dps_phase_deadline
+    ON debate_protocol_state(phase, phase_deadline_at);
+
+CREATE TABLE IF NOT EXISTS debate_blind_commits (
+    topic_id     TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role         TEXT NOT NULL,
+    msg_id       TEXT NOT NULL UNIQUE REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    round_no     INTEGER NOT NULL CHECK (round_no >= 1),
+    committed_at TEXT NOT NULL,
+    released_at  TEXT,
+    PRIMARY KEY (topic_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_dbc_unreleased
+    ON debate_blind_commits(topic_id, released_at);
+
+CREATE TABLE IF NOT EXISTS debate_judge_projections (
+    projection_id  TEXT PRIMARY KEY,
+    topic_id       TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    round_no       INTEGER NOT NULL CHECK (round_no >= 1),
+    order_key      TEXT NOT NULL CHECK (order_key IN ('AB','BA')),
+    left_msg_id    TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    right_msg_id   TEXT NOT NULL REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    normalized_json TEXT NOT NULL,
+    verdict_json   TEXT,
+    judge_role     TEXT,
+    created_at     TEXT NOT NULL,
+    decided_at     TEXT,
+    UNIQUE (topic_id, round_no, order_key)
+);
+
+CREATE TABLE IF NOT EXISTS debate_human_packets (
+    topic_id            TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    protocol_generation INTEGER NOT NULL CHECK (protocol_generation >= 1),
+    msg_id              TEXT NOT NULL UNIQUE REFERENCES debate_messages(msg_id) ON DELETE CASCADE,
+    state               TEXT NOT NULL CHECK (state IN ('open','resolved')),
+    exact_human_action  TEXT NOT NULL,
+    payload_json        TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    resolved_at         TEXT,
+    PRIMARY KEY (topic_id, protocol_generation)
+);
+CREATE INDEX IF NOT EXISTS idx_dhp_open
+    ON debate_human_packets(state, created_at);
+
+CREATE TABLE IF NOT EXISTS debate_role_recovery_log (
+    recovery_id    TEXT PRIMARY KEY,
+    topic_id       TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+    role           TEXT NOT NULL,
+    old_session_id TEXT,
+    new_session_id TEXT NOT NULL,
+    generation     INTEGER NOT NULL CHECK (generation >= 1),
+    reason         TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drrl_topic_created
+    ON debate_role_recovery_log(topic_id, created_at);
+
+CREATE TABLE IF NOT EXISTS debate_scheduler_decisions (
+    decision_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    decided_at      TEXT NOT NULL,
+    interval_seconds REAL NOT NULL CHECK (interval_seconds >= 0),
+    reason          TEXT NOT NULL CHECK (reason IN (
+        'event_signal','eligible_backlog','capacity_wait','active_worker_lease',
+        'persisted_retry_backoff','resource_blocked','idle_crash_replay_sweep')),
+    queue_depth     INTEGER NOT NULL CHECK (queue_depth >= 0),
+    live_workers    INTEGER NOT NULL CHECK (live_workers >= 0),
+    resource_tier   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_dsd_decided_at
+    ON debate_scheduler_decisions(decided_at);
 
 -- ── Memory Reflection (Phase 1) ─────────────────────────────────────────
 -- Reviewable memory consolidation runs. Async job model with state machine
@@ -1841,16 +1954,14 @@ _MIGRATIONS = [
         "debate_wake_log table and indexes (v3.10)",
     ),
     (
-        "SELECT 1 FROM pragma_table_info('debate_messages') "
-        "WHERE name='standing'",
+        "SELECT 1 FROM pragma_table_info('debate_messages') WHERE name='standing'",
         "ALTER TABLE debate_messages "
         "ADD COLUMN standing INTEGER DEFAULT NULL "
         "CHECK (standing IS NULL OR standing IN (0, 1))",
         "debate_messages.standing column (v3.11)",
     ),
     (
-        "SELECT 1 FROM pragma_table_info('debate_messages') "
-        "WHERE name='vehicle'",
+        "SELECT 1 FROM pragma_table_info('debate_messages') WHERE name='vehicle'",
         "ALTER TABLE debate_messages "
         "ADD COLUMN vehicle TEXT DEFAULT NULL "
         "CHECK (vehicle IS NULL "
@@ -2174,6 +2285,159 @@ def _split_schema_sql(sql: str) -> list[str]:
     return [s.strip() for s in stmts if s.strip()]
 
 
+_DEBATE_MESSAGE_KINDS_V1 = (
+    "'Q', 'A', 'STATUS', 'DECISION', 'PING', 'WATERMARK', 'STATE', "
+    "'COMPACTION', 'CLAIM', 'CHALLENGE', 'EVIDENCE', 'REBUT', "
+    "'CONCEDE', 'VERIFY', 'DISSENT', 'ESCALATE'"
+)
+
+
+def _create_debate_message_indexes_and_triggers(conn: sqlite3.Connection) -> None:
+    """Restore every object owned by a rebuilt ``debate_messages`` table."""
+    statements = (
+        "CREATE INDEX IF NOT EXISTS idx_debmsg_topic_ts "
+        "ON debate_messages(topic_id, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_debmsg_topic_kind "
+        "ON debate_messages(topic_id, kind)",
+        "CREATE INDEX IF NOT EXISTS idx_debmsg_topic_priority "
+        "ON debate_messages(topic_id, priority)",
+        "CREATE INDEX IF NOT EXISTS idx_debmsg_topic_role_ts "
+        "ON debate_messages(topic_id, role, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_debmsg_reply_to "
+        "ON debate_messages(reply_to) WHERE reply_to IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_debmsg_protocol_round "
+        "ON debate_messages(topic_id, protocol_version, round_no, kind)",
+        """
+        CREATE TRIGGER IF NOT EXISTS debate_messages_fts_ai
+        AFTER INSERT ON debate_messages BEGIN
+            INSERT INTO debate_messages_fts(msg_id, topic_id, role, kind, body)
+            VALUES (new.msg_id, new.topic_id, new.role, new.kind, new.body);
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS debate_messages_fts_ad
+        AFTER DELETE ON debate_messages BEGIN
+            DELETE FROM debate_messages_fts WHERE msg_id = old.msg_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS debate_messages_fts_au
+        AFTER UPDATE OF topic_id, role, kind, body ON debate_messages BEGIN
+            DELETE FROM debate_messages_fts WHERE msg_id = old.msg_id;
+            INSERT INTO debate_messages_fts(msg_id, topic_id, role, kind, body)
+            VALUES (new.msg_id, new.topic_id, new.role, new.kind, new.body);
+        END
+        """,
+    )
+    for statement in statements:
+        conn.execute(statement)
+
+
+def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
+    """Losslessly widen the append-only debate envelope for ``debate/v1``.
+
+    SQLite cannot ALTER a CHECK constraint.  The migration therefore rebuilds
+    the table inside ``init_db``'s existing EXCLUSIVE transaction, verifies the
+    row count and exact msg_id set before dropping the old table, then restores
+    all indexes and FTS triggers.  A failure rolls the whole transaction back.
+    """
+    table_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='debate_messages'"
+    ).fetchone()
+    if table_row is None:
+        raise RuntimeError("debate_messages missing after base schema creation")
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info('debate_messages')").fetchall()
+    }
+    required = {"protocol_version", "round_no", "body_mode", "payload_json"}
+    table_sql = str(table_row["sql"] or "")
+    needs_rebuild = not required.issubset(columns) or "'CLAIM'" not in table_sql
+    if not needs_rebuild:
+        _create_debate_message_indexes_and_triggers(conn)
+        return
+
+    old_count = int(conn.execute("SELECT COUNT(*) FROM debate_messages").fetchone()[0])
+    conn.execute("DROP TABLE IF EXISTS debate_messages_v1_new")
+    conn.execute(
+        f"""
+        CREATE TABLE debate_messages_v1_new (
+            msg_id     TEXT PRIMARY KEY,
+            topic_id   TEXT NOT NULL REFERENCES debates(topic_id) ON DELETE CASCADE,
+            role       TEXT NOT NULL,
+            ts         TEXT NOT NULL,
+            priority   TEXT NOT NULL
+                CHECK (priority IN ('H', 'M', 'L', 'INFO')),
+            kind       TEXT NOT NULL CHECK (kind IN ({_DEBATE_MESSAGE_KINDS_V1})),
+            standing   INTEGER DEFAULT NULL
+                CHECK (standing IS NULL OR standing IN (0, 1)),
+            vehicle    TEXT DEFAULT NULL
+                CHECK (vehicle IS NULL OR vehicle IN
+                       ('analysis', 'review', 'implementation')),
+            reply_to   TEXT REFERENCES debate_messages(msg_id) ON DELETE SET NULL,
+            body       TEXT NOT NULL,
+            protocol_version TEXT DEFAULT NULL
+                CHECK (protocol_version IS NULL OR protocol_version = 'debate/v1'),
+            round_no   INTEGER DEFAULT NULL
+                CHECK (round_no IS NULL OR round_no >= 1),
+            body_mode  TEXT DEFAULT NULL
+                CHECK (body_mode IS NULL OR body_mode IN ('structured', 'live_text')),
+            payload_json TEXT DEFAULT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    def source(column: str) -> str:
+        return column if column in columns else "NULL"
+
+    conn.execute(
+        "INSERT INTO debate_messages_v1_new "
+        "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,"
+        " protocol_version,round_no,body_mode,payload_json,created_at) "
+        "SELECT msg_id,topic_id,role,ts,priority,kind,"
+        f"{source('standing')},{source('vehicle')},reply_to,body,"
+        f"{source('protocol_version')},{source('round_no')},"
+        f"{source('body_mode')},{source('payload_json')},created_at "
+        "FROM debate_messages ORDER BY ts,msg_id"
+    )
+    new_count = int(
+        conn.execute("SELECT COUNT(*) FROM debate_messages_v1_new").fetchone()[0]
+    )
+    missing = conn.execute(
+        "SELECT msg_id FROM debate_messages EXCEPT "
+        "SELECT msg_id FROM debate_messages_v1_new LIMIT 1"
+    ).fetchone()
+    extra = conn.execute(
+        "SELECT msg_id FROM debate_messages_v1_new EXCEPT "
+        "SELECT msg_id FROM debate_messages LIMIT 1"
+    ).fetchone()
+    if new_count != old_count or missing is not None or extra is not None:
+        raise RuntimeError(
+            "debate_messages debate/v1 migration failed lossless-copy check: "
+            f"old={old_count} new={new_count} missing={missing} extra={extra}"
+        )
+
+    for trigger in (
+        "debate_messages_fts_ai",
+        "debate_messages_fts_ad",
+        "debate_messages_fts_au",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("DROP TABLE debate_messages")
+    conn.execute("ALTER TABLE debate_messages_v1_new RENAME TO debate_messages")
+    _create_debate_message_indexes_and_triggers(conn)
+    fk_problem = conn.execute("PRAGMA foreign_key_check").fetchone()
+    if fk_problem is not None:
+        raise RuntimeError(
+            f"debate_messages debate/v1 migration failed foreign-key check: {tuple(fk_problem)}"
+        )
+    logger.info(
+        "Migration applied: debate_messages debate/v1 envelope (%d rows preserved)",
+        old_count,
+    )
+
+
 def init_db(db_path: str | None = None) -> None:
     """Create tables if they don't exist, run migrations, set WAL mode.
 
@@ -2193,6 +2457,7 @@ def init_db(db_path: str | None = None) -> None:
                 for stmt in _split_schema_sql(migrate_q):
                     raw.execute(stmt)
                 logger.info("Migration applied: %s", desc)
+        _migrate_debate_messages_v1(raw)
         _repair_memory_fts_triggers(raw)
         raw.execute("COMMIT;")
     except Exception:
@@ -2220,9 +2485,9 @@ def init_db(db_path: str | None = None) -> None:
             )
 
     with _get_conn(_path) as conn:
-        debate_count = conn.execute(
-            "SELECT COUNT(*) FROM debate_messages"
-        ).fetchone()[0]
+        debate_count = conn.execute("SELECT COUNT(*) FROM debate_messages").fetchone()[
+            0
+        ]
         debate_fts_count = conn.execute(
             "SELECT COUNT(*) FROM debate_messages_fts"
         ).fetchone()[0]

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -131,9 +132,76 @@ def _notify(target: dict[str, Any], trigger_msg_id: str) -> None:
         pass
 
 
+def _trigger_envelope(trigger_msg_id: str) -> dict[str, Any]:
+    try:
+        db_path = os.environ.get(
+            "SQLITE_MEMORY_DB", os.path.expanduser("~/.claude/memory/memory.db")
+        )
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT m.kind,m.role,COALESCE(m.protocol_version,p.protocol_version) "
+                "AS protocol_version,m.round_no,m.body_mode,m.payload_json,p.phase "
+                "FROM debate_messages m LEFT JOIN debate_protocol_state p "
+                "ON p.topic_id=m.topic_id WHERE m.msg_id=?",
+                (trigger_msg_id,),
+            ).fetchone()
+            return dict(row) if row else {}
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return {}
+
+
 def _wake_prompt(target: dict[str, Any], trigger_msg_id: str, topic_id: str) -> str:
     role = target.get("target_role") or "UNKNOWN"
     session_id = target.get("target_session_id") or ""
+    envelope = _trigger_envelope(trigger_msg_id)
+    if envelope.get("protocol_version") == "debate/v1":
+        trigger_kind = str(envelope.get("kind") or "")
+        round_no = envelope.get("round_no")
+        phase = str(envelope.get("phase") or "")
+        return f"""You are {role} in deterministic Debate Protocol debate/v1.
+
+Autonomous wake trigger:
+- topic_id: {topic_id}
+- trigger_msg_id: {trigger_msg_id}
+- trigger_kind: {trigger_kind}
+- server_round_no: {round_no}
+- server_phase: {phase}
+- session_id: {session_id}
+
+Required server sequence:
+1. Call debate_signal_check for this exact role/session/topic and read the
+   authoritative typed envelope. Never infer protocol state from prose.
+2. If there is no substantive work, call debate_worker_no_action for this
+   trigger, reply NO_ACTION, and stop.
+3. Otherwise FIRST call debate_signal_advance through trigger_msg_id. The
+   server rejects any response while an earlier addressed H message is unread.
+4. Post at most one response with debate_post_with_recipients using:
+   protocol_version="debate/v1", author_session_id="{session_id}",
+   body_mode="structured" (use "live_text" only when irreducible narrative is
+   needed), and reply_to="{trigger_msg_id}" for every targeted kind.
+5. Use a semantic kind, never legacy Q/A/STATUS/DECISION. Canonical choices:
+   PING in BLIND_CLAIM -> CLAIM (with reply_to set to this PING);
+   CLAIM -> CHALLENGE or EVIDENCE; CHALLENGE -> REBUT or CONCEDE;
+   EVIDENCE/REBUT/CONCEDE -> VERIFY. The server phase is authoritative.
+6. payload_json must be a JSON object with the exact minimum schema:
+   CLAIM {{summary, assumptions[], evidence_refs[]}};
+   CHALLENGE {{target, challenge_type, requested_disposition}};
+   EVIDENCE {{target, source_id, locator, retrieved_at, content_hash,
+              verification_status}};
+   REBUT {{target, disposition, evidence_refs[]}};
+   CONCEDE {{target, scope, consequence}};
+   VERIFY {{target, result, checks[]}}.
+   Every payload target must equal reply_to. result/verification_status is one
+   of verified, contested, unsupported, unknown.
+7. Address only roles that must act next. The launcher has already emitted one
+   RECEIVED receipt; do not emit another.
+8. Do not edit files, run unrelated commands, broaden scope, or post a second
+   response. Stop after the one typed response.
+"""
     return f"""You are {role} in the local debate protocol.
 
 Autonomous wake trigger:

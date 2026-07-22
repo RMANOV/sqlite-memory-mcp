@@ -56,6 +56,22 @@ PUMP_ARGS = [
     "STATE",
     "--action-kind",
     "PING",
+    "--action-kind",
+    "CLAIM",
+    "--action-kind",
+    "CHALLENGE",
+    "--action-kind",
+    "EVIDENCE",
+    "--action-kind",
+    "REBUT",
+    "--action-kind",
+    "CONCEDE",
+    "--action-kind",
+    "VERIFY",
+    "--action-kind",
+    "DISSENT",
+    "--action-kind",
+    "ESCALATE",
 ]
 
 
