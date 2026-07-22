@@ -379,6 +379,49 @@ def test_pump_singleton_mutex_is_atomic_cross_process():
         holder.wait(timeout=15)
 
 
+@windows_only
+def test_pump_singleton_claims_existing_unowned_mutex():
+    """An existing kernel object is not proof that another pump owns it."""
+    import subprocess
+
+    env = dict(os.environ)
+    env["DEBATE_PUMP_SINGLETON_MUTEX"] = rf"Local\DebateUnownedTest{os.getpid()}"
+    repo_bootstrap = "import sys; sys.path.insert(0, r'" + str(REPO) + "'); "
+    observer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            repo_bootstrap
+            + "import ctypes, os, time; "
+            + "k=ctypes.WinDLL('kernel32', use_last_error=True); "
+            + "k.CreateMutexW.restype=ctypes.c_void_p; "
+            + "h=k.CreateMutexW(None, False, os.environ['DEBATE_PUMP_SINGLETON_MUTEX']); "
+            + "print(bool(h), flush=True); time.sleep(4)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert observer.stdout.readline().strip() == "True"
+        contender = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                repo_bootstrap
+                + "from debate_wake_signal import acquire_pump_singleton; "
+                + "print(acquire_pump_singleton())",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        assert contender.stdout.strip() == "True"
+    finally:
+        observer.wait(timeout=15)
+
+
 def test_agent_log_dir_stays_bounded(tmp_path, monkeypatch):
     import debate_wake
 
