@@ -19,6 +19,7 @@ from typing import Any
 from fastmcp_compat import FastMCP
 
 from db_utils import (
+    DB_PATH as _DB_PATH,
     get_conn as _get_conn,
     get_entity_id as _get_entity_id,
     fts_query as _fts_query,
@@ -83,6 +84,18 @@ def _record_entity_access(
         )
     except sqlite3.OperationalError as exc:
         logger.debug("Access log write failed: %s", exc)
+
+
+def _record_entity_access_best_effort(entity_ids: list[int], tool_name: str) -> None:
+    """Write read telemetry in a separate, short-lived transaction."""
+    if not entity_ids:
+        return
+    try:
+        with sqlite3.connect(_DB_PATH, timeout=0.05) as conn:
+            conn.execute("PRAGMA busy_timeout=50")
+            _record_entity_access(conn, entity_ids, tool_name)
+    except sqlite3.Error as exc:
+        logger.debug("Access log connection failed: %s", exc)
 
 
 # ── One-time JSONL migration ────────────────────────────────────────────
@@ -673,8 +686,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                     entity["project"] = r["project"]
                 results.append(entity)
 
-        _record_entity_access(conn, eids, "search_nodes")
-
+    _record_entity_access_best_effort(eids, "search_nodes")
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
     return json.dumps({"entities": results, "query": query})
 
@@ -709,8 +721,7 @@ def open_nodes(names: list[str]) -> str:
             _export_relations(conn, found_ids) if len(found_ids) >= 2 else []
         )
 
-        _record_entity_access(conn, found_ids, "open_nodes")
-
+    _record_entity_access_best_effort(found_ids, "open_nodes")
     return json.dumps({"entities": entities_out, "relations": relations_out})
 
 
