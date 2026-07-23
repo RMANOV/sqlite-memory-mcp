@@ -847,7 +847,7 @@ def test_pending_delivery_queue_is_durable_and_cursor_independent(tmp_path):
         con.close()
 
     queued = module._fetch_pending_deliveries([], ["Q"], 1)
-    assert [row["msg_id"] for row in queued] == ["new", "legacy", "old"]
+    assert [row["msg_id"] for row in queued] == ["new"]
     assert module._complete_pending_deliveries("new") == 1
     queued_after_ack = module._fetch_pending_deliveries([], ["Q"], 10)
     assert [row["msg_id"] for row in queued_after_ack] == ["old", "legacy"]
@@ -859,3 +859,118 @@ def test_pending_delivery_queue_is_durable_and_cursor_independent(tmp_path):
     )
     queued_after_legacy_ack = module._fetch_pending_deliveries([], ["Q"], 10)
     assert [row["msg_id"] for row in queued_after_legacy_ack] == ["old"]
+
+
+def test_pending_delivery_budget_is_hard_and_reserves_oldest_fairness(tmp_path):
+    module = _load_hook_module(
+        "debate_pump_targeted_budget_test", "hooks/debate_pump.py"
+    )
+    module.DB_PATH = tmp_path / "memory.db"
+    con = sqlite3.connect(module.DB_PATH)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE debates(topic_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+            CREATE TABLE debate_messages(
+                msg_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, ts TEXT NOT NULL,
+                priority TEXT NOT NULL, kind TEXT NOT NULL
+            );
+            CREATE TABLE debate_message_recipients(
+                msg_id TEXT NOT NULL, recipient TEXT NOT NULL,
+                recipient_mode TEXT NOT NULL, PRIMARY KEY(msg_id, recipient)
+            );
+            CREATE TABLE debate_delivery_queue(
+                msg_id TEXT NOT NULL, recipient TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL, completed_at TEXT,
+                PRIMARY KEY(msg_id, recipient)
+            );
+            INSERT INTO debates VALUES('T','ACTIVE');
+            """
+        )
+        for index in range(8):
+            msg_id = f"m{index}"
+            ts = f"2026-07-22T10:00:0{index}Z"
+            con.execute(
+                "INSERT INTO debate_messages VALUES(?, 'T', ?, 'H', 'Q')",
+                (msg_id, ts),
+            )
+            con.execute(
+                "INSERT INTO debate_message_recipients VALUES(?, 'EXECUTOR_1', 'normal')",
+                (msg_id,),
+            )
+            con.execute(
+                "INSERT INTO debate_delivery_queue VALUES(?, 'EXECUTOR_1', ?, NULL)",
+                (msg_id, ts),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    queued = module._fetch_pending_deliveries([], ["Q"], 2)
+    assert len(queued) == 2
+    assert [row["msg_id"] for row in queued] == ["m7", "m0"]
+
+
+def test_pending_delivery_compat_never_replays_pre_queue_history(tmp_path):
+    module = _load_hook_module(
+        "debate_pump_targeted_history_test", "hooks/debate_pump.py"
+    )
+    module.DB_PATH = tmp_path / "memory.db"
+    con = sqlite3.connect(module.DB_PATH)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE debates(topic_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+            CREATE TABLE debate_messages(
+                msg_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, ts TEXT NOT NULL,
+                priority TEXT NOT NULL, kind TEXT NOT NULL
+            );
+            CREATE TABLE debate_message_recipients(
+                msg_id TEXT NOT NULL, recipient TEXT NOT NULL,
+                recipient_mode TEXT NOT NULL, PRIMARY KEY(msg_id, recipient)
+            );
+            CREATE TABLE debate_delivery_queue(
+                msg_id TEXT NOT NULL, recipient TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL, completed_at TEXT,
+                PRIMARY KEY(msg_id, recipient)
+            );
+            INSERT INTO debates VALUES('T','ACTIVE');
+            INSERT INTO debate_messages VALUES(
+                'historical','T','2026-07-01T10:00:00Z','H','Q'
+            );
+            INSERT INTO debate_message_recipients
+            VALUES('historical','EXECUTOR_1','normal');
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert module._fetch_pending_deliveries([], ["Q"], 10) == []
+
+    con = sqlite3.connect(module.DB_PATH)
+    try:
+        con.executescript(
+            """
+            INSERT INTO debate_messages VALUES(
+                'activation','T','2026-07-22T10:00:00Z','H','Q'
+            );
+            INSERT INTO debate_message_recipients
+            VALUES('activation','EXECUTOR_1','normal');
+            INSERT INTO debate_delivery_queue VALUES(
+                'activation','EXECUTOR_1','2026-07-22T10:00:00Z',
+                '2026-07-22T10:00:01Z'
+            );
+            INSERT INTO debate_messages VALUES(
+                'mixed-gap','T','2026-07-22T10:00:02Z','H','Q'
+            );
+            INSERT INTO debate_message_recipients
+            VALUES('mixed-gap','EXECUTOR_1','normal');
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    recovered = module._fetch_pending_deliveries([], ["Q"], 10)
+    assert [row["msg_id"] for row in recovered] == ["mixed-gap"]

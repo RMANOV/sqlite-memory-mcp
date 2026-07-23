@@ -1677,6 +1677,10 @@ def test_merge_repairs_local_stale_status_from_field_event_authority(conn):
             "done",
         ),
     )
+    conn.execute(
+        "UPDATE tasks SET tombstone_pushed_at = ? WHERE id = ?",
+        ("2026-04-02T08:00:00+00:00", tid),
+    )
 
     remote_events = [
         {
@@ -1706,6 +1710,11 @@ def test_merge_repairs_local_stale_status_from_field_event_authority(conn):
         }
     ]
 
+    events_before = conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE aggregate_id = ?",
+        (tid,),
+    ).fetchone()[0]
+
     _, updated = merge_import_tasks(
         conn,
         remote,
@@ -1714,7 +1723,27 @@ def test_merge_repairs_local_stale_status_from_field_event_authority(conn):
     )
 
     assert _task(conn, tid)["status"] == "done"
+    assert _task(conn, tid)["tombstone_pushed_at"] == "2026-04-02T08:00:00+00:00"
     assert updated >= 1
+    events_after_repair = conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE aggregate_id = ?",
+        (tid,),
+    ).fetchone()[0]
+    assert events_after_repair == events_before
+
+    _, repeated_updates = merge_import_tasks(
+        conn,
+        remote,
+        import_content=False,
+        remote_events=remote_events,
+    )
+    events_after_repeat = conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE aggregate_id = ?",
+        (tid,),
+    ).fetchone()[0]
+
+    assert repeated_updates == 0
+    assert events_after_repeat == events_before
 
 
 def test_merge_records_conflict_objects(conn):

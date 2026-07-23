@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from memory_audit import (
+    _repair_context_pack_artifacts,
     govern_fact,
     list_memory_audit_issues,
     maybe_run_memory_audit,
@@ -172,6 +173,44 @@ def test_run_memory_audit_batches_provenance_source_timestamps(conn):
     assert len(timestamp_reads) == 1
 
 
+def test_context_pack_repair_preserves_quality_confidence_and_uses_unknown_for_missing(
+    conn,
+):
+    ts = "2026-03-31T08:00:00+00:00"
+    conn.execute(
+        "INSERT INTO context_packs ("
+        "pack_id, session_id, entity_id, pack_type, target_ref, input_signature, "
+        "token_budget, body, freshness_score, contract_version, created_at"
+        ") VALUES ('pack-confidence', NULL, NULL, 'executor', 'task-a', 'sig', "
+        "100, 'pack body', 0.91, 'memory_contract_v2', ?)",
+        (ts,),
+    )
+    conn.execute(
+        "INSERT INTO memory_artifacts ("
+        "artifact_id, artifact_key, artifact_kind, scope_kind, scope_ref, title, "
+        "body, confidence, status, created_at, updated_at"
+        ") VALUES ('artifact-confidence', 'summary:context_pack:pack-confidence', "
+        "'summary', 'context_pack', 'pack-confidence', 'executor context summary', "
+        "'pack body', 0.42, 'active', ?, ?)",
+        (ts, ts),
+    )
+
+    assert _repair_context_pack_artifacts(conn) == 0
+    existing = conn.execute(
+        "SELECT confidence FROM memory_artifacts "
+        "WHERE artifact_id = 'artifact-confidence'"
+    ).fetchone()
+    assert existing["confidence"] == pytest.approx(0.42)
+
+    conn.execute("DELETE FROM memory_artifacts WHERE artifact_id='artifact-confidence'")
+    assert _repair_context_pack_artifacts(conn) == 1
+    recovered = conn.execute(
+        "SELECT confidence FROM memory_artifacts "
+        "WHERE artifact_key = 'summary:context_pack:pack-confidence'"
+    ).fetchone()
+    assert recovered["confidence"] == pytest.approx(0.0)
+
+
 def test_govern_fact_contradiction_updates_counts_and_replay(conn):
     _insert_fact(conn, "fact-left", object_text="Redis")
     _insert_fact(conn, "fact-right", object_text="PostgreSQL")
@@ -263,6 +302,50 @@ def test_rebuild_task_from_events_repairs_stale_materialization(conn):
 
     assert "status" in result["repaired_fields"]
     assert row["status"] == "done"
+
+
+def test_rebuild_task_from_events_never_overwrites_newer_materialized_state(conn):
+    ledger_ts = "2026-03-31T08:00:00+00:00"
+    row_ts = "2026-03-31T09:00:00+00:00"
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, type, created_at, updated_at) "
+        "VALUES ('task-newer-row', 'Ledger title', 'not_started', 'medium', "
+        "'inbox', 'task', ?, ?)",
+        (ledger_ts, ledger_ts),
+    )
+    from db_utils import upsert_field_versions
+
+    upsert_field_versions(
+        conn,
+        "task-newer-row",
+        ("title",),
+        timestamp=ledger_ts,
+        machine_id="fedora",
+        new_values={"title": "Ledger title"},
+        tool_name="test.newer_materialized_guard",
+    )
+    conn.execute(
+        "UPDATE tasks SET title = 'Newer materialized title', updated_at = ? "
+        "WHERE id = 'task-newer-row'",
+        (row_ts,),
+    )
+
+    result = rebuild_task_from_events(conn, "task-newer-row", repair=True)
+    row = conn.execute(
+        "SELECT title, updated_at FROM tasks WHERE id = 'task-newer-row'"
+    ).fetchone()
+
+    assert result["repaired_fields"] == []
+    assert result["repair_skipped_reason"] == "materialized_newer_than_ledger"
+    assert row["title"] == "Newer materialized title"
+    assert row["updated_at"] == row_ts
+
+    audit = run_memory_audit(conn, repair=True)
+    assert any(
+        issue["issue_type"] == "task_write_bypass"
+        and issue["subject_ref"] == "task-newer-row"
+        for issue in audit["issues"]
+    )
 
 
 def test_run_memory_audit_detects_task_write_bypass(conn):

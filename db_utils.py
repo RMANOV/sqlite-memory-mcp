@@ -5390,6 +5390,7 @@ def merge_import_tasks(
 
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
+            materialization_repairs: set[str] = set()
             local_status_state = local_status_authority.get(local_id)
             local_status_value = _normalize_task_status_value(
                 (local_status_state or {}).get("value")
@@ -5400,6 +5401,7 @@ def merge_import_tasks(
                 != task_content_map.get(local_id, {}).get("status")
             ):
                 fields_to_update["status"] = local_status_value
+                materialization_repairs.add("status")
                 task_content_map[local_id]["status"] = local_status_value
                 status_ts = str((local_status_state or {}).get("updated_at") or "")
                 semantic_update_timestamps = [status_ts] if status_ts else []
@@ -5702,14 +5704,24 @@ def merge_import_tasks(
                     # A merged status change yields a new local tombstone state
                     # that THIS machine has not pushed; clear the prior push stamp
                     # so it must be re-pushed before aging out of export / Tier-2.
-                    if "status" in safe_fields:
+                    if (
+                        "status" in safe_fields
+                        and "status" not in materialization_repairs
+                    ):
                         safe_fields["tombstone_pushed_at"] = None
                     set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
                     values = list(safe_fields.values()) + [local_id]
                     conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
-                    # PF-03 fix: record merge in event ledger
+                    # Record only new semantic merge authority. A materialization
+                    # repair is already backed by its authoritative event, while
+                    # tombstone_pushed_at is transport metadata rather than a
+                    # user-domain field. Re-emitting either creates self-churn.
                     for merged_field in safe_fields:
-                        if merged_field == "updated_at":
+                        if merged_field in {
+                            "updated_at",
+                            "tombstone_pushed_at",
+                            *materialization_repairs,
+                        }:
                             continue
                         record_memory_event(
                             conn,

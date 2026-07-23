@@ -1953,17 +1953,7 @@ def post_message(
             if token.upper() in declared_roles
         }
         for recipient in sorted(derived):
-            conn.execute(
-                "INSERT OR IGNORE INTO debate_message_recipients "
-                "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'normal')",
-                (msg_id, recipient),
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO debate_delivery_queue "
-                "(msg_id, recipient, enqueued_at, completed_at) "
-                "VALUES (?, ?, ?, NULL)",
-                (msg_id, recipient, ts),
-            )
+            _enqueue_delivery(conn, msg_id, recipient, ts, mode="normal")
 
     new_state = debate["state"]
     if kind == "STATE" and new_state_target is not None:
@@ -3383,6 +3373,28 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
+def _enqueue_delivery(
+    conn: sqlite3.Connection,
+    msg_id: str,
+    recipient: str,
+    enqueued_at: str,
+    *,
+    mode: str,
+) -> None:
+    """Idempotently persist recipient intent and its durable delivery row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO debate_message_recipients "
+        "(msg_id, recipient, recipient_mode) VALUES (?, ?, ?)",
+        (msg_id, recipient, mode),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO debate_delivery_queue "
+        "(msg_id, recipient, enqueued_at, completed_at) "
+        "VALUES (?, ?, ?, NULL)",
+        (msg_id, recipient, enqueued_at),
+    )
+
+
 def debate_post_with_recipients(
     conn: sqlite3.Connection,
     *,
@@ -3515,28 +3527,16 @@ def debate_post_with_recipients(
     )
     msg_id = post_result["msg_id"]
     for recipient in deduped:
-        conn.execute(
-            "INSERT INTO debate_message_recipients "
-            "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'normal')",
-            (msg_id, recipient),
-        )
-        conn.execute(
-            "INSERT INTO debate_delivery_queue "
-            "(msg_id, recipient, enqueued_at, completed_at) "
-            "VALUES (?, ?, ?, NULL)",
-            (msg_id, recipient, post_result["ts"]),
+        _enqueue_delivery(
+            conn, msg_id, recipient, post_result["ts"], mode="normal"
         )
     for recipient in diagnostic_deduped:
-        conn.execute(
-            "INSERT INTO debate_message_recipients "
-            "(msg_id, recipient, recipient_mode) VALUES (?, ?, 'diagnostic')",
-            (msg_id, recipient),
-        )
-        conn.execute(
-            "INSERT INTO debate_delivery_queue "
-            "(msg_id, recipient, enqueued_at, completed_at) "
-            "VALUES (?, ?, ?, NULL)",
-            (msg_id, recipient, post_result["ts"]),
+        _enqueue_delivery(
+            conn,
+            msg_id,
+            recipient,
+            post_result["ts"],
+            mode="diagnostic",
         )
 
     result = {

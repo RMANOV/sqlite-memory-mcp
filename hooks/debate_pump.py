@@ -287,11 +287,11 @@ def _fetch_pending_deliveries(
     temporarily-unbound trigger from hiding a newly addressed message
     (head-of-line blocking).
 
-    Newest addressed rows are returned first even when their posting MCP process
-    predates the queue table and therefore left no delivery row.
-    This compatibility fast path means existing agent sessions need no restart.
-    A small oldest queued slice is appended for starvation-free crash recovery.
-    Claim/wake uniqueness remains the dispatch idempotency authority.
+    Newest queued rows are returned first. A bounded compatibility slice can
+    recover mixed-version posts only after the queue's first observed enqueue;
+    pre-queue history is never replayed as fresh work. When the queue saturates
+    the budget, one slot is reserved for its oldest row to prevent starvation.
+    The returned row count never exceeds ``limit``.
     """
     if limit <= 0:
         return []
@@ -323,34 +323,49 @@ def _fetch_pending_deliveries(
             pending_select_sql + "ORDER BY q.enqueued_at DESC, m.msg_id DESC LIMIT ?",
             [*params, limit],
         ).fetchall()
-        latest_addressed = con.execute(
-            "SELECT DISTINCT m.msg_id, m.topic_id, m.ts, NULL AS enqueued_at "
-            "FROM debate_messages m "
-            "JOIN debates d ON d.topic_id = m.topic_id "
-            "JOIN debate_message_recipients r ON r.msg_id = m.msg_id "
-            "WHERE NOT EXISTS (SELECT 1 FROM debate_delivery_queue q "
-            " WHERE q.msg_id=m.msg_id AND q.recipient=r.recipient) "
-            "AND d.state IN ('INIT','ACTIVE') "
-            f"{blind_sql} {topic_sql} {kind_sql} "
-            "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
-            [*params, max(limit, 64)],
-        ).fetchall()
-        fairness_limit = min(16, max(1, limit // 4))
+        saturated = len(newest_queued) == limit
         oldest = (
             con.execute(
                 pending_select_sql + "ORDER BY q.enqueued_at ASC, m.msg_id ASC LIMIT ?",
-                [*params, fairness_limit],
+                [*params, 1],
             ).fetchall()
-            if len(newest_queued) == limit
+            if saturated and limit > 1
             else []
         )
+        latest_addressed = []
+        if not saturated:
+            remaining = limit - len(newest_queued)
+            latest_addressed = con.execute(
+                "SELECT DISTINCT m.msg_id, m.topic_id, m.ts, NULL AS enqueued_at "
+                "FROM debate_messages m "
+                "JOIN debates d ON d.topic_id = m.topic_id "
+                "JOIN debate_message_recipients r ON r.msg_id = m.msg_id "
+                "WHERE NOT EXISTS (SELECT 1 FROM debate_delivery_queue q "
+                " WHERE q.msg_id=m.msg_id AND q.recipient=r.recipient) "
+                "AND m.ts >= (SELECT MIN(enqueued_at) FROM debate_delivery_queue) "
+                "AND d.state IN ('INIT','ACTIVE') "
+                f"{blind_sql} {topic_sql} {kind_sql} "
+                "ORDER BY m.ts DESC, m.msg_id DESC LIMIT ?",
+                [*params, remaining],
+            ).fetchall()
+
+        if oldest:
+            candidates = [
+                *newest_queued[: limit - 1],
+                *oldest,
+                *newest_queued[limit - 1 :],
+            ]
+        else:
+            candidates = [*newest_queued, *latest_addressed]
         seen: set[str] = set()
         out: list[sqlite3.Row] = []
-        for row in [*newest_queued, *latest_addressed, *oldest]:
+        for row in candidates:
             msg_id = str(row["msg_id"])
             if msg_id not in seen:
                 seen.add(msg_id)
                 out.append(row)
+                if len(out) == limit:
+                    break
         return out
     finally:
         if owns_connection:
