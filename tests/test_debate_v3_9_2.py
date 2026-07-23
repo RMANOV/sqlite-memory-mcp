@@ -310,6 +310,36 @@ def test_signal_check_dedupes_role_and_session_id_match(topic):
     assert len(out["pending"]) == 1
 
 
+def test_ping_explicit_and_derived_recipient_is_idempotent(topic):
+    conn, t = topic
+
+    result = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="PING",
+        body="wake now target=EXECUTOR",
+        addressed_to=["EXECUTOR"],
+    )
+
+    recipients = conn.execute(
+        "SELECT recipient, recipient_mode FROM debate_message_recipients "
+        "WHERE msg_id = ?",
+        (result["msg_id"],),
+    ).fetchall()
+    queued = conn.execute(
+        "SELECT recipient FROM debate_delivery_queue WHERE msg_id = ?",
+        (result["msg_id"],),
+    ).fetchall()
+
+    assert [(row["recipient"], row["recipient_mode"]) for row in recipients] == [
+        ("EXECUTOR", "normal")
+    ]
+    assert [row["recipient"] for row in queued] == ["EXECUTOR"]
+    assert result["recipient_count"] == 1
+
+
 def test_signal_check_truncation_and_next_cursor(topic):
     conn, t = topic
     for i in range(5):
