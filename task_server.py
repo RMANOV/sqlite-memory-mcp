@@ -81,19 +81,12 @@ def _find_note_by_title_project(
     title_key = _normalize_title_key(title)
     if not title_key:
         return None
-    if project is None:
-        rows = conn.execute(
-            "SELECT id, title, description, notes, status, section, priority, "
-            "project, updated_at, created_at "
-            "FROM tasks WHERE type = 'note' AND project IS NULL"
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, title, description, notes, status, section, priority, "
-            "project, updated_at, created_at "
-            "FROM tasks WHERE type = 'note' AND project = ?",
-            (project,),
-        ).fetchall()
+    project_predicate = "project IS NULL" if project is None else "project = ?"
+    params = () if project is None else (project,)
+    rows = conn.execute(
+        f"SELECT id, title FROM tasks WHERE type = 'note' AND {project_predicate}",
+        params,
+    ).fetchall()
     for row in rows:
         if _normalize_title_key(row["title"]) == title_key:
             return dict(row)
@@ -900,6 +893,28 @@ def _score_entity_lookup(
     }
 
 
+def _score_lookup_candidates(
+    task_rows: list[sqlite3.Row],
+    entity_rows: list[sqlite3.Row],
+    obs_by_entity: dict[int, list[str]],
+    query: str,
+) -> list[dict[str, Any]]:
+    matches = [
+        scored
+        for row in task_rows
+        if (scored := _score_task_lookup(row, query)) is not None
+    ]
+    matches.extend(
+        scored
+        for row in entity_rows
+        if (
+            scored := _score_entity_lookup(row, query, obs_by_entity.get(row["id"], []))
+        )
+        is not None
+    )
+    return matches
+
+
 @mcp.tool()
 def find_by_title(title_fragment: str, limit: int = 20) -> str:
     """Find tasks, notes, or entities by partial title or remembered phrase.
@@ -927,19 +942,7 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
             conn, query, limit
         )
         matches.extend(
-            scored
-            for row in task_rows
-            if (scored := _score_task_lookup(row, query)) is not None
-        )
-        matches.extend(
-            scored
-            for row in entity_rows
-            if (
-                scored := _score_entity_lookup(
-                    row, query, obs_by_entity.get(row["id"], [])
-                )
-            )
-            is not None
+            _score_lookup_candidates(task_rows, entity_rows, obs_by_entity, query)
         )
 
         # FTS OR queries can surface only low-signal token collisions. In that
@@ -952,20 +955,8 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
             task_rows, entity_rows, obs_by_entity, strategy = _lookup_rows(
                 conn, query, limit, force_full_scan=True
             )
-            matches = [
-                scored
-                for row in task_rows
-                if (scored := _score_task_lookup(row, query)) is not None
-            ]
-            matches.extend(
-                scored
-                for row in entity_rows
-                if (
-                    scored := _score_entity_lookup(
-                        row, query, obs_by_entity.get(row["id"], [])
-                    )
-                )
-                is not None
+            matches = _score_lookup_candidates(
+                task_rows, entity_rows, obs_by_entity, query
             )
 
     matches.sort(
