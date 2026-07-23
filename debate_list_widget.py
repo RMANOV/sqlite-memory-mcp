@@ -220,19 +220,22 @@ def apply_debate_controls(key: str, items: list[dict], params: dict | None) -> l
     state = normalize_debate_control_params(key, params)
     config = _CONTROL_CONFIG.get(key, _CONTROL_CONFIG["topics"])
     filters = state["control_filters"]
+    selected_filters = {
+        dimension: set(selected)
+        for dimension, selected in filters.items()
+        if selected
+    }
     query = state["control_text"].strip().casefold()
 
     visible = []
     for item in items:
         rejected = False
-        for dimension, selected in filters.items():
-            if not selected:
-                continue
+        for dimension, selected in selected_filters.items():
             if dimension == "due":
-                if not (_due_buckets(item.get("due_date")) & set(selected)):
+                if not (_due_buckets(item.get("due_date")) & selected):
                     rejected = True
                     break
-            elif str(item.get(dimension) or "") not in set(selected):
+            elif str(item.get(dimension) or "") not in selected:
                 rejected = True
                 break
         if rejected:

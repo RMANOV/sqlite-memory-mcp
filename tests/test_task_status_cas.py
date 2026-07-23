@@ -376,7 +376,12 @@ def test_undo_is_single_use_and_foreign_advance_conflicts(db_path):
 def test_live_path_fence_resolves_symlinks_before_open(db_path, tmp_path):
     _create(db_path, "fenced", "not_started")
     link = tmp_path / "alias.db"
-    os.symlink(db_path, link)
+    try:
+        os.symlink(db_path, link)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
 
     with pytest.raises(PermissionError, match="fenced DB path"):
         transition_status(

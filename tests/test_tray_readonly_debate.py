@@ -46,7 +46,7 @@ def asof_clock():
     return AS_OF
 
 
-pytestmark = pytest.mark.skipif(
+requires_frozen_fixtures = pytest.mark.skipif(
     not (os.path.exists(FX_A) and os.path.exists(FX_B)),
     reason="frozen fixtures not present",
 )
@@ -87,6 +87,7 @@ def test_S2a_refusal_precedes_any_db_open(monkeypatch):
         pass
 
 
+@requires_frozen_fixtures
 def test_query_only_blocks_writes():
     from debate_read_dao import DebateReadDAO
     import sqlite3
@@ -105,6 +106,7 @@ def test_query_only_blocks_writes():
 
 
 # ── frozen-clock reproduction ───────────────────────────────────────────────
+@requires_frozen_fixtures
 def test_T2_fxa_section_a_zero():
     """Layer-1 board parity: FX-A section-A (live_await=False) == 0 (unchanged by
     adoption fix 1)."""
@@ -118,6 +120,7 @@ def test_T2_fxa_section_a_zero():
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_LIVE_AWAIT_fxa_drops_broad_keyword_false_positives():
     """The frozen prod snapshot contains historical operator keywords but no
     explicit unresolved operator request. The live view must stay empty rather
@@ -134,6 +137,7 @@ def test_LIVE_AWAIT_fxa_drops_broad_keyword_false_positives():
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_T1_fxb_recent_role_pin_exactly_10_in_order():
     from debate_read_dao import DebateReadDAO
 
@@ -149,6 +153,7 @@ def test_T1_fxb_recent_role_pin_exactly_10_in_order():
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_T3_fxb_section_a_10():
     """Layer-1 (human- recipient) parity: FX-B section-A (live_await=False) is
     exactly the 10 seeded targets. The live combined view is a superset."""
@@ -248,6 +253,7 @@ def test_ADOPTIONFIX1_live_await_surfaces_role_addressed(tmp_path):
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_T6_fxb_topics_10_targets():
     from debate_read_dao import DebateReadDAO
 
@@ -261,6 +267,7 @@ def test_T6_fxb_topics_10_targets():
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_T4_fxb_search_nonces_hit_only_their_source():
     from debate_read_dao import DebateReadDAO
 
@@ -277,6 +284,7 @@ def test_T4_fxb_search_nonces_hit_only_their_source():
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_T4_fxb_search_exact_equality_vs_board():
     """Per-source id list + order must equal the board reference on FX-B (M4)."""
     if not os.path.exists(os.path.join(BOARD_DIR, "board.py")):
@@ -308,6 +316,7 @@ def test_T4_fxb_search_exact_equality_vs_board():
         dao.close()
 
 
+@requires_frozen_fixtures
 def test_time_to_find_data_precondition():
     """Structural time-to-find precondition (spec T1/T3/T6): the target set is
     exactly the first screen (zero scroll) and the read is sub-100ms."""
@@ -666,6 +675,7 @@ def test_tasklistwidget_debate_guard_context_menu(qapp, monkeypatch):
     assert not db.delete_task.called
 
 
+@requires_frozen_fixtures
 def test_BLOCKER1_fullwindow_debate_tabs_visible_and_load(qapp, tmp_path, monkeypatch):
     """Integration regression (audit 370313098246 BLOCKER 1): the three debate
     tabs must stay VISIBLE through FullWindow.__init__ → refresh() and actually
