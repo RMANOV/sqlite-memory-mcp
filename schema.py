@@ -233,6 +233,65 @@ CREATE TABLE IF NOT EXISTS task_entity_links (
 );
 CREATE INDEX IF NOT EXISTS idx_tel_entity ON task_entity_links(entity_id);
 
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    entity_id        INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    alias            TEXT    NOT NULL,
+    normalized_alias TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL,
+    PRIMARY KEY (entity_id, normalized_alias)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized
+    ON entity_aliases(normalized_alias);
+
+CREATE TABLE IF NOT EXISTS link_suggestion_decisions (
+    decision_id       TEXT PRIMARY KEY,
+    task_id           TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    entity_id         INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    decision          TEXT    NOT NULL CHECK (decision IN ('accepted', 'rejected')),
+    score             REAL    DEFAULT NULL,
+    rank_at_decision  INTEGER DEFAULT NULL,
+    signals_json      TEXT    NOT NULL DEFAULT '{}',
+    model_version     TEXT    NOT NULL,
+    decision_source   TEXT    NOT NULL,
+    decided_by        TEXT    NOT NULL,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL,
+    UNIQUE(task_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_link_decisions_decision
+    ON link_suggestion_decisions(decision, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_link_decisions_model
+    ON link_suggestion_decisions(model_version, decision);
+
+CREATE TABLE IF NOT EXISTS link_community_runs (
+    run_id              TEXT PRIMARY KEY,
+    model_version       TEXT    NOT NULL,
+    algorithm           TEXT    NOT NULL CHECK (algorithm = 'leiden'),
+    seed                INTEGER NOT NULL,
+    resolutions_json    TEXT    NOT NULL,
+    primary_resolution  TEXT    NOT NULL,
+    stability_json      TEXT    NOT NULL,
+    label_count         INTEGER NOT NULL,
+    node_count          INTEGER NOT NULL,
+    edge_count          INTEGER NOT NULL,
+    created_at          TEXT    NOT NULL,
+    active              INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_link_community_one_active
+    ON link_community_runs(active) WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS link_community_memberships (
+    run_id           TEXT NOT NULL REFERENCES link_community_runs(run_id) ON DELETE CASCADE,
+    resolution       TEXT NOT NULL,
+    node_kind        TEXT NOT NULL CHECK (node_kind IN ('task', 'entity', 'project', 'source')),
+    node_ref         TEXT NOT NULL,
+    community_id     INTEGER NOT NULL,
+    stability_score  REAL NOT NULL,
+    PRIMARY KEY (run_id, resolution, node_kind, node_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_link_community_lookup
+    ON link_community_memberships(run_id, resolution, node_kind, node_ref);
+
 CREATE TABLE IF NOT EXISTS task_attachments (
     attachment_id  TEXT PRIMARY KEY,
     task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -2303,6 +2362,39 @@ def _repair_memory_fts_triggers(conn: sqlite3.Connection) -> None:
         logger.info("Migration applied: repaired %s trigger", name)
 
 
+def _backfill_manual_link_decisions(conn: sqlite3.Connection) -> None:
+    """Treat existing manual task↔entity links as explicit positive labels.
+
+    The identifiers are deterministic, so the backfill is idempotent.  These
+    rows remain distinguishable from decisions captured by the suggestion UI
+    and must not be mistaken for negative-label coverage.
+    """
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO link_suggestion_decisions (
+            decision_id, task_id, entity_id, decision, score, rank_at_decision,
+            signals_json, model_version, decision_source, decided_by,
+            created_at, updated_at
+        )
+        SELECT
+            'legacy-manual:' || tel.task_id || ':' || tel.entity_id,
+            tel.task_id,
+            tel.entity_id,
+            'accepted',
+            tel.score,
+            NULL,
+            '{"legacy_manual_link":true}',
+            'legacy/manual',
+            'legacy_manual_link',
+            'legacy',
+            tel.created_at,
+            tel.created_at
+        FROM task_entity_links AS tel
+        WHERE tel.link_type = 'manual'
+        """
+    )
+
+
 def _split_schema_sql(sql: str) -> list[str]:
     """Split SQL schema into statements, respecting BEGIN...END trigger blocks.
 
@@ -2508,6 +2600,7 @@ def init_db(db_path: str | None = None) -> None:
                 logger.info("Migration applied: %s", desc)
         _migrate_debate_messages_v1(raw)
         _repair_memory_fts_triggers(raw)
+        _backfill_manual_link_decisions(raw)
         raw.execute("COMMIT;")
     except Exception:
         raw.execute("ROLLBACK;")
@@ -2558,16 +2651,15 @@ def init_db(db_path: str | None = None) -> None:
 
     # Optional: initialize sqlite-vec virtual table for semantic search
     try:
-        from vec_search import (
-            VEC_AVAILABLE,
-            init_vec_table,
-            init_task_vec_table,
-        )
+        import vec_search as _vec_search
 
-        if VEC_AVAILABLE:
-            with _get_conn(_path) as conn:
-                init_vec_table(conn)
-                init_task_vec_table(conn)
+        with _get_conn(_path) as conn:
+            if _vec_search.VEC_AVAILABLE:
+                _vec_search.init_vec_table(conn)
+                _vec_search.init_task_vec_table(conn)
+            prune = getattr(_vec_search, "prune_orphan_task_embeddings", None)
+            if callable(prune):
+                prune(conn)
     except Exception as e:
         logger.debug("sqlite-vec init skipped: %s", e)
 

@@ -18,11 +18,14 @@ from db_utils import (
     tokenize_for_similarity as _tokenize,
     fts_sync_entity as _fts_sync,
     setup_logger,
-    now_iso as _now_iso,
     TaskDAO,
 )
 from premium_runtime import maybe_mount_premium_extensions
 from schema import error as _error
+from link_suggestions import (
+    record_link_decision as _record_link_decision,
+    suggest_links as _suggest_links,
+)
 
 # ── Logging (file-only, NEVER stdout — breaks MCP stdio) ────────────────
 
@@ -76,21 +79,23 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
         entity_id = _get_entity_id(conn, entity_name)
         if not entity_id:
             return _error(f"Entity '{entity_name}' not found")
-        now = _now_iso()
-
-        TaskDAO.link_entity(
-            conn, task_id, entity_id, link_type="manual", created_at=now
+        result = _record_link_decision(
+            conn,
+            task_id=task_id,
+            entity_id=entity_id,
+            decision="accepted",
+            decided_by="human",
+            decision_source="manual_link",
+            accepted_link_type="manual",
         )
-
-        return json.dumps(
-            {
-                "task_id": task_id,
-                "entity_name": entity_name,
-                "entity_id": entity_id,
-                "link_type": "manual",
-                "created_at": now,
-            }
-        )
+        result["link_type"] = "manual"
+        link_row = conn.execute(
+            "SELECT created_at FROM task_entity_links "
+            "WHERE task_id = ? AND entity_id = ?",
+            (task_id, entity_id),
+        ).fetchone()
+        result["created_at"] = link_row["created_at"] if link_row else None
+        return json.dumps(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -100,12 +105,38 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
 
 @mcp.tool()
 def unlink_task_entity(task_id: str, entity_name: str) -> str:
-    """Remove a link between a task and a knowledge graph entity."""
+    """Remove a task↔entity link.
+
+    Removing a silent high-confidence link also records an explicit human
+    rejection, so that pair stays suppressed and becomes a real evaluation
+    label. Other link types preserve the historical unlink behavior.
+    """
     with _get_conn() as conn:
         entity_id = _get_entity_id(conn, entity_name)
         if not entity_id:
             return _error(f"Entity '{entity_name}' not found")
 
+        existing = conn.execute(
+            "SELECT link_type FROM task_entity_links "
+            "WHERE task_id = ? AND entity_id = ?",
+            (task_id, entity_id),
+        ).fetchone()
+        if existing is not None and existing["link_type"] == "auto_high_confidence":
+            result = _record_link_decision(
+                conn,
+                task_id=task_id,
+                entity_id=entity_id,
+                decision="rejected",
+                decided_by="human",
+                decision_source="auto_high_confidence_rejected_by_human",
+            )
+            return json.dumps(
+                {
+                    "removed": True,
+                    "decision_recorded": "rejected",
+                    "decision_id": result["decision_id"],
+                }
+            )
         removed = TaskDAO.unlink_entity(conn, task_id, entity_id)
 
         return json.dumps({"removed": removed > 0})
@@ -147,70 +178,28 @@ def get_entity_tasks(entity_name: str) -> str:
 
 
 @mcp.tool()
-def suggest_task_links(task_id: str, limit: int = 5) -> str:
+def suggest_task_links(
+    task_id: str, limit: int = 5, include_vector: bool = False
+) -> str:
     """Suggest knowledge graph entities that may be related to a task.
 
-    Uses FTS5 for candidate retrieval + Jaccard similarity for ranking.
-    Does NOT auto-create links — returns suggestions for human/Claude review.
+    Uses one versioned pairwise scorer with exact name/alias, FTS5, project,
+    provenance, graph/meta-path, temporal, optional vector, and weak derived
+    community signals. Does NOT auto-create links.
     """
     with _get_conn() as conn:
-        task = TaskDAO.get_by_id(conn, task_id, "title, description")
-        if not task:
-            return _error(f"Task {task_id} not found")
-
-        search_text = f"{task['title'] or ''} {task['description'] or ''}"
-        task_tokens = _tokenize(search_text)
-        if not task_tokens:
-            return json.dumps({"task_id": task_id, "suggestions": []})
-
-        fts_q = _fts_query(search_text)
-        if not fts_q:
-            return json.dumps({"task_id": task_id, "suggestions": []})
-
-        candidates = conn.execute(
-            "SELECT rowid, name, entity_type, rank "
-            "FROM memory_fts WHERE memory_fts MATCH ? "
-            "ORDER BY rank LIMIT 50",
-            (fts_q,),
-        ).fetchall()
-
-        linked_ids = TaskDAO.get_linked_entity_ids(conn, task_id)
-        observations = _observations_by_entity(
-            conn, [candidate["rowid"] for candidate in candidates]
-        )
-
-        scored = []
-        for c in candidates:
-            if c["rowid"] in linked_ids:
-                continue
-
-            obs_text = " ".join(observations.get(c["rowid"], []))
-            entity_tokens = _tokenize(f"{c['name']} {obs_text}")
-
-            if not entity_tokens:
-                continue
-
-            t_tok = set(sorted(task_tokens)[:500])
-            e_tok = set(sorted(entity_tokens)[:500])
-            intersection = t_tok & e_tok
-            union = t_tok | e_tok
-            jaccard = len(intersection) / len(union) if union else 0.0
-
-            norm_rank = min(1.0, abs(c["rank"]) / 20.0)
-            combined = 0.6 * norm_rank + 0.4 * jaccard
-
-            scored.append(
-                {
-                    "entity_name": c["name"],
-                    "entity_type": c["entity_type"],
-                    "score": round(combined, 4),
-                    "shared_keywords": sorted(intersection)[:10],
-                }
+        try:
+            result = _suggest_links(
+                conn,
+                task_id,
+                limit=limit,
+                include_vector=include_vector,
             )
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-
-        return json.dumps({"task_id": task_id, "suggestions": scored[:limit]})
+        except ValueError as exc:
+            return _error(str(exc))
+        result["accept_tool"] = "link_task_entity"
+        result["undo_auto_tool"] = "unlink_task_entity"
+        return json.dumps(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

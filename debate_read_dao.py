@@ -18,6 +18,7 @@ frozen ``as_of``; there is **no** live ``datetime.now`` on the harness path.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -153,6 +154,9 @@ class DebateReadDAO:
             "has_blind_commits": "debate_blind_commits" in names,
             "has_human_packets": "debate_human_packets" in names,
             "has_protocol_state": "debate_protocol_state" in names,
+            "has_link_decisions": "link_suggestion_decisions" in names,
+            "has_task_entity_links": "task_entity_links" in names,
+            "has_entities": "entities" in names,
         }
 
     def _visible_sql(self, alias="m"):
@@ -492,6 +496,63 @@ class DebateReadDAO:
                 }
             )
         return items, int(before)
+
+    def recent_auto_links(self, *, hours=24, limit=3):
+        """Newest high-confidence silent accepts, bounded for operator review.
+
+        These rows are informational and reversible.  Silence keeps the link;
+        they are not counted as human training labels.
+        """
+        if not (
+            self._caps["has_link_decisions"]
+            and self._caps["has_task_entity_links"]
+            and self._caps["has_tasks"]
+            and self._caps["has_entities"]
+        ):
+            return []
+        hours = max(1, min(int(hours), 168))
+        limit = max(1, min(int(limit), 3))
+        cutoff = self._now() - timedelta(hours=hours)
+        rows = self._conn.execute(
+            "SELECT d.decision_id, d.task_id, d.entity_id, d.score, "
+            "d.signals_json, d.model_version, d.updated_at, "
+            "t.title AS task_title, e.name AS entity_name "
+            "FROM link_suggestion_decisions AS d "
+            "JOIN tasks AS t ON t.id = d.task_id "
+            "JOIN entities AS e ON e.id = d.entity_id "
+            "JOIN task_entity_links AS tel "
+            "  ON tel.task_id = d.task_id AND tel.entity_id = d.entity_id "
+            "WHERE d.decision = 'accepted' "
+            "AND d.decision_source = 'auto_high_confidence' "
+            "AND tel.link_type = 'auto_high_confidence' "
+            "AND datetime(d.updated_at) >= datetime(?) "
+            "ORDER BY COALESCE(d.score, 0) DESC, d.updated_at DESC, d.decision_id "
+            "LIMIT ?",
+            (cutoff.isoformat(), limit),
+        ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                receipt = json.loads(row["signals_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                receipt = {}
+            items.append(
+                {
+                    "id": f"link:{row['decision_id']}",
+                    "decision_id": row["decision_id"],
+                    "task_id": row["task_id"],
+                    "task_title": row["task_title"],
+                    "entity_id": int(row["entity_id"]),
+                    "entity_name": row["entity_name"],
+                    "score": float(row["score"] or 0.0),
+                    "reasons": list(receipt.get("reasons") or [])[:3],
+                    "model_version": row["model_version"],
+                    "updated_at": row["updated_at"],
+                    "age": self._rel(row["updated_at"]),
+                    "reversible": True,
+                }
+            )
+        return items
 
     # ---- VIEW 2: recent (board.py:466-521) ----------------------------------
     def recent(self, hours, role, kinds):

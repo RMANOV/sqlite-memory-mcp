@@ -337,21 +337,72 @@ def vec_sync_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
 
 
-def vec_remove_task(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's embedding by its UUID."""
-    if not VEC_AVAILABLE:
-        return
+def vec_remove_task_rowid(conn: sqlite3.Connection, rowid: int) -> bool:
+    """Remove one task embedding by SQLite rowid.
+
+    Deletion only needs sqlite-vec, not the transformer model.  Returning a
+    boolean lets hard-delete paths distinguish an unavailable derived cache
+    from a completed cleanup.
+    """
+    if not _HAS_VEC or not load_vec(conn):
+        return False
     try:
-        if load_vec(conn):
-            row = conn.execute(
-                "SELECT rowid FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if row:
-                conn.execute(
-                    "DELETE FROM task_embeddings WHERE rowid = ?", (row["rowid"],)
-                )
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_embeddings'"
+        ).fetchone()
+        if table is None:
+            return True
+        conn.execute("DELETE FROM task_embeddings WHERE rowid = ?", (int(rowid),))
+        return True
     except sqlite3.Error as e:
-        logger.debug("vec_remove_task(%s) failed: %s", task_id, e)
+        logger.debug("vec_remove_task_rowid(%s) failed: %s", rowid, e)
+        return False
+
+
+def vec_remove_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Remove a task's embedding by UUID before the task row is deleted."""
+    try:
+        row = conn.execute(
+            "SELECT rowid FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.Error as e:
+        logger.debug("vec_remove_task(%s) lookup failed: %s", task_id, e)
+        return False
+    if row is None:
+        return True
+    return vec_remove_task_rowid(conn, int(row["rowid"]))
+
+
+def prune_orphan_task_embeddings(conn: sqlite3.Connection) -> int:
+    """Delete derived task embeddings whose task row no longer exists.
+
+    This is safe to run repeatedly and never generates embeddings.  It repairs
+    databases created before hard-delete paths cleaned the optional vec0 cache.
+    """
+    if not _HAS_VEC or not load_vec(conn):
+        return 0
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_embeddings'"
+        ).fetchone()
+        if table is None:
+            return 0
+        orphan_rowids = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT te.rowid FROM task_embeddings AS te "
+                "LEFT JOIN tasks AS t ON t.rowid = te.rowid "
+                "WHERE t.rowid IS NULL ORDER BY te.rowid"
+            ).fetchall()
+        ]
+        for rowid in orphan_rowids:
+            conn.execute("DELETE FROM task_embeddings WHERE rowid = ?", (rowid,))
+        if orphan_rowids:
+            logger.info("Pruned %d orphan task embeddings", len(orphan_rowids))
+        return len(orphan_rowids)
+    except sqlite3.Error as e:
+        logger.warning("prune_orphan_task_embeddings failed: %s", e)
+        return 0
 
 
 def task_vector_search(

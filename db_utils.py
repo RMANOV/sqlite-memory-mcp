@@ -2645,6 +2645,23 @@ def compute_recency_decay(
 # ── Task DAO ──────────────────────────────────────────────────────────────
 
 
+def _remove_task_embedding_rowid_safe(
+    conn: sqlite3.Connection, task_rowid: int
+) -> bool:
+    """Best-effort cleanup of the optional vec0 cache before a hard delete."""
+    try:
+        from vec_search import vec_remove_task_rowid
+
+        return vec_remove_task_rowid(conn, task_rowid)
+    except (ImportError, RuntimeError, sqlite3.Error) as exc:
+        log.debug(
+            "Task embedding cleanup deferred for rowid=%s: %s",
+            task_rowid,
+            exc,
+        )
+        return False
+
+
 class TaskDAO:
     """Data Access Object for tasks table. All raw SQL lives here.
 
@@ -2758,6 +2775,12 @@ class TaskDAO:
     @staticmethod
     def delete(conn: sqlite3.Connection, task_id: str) -> int:
         """Hard-delete a task. Returns rowcount. Prefer soft-delete (status=cancelled)."""
+        row = conn.execute(
+            "SELECT rowid FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return 0
+        _remove_task_embedding_rowid_safe(conn, int(row["rowid"]))
         return conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,)).rowcount
 
     @staticmethod
@@ -3169,15 +3192,18 @@ class TaskDAO:
                 datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)
             ).isoformat()
         )
-        conn.execute(
-            "DELETE FROM tasks WHERE type = 'task' "
+        hard_delete_rows = conn.execute(
+            "SELECT rowid, id FROM tasks WHERE type = 'task' "
             "AND status = 'archived' "
             "AND tombstone_pushed_at IS NOT NULL AND tombstone_pushed_at < ? "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM tasks child WHERE child.parent_id = tasks.id"
-            ")",
+            ") ORDER BY rowid",
             (hard_cutoff,),
-        )
+        ).fetchall()
+        for row in hard_delete_rows:
+            _remove_task_embedding_rowid_safe(conn, int(row["rowid"]))
+            conn.execute("DELETE FROM tasks WHERE id = ?", (row["id"],))
         return retired
 
     @staticmethod

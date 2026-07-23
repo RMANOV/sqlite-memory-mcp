@@ -112,6 +112,7 @@ from db_utils import (
 from schema import init_db
 from smart_retrieval import suggested_ready
 from task_status_cas import StatusToken, transition_status
+from link_suggestions import auto_accept_high_confidence_links
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -132,6 +133,9 @@ _TRAY_RSS_LOG_MB = _env_int("SQLITE_MEMORY_TRAY_RSS_LOG_MB", 512, 0)
 _TRAY_RSS_EXIT_MB = _env_int("SQLITE_MEMORY_TRAY_RSS_EXIT_MB", 3072, 0)
 _TRAY_RSS_CHECK_INTERVAL_MS = _env_int(
     "SQLITE_MEMORY_TRAY_RSS_CHECK_INTERVAL_MS", 60_000, 10_000
+)
+_TRAY_LINK_SCAN_INTERVAL_SECONDS = _env_int(
+    "SQLITE_MEMORY_TRAY_LINK_SCAN_INTERVAL_SECONDS", 600, 60
 )
 
 
@@ -222,6 +226,7 @@ class TaskDB:
         self._repair_fts_if_needed()
 
         self._last_promote_time: float = 0.0
+        self._last_link_scan_time: float = 0.0
         self.search_engine = TaskSearchEngine()
 
         # Entity enrichment cache — pre-loaded obs preview + task count
@@ -295,6 +300,25 @@ class TaskDB:
             return 0
         self._last_promote_time = now
         return TaskDAO.promote_due_today(self._conn)
+
+    def auto_accept_relevant_links(self):
+        """Run the bounded silent-link policy at most once per interval."""
+        now = time.monotonic()
+        if now - self._last_link_scan_time < _TRAY_LINK_SCAN_INTERVAL_SECONDS:
+            return {"accepted": [], "accepted_count": 0, "throttled": True}
+        self._last_link_scan_time = now
+        try:
+            result = auto_accept_high_confidence_links(self._conn)
+            result["throttled"] = False
+            return result
+        except Exception as exc:  # UI boundary: optional automation must fail open.
+            logger.warning("automatic link scan failed: %s", exc, exc_info=True)
+            return {
+                "accepted": [],
+                "accepted_count": 0,
+                "throttled": False,
+                "error": str(exc),
+            }
 
     def get_all_active(self):
         """Return all active tasks (excludes done, archived, cancelled)."""
@@ -1936,6 +1960,9 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
     def _do_refresh(self):
         # Auto-promote tasks whose due date has arrived
         self.db.promote_due_today()
+        auto_link = getattr(self.db, "auto_accept_relevant_links", None)
+        if callable(auto_link):
+            auto_link()
 
         # Rebuild project chips (cached 60s)
         now_mono = time.monotonic()
@@ -2270,6 +2297,7 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     "section_a_before": cand,
                     "section_b": task_items,
                     "section_b_before": task_before,
+                    "auto_links": dao.recent_auto_links(hours=24, limit=3),
                 }
             elif key == "topics":
                 if self._topics_open_topic:
@@ -2337,11 +2365,12 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                 )
         elif key == "waiting":
             items = rows.get("section_a", [])
+            auto_links = rows.get("auto_links", [])
             # The old denominator counted every recent Q/DECISION candidate,
             # not operator asks. "1 of 99" was therefore misleading noise on
             # the operator surface; only the actionable result count belongs
             # in this header.
-            lw.add_header(f"Waiting on me ({len(items)})")
+            lw.add_header(f"Waiting on me ({len(items) + len(auto_links)})")
             for it in items:
                 mid = it["msg_id"]
                 stale = " ⏳" if it.get("stale") else ""
@@ -2359,6 +2388,55 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
                     topic_id=None,
                     copy_payload=copy_block,
                     reader_payload=self._debate_reader_payload(it),
+                )
+            if auto_links:
+                lw.add_header(
+                    f"Auto-linked · silence keeps the link "
+                    f"({len(auto_links)} of 3 daily)"
+                )
+            for item in auto_links:
+                row_id = str(item["id"])
+                score = float(item.get("score") or 0.0)
+                reasons = ", ".join(item.get("reasons") or []) or "strict policy"
+                text = (
+                    f"[AUTO-LINK] {item.get('task_title', '')} → "
+                    f"{item.get('entity_name', '')} · {score:.3f} · "
+                    f"{item.get('age', '')}"
+                )
+                undo = (
+                    "To undo: unlink_task_entity("
+                    f"task_id={item.get('task_id')!r}, "
+                    f"entity_name={item.get('entity_name')!r})."
+                )
+                body = (
+                    f"Automatically linked by {item.get('model_version', '')}. "
+                    f"Signals: {reasons}. No action is required; silence keeps "
+                    f"the reversible link.\n\n{undo}"
+                )
+                record = "\n".join(
+                    (
+                        f"decision_id: {item.get('decision_id', '')}",
+                        f"task_id: {item.get('task_id', '')}",
+                        f"task: {item.get('task_title', '')}",
+                        f"entity_id: {item.get('entity_id', '')}",
+                        f"entity: {item.get('entity_name', '')}",
+                        f"score: {score:.6f}",
+                        f"updated_at: {item.get('updated_at', '')}",
+                        f"reasons: {reasons}",
+                        "",
+                        undo,
+                    )
+                )
+                lw.add_debate_row(
+                    row_id,
+                    text,
+                    topic_id=None,
+                    copy_payload=record,
+                    reader_payload={
+                        "title": f"Auto-linked · {item.get('entity_name', '')}",
+                        "body": body,
+                        "record": record,
+                    },
                 )
             task_items = rows.get("section_b", [])
             task_lw = self._waiting_task_list
