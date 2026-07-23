@@ -1,9 +1,11 @@
-"""Hard-gated offline Leiden projection for memory threads.
+"""Fail-fast offline Leiden projection for memory threads.
 
 This module builds a sparse, auditable graph and stores only derived community
 memberships.  It never creates task↔entity links.  An active projection is only
 a weak ``same_community`` signal in ``link_suggestions``; it does not create a
-new agent-facing stream or expand task digests.
+new agent-facing stream or expand task digests.  The projection may start with
+zero human labels so usefulness can be tested immediately; zero-label output is
+reported as unvalidated rather than being mistaken for measured quality.
 """
 
 from __future__ import annotations
@@ -414,13 +416,25 @@ def run_memory_thread_projection(
     seed: int = DEFAULT_SEED,
     include_vector: bool = True,
     persist: bool = False,
+    restart_transaction_before_persist: bool = False,
 ) -> dict[str, Any]:
-    """Run the offline projection only after sufficient real review labels."""
+    """Run the offline projection, including the zero-label fail-fast phase.
+
+    ``restart_transaction_before_persist`` is intended for the standalone CLI:
+    it releases the long read snapshot after graph computation, then acquires a
+    short IMMEDIATE writer transaction only for replacing the derived rows.
+    """
     progress = decision_progress(conn)
+    validation_state = (
+        "unvalidated_cold_start"
+        if int(progress["qualified_total"]) == 0
+        else "observed_human_labels"
+    )
     if not progress["gate"]["ready"]:
         return {
             "ok": False,
             "error": "INSUFFICIENT_REVIEW_LABELS",
+            "validation_state": validation_state,
             "label_progress": progress,
             "mutated": False,
         }
@@ -444,6 +458,7 @@ def run_memory_thread_projection(
         return {
             "ok": False,
             "error": "EMPTY_GRAPH",
+            "validation_state": validation_state,
             "label_progress": progress,
             "graph": graph_report,
             "mutated": False,
@@ -461,6 +476,10 @@ def run_memory_thread_projection(
     }
     run_id = str(uuid.uuid4())
     if persist:
+        if restart_transaction_before_persist:
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+            conn.execute("BEGIN IMMEDIATE")
         now = now_iso()
         conn.execute("UPDATE link_community_runs SET active = 0 WHERE active = 1")
         conn.execute(
@@ -502,6 +521,9 @@ def run_memory_thread_projection(
             "VALUES (?, ?, ?, ?, ?, ?)",
             rows,
         )
+        if restart_transaction_before_persist:
+            conn.execute("COMMIT")
+            conn.execute("BEGIN")
 
     return {
         "ok": True,
@@ -509,6 +531,7 @@ def run_memory_thread_projection(
         "persisted": persist,
         "mutated": persist,
         "model_version": CLUSTER_MODEL_VERSION,
+        "validation_state": validation_state,
         "label_progress": progress,
         "graph": graph_report,
         "stability": stability,
