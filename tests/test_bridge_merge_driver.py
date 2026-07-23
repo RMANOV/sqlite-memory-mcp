@@ -24,6 +24,7 @@ on unparsable input.
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -634,6 +635,24 @@ def test_ensure_protection_makes_no_commit(tmp_path):
     bmd.ensure_bridge_merge_protection(str(repo))
     bmd.ensure_bridge_merge_protection(str(repo))  # idempotent re-run
     assert git("rev-parse", "HEAD").stdout.strip() == head_before
+
+
+def test_ensure_gitattributes_does_not_rewrite_identical_file(tmp_path, monkeypatch):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    assert bmd.ensure_gitattributes(str(repo)) is True
+
+    writes = []
+    original_write_text = Path.write_text
+
+    def tracked_write_text(path, *args, **kwargs):
+        writes.append(path)
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", tracked_write_text)
+
+    assert bmd.ensure_gitattributes(str(repo)) is True
+    assert writes == []
 
 
 def test_is_managed_gitattributes_content_verified(tmp_path):

@@ -518,6 +518,8 @@ def ensure_gitattributes(repo_dir: str) -> bool:
         new_text = (prefix + "\n\n" if prefix.strip() else "") + managed
 
     new_text = new_text.rstrip("\n") + "\n"
+    if new_text == existing:
+        return True
     try:
         path.write_text(new_text, encoding="utf-8")
     except OSError:
