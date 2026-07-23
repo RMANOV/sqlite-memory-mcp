@@ -1,8 +1,9 @@
-"""Offline, hard-gated Leiden projection for derived memory threads.
+"""Offline, fail-fast Leiden projection for derived memory threads.
 
 This is deliberately a CLI, not an MCP tool.  Normal agents cannot trigger
-clustering.  The default is a dry run; ``--persist`` still refuses to write
-until the real human-review label gate is satisfied.
+clustering.  The default is a dry run; ``--persist`` activates a derived weak
+signal even with zero human labels and reports that cold-start state as
+unvalidated.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from db_utils import DB_PATH, get_conn, get_conn_immediate
+from db_utils import DB_PATH, get_conn
 from memory_thread_clustering import (
     DEFAULT_PRIMARY_RESOLUTION,
     DEFAULT_RESOLUTIONS,
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--persist",
         action="store_true",
-        help="Persist derived memberships after all gates pass (default: dry run).",
+        help="Persist derived weak-signal memberships (default: dry run).",
     )
     return parser
 
@@ -57,8 +58,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     init_db(args.db)
     resolutions = tuple(args.resolutions or DEFAULT_RESOLUTIONS)
-    connection = get_conn_immediate if args.persist else get_conn
-    with connection(args.db) as conn:
+    # Graph construction and multi-seed Leiden runs are read-heavy and can
+    # take tens of seconds on the live database.  The projection explicitly
+    # releases that read snapshot before acquiring a short IMMEDIATE writer
+    # transaction for the derived rows.
+    with get_conn(args.db) as conn:
         report = run_memory_thread_projection(
             conn,
             resolutions=resolutions,
@@ -66,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             include_vector=not args.no_vector,
             persist=args.persist,
+            restart_transaction_before_persist=args.persist,
         )
         report["link_metrics"] = evaluate_link_suggestions(conn, k=5)
     print(json.dumps(report, ensure_ascii=False, indent=2))

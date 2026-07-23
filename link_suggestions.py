@@ -27,9 +27,14 @@ AUTO_ACCEPT_MIN_MARGIN = 0.08
 AUTO_ACCEPT_DAILY_LIMIT = 3
 AUTO_ACCEPT_SCAN_LIMIT = 30
 AUTO_ACCEPT_REVIEW_HOURS = 24
-MIN_LABELS_FOR_COMMUNITIES = 100
-MIN_ACCEPTED_FOR_COMMUNITIES = 20
-MIN_REJECTED_FOR_COMMUNITIES = 20
+# Fail-fast cold start: do not wait for a human-labelled corpus before testing
+# whether the weak community signal adds operational value.  Zero labels do
+# not make the model "validated"; that state is reported explicitly below.
+# Safety remains elsewhere: community has only 0.05 weight and can never
+# authorize an automatic canonical link on its own.
+MIN_LABELS_FOR_COMMUNITIES = 0
+MIN_ACCEPTED_FOR_COMMUNITIES = 0
+MIN_REJECTED_FOR_COMMUNITIES = 0
 _MAX_CANDIDATES = 100
 _FTS_CANDIDATES = 80
 _SIMILAR_TASKS = 20
@@ -867,7 +872,7 @@ def auto_accept_high_confidence_links(
 
 
 def decision_progress(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Return label counts and the deterministic Leiden eligibility gate."""
+    """Return label counts and the fail-fast Leiden eligibility state."""
     rows = conn.execute(
         "SELECT decision, decision_source, COUNT(*) AS n "
         "FROM link_suggestion_decisions GROUP BY decision, decision_source"
@@ -898,6 +903,8 @@ def decision_progress(conn: sqlite3.Connection) -> dict[str, Any]:
         "by_source": dict(by_source),
         "gate": {
             "ready": ready,
+            "mode": "zero_label_fail_fast",
+            "unvalidated": total == 0,
             "minimum_total": MIN_LABELS_FOR_COMMUNITIES,
             "minimum_accepted": MIN_ACCEPTED_FOR_COMMUNITIES,
             "minimum_rejected": MIN_REJECTED_FOR_COMMUNITIES,

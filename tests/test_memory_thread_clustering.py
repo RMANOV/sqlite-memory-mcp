@@ -45,19 +45,40 @@ def _seed_linked_pair(conn):
     return entity_id
 
 
-def test_projection_refuses_to_run_before_real_label_gate(conn):
+def test_projection_runs_from_zero_labels_as_unvalidated_cold_start(conn, monkeypatch):
     _seed_linked_pair(conn)
 
+    def fake_leiden(graph, *, resolutions, seed):
+        nodes = graph.nodes
+        return {
+            "nodes": nodes,
+            "memberships": {
+                f"{resolution:.6g}": [0 for _node in nodes]
+                for resolution in resolutions
+            },
+            "seed_stability": {f"{resolution:.6g}": 1.0 for resolution in resolutions},
+            "cross_resolution_stability": {
+                f"{left:.6g}->{right:.6g}": 1.0
+                for left, right in zip(resolutions, resolutions[1:], strict=False)
+            },
+            "community_counts": {f"{resolution:.6g}": 1 for resolution in resolutions},
+            "seeds": (seed, seed + 101, seed + 307),
+        }
+
+    monkeypatch.setattr(clustering, "_run_leiden", fake_leiden)
     report = clustering.run_memory_thread_projection(
         conn,
         include_vector=False,
         persist=True,
+        restart_transaction_before_persist=True,
     )
 
-    assert report["ok"] is False
-    assert report["error"] == "INSUFFICIENT_REVIEW_LABELS"
-    assert report["mutated"] is False
-    assert conn.execute("SELECT COUNT(*) FROM link_community_runs").fetchone()[0] == 0
+    assert report["ok"] is True
+    assert report["validation_state"] == "unvalidated_cold_start"
+    assert report["label_progress"]["qualified_total"] == 0
+    assert report["label_progress"]["gate"]["ready"] is True
+    assert report["mutated"] is True
+    assert conn.execute("SELECT COUNT(*) FROM link_community_runs").fetchone()[0] == 1
 
 
 def test_persisted_projection_is_derived_and_never_creates_links(conn, monkeypatch):

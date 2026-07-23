@@ -154,7 +154,7 @@ def test_weak_candidates_stay_hidden_and_unlinked(database):
     assert suggestions["suggestions"][0]["entity_id"] == entity_id
 
 
-def test_auto_labels_do_not_train_or_unlock_leiden(database):
+def test_auto_labels_do_not_count_as_human_labels_in_fail_fast_mode(database):
     _path, conn = database
     entity_id = _entity(conn, "Alpha Systems", project="alpha", observation="Alpha")
     _task(conn, "task-alpha", "Alpha Systems work", project="alpha")
@@ -164,7 +164,17 @@ def test_auto_labels_do_not_train_or_unlock_leiden(database):
     progress = decision_progress(conn)
     assert progress["by_source"][AUTO_ACCEPT_SOURCE]["accepted"] == 1
     assert progress["qualified_total"] == 0
-    assert progress["gate"]["ready"] is False
+    assert progress["gate"] == {
+        "ready": True,
+        "mode": "zero_label_fail_fast",
+        "unvalidated": True,
+        "minimum_total": 0,
+        "minimum_accepted": 0,
+        "minimum_rejected": 0,
+        "remaining_total": 0,
+        "remaining_accepted": 0,
+        "remaining_rejected": 0,
+    }
 
     reviewed = record_link_decision(
         conn,
