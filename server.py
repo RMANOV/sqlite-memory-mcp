@@ -32,6 +32,7 @@ from db_utils import (
     record_memory_event,
 )
 from premium_runtime import maybe_mount_premium_extensions
+from link_suggestions import normalize_phrase as _normalize_link_phrase
 
 # Optional vector search (graceful fallback to FTS5-only)
 try:
@@ -175,7 +176,7 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
     """Create new entities in the knowledge graph.
 
     Each entity dict has: name (str), entityType (str), observations (list[str]).
-    Optional: project (str). Duplicates are silently ignored.
+    Optional: project (str), aliases (list[str]). Duplicates are silently ignored.
     """
     now = _now()
     created = 0
@@ -185,6 +186,7 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
             etype = ent["entityType"]
             project = ent.get("project")
             observations = ent.get("observations", [])
+            aliases = ent.get("aliases", [])
             vis = ent.get("visibility", "private")
             if vis not in _VISIBILITY_LEVELS:
                 vis = "private"
@@ -243,6 +245,18 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
                             source_kind="entity",
                             source_ref=str(eid),
                             source_excerpt=obs[:300],
+                        )
+                for alias in aliases:
+                    alias_text = " ".join(str(alias).split())
+                    alias_key = _normalize_link_phrase(alias_text)
+                    if len(alias_key) >= 2 and alias_key != _normalize_link_phrase(
+                        name
+                    ):
+                        conn.execute(
+                            "INSERT OR IGNORE INTO entity_aliases "
+                            "(entity_id, alias, normalized_alias, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (eid, alias_text, alias_key, now),
                         )
                 _fts_sync(conn, eid)
                 if _VEC_AVAILABLE:

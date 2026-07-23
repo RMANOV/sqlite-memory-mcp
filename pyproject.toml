@@ -13,6 +13,7 @@ gui = ["PyQt6>=6.5"]
 dev = ["pytest>=7.0"]
 speed = ["orjson>=3.9.0"]
 vector = ["sqlite-vec>=0.1.6", "sentence-transformers>=3.0.0"]
+community = ["igraph>=0.11", "leidenalg>=0.10"]
 
 [project.scripts]
 sqlite-memory-mcp = "server:main"
@@ -65,7 +66,9 @@ py-modules = [
     "intelligence_v2",
     "lazy_enrichment",
     "lazy_verification",
+    "link_suggestions",
     "memory_audit",
+    "memory_thread_clustering",
     "n8n_server",
     "obsidian_publish",
     "overdue_bump",
