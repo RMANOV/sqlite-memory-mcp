@@ -18,7 +18,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from typing import Any
+from importlib.util import find_spec
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger("sqlite-kb")
 
@@ -35,12 +39,7 @@ try:
 except ImportError:
     _HAS_VEC = False
 
-try:
-    from sentence_transformers import SentenceTransformer
-
-    _HAS_ST = True
-except ImportError:
-    _HAS_ST = False
+_HAS_ST = find_spec("sentence_transformers") is not None
 
 VEC_AVAILABLE: bool = _HAS_VEC and _HAS_ST
 
@@ -56,10 +55,16 @@ MAX_OBS_FOR_EMBEDDING = 20  # MiniLM-L6-v2 has 256-token limit; cap observations
 
 def _get_model() -> SentenceTransformer:
     """Lazy-load the embedding model on first use (thread-safe)."""
-    global _model
+    global VEC_AVAILABLE, _HAS_ST, _model
     if _model is None:
         with _model_lock:
             if _model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except ImportError as exc:
+                    _HAS_ST = False
+                    VEC_AVAILABLE = False
+                    raise RuntimeError("sentence-transformers is unavailable") from exc
                 _model = SentenceTransformer(_MODEL_NAME)
                 logger.info("Loaded embedding model: %s", _MODEL_NAME)
     return _model

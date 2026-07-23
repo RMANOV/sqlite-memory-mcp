@@ -610,7 +610,7 @@ _PRAGMAS = (
     "PRAGMA journal_mode=WAL;",
     "PRAGMA foreign_keys=ON;",
     "PRAGMA busy_timeout=10000;",
-    "PRAGMA wal_autocheckpoint=100;",
+    "PRAGMA wal_autocheckpoint=1000;",
 )
 
 

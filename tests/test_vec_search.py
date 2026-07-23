@@ -1,7 +1,10 @@
+import json
 import os
 import sqlite3
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -20,6 +23,32 @@ class _FakeCursor:
 
     def __iter__(self):
         return iter(self._rows)
+
+
+def test_import_does_not_load_transformer_stack():
+    repo = Path(__file__).resolve().parents[1]
+    run = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json,sys; import vec_search; "
+                "print(json.dumps({"
+                "'sentence_transformers':'sentence_transformers' in sys.modules,"
+                "'torch':'torch' in sys.modules"
+                "}))"
+            ),
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(run.stdout) == {
+        "sentence_transformers": False,
+        "torch": False,
+    }
 
 
 def test_load_vec_returns_false_when_extension_load_fails(monkeypatch):
