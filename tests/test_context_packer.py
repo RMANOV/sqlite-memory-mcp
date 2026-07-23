@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from context_packer import (
     _estimate_tokens,
     _find_relevant_entities,
+    _prune_context_pack_history,
     build_context_pack,
     warm_recent_task_packs,
 )
@@ -353,3 +354,62 @@ def test_persisted_context_pack_materializes_summary_artifact_v2(conn):
     assert artifact["scope_kind"] == "context_pack"
     assert artifact["scope_ref"] == result["pack_id"]
     assert prov >= 1
+
+
+def test_prune_context_pack_history_removes_artifacts_and_provenance(conn):
+    for index in range(5):
+        pack_id = f"pack-prune-{index}"
+        artifact_id = f"artifact-prune-{index}"
+        ts = f"2026-03-24T10:00:0{index}+00:00"
+        conn.execute(
+            "INSERT INTO context_packs ("
+            "pack_id, session_id, entity_id, pack_type, target_ref, input_signature, "
+            "token_budget, body, freshness_score, contract_version, created_at"
+            ") VALUES (?, NULL, NULL, 'executor', 'task-prune', ?, 100, ?, 1.0, "
+            "'memory_contract_v2', ?)",
+            (pack_id, f"sig-{index}", f"body-{index}", ts),
+        )
+        conn.execute(
+            "INSERT INTO memory_artifacts ("
+            "artifact_id, artifact_key, artifact_kind, scope_kind, scope_ref, "
+            "title, body, confidence, status, created_at, updated_at"
+            ") VALUES (?, ?, 'summary', 'context_pack', ?, 'summary', ?, 0.5, "
+            "'active', ?, ?)",
+            (
+                artifact_id,
+                f"summary:context_pack:{pack_id}",
+                pack_id,
+                f"body-{index}",
+                ts,
+                ts,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO provenance_links ("
+            "provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+            "confidence, created_at"
+            ") VALUES (?, 'context_pack', ?, 'task', 'task-prune', 1.0, ?)",
+            (f"pack-prov-{index}", pack_id, ts),
+        )
+        conn.execute(
+            "INSERT INTO provenance_links ("
+            "provenance_id, subject_kind, subject_ref, source_kind, source_ref, "
+            "confidence, created_at"
+            ") VALUES (?, 'artifact', ?, 'task', 'task-prune', 1.0, ?)",
+            (f"artifact-prov-{index}", artifact_id, ts),
+        )
+
+    _prune_context_pack_history(conn, "executor", "task-prune", keep=2)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM context_packs WHERE target_ref='task-prune'"
+    ).fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memory_artifacts "
+        "WHERE scope_kind='context_pack' AND scope_ref LIKE 'pack-prune-%'"
+    ).fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM provenance_links "
+        "WHERE (subject_kind='context_pack' AND subject_ref LIKE 'pack-prune-%') "
+        "OR (subject_kind='artifact' AND subject_ref LIKE 'artifact-prune-%')"
+    ).fetchone()[0] == 4

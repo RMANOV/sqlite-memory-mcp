@@ -284,6 +284,35 @@ def _prune_context_pack_history(
     if not stale_ids:
         return
     ph = ",".join("?" * len(stale_ids))
+    artifact_ids: list[str] = []
+    if _sqlite_table_exists(conn, "memory_artifacts"):
+        artifact_ids = [
+            row["artifact_id"]
+            for row in conn.execute(
+                "SELECT artifact_id FROM memory_artifacts "
+                f"WHERE scope_kind = 'context_pack' AND scope_ref IN ({ph})",
+                stale_ids,
+            ).fetchall()
+        ]
+    if _sqlite_table_exists(conn, "provenance_links"):
+        conn.execute(
+            "DELETE FROM provenance_links "
+            f"WHERE subject_kind = 'context_pack' AND subject_ref IN ({ph})",
+            stale_ids,
+        )
+        if artifact_ids:
+            artifact_ph = ",".join("?" * len(artifact_ids))
+            conn.execute(
+                "DELETE FROM provenance_links "
+                f"WHERE subject_kind = 'artifact' AND subject_ref IN ({artifact_ph})",
+                artifact_ids,
+            )
+    if artifact_ids:
+        artifact_ph = ",".join("?" * len(artifact_ids))
+        conn.execute(
+            f"DELETE FROM memory_artifacts WHERE artifact_id IN ({artifact_ph})",
+            artifact_ids,
+        )
     conn.execute(f"DELETE FROM context_packs WHERE pack_id IN ({ph})", stale_ids)
 
 

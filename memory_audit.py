@@ -233,48 +233,53 @@ def rebuild_task_from_events(
             }
 
     repaired_fields: list[str] = []
+    repair_skipped_reason: str | None = None
     row_updated = str(row["updated_at"] or "")
     if repair and drift and max_event_ts:
         if row_updated > max_event_ts:
             logger.warning(
                 "Task %s: updated_at (%s) is ahead of max event ts (%s) — "
-                "likely manual UPDATE bypass. Repairing anyway (EB-01 fix).",
+                "refusing destructive replay over newer materialized state.",
                 task_id,
                 row_updated,
                 max_event_ts,
             )
-        set_clause = ", ".join(f"{field} = ?" for field in drift)
-        values = [rebuilt[field] for field in drift] + [max_event_ts, task_id]
-        conn.execute(
-            f"UPDATE tasks SET {set_clause}, updated_at = ? WHERE id = ?",
-            values,
-        )
-        for field in drift:
-            version_row = versions.get(field)
-            if version_row is not None:
-                _store_task_field_version(
-                    conn,
-                    task_id,
-                    field,
-                    updated_at=str(version_row["updated_at"] or max_event_ts),
-                    updated_by=str(version_row["updated_by"] or ""),
-                    new_value=str(version_row["new_value"])
-                    if version_row["new_value"] is not None
-                    else None,
-                    updated_order=int(version_row["updated_order"] or 0),
-                    source_event_id=version_row["source_event_id"],
-                )
-        repaired_fields = sorted(drift)
-        # EB-03 fix: record repair in event ledger so future audits see it
-        for field in drift:
-            record_memory_event(
-                conn,
-                event_type="repair",
-                aggregate_kind="task",
-                aggregate_id=task_id,
-                field_name=field,
-                new_value=str(rebuilt[field]) if rebuilt[field] is not None else None,
+            repair_skipped_reason = "materialized_newer_than_ledger"
+        else:
+            set_clause = ", ".join(f"{field} = ?" for field in drift)
+            values = [rebuilt[field] for field in drift] + [max_event_ts, task_id]
+            conn.execute(
+                f"UPDATE tasks SET {set_clause}, updated_at = ? WHERE id = ?",
+                values,
             )
+            for field in drift:
+                version_row = versions.get(field)
+                if version_row is not None:
+                    _store_task_field_version(
+                        conn,
+                        task_id,
+                        field,
+                        updated_at=str(version_row["updated_at"] or max_event_ts),
+                        updated_by=str(version_row["updated_by"] or ""),
+                        new_value=str(version_row["new_value"])
+                        if version_row["new_value"] is not None
+                        else None,
+                        updated_order=int(version_row["updated_order"] or 0),
+                        source_event_id=version_row["source_event_id"],
+                    )
+            repaired_fields = sorted(drift)
+            # EB-03 fix: record repair in event ledger so future audits see it
+            for field in drift:
+                record_memory_event(
+                    conn,
+                    event_type="repair",
+                    aggregate_kind="task",
+                    aggregate_id=task_id,
+                    field_name=field,
+                    new_value=str(rebuilt[field])
+                    if rebuilt[field] is not None
+                    else None,
+                )
 
     return {
         "task_id": task_id,
@@ -282,6 +287,7 @@ def rebuild_task_from_events(
         "rebuilt": rebuilt,
         "drift": drift,
         "repaired_fields": repaired_fields,
+        "repair_skipped_reason": repair_skipped_reason,
         "max_event_ts": max_event_ts or None,
     }
 
@@ -295,10 +301,19 @@ def _repair_context_pack_artifacts(conn: sqlite3.Connection) -> int:
     repaired = 0
     has_provenance_table = _sqlite_table_exists(conn, "provenance_links")
     rows = conn.execute(
-        "SELECT pack_id, pack_type, target_ref, body, freshness_score, created_at "
-        "FROM context_packs"
+        "SELECT pack_id, pack_type, body, created_at FROM context_packs"
     ).fetchall()
+    existing_keys = {
+        row["artifact_key"]
+        for row in conn.execute(
+            "SELECT artifact_key FROM memory_artifacts "
+            "WHERE scope_kind = 'context_pack'"
+        ).fetchall()
+    }
     for row in rows:
+        artifact_key = f"summary:context_pack:{row['pack_id']}"
+        if artifact_key in existing_keys:
+            continue
         provenance = []
         if has_provenance_table:
             prov_rows = conn.execute(
@@ -312,10 +327,13 @@ def _repair_context_pack_artifacts(conn: sqlite3.Connection) -> int:
             artifact_kind="summary",
             scope_kind="context_pack",
             scope_ref=row["pack_id"],
-            artifact_key=f"summary:context_pack:{row['pack_id']}",
+            artifact_key=artifact_key,
             title=f"{row['pack_type']} context summary",
             body=row["body"],
-            confidence=float(row["freshness_score"] or 0.0),
+            # Context-pack confidence means selection quality, not freshness.
+            # The legacy row has no quality field, so recovered artifacts are
+            # explicitly unknown rather than fabricated from freshness_score.
+            confidence=0.0,
             created_at=row["created_at"],
             updated_at=row["created_at"],
             provenance=provenance,
@@ -323,6 +341,7 @@ def _repair_context_pack_artifacts(conn: sqlite3.Connection) -> int:
         )
         if result.get("changed"):
             repaired += 1
+            existing_keys.add(artifact_key)
     return repaired
 
 
