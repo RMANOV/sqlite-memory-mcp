@@ -243,7 +243,6 @@ def rebuild_task_from_events(
                 row_updated,
                 max_event_ts,
             )
-    if repair and drift and max_event_ts:
         set_clause = ", ".join(f"{field} = ?" for field in drift)
         values = [rebuilt[field] for field in drift] + [max_event_ts, task_id]
         conn.execute(
@@ -294,13 +293,14 @@ def _repair_context_pack_artifacts(conn: sqlite3.Connection) -> int:
     ):
         return 0
     repaired = 0
+    has_provenance_table = _sqlite_table_exists(conn, "provenance_links")
     rows = conn.execute(
         "SELECT pack_id, pack_type, target_ref, body, freshness_score, created_at "
         "FROM context_packs"
     ).fetchall()
     for row in rows:
         provenance = []
-        if _sqlite_table_exists(conn, "provenance_links"):
+        if has_provenance_table:
             prov_rows = conn.execute(
                 "SELECT source_kind, source_ref, span_start, span_end, excerpt, confidence "
                 "FROM provenance_links WHERE subject_kind = 'context_pack' AND subject_ref = ?",
@@ -382,6 +382,7 @@ def _repair_fact_provenance(conn: sqlite3.Connection) -> int:
     ):
         return 0
     repaired = 0
+    has_claim_evidence_table = _sqlite_table_exists(conn, "claim_evidence")
     rows = conn.execute(
         "SELECT fact_id, source_claim_id FROM canonical_facts "
         "WHERE COALESCE(valid_to, '') = '' AND source_claim_id IS NOT NULL"
@@ -408,7 +409,7 @@ def _repair_fact_provenance(conn: sqlite3.Connection) -> int:
             excerpt=f"Backfilled provenance from source_claim_id {claim_id}",
             created_at=now_iso(),
         )
-        if _sqlite_table_exists(conn, "claim_evidence"):
+        if has_claim_evidence_table:
             evidence_rows = conn.execute(
                 "SELECT evidence_type, evidence_ref, excerpt, source_start, source_end "
                 "FROM claim_evidence WHERE claim_id = ?",
@@ -711,10 +712,7 @@ def replay_memory_events(
             raw = item.get(key)
             if not raw:
                 continue
-            try:
-                item[key] = json_loads(raw)
-            except Exception:
-                pass
+            item[key] = _parse_event_value(raw)
         events.append(item)
 
     return {
@@ -786,10 +784,7 @@ def list_memory_audit_issues(
         item = dict(row)
         raw = item.get("details_json")
         if raw:
-            try:
-                item["details_json"] = json_loads(raw)
-            except Exception:
-                pass
+            item["details_json"] = _parse_event_value(raw)
         issues.append(item)
     return {"count": len(issues), "issues": issues, "audit_version": _AUDIT_VERSION}
 
@@ -1228,7 +1223,7 @@ def maybe_run_memory_audit(
 
     now = now_iso()
     row = conn.execute(
-        "SELECT cadence_minutes, next_run_after, last_status FROM memory_audit_state "
+        "SELECT cadence_minutes, next_run_after FROM memory_audit_state "
         "WHERE runner_name = ?",
         (runner_name,),
     ).fetchone()
