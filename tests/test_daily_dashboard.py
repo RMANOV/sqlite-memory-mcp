@@ -280,6 +280,7 @@ def test_dashboard_bridge_exclusion(tmp_path):
     assert "daily_dashboard" not in (bridge_dir / "index.json").read_text()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="bin/task is a POSIX shell entrypoint")
 def test_bin_task_dash_set_dash_and_rm_use_temp_db(tmp_path):
     db_path = tmp_path / "memory.db"
     conn = _conn(db_path)
@@ -336,6 +337,7 @@ def test_bin_task_dash_set_dash_and_rm_use_temp_db(tmp_path):
     assert "dashboard removed: 1" in rm_run.stdout
 
 
+@pytest.mark.skipif(os.name == "nt", reason="bin/task is a POSIX shell entrypoint")
 def test_bin_task_fb_self_heals_roles_and_posts_to_conductor(tmp_path):
     db_path = tmp_path / "memory.db"
     conn = _conn(db_path)

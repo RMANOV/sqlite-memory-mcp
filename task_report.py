@@ -8,8 +8,9 @@ Usage:
     python task_report.py
 """
 
+import html
 import os
-from datetime import date, datetime
+from datetime import datetime
 
 from db_utils import BRIDGE_REPO, TASK_SECTIONS as SECTIONS
 from db_utils import PRIORITY_RANK, get_conn, is_overdue as _is_overdue
@@ -23,8 +24,6 @@ SECTION_LABELS = {
     "someday": "Someday",
 }
 
-PRIORITY_ORDER = {p: len(PRIORITY_RANK) - 1 - r for p, r in PRIORITY_RANK.items()}
-
 
 def _get_tasks() -> tuple[list[dict], set[str]]:
     """
@@ -34,44 +33,38 @@ def _get_tasks() -> tuple[list[dict], set[str]]:
     parent_ids_set: set of IDs that are referenced as parent_id by any task.
     """
     with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute(
-            """
+        tasks = [
+            dict(row)
+            for row in conn.execute(
+                """
             SELECT id, title, status, priority, section, due_date,
                    project, parent_id, notes, type, created_at, updated_at
             FROM tasks
             WHERE status NOT IN ('archived', 'cancelled')
             ORDER BY created_at
             """
-        )
-        tasks = [dict(row) for row in cur.fetchall()]
+            )
+        ]
 
         # Collect IDs that appear as parent_id (have children)
-        parent_ids: set[str] = set()
-        cur.execute("SELECT DISTINCT parent_id FROM tasks WHERE parent_id IS NOT NULL")
-        for row in cur.fetchall():
-            parent_ids.add(row[0])
+        parent_ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT parent_id FROM tasks WHERE parent_id IS NOT NULL"
+            )
+        }
 
         return tasks, parent_ids
 
 
 def _html_escape(text: str) -> str:
-    if not text:
-        return ""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#x27;")
-    )
+    return html.escape(text, quote=True) if text else ""
 
 
-def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
+def _render_card(task: dict, parent_ids: set[str]) -> str:
     title = _html_escape(task.get("title") or "Untitled")
     priority = (task.get("priority") or "low").lower()
-    if priority not in PRIORITY_ORDER:
+    if priority not in PRIORITY_RANK:
         priority = "low"
     due_date = task.get("due_date")
     project = task.get("project")
@@ -117,14 +110,12 @@ def _render_card(task: dict, today_str: str, parent_ids: set[str]) -> str:
       </div>"""
 
 
-def _render_column(
-    section: str, tasks: list[dict], today_str: str, parent_ids: set[str]
-) -> str:
+def _render_column(section: str, tasks: list[dict], parent_ids: set[str]) -> str:
     label = SECTION_LABELS.get(section, section.title())
     count = len(tasks)
 
     if tasks:
-        cards_html = "\n".join(_render_card(t, today_str, parent_ids) for t in tasks)
+        cards_html = "\n".join(_render_card(t, parent_ids) for t in tasks)
     else:
         cards_html = '<div class="empty-state">No tasks</div>'
 
@@ -141,8 +132,6 @@ def _render_column(
 
 
 def _build_html(tasks: list[dict], parent_ids: set[str]) -> str:
-    today = date.today()
-    today_str = today.isoformat()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # Group tasks by section
@@ -161,7 +150,7 @@ def _build_html(tasks: list[dict], parent_ids: set[str]) -> str:
     overdue = sum(1 for t in tasks if _is_overdue(t.get("due_date")))
 
     columns_html = "".join(
-        _render_column(s, by_section[s], today_str, parent_ids) for s in SECTIONS
+        _render_column(s, by_section[s], parent_ids) for s in SECTIONS
     )
 
     return f"""<!DOCTYPE html>

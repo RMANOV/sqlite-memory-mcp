@@ -214,31 +214,44 @@ def _kind_clause(kinds: list[str]) -> tuple[str, list[str]]:
     return f"AND m.kind IN ({placeholders})", kinds
 
 
+def _table_exists(con: sqlite3.Connection, table_name: str) -> bool:
+    return (
+        con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _blind_commit_clause(has_blind_table: bool) -> str:
+    if not has_blind_table:
+        return ""
+    return (
+        "AND NOT EXISTS (SELECT 1 FROM debate_blind_commits bc "
+        " WHERE bc.msg_id=m.msg_id AND bc.released_at IS NULL) "
+    )
+
+
 def _fetch_new(
     last_ts: str,
     last_msg_id: str,
     topics: list[str],
     kinds: list[str],
     limit: int,
+    con: sqlite3.Connection | None = None,
+    has_blind_table: bool | None = None,
 ) -> list[sqlite3.Row]:
     topic_sql, topic_params = _topic_clause(topics)
     kind_sql, kind_params = _kind_clause(kinds)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
+    owns_connection = con is None
+    if con is None:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
     try:
-        has_blind_table = (
-            con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='debate_blind_commits'"
-            ).fetchone()
-            is not None
-        )
-        blind_sql = (
-            "AND NOT EXISTS (SELECT 1 FROM debate_blind_commits bc "
-            " WHERE bc.msg_id=m.msg_id AND bc.released_at IS NULL) "
-            if has_blind_table
-            else ""
-        )
+        if has_blind_table is None:
+            has_blind_table = _table_exists(con, "debate_blind_commits")
+        blind_sql = _blind_commit_clause(has_blind_table)
         return con.execute(
             "SELECT DISTINCT m.msg_id, m.topic_id, m.ts "
             "FROM debate_messages m "
@@ -253,11 +266,17 @@ def _fetch_new(
             [last_ts, last_ts, last_msg_id, *topic_params, *kind_params, limit],
         ).fetchall()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
 
 def _fetch_pending_deliveries(
-    topics: list[str], kinds: list[str], limit: int
+    topics: list[str],
+    kinds: list[str],
+    limit: int,
+    con: sqlite3.Connection | None = None,
+    has_delivery_queue: bool | None = None,
+    has_blind_table: bool | None = None,
 ) -> list[sqlite3.Row]:
     """Read the durable recipient queue independently of the legacy cursor.
 
@@ -278,31 +297,18 @@ def _fetch_pending_deliveries(
         return []
     topic_sql, topic_params = _topic_clause(topics)
     kind_sql, kind_params = _kind_clause(kinds)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
+    owns_connection = con is None
+    if con is None:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
     try:
-        has_delivery_queue = (
-            con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='debate_delivery_queue'"
-            ).fetchone()
-            is not None
-        )
+        if has_delivery_queue is None:
+            has_delivery_queue = _table_exists(con, "debate_delivery_queue")
         if not has_delivery_queue:
             return []  # mixed-version upgrade window
-        has_blind_table = (
-            con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='debate_blind_commits'"
-            ).fetchone()
-            is not None
-        )
-        blind_sql = (
-            "AND NOT EXISTS (SELECT 1 FROM debate_blind_commits bc "
-            " WHERE bc.msg_id=m.msg_id AND bc.released_at IS NULL) "
-            if has_blind_table
-            else ""
-        )
+        if has_blind_table is None:
+            has_blind_table = _table_exists(con, "debate_blind_commits")
+        blind_sql = _blind_commit_clause(has_blind_table)
         pending_select_sql = (
             "SELECT DISTINCT m.msg_id, m.topic_id, m.ts, q.enqueued_at "
             "FROM debate_messages m "
@@ -330,10 +336,14 @@ def _fetch_pending_deliveries(
             [*params, max(limit, 64)],
         ).fetchall()
         fairness_limit = min(16, max(1, limit // 4))
-        oldest = con.execute(
-            pending_select_sql + "ORDER BY q.enqueued_at ASC, m.msg_id ASC LIMIT ?",
-            [*params, fairness_limit],
-        ).fetchall()
+        oldest = (
+            con.execute(
+                pending_select_sql + "ORDER BY q.enqueued_at ASC, m.msg_id ASC LIMIT ?",
+                [*params, fairness_limit],
+            ).fetchall()
+            if len(newest_queued) == limit
+            else []
+        )
         seen: set[str] = set()
         out: list[sqlite3.Row] = []
         for row in [*newest_queued, *latest_addressed, *oldest]:
@@ -343,7 +353,8 @@ def _fetch_pending_deliveries(
                 out.append(row)
         return out
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
 
 def _complete_pending_deliveries(msg_id: str, *, enqueued_at: str | None = None) -> int:
@@ -960,6 +971,8 @@ def _fetch_released_blind_replay(
     last_msg_id: str,
     topics: list[str],
     limit: int,
+    con: sqlite3.Connection | None = None,
+    has_blind_table: bool | None = None,
 ) -> list[sqlite3.Row]:
     """Recover blind CLAIMs that became visible after the main cursor passed.
 
@@ -969,14 +982,14 @@ def _fetch_released_blind_replay(
     caller never moves the global cursor when processing these rows.
     """
     topic_sql, topic_params = _topic_clause(topics)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
+    owns_connection = con is None
+    if con is None:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
     try:
-        exists = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='debate_blind_commits'"
-        ).fetchone()
-        if exists is None:
+        if has_blind_table is None:
+            has_blind_table = _table_exists(con, "debate_blind_commits")
+        if not has_blind_table:
             return []
         return con.execute(
             "SELECT DISTINCT m.msg_id,m.topic_id,m.ts "
@@ -991,7 +1004,8 @@ def _fetch_released_blind_replay(
             [last_ts, last_ts, last_msg_id, *topic_params, limit],
         ).fetchall()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
 
 def _adaptive_scheduler_decision(
@@ -1487,24 +1501,38 @@ def main() -> int:
                     _wait_or_stop(float(decision["interval_seconds"]))
                     continue
 
-            targeted_rows = _fetch_pending_deliveries(
-                topics,
-                effective_action_kinds,
-                effective_limit,
-            )
-            regular_rows = _fetch_new(
-                last_ts,
-                last_msg_id,
-                topics,
-                effective_action_kinds,
-                effective_limit,
-            )
-            replay_rows = _fetch_released_blind_replay(
-                last_ts,
-                last_msg_id,
-                topics,
-                effective_limit,
-            )
+            scan_con = sqlite3.connect(DB_PATH)
+            scan_con.row_factory = sqlite3.Row
+            try:
+                has_blind_table = _table_exists(scan_con, "debate_blind_commits")
+                has_delivery_queue = _table_exists(scan_con, "debate_delivery_queue")
+                targeted_rows = _fetch_pending_deliveries(
+                    topics,
+                    effective_action_kinds,
+                    effective_limit,
+                    scan_con,
+                    has_delivery_queue,
+                    has_blind_table,
+                )
+                regular_rows = _fetch_new(
+                    last_ts,
+                    last_msg_id,
+                    topics,
+                    effective_action_kinds,
+                    effective_limit,
+                    scan_con,
+                    has_blind_table,
+                )
+                replay_rows = _fetch_released_blind_replay(
+                    last_ts,
+                    last_msg_id,
+                    topics,
+                    effective_limit,
+                    scan_con,
+                    has_blind_table,
+                )
+            finally:
+                scan_con.close()
             rows_by_id: dict[str, dict[str, Any]] = {}
             rows = []
             for source_rows, targeted, replay, cursor_eligible in (

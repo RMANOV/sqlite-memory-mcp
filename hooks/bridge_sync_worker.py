@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Background worker: runs bridge_pull + bridge_push with intelligent error handling.
+"""Background worker: runs the canonical bridge sync with error handling.
 
 Spawned by bridge_auto_sync.py hook. Runs detached from Claude session.
 Pull imports remote tasks into local DB, then push exports merged state.
@@ -8,7 +8,7 @@ Writes notifications for the hook to pick up on next tool call.
 
 ARCHITECTURE NOTE — NOT a duplicate of ../bridge_sync_worker.py (authoritative sync engine):
   - THIS file: orchestration wrapper — locking, failure counter, notifications,
-    calls bridge_server.bridge_pull / bridge_push (MCP tools) via asyncio
+    calls bridge_server.bridge_push (the canonical pull/merge/export/push tool)
   - ../bridge_sync_worker.py: low-level sync engine — called by task_tray.py's Sync
     button, imports db_utils directly, no MCP server dependency
 
@@ -303,21 +303,11 @@ def main(progress_callback=None):
                 return
 
             sys.path.insert(0, SERVER_DIR)
-            from bridge_server import bridge_pull, bridge_push
+            from bridge_server import bridge_push
 
-            # Step 1: Pull remote changes into local DB
-            _progress(5, "git pull...")
-            pull_result_raw = _call_tool(bridge_pull)
-            logging.info("bridge_pull result: %s", pull_result_raw)
-            pull_result = _parse_result(pull_result_raw)
-            block_msg = _sync_block_message(pull_result, "bridge pull blocked")
-            if block_msg:
-                notify("warning", f"BRIDGE: sync blocked — {block_msg}")
-                return
-            _progress(35, "Preparing push...")
-
-            # Step 2: Push local (now merged) DB to remote
-            _progress(40, "Pushing...")
+            # bridge_push owns the complete pull -> merge -> export -> push
+            # pipeline. Calling bridge_pull first repeats the import/merge pass.
+            _progress(5, "Pulling, merging, and pushing...")
 
             result_str = _call_tool(bridge_push, tag="shared")
             logging.info("bridge_push result: %s", result_str)
@@ -334,10 +324,9 @@ def main(progress_callback=None):
                     notify("warning", f"BRIDGE: sync blocked — {block_msg}")
                     return
                 message = str(result.get("message", ""))
-                if (
-                    not pushed
-                    and result.get("pushed") == 0
-                    and message.startswith("No changes")
+                if not pushed and (
+                    result.get("skipped") is True
+                    or (result.get("pushed") == 0 and message.startswith("No changes"))
                 ):
                     pushed = True
 

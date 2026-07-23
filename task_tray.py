@@ -1480,15 +1480,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
 
         self.refresh()
 
-    def _run_purge(self):
-        self._last_purged = self.db.purge_old_done(days=30)
-        self.db.purge_old_dashboard()
-
-    def _process_recurring(self):
-        created = _run_recurring_maintenance(self.db.db_path)
-        if created:
-            self.refresh()
-
     # ── Appearance ─────────────────────────────────────────────────────
 
     def _apply_debate_appearance(self):
@@ -1853,41 +1844,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
         """Coalesce entity searches into a single background worker."""
         self._entity_search.request(query)
 
-    def _import_remote_entities(self, remote_entities, conn=None):
-        """Import entities from remote shared.json that don't exist locally."""
-        if conn is not None:
-            self._import_remote_entities_inner(conn, remote_entities)
-        else:
-            with get_conn(self.db.db_path) as conn:
-                self._import_remote_entities_inner(conn, remote_entities)
-
-    @staticmethod
-    def _import_remote_entities_inner(conn, remote_entities):
-        for e in remote_entities:
-            existing = conn.execute(
-                "SELECT id FROM entities WHERE name = ?", (e["name"],)
-            ).fetchone()
-            if existing:
-                continue
-            now = now_iso()
-            eid = conn.execute(
-                "INSERT INTO entities (name, entity_type, project, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    e["name"],
-                    e["entityType"],
-                    e.get("project") or "shared:bridge",
-                    now,
-                    now,
-                ),
-            ).lastrowid
-            for o in e.get("observations", []):
-                conn.execute(
-                    "INSERT INTO observations (entity_id, content, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (eid, o["content"], o.get("createdAt", now)),
-                )
-
     def _sort_tasks(self, tasks, sort_mode=None):
         """Sort tasks by given sort mode (or current working sort mode)."""
         mode = sort_mode or self._sort_mode
@@ -1967,16 +1923,6 @@ class FullWindow(QMainWindow, BridgeSyncMixin, FilterMixin):
             )
         # mode == "created"
         return sorted(tasks, key=lambda t: t.get("created_at") or "", reverse=True)
-
-    def _cycle_sort(self):
-        """Cycle to next sort mode and refresh."""
-        idx = self._SORT_MODES.index(self._sort_mode)
-        self._sort_mode = self._SORT_MODES[(idx + 1) % len(self._SORT_MODES)]
-        self._sort_btn.setText(f"{self._SORT_LABELS[self._sort_mode]} \u25be")
-        if hasattr(self, "_sort_actions") and self._sort_mode in self._sort_actions:
-            self._sort_actions[self._sort_mode].setChecked(True)
-        self._save_ui_state()
-        self.refresh()
 
     def refresh(self):
         if getattr(self, "_refreshing", False):

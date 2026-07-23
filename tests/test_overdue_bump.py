@@ -37,6 +37,19 @@ def test_script_dry_run_and_live_share_task_only_dao_path(tmp_path, capsys):
     with get_conn(db_path) as conn:
         assert TaskDAO.get_by_id(conn, "overdue-task")["priority"] == "high"
         assert TaskDAO.get_by_id(conn, "overdue-note")["priority"] == "low"
+        version = conn.execute(
+            "SELECT new_value, source_event_id FROM task_field_versions "
+            "WHERE task_id = 'overdue-task' AND field_name = 'priority'"
+        ).fetchone()
+        assert version["new_value"] == "high"
+        event = conn.execute(
+            "SELECT event_type, tool_name, new_value FROM memory_events "
+            "WHERE event_id = ?",
+            (version["source_event_id"],),
+        ).fetchone()
+        assert event["event_type"] == "task_field_set"
+        assert event["tool_name"] == "overdue_bump.run"
+        assert event["new_value"] == "high"
 
     assert "Bumped 1 task" in capsys.readouterr().out
 
@@ -55,3 +68,13 @@ def test_task_server_delegates_bump_to_task_dao(tmp_path, monkeypatch):
     with get_conn(db_path) as conn:
         assert TaskDAO.get_by_id(conn, "server-task")["priority"] == "high"
         assert TaskDAO.get_by_id(conn, "server-note")["priority"] == "low"
+
+
+def test_script_rejects_invalid_priority_without_opening_db(tmp_path, capsys):
+    assert run(str(tmp_path / "unused.db"), "urgent", dry_run=False) == 1
+    assert "invalid priority 'urgent'" in capsys.readouterr().err
+
+
+def test_script_low_priority_is_an_explicit_noop(tmp_path, capsys):
+    assert run(str(tmp_path / "unused.db"), "low", dry_run=False) == 0
+    assert "nothing to bump" in capsys.readouterr().out

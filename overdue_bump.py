@@ -10,7 +10,6 @@ import sys
 
 from db_utils import (
     DB_PATH,
-    PRIORITY_RANK,
     TASK_PRIORITIES,
     TaskDAO,
     get_conn,
@@ -18,7 +17,7 @@ from db_utils import (
 
 
 def run(db_path: str, target_priority: str, dry_run: bool) -> int:
-    if target_priority not in PRIORITY_RANK:
+    if target_priority not in TASK_PRIORITIES:
         print(
             f"Error: invalid priority '{target_priority}'. "
             f"Choose from: {', '.join(TASK_PRIORITIES)}",
@@ -26,10 +25,7 @@ def run(db_path: str, target_priority: str, dry_run: bool) -> int:
         )
         return 1
 
-    target_rank = PRIORITY_RANK[target_priority]
-    lower_priorities = [p for p, r in PRIORITY_RANK.items() if r < target_rank]
-
-    if not lower_priorities:
+    if target_priority == TASK_PRIORITIES[0]:
         print(f"No priorities lower than '{target_priority}' — nothing to bump.")
         return 0
 

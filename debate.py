@@ -235,9 +235,7 @@ def validate_numbered_executor_role(role: str) -> None:
         )
 
 
-def _validate_unique_roster(
-    roles: list[dict[str, Any]], *, require_numbered_executors: bool
-) -> None:
+def _validate_unique_roster(roles: list[dict[str, Any]]) -> None:
     seen_roles: set[str] = set()
     seen_sessions: set[str] = set()
     for entry in roles:
@@ -253,8 +251,6 @@ def _validate_unique_roster(
                 f"duplicate_session_in_roster: {session_id}",
                 error_type="roster_duplicate_session",
             )
-        if require_numbered_executors:
-            validate_numbered_executor_role(role)
         seen_roles.add(role)
         seen_sessions.add(session_id)
 
@@ -385,7 +381,7 @@ def init_debate(
         validate_role(role)
         if not isinstance(session_id, str) or not session_id:
             raise DebateError(f"invalid_roles_entry: role {role} missing session_id")
-    _validate_unique_roster(roles, require_numbered_executors=False)
+    _validate_unique_roster(roles)
     if resolve_by is not None:
         validate_iso_utc(resolve_by)
     if protocol_version not in (None, "", DEBATE_PROTOCOL_V1):

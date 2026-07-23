@@ -393,7 +393,6 @@ def _ready_reason_codes(
     *,
     due: date | None,
     today: date,
-    include_readings: bool,
 ) -> list[str]:
     codes: list[str] = []
     text = _ready_task_text(task)
@@ -426,13 +425,6 @@ def _ready_reason_codes(
         codes.append("reopen_requested_by_user")
     if _infer_ready_blockers(task):
         codes.append("blocked_by_open_item")
-
-    if (
-        _ready_is_reading(task)
-        and not include_readings
-        and "reading_surface" not in codes
-    ):
-        codes.append("reading_surface")
 
     return [code for code in dict.fromkeys(codes) if code in REASON_CODES]
 
@@ -527,8 +519,6 @@ def _ready_state(
         return "ready_now"
     if section == "someday" and not _ready_has_explicit_surface(task) and due is None:
         return "excluded"
-    if task.get("priority") in {"critical", "high"} or section in {"inbox", "next"}:
-        return "suggested_ready"
     return "suggested_ready"
 
 
@@ -558,7 +548,6 @@ def build_ready_record(
         task,
         due=due,
         today=today,
-        include_readings=include_readings,
     )
     ready_state = _ready_state(
         task,

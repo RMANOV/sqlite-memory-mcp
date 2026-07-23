@@ -168,10 +168,9 @@ def test_hook_worker_treats_no_change_push_as_success(tmp_path, monkeypatch):
             self.fn = fn
 
     fake_bridge_server = types.SimpleNamespace(
-        bridge_pull=Tool(lambda: json.dumps({"new_tasks": 0})),
         bridge_push=Tool(
             lambda tag="shared": json.dumps(
-                {"pushed": 0, "tasks": 3, "message": "No changes — already up to date"}
+                {"pushed": False, "skipped": True, "tasks": 3}
             )
         ),
     )
@@ -184,7 +183,7 @@ def test_hook_worker_treats_no_change_push_as_success(tmp_path, monkeypatch):
     assert notifications[-1] == ("info", "BRIDGE: synced 3 tasks OK")
 
 
-def test_hook_worker_blocks_push_when_pull_fails_closed(tmp_path, monkeypatch):
+def test_hook_worker_stops_when_canonical_sync_fails_closed(tmp_path, monkeypatch):
     module = _load_module(
         "bridge_hook_worker_pull_block_test", ROOT / "hooks" / "bridge_sync_worker.py"
     )
@@ -209,20 +208,16 @@ def test_hook_worker_blocks_push_when_pull_fails_closed(tmp_path, monkeypatch):
         def __init__(self, fn):
             self.fn = fn
 
-    def fail_push(tag="shared"):
-        raise AssertionError("bridge_push must not run after pull is blocked")
-
     fake_bridge_server = types.SimpleNamespace(
-        bridge_pull=Tool(
-            lambda: json.dumps(
+        bridge_push=Tool(
+            lambda tag="shared": json.dumps(
                 {
                     "blocked_by_repo_state": True,
                     "git_pull_failed": True,
                     "error": "bridge_pull git pull failed; import blocked",
                 }
             )
-        ),
-        bridge_push=Tool(fail_push),
+        )
     )
     monkeypatch.setitem(sys.modules, "bridge_server", fake_bridge_server)
 
@@ -239,7 +234,8 @@ def test_hook_worker_blocks_push_when_pull_fails_closed(tmp_path, monkeypatch):
 
 def test_hook_worker_treats_git_add_failure_as_blocked(tmp_path, monkeypatch):
     module = _load_module(
-        "bridge_hook_worker_git_add_block_test", ROOT / "hooks" / "bridge_sync_worker.py"
+        "bridge_hook_worker_git_add_block_test",
+        ROOT / "hooks" / "bridge_sync_worker.py",
     )
     module.LOCK_FILE = str(tmp_path / ".lock")
     module.LAST_SYNC = str(tmp_path / ".last_sync")
@@ -269,7 +265,6 @@ def test_hook_worker_treats_git_add_failure_as_blocked(tmp_path, monkeypatch):
             self.fn = fn
 
     fake_bridge_server = types.SimpleNamespace(
-        bridge_pull=Tool(lambda: json.dumps({"new_tasks": 0})),
         bridge_push=Tool(
             lambda tag="shared": json.dumps(
                 {
@@ -366,7 +361,7 @@ def test_hook_worker_retries_after_previous_failures(tmp_path, monkeypatch):
     module.FAIL_COUNTER = str(tmp_path / ".fail_count")
     module.SERVER_DIR = str(tmp_path)
 
-    calls = {"pull": 0, "push": 0}
+    calls = {"push": 0}
     notifications = []
     fail_counts = []
 
@@ -384,25 +379,18 @@ def test_hook_worker_retries_after_previous_failures(tmp_path, monkeypatch):
         def __init__(self, fn):
             self.fn = fn
 
-    def fake_pull():
-        calls["pull"] += 1
-        return json.dumps({"new_tasks": 0})
-
     def fake_push(tag="shared"):
         calls["push"] += 1
-        return json.dumps(
-            {"pushed": 0, "tasks": 2, "message": "No changes — already up to date"}
-        )
+        return json.dumps({"pushed": False, "skipped": True, "tasks": 2})
 
     fake_bridge_server = types.SimpleNamespace(
-        bridge_pull=Tool(fake_pull),
         bridge_push=Tool(fake_push),
     )
     monkeypatch.setitem(sys.modules, "bridge_server", fake_bridge_server)
 
     module.main()
 
-    assert calls == {"pull": 1, "push": 1}
+    assert calls == {"push": 1}
     assert fail_counts == [0]
     assert notifications[-1] == ("info", "BRIDGE: synced 2 tasks OK")
 
@@ -420,7 +408,7 @@ def test_hook_worker_drains_writes_that_arrive_during_sync(tmp_path, monkeypatch
 
     notifications = []
     fail_counts = []
-    calls = {"pull": 0, "push": 0}
+    calls = {"push": 0}
     clock = iter([100.0, 101.0, 102.0, 103.0])
 
     monkeypatch.setattr(module, "acquire_lock", lambda: True)
@@ -438,29 +426,22 @@ def test_hook_worker_drains_writes_that_arrive_during_sync(tmp_path, monkeypatch
         def __init__(self, fn):
             self.fn = fn
 
-    def fake_pull():
-        calls["pull"] += 1
-        return json.dumps({"new_tasks": 0})
-
     def fake_push(tag="shared"):
         calls["push"] += 1
         if calls["push"] == 1:
             Path(module.DIRTY_FLAG).write_text(
                 str(module.time.time()), encoding="utf-8"
             )
-        return json.dumps(
-            {"pushed": 0, "tasks": 4, "message": "No changes — already up to date"}
-        )
+        return json.dumps({"pushed": False, "skipped": True, "tasks": 4})
 
     fake_bridge_server = types.SimpleNamespace(
-        bridge_pull=Tool(fake_pull),
         bridge_push=Tool(fake_push),
     )
     monkeypatch.setitem(sys.modules, "bridge_server", fake_bridge_server)
 
     module.main()
 
-    assert calls == {"pull": 2, "push": 2}
+    assert calls == {"push": 2}
     assert fail_counts == [0, 0]
     assert Path(module.LAST_SYNC).exists()
     assert not Path(module.DIRTY_FLAG).exists()
