@@ -1643,7 +1643,7 @@ def debate_compact(
 
 # Tool 31: debate_advance_watermark (turn-3 helper, msg:4c8a91be)
 @mcp.tool()
-@_db_tool(error_mapper=_debate_error_response)
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_advance_watermark(
     conn,
     topic_id: str,
@@ -1656,7 +1656,9 @@ def debate_advance_watermark(
     canonical WATERMARK message of the form:
       'processed_up_to_ts=<ts> processed_up_to_msg_id=<msg_id>'
 
-    Atomically updates debate_watermarks. Reduces caller error surface
+    Atomically updates debate_watermarks and reconciles the active primary
+    session's addressed-subset cursor through the same ledger point. Diagnostic
+    and derived worker cursors remain independent. Reduces caller error surface
     vs constructing the WATERMARK body by hand.
     """
     return _debate_advance_watermark_dao(
@@ -1752,10 +1754,12 @@ def debate_signal_check(
 
     session_id must match ^(cc|codex|mcp|tray|human)-[a-zA-Z0-9_]{4,64}$.
     Cursor precedence: since_msg_id > since_ts > debate_signal_state row
-    > start of topic. limit defaults to 200, capped at 1000; out-of-range
-    or non-int raises with a specific error_type. Returns pending list,
-    truncated bool + next_cursor for pagination, max_priority for
-    short-circuit logic, plus topic_state.
+    > start of topic. Before the persisted-cursor path, an active primary
+    binding self-heals legacy drift from a newer role watermark by advancing
+    only to the newest visible addressed message covered by that watermark.
+    limit defaults to 200, capped at 1000; out-of-range or non-int raises with
+    a specific error_type. Returns pending list, truncated bool + next_cursor
+    for pagination, max_priority for short-circuit logic, plus topic_state.
     """
     return _debate_signal_check_dao(
         conn,

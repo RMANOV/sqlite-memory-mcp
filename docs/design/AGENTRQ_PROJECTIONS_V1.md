@@ -66,6 +66,13 @@ tools. No row below is created by this item.
 | `debate_worker_claim` (tool) | `intel_server.py:1835` | Idempotent worker allocation over `debate_worker_claims`. |
 | `assert_dashboard_conductor_writer` (guard) | `db_utils.py:1449` | Fail-closed single-writer guard for `daily_dashboard` (see §3). |
 
+The two cursor rows are intentionally different projections, not competing
+authorities. A role watermark covers the full visible ledger and therefore
+one-way reconciles the active primary session to the newest addressed message
+within that range. A session cursor does not move the role watermark because
+the addressed stream cannot prove consumption of non-addressed ledger rows.
+Diagnostic and derived-worker cursors remain independent.
+
 ### 1.1 Dashboard kind/priority vocabulary (existing)
 
 `daily_dashboard.kind` is constrained to the existing enum
