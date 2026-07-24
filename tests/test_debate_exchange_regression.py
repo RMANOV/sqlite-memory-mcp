@@ -100,10 +100,7 @@ def test_wake_prompt_uses_real_worker_no_action_argument_and_bounded_codex_mode(
     monkeypatch,
 ):
     wake = _load_hook("debate_wake_exchange_regression", "hooks/debate_wake.py")
-    # The codex route is gated OFF on Windows unless explicitly enabled
-    # (advocate BLOCK high-risk #3: auto-spawned --dangerously-bypass is an
-    # attack surface). This test verifies the command SHAPE, so opt in.
-    monkeypatch.setenv("DEBATE_WAKE_CODEX_ENABLED", "1")
+    monkeypatch.setenv("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_unified__")
     prompt = wake._wake_prompt(
         {"target_role": "EXECUTOR", "target_session_id": "codex-executor1-W7"},
         "a00000000001",
@@ -115,7 +112,10 @@ def test_wake_prompt_uses_real_worker_no_action_argument_and_bounded_codex_mode(
     assert "worker_session_id (the session_id shown above)" in prompt
     assert "topic_id, role, session_id, trigger_msg_id" not in prompt
     assert "--ephemeral" in command
-    assert 'model_reasoning_effort="low"' in command
+    assert "--ignore-user-config" in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert any(item == 'model_reasoning_effort="low"' for item in command)
     source = (ROOT / "hooks/debate_wake.py").read_text(encoding="utf-8")
     assert '"CODEX_DEBATE_WRAPPER_BYPASS": "1"' in source
 

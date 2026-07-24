@@ -2659,6 +2659,7 @@ def rotate_role_binding(
     )
 
     warning: str | None = None
+    cursor_source: str | None = None
     now = now_iso()
     if cursor_mode == "head":
         head = conn.execute(
@@ -2680,10 +2681,33 @@ def rotate_role_binding(
             )
     elif cursor_mode == "copy":
         source = conn.execute(
-            "SELECT last_processed_msg_id, last_processed_ts "
-            "FROM debate_signal_state "
-            "WHERE session_id = ? AND role = ? AND topic_id = ?",
-            (old_session_id, role, topic_id),
+            "SELECT last_processed_msg_id, last_processed_ts, cursor_source "
+            "FROM ("
+            " SELECT s.last_processed_msg_id, s.last_processed_ts, "
+            " 'primary' AS cursor_source "
+            " FROM debate_signal_state s "
+            " WHERE s.session_id = ? AND s.role = ? AND s.topic_id = ? "
+            " UNION ALL "
+            " SELECT s.last_processed_msg_id, s.last_processed_ts, "
+            " 'completed_worker' AS cursor_source "
+            " FROM debate_worker_claims c "
+            " JOIN debate_signal_state s "
+            "   ON s.session_id = c.worker_session_id "
+            "  AND s.role = c.role AND s.topic_id = c.topic_id "
+            " WHERE c.parent_session_id = ? AND c.role = ? AND c.topic_id = ? "
+            "   AND c.state = 'completed'"
+            ") "
+            "WHERE last_processed_ts IS NOT NULL "
+            "ORDER BY last_processed_ts DESC, last_processed_msg_id DESC "
+            "LIMIT 1",
+            (
+                old_session_id,
+                role,
+                topic_id,
+                old_session_id,
+                role,
+                topic_id,
+            ),
         ).fetchone()
         if source is None:
             warning = "copy_source_cursor_missing"
@@ -2711,6 +2735,7 @@ def rotate_role_binding(
                     now,
                 ),
             )
+            cursor_source = str(source["cursor_source"])
     else:  # replay
         conn.execute(
             "DELETE FROM debate_signal_state "
@@ -2723,6 +2748,7 @@ def rotate_role_binding(
             "old_session_id": old_session_id,
             "new_session_id": new_session_id,
             "cursor_mode": cursor_mode,
+            "cursor_source": cursor_source,
             "warning": warning,
         }
     )

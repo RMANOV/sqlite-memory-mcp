@@ -24,6 +24,7 @@ sqlite-memory-bridge = "bridge_server:main"
 sqlite-memory-collab = "collab_server:main"
 sqlite-memory-entity = "entity_server:main"
 sqlite-memory-intel = "intel_server:main"
+sqlite-memory-debate-worker = "debate_worker_server:main"
 sqlite-memory-unified = "unified_server:main"
 sqlite-memory-n8n = "n8n_server:main"
 sqlite-memory-doctor = "install_doctor:main"
@@ -61,6 +62,7 @@ py-modules = [
     "debate_prompt_context",
     "debate_read_dao",
     "debate_retrieval",
+    "debate_worker_server",
     "debate_wake_signal",
     "enrichment_constants",
     "entity_server",

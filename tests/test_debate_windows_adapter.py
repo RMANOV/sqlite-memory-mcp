@@ -323,20 +323,41 @@ def test_agent_command_mcp_prefix_is_configurable(monkeypatch):
     allowed = cmd[cmd.index("--allowedTools") + 1]
     assert "mcp__sqlite_unified__debate_worker_claim" in allowed
     assert "mcp__sqlite_intel__" not in allowed
+    assert cmd[cmd.index("--setting-sources") + 1] == "project"
+    assert "--strict-mcp-config" in cmd
+    config = json.loads(cmd[cmd.index("--mcp-config") + 1])
+    assert list(config["mcpServers"]) == ["sqlite_unified"]
+    server = config["mcpServers"]["sqlite_unified"]
+    assert Path(server["args"][0]).name == "debate_worker_server.py"
+
+
+def test_invalid_mcp_prefix_is_typed_refusal(monkeypatch):
+    import debate_wake
+
+    monkeypatch.setenv("DEBATE_WAKE_MCP_PREFIX", "not-an-mcp-prefix")
+    assert debate_wake._agent_command({"target_runtime": "cc"}, "m1", "T1") is None
 
 
 @windows_only
-def test_codex_route_disabled_by_default_on_windows(monkeypatch):
-    """Advocate BLOCK high-risk #3: the auto-spawned codex route runs with
-    --dangerously-bypass-approvals-and-sandbox. On Windows it must be a typed
-    refusal unless explicitly enabled — never a silent automatic bypass."""
+def test_codex_route_is_safe_and_enabled_by_default(monkeypatch):
+    """Windows Codex wake must not trade zero-paste for unrestricted access."""
     import debate_wake
 
-    monkeypatch.delenv("DEBATE_WAKE_CODEX_ENABLED", raising=False)
-    assert debate_wake._agent_command({"target_runtime": "codex"}, "m1", "T1") is None
-    monkeypatch.setenv("DEBATE_WAKE_CODEX_ENABLED", "1")
+    monkeypatch.setenv("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_unified__")
     cmd = debate_wake._agent_command({"target_runtime": "codex"}, "m1", "T1")
-    assert cmd is not None and "--ephemeral" in cmd
+    assert cmd is not None
+    assert "--ephemeral" in cmd
+    assert "--ignore-user-config" in cmd
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+    config_values = [
+        cmd[index + 1] for index, item in enumerate(cmd) if item == "--config"
+    ]
+    assert 'approval_policy="on-request"' in config_values
+    assert 'approvals_reviewer="auto_review"' in config_values
+    enabled = next(value for value in config_values if ".enabled_tools=" in value)
+    tools = json.loads(enabled.split("=", 1)[1])
+    assert tools == list(debate_wake._WAKE_TOOL_SUFFIXES)
 
 
 @windows_only

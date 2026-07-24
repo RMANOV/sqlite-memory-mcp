@@ -317,56 +317,149 @@ def _record_receipt_event(event: dict[str, Any]) -> None:
         )
 
 
+def _mcp_server_identity() -> tuple[str, str]:
+    """Return the configured MCP tool prefix and its validated server name."""
+    prefix = os.environ.get("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_intel__")
+    if (
+        not prefix.startswith("mcp__")
+        or not prefix.endswith("__")
+        or len(prefix) <= len("mcp____")
+    ):
+        raise ValueError(f"invalid DEBATE_WAKE_MCP_PREFIX: {prefix!r}")
+    server_name = prefix[len("mcp__") : -len("__")]
+    if not all(
+        char.isascii() and (char.isalnum() or char in "_-") for char in server_name
+    ):
+        raise ValueError(f"invalid MCP server name in prefix: {prefix!r}")
+    return prefix, server_name
+
+
+def _mcp_python_executable() -> str:
+    """Use console Python for stdio even when the resident pump is pythonw."""
+    configured = os.environ.get("DEBATE_WAKE_MCP_PYTHON", "").strip()
+    if configured:
+        return configured
+    executable = Path(sys.executable)
+    if IS_WINDOWS and executable.name.lower() == "pythonw.exe":
+        console_python = executable.with_name("python.exe")
+        if console_python.is_file():
+            return str(console_python)
+    return str(executable)
+
+
+def _mcp_server_path() -> str:
+    configured = os.environ.get("DEBATE_WAKE_MCP_SERVER", "").strip()
+    return configured or str(REPO / "debate_worker_server.py")
+
+
+def _claude_mcp_config(server_name: str) -> str:
+    """Build a single-server config; never inherit the user's full MCP fleet."""
+    return json.dumps(
+        {
+            "mcpServers": {
+                server_name: {
+                    "type": "stdio",
+                    "command": _mcp_python_executable(),
+                    "args": [_mcp_server_path()],
+                }
+            }
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _toml_string(value: str) -> str:
+    """JSON string syntax is valid TOML basic-string syntax."""
+    return json.dumps(value, ensure_ascii=True)
+
+
+_WAKE_TOOL_SUFFIXES = (
+    "debate_signal_check",
+    "debate_post_with_recipients",
+    "debate_signal_advance",
+    "debate_binding_list",
+    "debate_worker_claim",
+    "debate_worker_no_action",
+)
+
+
 def _agent_command(
     target: dict[str, Any], trigger_msg_id: str, topic_id: str
 ) -> list[str] | None:
     runtime = str(target.get("target_runtime") or "")
-    if runtime in {"cc", "claude"}:
-        # The MCP server name differs per deployment (sqlite_intel on the
-        # Fedora stack, sqlite_unified on Windows); the tool suffixes do not.
-        prefix = os.environ.get("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_intel__")
-        allowed = ",".join(
-            prefix + suffix
-            for suffix in (
-                "debate_signal_check",
-                "debate_post_with_recipients",
-                "debate_signal_advance",
-                "debate_binding_list",
-                "debate_worker_claim",
-                "debate_worker_no_action",
-            )
+    try:
+        prefix, server_name = _mcp_server_identity()
+    except ValueError as exc:
+        _log(
+            "agent_mcp_prefix_invalid",
+            msg_id=trigger_msg_id,
+            topic_id=topic_id,
+            error=str(exc),
         )
+        return None
+    allowed_tool_names = [prefix + suffix for suffix in _WAKE_TOOL_SUFFIXES]
+
+    if runtime in {"cc", "claude"}:
+        # Deterministic headless worker:
+        # - project-only settings prevent user SessionStart hooks from
+        #   injecting unrelated work or forcing xhigh/team orchestration;
+        # - strict single-server MCP config avoids racing the entire user MCP
+        #   fleet and exposes only the debate worker surface;
+        # - explicit low effort keeps bounded wake latency predictable.
         return [
             "claude",
             "-p",
+            "--setting-sources",
+            "project",
+            "--model",
+            os.environ.get("DEBATE_WAKE_CLAUDE_MODEL", "fable"),
+            "--effort",
+            os.environ.get("DEBATE_WAKE_CLAUDE_EFFORT", "low"),
             "--permission-mode",
             "auto",
+            "--mcp-config",
+            _claude_mcp_config(server_name),
+            "--strict-mcp-config",
             "--allowedTools",
-            allowed,
+            ",".join(allowed_tool_names),
         ]
     if runtime == "codex":
-        # Advocate BLOCK high-risk #3: the codex route runs with
-        # --dangerously-bypass-approvals-and-sandbox (inherited Linux
-        # behavior). A zero-paste pump turns that into an automatic attack
-        # surface, so on Windows the route is OFF unless explicitly enabled.
-        # Typed refusal (unsupported_runtime) — never a silent bypass.
-        if IS_WINDOWS and os.environ.get("DEBATE_WAKE_CODEX_ENABLED", "0") != "1":
-            _log(
-                "codex_route_disabled_on_windows",
-                msg_id=trigger_msg_id,
-                topic_id=topic_id,
-                hint="set DEBATE_WAKE_CODEX_ENABLED=1 to enable",
-            )
-            return None
+        # Safe zero-paste Codex route. The OS sandbox remains read-only, the
+        # user's broad config/MCP fleet is ignored, and only six canonical
+        # debate tools are registered. Side-effecting MCP calls still pass
+        # through Codex automatic approval review; reviewer failure is closed.
+        server_key = f"mcp_servers.{server_name}"
+        enabled_tools = json.dumps(_WAKE_TOOL_SUFFIXES, separators=(",", ":"))
         return [
             "codex",
             "exec",
+            "--ignore-user-config",
+            "--sandbox",
+            "read-only",
             "--cd",
             str(REPO),
-            "--dangerously-bypass-approvals-and-sandbox",
             "--ephemeral",
             "--config",
-            'model_reasoning_effort="low"',
+            f"model_reasoning_effort={_toml_string(os.environ.get('DEBATE_WAKE_CODEX_EFFORT', 'low'))}",
+            "--config",
+            'approval_policy="on-request"',
+            "--config",
+            'approvals_reviewer="auto_review"',
+            "--config",
+            f"{server_key}.required=true",
+            "--config",
+            f"{server_key}.command={_toml_string(_mcp_python_executable())}",
+            "--config",
+            f"{server_key}.args={json.dumps([_mcp_server_path()], separators=(',', ':'))}",
+            "--config",
+            f"{server_key}.startup_timeout_sec=30.0",
+            "--config",
+            f"{server_key}.tool_timeout_sec=120.0",
+            "--config",
+            f"{server_key}.enabled_tools={enabled_tools}",
+            "--color",
+            "never",
         ]
     return None
 

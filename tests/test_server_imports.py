@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import bridge_server
 import collab_server
 import db_utils
+import debate_worker_server
 import entity_server
 import intel_server
 import server
@@ -62,6 +63,18 @@ def test_unified_server_imports_and_exposes_mcp_instance():
     assert hasattr(unified_server, "mcp")
 
 
+def test_debate_worker_server_exposes_only_bounded_wake_surface():
+    tools = asyncio.run(_list_tools(debate_worker_server.mcp))
+    assert {tool.name for tool in tools} == {
+        "debate_signal_check",
+        "debate_post_with_recipients",
+        "debate_signal_advance",
+        "debate_binding_list",
+        "debate_worker_claim",
+        "debate_worker_no_action",
+    }
+
+
 def test_project_scripts_call_main_wrappers():
     with (_ROOT / "pyproject.toml").open("rb") as fh:
         scripts = tomllib.load(fh)["project"]["scripts"]
@@ -74,6 +87,7 @@ def test_project_scripts_call_main_wrappers():
     assert scripts["sqlite-memory-collab"] == "collab_server:main"
     assert scripts["sqlite-memory-entity"] == "entity_server:main"
     assert scripts["sqlite-memory-intel"] == "intel_server:main"
+    assert scripts["sqlite-memory-debate-worker"] == "debate_worker_server:main"
     assert scripts["sqlite-memory-unified"] == "unified_server:main"
 
 
@@ -222,6 +236,7 @@ def test_task_server_instructions_make_description_the_default_body_field():
         collab_server,
         entity_server,
         intel_server,
+        debate_worker_server,
         unified_server,
     ],
     ids=lambda module: module.__name__,

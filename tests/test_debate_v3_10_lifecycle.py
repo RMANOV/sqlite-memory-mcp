@@ -133,9 +133,7 @@ def test_debate_state_resolved_retires_active_bindings_atomically(topic):
         body="block close",
     )
 
-    blocked = transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED"
-    )
+    blocked = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
     assert blocked["new_state"] == "ACTIVE"
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
@@ -148,9 +146,7 @@ def test_debate_state_resolved_retires_active_bindings_atomically(topic):
         body="answered",
         reply_to=q["msg_id"],
     )
-    out = transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED"
-    )
+    out = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
     assert out["new_state"] == "RESOLVED"
     assert out["retired_bindings"] == 1
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "retired"
@@ -170,9 +166,7 @@ def test_debate_state_archived_retires_diagnostic_bindings_atomically(topic):
     transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
     assert _binding_state(conn, t, "EXECUTOR", "codex-diag1") == "diagnostic"
 
-    out = transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="ARCHIVED"
-    )
+    out = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ARCHIVED")
     assert out["new_state"] == "ARCHIVED"
     assert out["retired_bindings"] == 1
     assert _binding_state(conn, t, "EXECUTOR", "codex-diag1") == "retired"
@@ -219,7 +213,9 @@ def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "retired"
 
 
-def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_workers(topic):
+def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_workers(
+    topic,
+):
     conn, t = topic
     bind_role_session(
         conn,
@@ -326,6 +322,60 @@ def test_rotate_requires_cursor_mode_and_copy_missing_cursor_warns(topic):
     )
 
 
+def test_rotate_copy_rolls_up_latest_completed_worker_cursor(topic):
+    conn, t = topic
+    bind_role_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        session_id="codex-exec1",
+        reason="primary",
+    )
+    trigger = debate_post_with_recipients(
+        conn,
+        topic_id=t,
+        role="CONDUCTOR",
+        priority="H",
+        kind="Q",
+        body="worker-owned handoff anchor",
+        addressed_to=["EXECUTOR"],
+    )
+    claim = claim_worker_session(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        parent_session_id="codex-exec1",
+        trigger_msg_id=trigger["msg_id"],
+    )
+    worker_no_action(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        worker_session_id=claim["worker_session_id"],
+        trigger_msg_id=trigger["msg_id"],
+        reason="bounded trigger handled",
+    )
+
+    out = rotate_role_binding(
+        conn,
+        topic_id=t,
+        role="EXECUTOR",
+        old_session_id="codex-exec1",
+        new_session_id="codex-exec2",
+        cursor_mode="copy",
+        reason="handoff after ephemeral worker",
+    )
+
+    cursor = conn.execute(
+        "SELECT last_processed_msg_id FROM debate_signal_state "
+        "WHERE topic_id = ? AND role = ? AND session_id = ?",
+        (t, "EXECUTOR", "codex-exec2"),
+    ).fetchone()
+    assert out["warning"] is None
+    assert out["cursor_source"] == "completed_worker"
+    assert cursor["last_processed_msg_id"] == trigger["msg_id"]
+
+
 def test_wake_adapter_signal_only_and_loop_suppressed(topic):
     conn, t = topic
     bind_role_session(
@@ -427,10 +477,7 @@ def test_direct_session_addressing_rejected_unless_diagnostic_binding(topic):
             body="bad direct",
             addressed_to=["codex-diag1"],
         )
-    assert (
-        exc_info.value.error_type
-        == "recipient_direct_session_requires_diagnostic"
-    )
+    assert exc_info.value.error_type == "recipient_direct_session_requires_diagnostic"
 
     bind_role_session(
         conn,
@@ -767,9 +814,9 @@ def test_worker_no_action_completes_claim_and_advances_worker_cursor(topic):
         trigger_msg_id=trigger["msg_id"],
         details={"source": "test"},
     )
-    message_count = conn.execute("SELECT COUNT(*) AS n FROM debate_messages").fetchone()[
-        "n"
-    ]
+    message_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM debate_messages"
+    ).fetchone()["n"]
 
     out = worker_no_action(
         conn,
@@ -808,7 +855,10 @@ def test_worker_no_action_completes_claim_and_advances_worker_cursor(topic):
     assert cursor["last_processed_msg_id"] == trigger["msg_id"]
     assert duplicate["worker_session_id"] == claim["worker_session_id"]
     assert duplicate["no_action"] is True
-    assert conn.execute("SELECT COUNT(*) AS n FROM debate_messages").fetchone()["n"] == message_count
+    assert (
+        conn.execute("SELECT COUNT(*) AS n FROM debate_messages").fetchone()["n"]
+        == message_count
+    )
 
 
 def test_worker_no_action_keeps_newer_worker_cursor_when_trigger_is_stale(topic):
@@ -1110,7 +1160,9 @@ def test_standing_false_decision_is_not_resurfaced_as_mandate(topic):
     assert [m["msg_id"] for m in out["pending"]] == [standing["msg_id"]]
 
 
-def test_signal_check_limit_skips_done_one_shot_decisions_without_starving_later_work(topic):
+def test_signal_check_limit_skips_done_one_shot_decisions_without_starving_later_work(
+    topic,
+):
     conn, t = topic
     bind_role_session(
         conn,
