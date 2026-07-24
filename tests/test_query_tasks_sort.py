@@ -32,7 +32,7 @@ def task_env(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)
     monkeypatch.setattr(task_server, "_get_conn", _conn_factory(db_path))
-    monkeypatch.setattr(task_server, "_vec_sync_task_safe", lambda conn, task_id: None)
+    monkeypatch.setattr(task_server, "_vec_sync_task_safe", lambda task_id: None)
     return db_path
 
 
@@ -160,9 +160,7 @@ def test_tie_breaker_is_deterministic(task_env):
     _mk(title="t1", priority="medium", due_date="2026-07-01")
     _mk(title="t2", priority="medium", due_date="2026-07-01")
     _mk(title="t3", priority="medium", due_date="2026-07-01")
-    runs = [
-        _titles(task_server.query_tasks.fn(sort_by="due_date")) for _ in range(3)
-    ]
+    runs = [_titles(task_server.query_tasks.fn(sort_by="due_date")) for _ in range(3)]
     assert runs[0] == runs[1] == runs[2]  # stable across repeated calls
 
 

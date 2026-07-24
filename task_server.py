@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from typing import Any
 
@@ -26,6 +27,7 @@ from db_utils import (
     setup_logger,
     apply_task_mutation as _apply_task_mutation,
     create_task_with_ledger as _create_task_with_ledger,
+    DB_PATH as _DB_PATH,
 )
 from retrieval_contract import (
     RETRIEVAL_CONTRACT_VERSION,
@@ -61,14 +63,63 @@ def _get_search_engine() -> TaskSearchEngine:
     return _search_engine
 
 
-def _vec_sync_task_safe(conn, task_id: str) -> None:
-    """Sync task embedding, logging failures for graceful degradation."""
-    try:
-        from vec_search import vec_sync_task
+class _TaskEmbeddingScheduler:
+    """Coalesce optional embedding refreshes onto one daemon worker."""
 
-        vec_sync_task(conn, task_id)
-    except Exception as e:
-        logger.debug("vec_sync_task(%s) skipped: %s", task_id, e, exc_info=True)
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[str, None] = {}
+        self._running = False
+
+    def request(self, task_id: str) -> None:
+        with self._lock:
+            self._pending[task_id] = None
+            if self._running:
+                return
+            self._running = True
+        threading.Thread(
+            target=self._run,
+            name="sqlite-task-embedding",
+            daemon=True,
+        ).start()
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._running = False
+                    return
+                task_id = next(iter(self._pending))
+                self._pending.pop(task_id, None)
+            try:
+                from vec_search import vec_sync_task_detached
+
+                vec_sync_task_detached(_DB_PATH, task_id)
+            except Exception as exc:
+                logger.debug(
+                    "detached vec_sync_task(%s) skipped: %s",
+                    task_id,
+                    exc,
+                    exc_info=True,
+                )
+
+
+_task_embedding_scheduler = _TaskEmbeddingScheduler()
+
+
+def _vec_sync_task_safe(task_id: str) -> None:
+    """Schedule derived embedding work after the authoritative commit."""
+    try:
+        _task_embedding_scheduler.request(task_id)
+    except Exception as exc:
+        # The authoritative task is already committed.  Optional cache
+        # scheduling must never turn that success into a retry/duplicate.
+        logger.debug(
+            "task embedding scheduling skipped for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
 
 
 def _normalize_title_key(value: str | None) -> str:
@@ -192,7 +243,7 @@ def create_task_or_note(
             type=type,
             tool_name="sqlite-tasks.create_task_or_note",
         )
-        _vec_sync_task_safe(conn, task_id)
+    _vec_sync_task_safe(task_id)
 
     logger.info("create_task_or_note: %s (%s)", title, task_id)
     return json.dumps(
@@ -254,6 +305,8 @@ def upsert_note_by_title_project(
         return json.dumps({"error": err})
 
     now = _now()
+    embed_task_id: str | None = None
+    response: dict[str, Any]
     with _get_conn() as conn:
         existing = _find_note_by_title_project(conn, title=title, project=project_value)
         if existing:
@@ -299,46 +352,49 @@ def upsert_note_by_title_project(
             if {"title", "description", "notes"} & set(
                 result.get("changed_fields", ())
             ):
-                _vec_sync_task_safe(conn, existing["id"])
-            return json.dumps(
-                {
-                    "task_id": existing["id"],
-                    "title": title,
-                    "type": "note",
-                    "action": "updated",
-                    "fields": result.get("changed_fields", []),
-                    "matched_on": "normalized_title_project",
-                }
+                embed_task_id = existing["id"]
+            response = {
+                "task_id": existing["id"],
+                "title": title,
+                "type": "note",
+                "action": "updated",
+                "fields": result.get("changed_fields", []),
+                "matched_on": "normalized_title_project",
+            }
+        else:
+            task_id = str(uuid.uuid4())
+            _create_task_with_ledger(
+                conn,
+                task_id,
+                title,
+                now,
+                description=description or None,
+                status="not_started",
+                priority=create_priority,
+                section=create_section,
+                project=project_value,
+                notes=notes or None,
+                type="note",
+                tool_name="sqlite-tasks.upsert_note_by_title_project",
             )
+            embed_task_id = task_id
+            response = {
+                "task_id": task_id,
+                "title": title,
+                "type": "note",
+                "status": "not_started",
+                "action": "created",
+                "matched_on": "normalized_title_project",
+            }
 
-        task_id = str(uuid.uuid4())
-        _create_task_with_ledger(
-            conn,
-            task_id,
-            title,
-            now,
-            description=description or None,
-            status="not_started",
-            priority=create_priority,
-            section=create_section,
-            project=project_value,
-            notes=notes or None,
-            type="note",
-            tool_name="sqlite-tasks.upsert_note_by_title_project",
-        )
-        _vec_sync_task_safe(conn, task_id)
-
-    logger.info("upsert_note_by_title_project: %s (%s)", title, task_id)
-    return json.dumps(
-        {
-            "task_id": task_id,
-            "title": title,
-            "type": "note",
-            "status": "not_started",
-            "action": "created",
-            "matched_on": "normalized_title_project",
-        }
+    if embed_task_id:
+        _vec_sync_task_safe(embed_task_id)
+    logger.info(
+        "upsert_note_by_title_project: %s (%s)",
+        title,
+        response["task_id"],
     )
+    return json.dumps(response)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -425,6 +481,7 @@ def update_task(
 
     updates["updated_at"] = _now()
 
+    reembed = False
     with _get_conn() as conn:
         result = _apply_task_mutation(
             conn,
@@ -437,8 +494,10 @@ def update_task(
             return json.dumps({"error": f"Task {task_id} not found"})
         # Re-embed if content fields changed
         if {"title", "description", "notes"} & set(result.get("changed_fields", ())):
-            _vec_sync_task_safe(conn, task_id)
+            reembed = True
 
+    if reembed:
+        _vec_sync_task_safe(task_id)
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
     return json.dumps({"updated": task_id, "fields": list(updates.keys())})
 
