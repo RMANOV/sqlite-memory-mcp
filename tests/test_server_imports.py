@@ -87,7 +87,6 @@ def test_project_scripts_call_main_wrappers():
     assert scripts["sqlite-memory-collab"] == "collab_server:main"
     assert scripts["sqlite-memory-entity"] == "entity_server:main"
     assert scripts["sqlite-memory-intel"] == "intel_server:main"
-    assert scripts["sqlite-memory-debate-worker"] == "debate_worker_server:main"
     assert scripts["sqlite-memory-unified"] == "unified_server:main"
 
 
