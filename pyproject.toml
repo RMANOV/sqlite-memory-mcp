@@ -32,6 +32,12 @@ sqlite-memory-demo = "demo_flow:main"
 task-tray = "task_tray:main"
 memory-digest = "daily_digest:main"
 
+[tool.ruff.lint]
+# Ruff 0.16 expanded its implicit default from 59 to 413 rules. Keep the
+# repository's established lint contract explicit so CI does not change
+# behavior when the runner installs a newer Ruff release.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.setuptools]
 py-modules = [
     "advanced_context",
