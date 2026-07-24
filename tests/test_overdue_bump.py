@@ -61,7 +61,7 @@ def test_task_server_delegates_bump_to_task_dao(tmp_path, monkeypatch):
         _create_overdue(conn, "server-task", task_type="task")
         _create_overdue(conn, "server-note", task_type="note")
 
-    monkeypatch.setattr(task_server, "_get_conn", lambda: get_conn(db_path))
+    monkeypatch.setattr(task_server, "_get_write_conn", lambda: get_conn(db_path))
     payload = json.loads(task_server.bump_overdue_priority.__wrapped__("high"))
 
     assert payload == {"bumped": 1, "target_priority": "high"}

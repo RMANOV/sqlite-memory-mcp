@@ -39,7 +39,7 @@ from fastmcp.server.auth import StaticTokenVerifier
 
 from db_utils import (
     ensure_db_initialized,
-    get_conn as _get_conn,
+    get_conn_immediate as _get_write_conn,
     get_entity_id as _get_entity_id,
     now_iso as _now,
     record_memory_event,
@@ -95,6 +95,7 @@ def _assert_loopback(host: str) -> str:
             "any external exposure."
         )
     return host
+
 
 # ── Exact deny-by-default allowlist (frozen) ────────────────────────────────
 # This is the *entire* tool surface exposed to n8n. Tests assert exact equality
@@ -185,6 +186,9 @@ def _audit_n8n_write(
 
     Uniform across all five write tools (criterion #3): actor_type=``n8n``,
     actor_id=the normalized source/workflow tag, plus request context payload.
+    The separate audit transaction starts IMMEDIATE so it waits at BEGIN
+    instead of losing a DEFERRED read-to-write upgrade race against detached
+    task-embedding maintenance.
     Best-effort: an audit failure must never lose the user's write, so it is
     logged but not raised.
     """
@@ -196,7 +200,7 @@ def _audit_n8n_write(
         }
         if result_summary is not None:
             payload["result"] = result_summary
-        with _get_conn() as conn:
+        with _get_write_conn() as conn:
             record_memory_event(
                 conn,
                 event_type="n8n_write",
@@ -219,7 +223,7 @@ def _stamp_entity_origin(names: list[str], source: str) -> None:
     if not names:
         return
     try:
-        with _get_conn() as conn:
+        with _get_write_conn() as conn:
             for name in names:
                 eid = _get_entity_id(conn, name)
                 if eid is not None:

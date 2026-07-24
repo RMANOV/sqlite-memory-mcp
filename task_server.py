@@ -17,6 +17,7 @@ from fastmcp_compat import FastMCP
 
 from db_utils import (
     get_conn as _get_conn,
+    get_conn_immediate as _get_conn_immediate,
     fts_query as _fts_query,
     TaskDAO,
     TASK_ACTIVE_EXCLUSIONS as _TASK_ACTIVE_EXCLUSIONS,
@@ -45,6 +46,12 @@ from smart_retrieval import (
     ready_context as _ready_context,
     suggested_ready as _suggested_ready,
 )
+
+# Explicit injection seam for authoritative task mutations. Production writes
+# reserve the SQLite writer slot before their read/modify/write sequence; tests
+# that replace the connection factory must replace this seam as well so an
+# isolated fixture can never fall through to the live database.
+_get_write_conn = _get_conn_immediate
 
 # Pre-built SQL for active-task exclusion
 _EXCL_PH = ",".join("?" for _ in _TASK_ACTIVE_EXCLUSIONS)
@@ -221,7 +228,7 @@ def create_task_or_note(
     ):
         return json.dumps({"error": err})
 
-    with _get_conn() as conn:
+    with _get_write_conn() as conn:
         if parent_id:
             if not TaskDAO.exists(conn, parent_id):
                 return json.dumps({"error": f"Parent task {parent_id} not found"})
@@ -307,7 +314,7 @@ def upsert_note_by_title_project(
     now = _now()
     embed_task_id: str | None = None
     response: dict[str, Any]
-    with _get_conn() as conn:
+    with _get_write_conn() as conn:
         existing = _find_note_by_title_project(conn, title=title, project=project_value)
         if existing:
             if not update_if_found:
@@ -482,7 +489,7 @@ def update_task(
     updates["updated_at"] = _now()
 
     reembed = False
-    with _get_conn() as conn:
+    with _get_write_conn() as conn:
         result = _apply_task_mutation(
             conn,
             task_id,
@@ -1153,7 +1160,7 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
     if older_than_days < 0:
         return json.dumps({"error": "older_than_days must be non-negative"})
 
-    with _get_conn() as conn:
+    with _get_write_conn() as conn:
         affected_ids = TaskDAO.archive_done(conn, older_than_days)
 
     logger.info(
@@ -1180,7 +1187,7 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
     if _TASK_PRIORITIES.index(target_priority) == 0:
         return json.dumps({"bumped": 0, "message": "No lower priorities to bump"})
 
-    with _get_conn() as conn:
+    with _get_write_conn() as conn:
         bumped = TaskDAO.bump_overdue_priority(
             conn,
             target_priority,
