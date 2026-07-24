@@ -28,7 +28,7 @@ def task_env(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     init_db(db_path)
     monkeypatch.setattr(task_server, "_get_conn", _conn_factory(db_path))
-    monkeypatch.setattr(task_server, "_vec_sync_task_safe", lambda conn, task_id: None)
+    monkeypatch.setattr(task_server, "_vec_sync_task_safe", lambda task_id: None)
     return db_path
 
 

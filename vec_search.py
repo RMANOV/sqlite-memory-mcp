@@ -337,6 +337,98 @@ def vec_sync_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
 
 
+def vec_sync_task_detached(db_path: str, task_id: str) -> bool:
+    """Refresh one task embedding without holding a DB lock during inference.
+
+    Embedding generation may lazy-load a large model or block on a broken model
+    cache.  It must therefore happen outside any SQLite transaction.  The
+    authoritative task write commits first; this helper reads a content
+    snapshot, closes that connection, computes the embedding, and opens a short
+    write transaction only for the derived-cache replacement.
+
+    If the task changes while inference is running, the stale result is
+    discarded.  A later coalesced request or startup backfill will refresh it.
+    """
+    if not VEC_AVAILABLE:
+        return False
+
+    read_conn = sqlite3.connect(db_path, timeout=10)
+    read_conn.row_factory = sqlite3.Row
+    try:
+        table = read_conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_embeddings'"
+        ).fetchone()
+        if table is None:
+            return False
+        row = read_conn.execute(
+            "SELECT rowid, title, description, notes FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        snapshot = (
+            int(row["rowid"]),
+            row["title"],
+            row["description"],
+            row["notes"],
+        )
+        text = _task_text(row["title"], row["description"], row["notes"])
+    finally:
+        read_conn.close()
+
+    emb = _embed_text_or_none(text, context=f"task:{task_id}")
+    if emb is None:
+        return False
+
+    write_conn = sqlite3.connect(db_path, timeout=10, isolation_level=None)
+    write_conn.row_factory = sqlite3.Row
+    try:
+        write_conn.execute("PRAGMA busy_timeout=10000")
+        if not load_vec(write_conn):
+            return False
+        write_conn.execute("BEGIN IMMEDIATE")
+        current = write_conn.execute(
+            "SELECT rowid, title, description, notes FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            write_conn.execute("ROLLBACK")
+            return False
+        current_snapshot = (
+            int(current["rowid"]),
+            current["title"],
+            current["description"],
+            current["notes"],
+        )
+        if current_snapshot != snapshot:
+            write_conn.execute("ROLLBACK")
+            logger.debug(
+                "Discarded stale detached embedding for task %s",
+                task_id,
+            )
+            return False
+        write_conn.execute(
+            "DELETE FROM task_embeddings WHERE rowid = ?",
+            (snapshot[0],),
+        )
+        write_conn.execute(
+            "INSERT INTO task_embeddings(rowid, embedding) VALUES (?, ?)",
+            (snapshot[0], emb),
+        )
+        write_conn.execute("COMMIT")
+        return True
+    except sqlite3.Error as exc:
+        if write_conn.in_transaction:
+            try:
+                write_conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        logger.warning("detached vec_sync_task(%s) failed: %s", task_id, exc)
+        return False
+    finally:
+        write_conn.close()
+
+
 def vec_remove_task_rowid(conn: sqlite3.Connection, rowid: int) -> bool:
     """Remove one task embedding by SQLite rowid.
 
