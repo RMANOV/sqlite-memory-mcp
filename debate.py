@@ -1707,7 +1707,10 @@ def post_message(
 
     Side-effects (post-INSERT, only when validations pass):
       kind=STATE: triggers transition via VALID_TRANSITIONS + UPDATE debates.
-      kind=WATERMARK: updates debate_watermarks for (topic_id, role).
+      kind=WATERMARK: updates debate_watermarks for (topic_id, role), then
+      reconciles the active primary session's addressed-subset cursor. A full
+      visible-ledger acknowledgement implies that its addressed subset was
+      processed; the inverse is intentionally not true.
     """
     validate_topic_id(topic_id)
     validate_role(role)
@@ -1965,6 +1968,7 @@ def post_message(
             (new_state, archived_at, topic_id),
         )
 
+    signal_cursor_reconciliation: dict[str, Any] | None = None
     if kind == "WATERMARK" and watermark_resolved is not None:
         wm_id, wm_ts = watermark_resolved
         conn.execute(
@@ -1976,6 +1980,16 @@ def post_message(
             "last_processed_ts = excluded.last_processed_ts, "
             "updated_at = excluded.updated_at",
             (topic_id, role, wm_id, wm_ts, ts),
+        )
+        signal_cursor_reconciliation = (
+            _reconcile_active_signal_cursor_from_role_watermark(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                watermark_msg_id=wm_id,
+                watermark_ts=wm_ts,
+                reconciled_at=ts,
+            )
         )
 
     result = {
@@ -2001,6 +2015,8 @@ def post_message(
                 worker_session_id=author_session_id,
                 now=ts,
             )
+    if signal_cursor_reconciliation is not None:
+        result["signal_cursor_reconciliation"] = signal_cursor_reconciliation
     return result
 
 
@@ -3527,9 +3543,7 @@ def debate_post_with_recipients(
     )
     msg_id = post_result["msg_id"]
     for recipient in deduped:
-        _enqueue_delivery(
-            conn, msg_id, recipient, post_result["ts"], mode="normal"
-        )
+        _enqueue_delivery(conn, msg_id, recipient, post_result["ts"], mode="normal")
     for recipient in diagnostic_deduped:
         _enqueue_delivery(
             conn,
@@ -3558,10 +3572,136 @@ def debate_post_with_recipients(
         "body_mode",
         "protocol_state",
         "worker_claim",
+        "signal_cursor_reconciliation",
     ):
         if key in post_result:
             result[key] = post_result[key]
     return result
+
+
+def _reconcile_active_signal_cursor_from_role_watermark(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    watermark_msg_id: str,
+    watermark_ts: str,
+    reconciled_at: str,
+    expected_session_id: str | None = None,
+) -> dict[str, str] | None:
+    """Project a role-ledger acknowledgement onto its addressed subset.
+
+    ``debate_watermarks`` covers the complete visible role ledger while
+    ``debate_signal_state`` covers only messages addressed to one concrete
+    session (or its role). Therefore the implication is intentionally one-way:
+    acknowledging the full ledger through ``watermark`` also acknowledges the
+    addressed subset through that point, but an inbox acknowledgement must
+    never skip non-addressed ledger messages by moving the role watermark.
+
+    Only the active primary binding is reconciled. Diagnostic sessions and
+    derived ``-W<n>`` workers retain independent cursors. The compound cursor
+    update is monotonic and selects the newest *visible addressed* message at
+    or before the role watermark rather than copying an unaddressed target.
+    """
+    active = conn.execute(
+        "SELECT session_id FROM debate_role_bindings "
+        "WHERE topic_id=? AND role=? AND state='active' LIMIT 2",
+        (topic_id, role),
+    ).fetchall()
+    if len(active) != 1:
+        # Legacy topics without a binding registry — or a corrupt ambiguous
+        # registry — must not guess which concrete session owns the role.
+        return None
+    session_id = str(active[0]["session_id"])
+    if expected_session_id is not None and session_id != expected_session_id:
+        return None
+    if is_worker_session_id(session_id) or SESSION_ID_RE.fullmatch(session_id) is None:
+        return None
+
+    visibility_predicate, visibility_params = _protocol_v1_visibility_sql(
+        alias="m", viewer_role=role, control_plane=False
+    )
+    candidate = conn.execute(
+        "SELECT m.msg_id,m.ts FROM debate_messages m "
+        "WHERE m.topic_id=? "
+        "AND (m.ts < ? OR (m.ts = ? AND m.msg_id <= ?)) "
+        "AND " + visibility_predicate + " AND EXISTS ("
+        " SELECT 1 FROM debate_message_recipients r "
+        " WHERE r.msg_id=m.msg_id AND r.recipient IN (?,?)"
+        ") ORDER BY m.ts DESC,m.msg_id DESC LIMIT 1",
+        (
+            topic_id,
+            watermark_ts,
+            watermark_ts,
+            watermark_msg_id,
+            *visibility_params,
+            role,
+            session_id,
+        ),
+    ).fetchone()
+    if candidate is None:
+        return None
+
+    current = conn.execute(
+        "SELECT last_processed_msg_id,last_processed_ts "
+        "FROM debate_signal_state "
+        "WHERE session_id=? AND role=? AND topic_id=?",
+        (session_id, role, topic_id),
+    ).fetchone()
+    proposed_cursor = (candidate["ts"], candidate["msg_id"])
+    if current is not None and current["last_processed_ts"]:
+        current_cursor = (
+            current["last_processed_ts"],
+            current["last_processed_msg_id"] or "",
+        )
+        if proposed_cursor <= current_cursor:
+            return None
+
+    conn.execute(
+        "INSERT INTO debate_signal_state "
+        "(session_id,role,topic_id,last_processed_msg_id,last_processed_ts,last_check_at) "
+        "VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(session_id,role,topic_id) DO UPDATE SET "
+        "last_processed_msg_id=excluded.last_processed_msg_id,"
+        "last_processed_ts=excluded.last_processed_ts,"
+        "last_check_at=excluded.last_check_at "
+        "WHERE debate_signal_state.last_processed_ts IS NULL "
+        "OR excluded.last_processed_ts > debate_signal_state.last_processed_ts "
+        "OR (excluded.last_processed_ts = debate_signal_state.last_processed_ts "
+        "AND excluded.last_processed_msg_id > "
+        "COALESCE(debate_signal_state.last_processed_msg_id,''))",
+        (
+            session_id,
+            role,
+            topic_id,
+            candidate["msg_id"],
+            candidate["ts"],
+            reconciled_at,
+        ),
+    )
+    persisted = conn.execute(
+        "SELECT last_processed_msg_id,last_processed_ts "
+        "FROM debate_signal_state "
+        "WHERE session_id=? AND role=? AND topic_id=?",
+        (session_id, role, topic_id),
+    ).fetchone()
+    if (
+        persisted is None
+        or (
+            persisted["last_processed_ts"],
+            persisted["last_processed_msg_id"] or "",
+        )
+        != proposed_cursor
+    ):
+        # A concurrent/newer cursor won the monotonic upsert. That is already
+        # the desired invariant, so there is no reconciliation event to report.
+        return None
+    return {
+        "session_id": session_id,
+        "last_processed_msg_id": candidate["msg_id"],
+        "last_processed_ts": candidate["ts"],
+        "source_watermark_msg_id": watermark_msg_id,
+    }
 
 
 def _validate_signal_caller(
@@ -3735,7 +3875,9 @@ def debate_signal_check(
     Cursor precedence (matches read_messages from v3.9.0):
       1. since_msg_id explicit (pagination walk)
       2. since_ts explicit
-      3. debate_signal_state row for (session_id, role, topic_id)
+      3. debate_signal_state row for (session_id, role, topic_id), after
+         one-way reconciliation from a newer role watermark for the active
+         primary binding
       4. start of topic (no filter)
 
     Pagination contract: fetch limit+1 rows; ``truncated=True`` when
@@ -3771,6 +3913,23 @@ def debate_signal_check(
         if worker_claim is not None and protocol_enabled
         else None
     )
+    cursor_reconciliation: dict[str, str] | None = None
+    if since_msg_id is None and since_ts is None and worker_claim is None:
+        role_watermark = get_watermark(conn, topic_id, role)
+        if (
+            role_watermark is not None
+            and role_watermark.get("last_processed_msg_id")
+            and role_watermark.get("last_processed_ts")
+        ):
+            cursor_reconciliation = _reconcile_active_signal_cursor_from_role_watermark(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                watermark_msg_id=role_watermark["last_processed_msg_id"],
+                watermark_ts=role_watermark["last_processed_ts"],
+                reconciled_at=now_iso(),
+                expected_session_id=session_id,
+            )
 
     cursor_ts: str | None = None
     cursor_msg_id: str = ""
@@ -3957,7 +4116,7 @@ def debate_signal_check(
                 ),
             )
 
-    return {
+    result = {
         "pending": pending,
         "count": len(pending),
         "truncated": truncated,
@@ -3966,6 +4125,11 @@ def debate_signal_check(
         "topic_state": debate["state"],
         "limit": effective_limit,
     }
+    if cursor_reconciliation is not None:
+        result["cursor_reconciled_from_watermark"] = cursor_reconciliation[
+            "last_processed_msg_id"
+        ]
+    return result
 
 
 def debate_signal_advance(

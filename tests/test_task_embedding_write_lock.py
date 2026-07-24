@@ -20,7 +20,7 @@ def test_create_schedules_embedding_only_after_commit(monkeypatch):
         yield object()
         events.append("commit")
 
-    monkeypatch.setattr(task_server, "_get_conn", fake_conn)
+    monkeypatch.setattr(task_server, "_get_write_conn", fake_conn)
     monkeypatch.setattr(
         task_server,
         "_create_task_with_ledger",

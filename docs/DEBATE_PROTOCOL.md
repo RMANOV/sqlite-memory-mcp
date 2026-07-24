@@ -505,12 +505,36 @@ The `debate_watermarks` row is updated atomically with both
 `last_processed_msg_id` AND `last_processed_ts` columns so the
 compound `(ts, msg_id)` cursor never falls back to ts-only.
 
+#### Two cursor domains and one-way reconciliation
+
+The protocol retains two cursor domains because they cover different streams:
+
+- `debate_watermarks[(topic_id, role)]` acknowledges the complete visible
+  role ledger consumed through `debate_read`.
+- `debate_signal_state[(session_id, role, topic_id)]` acknowledges only the
+  addressed inbox consumed through `debate_signal_check`.
+
+They are not interchangeable. A full-ledger acknowledgement *does* imply that
+the active primary session processed the addressed subset through the same
+point. Therefore a `WATERMARK` update atomically advances that session cursor
+to the newest visible message at or before the watermark that is addressed to
+the role or active session. `debate_signal_check` repeats this reconciliation
+before a normal persisted-cursor read, repairing rows created by older
+versions.
+
+The implication is deliberately one-way: `debate_signal_advance` never moves
+the role watermark because an addressed inbox omits non-addressed ledger
+messages. Diagnostic bindings and derived `-W<n>` workers remain isolated and
+are never advanced from the role watermark. This prevents duplicate addressed
+delivery without hiding unread transcript context.
+
 ### `debate_advance_watermark(topic_id, role, processed_up_to_msg_id)`
 
 Convenience wrapper around `debate_post(kind="WATERMARK")`. Takes only
 a `msg_id`, looks up its `ts` from the message row, and writes a
-canonical msg_id-only WATERMARK message. Reduces caller error surface
-vs constructing the body by hand. Raises
+canonical msg_id-only WATERMARK message. The role watermark and applicable
+active-session subset reconciliation commit in one immediate transaction.
+Reduces caller error surface vs constructing the body by hand. Raises
 `unknown_msg_id_for_watermark` if the `msg_id` is not in the topic.
 
 ### `debate_set_topic_priority(topic_id, role, lane, reason, next_action="", blocked_by="")`
