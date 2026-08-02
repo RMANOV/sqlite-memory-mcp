@@ -4,6 +4,21 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.13.1
+
+### Fixed
+
+- **Legacy debate role/session migration.** Databases created before the
+  one-active-role-per-session invariant can contain multiple active roles for
+  the same `(topic_id, session_id)`. Startup now keeps the most recently
+  updated binding, retires older duplicates with an audit reason, and only then
+  creates the unique index. This prevents `sqlite_bridge` and `sqlite_intel`
+  startup paths from failing while preserving the complete binding history.
+- **Foreign-key baseline during debate schema rebuilds.** The v1 envelope
+  migration now rejects only foreign-key violations introduced by its own
+  rebuild, instead of aborting on unrelated legacy violations that already
+  existed elsewhere in the database.
+
 ## v3.12.5
 
 ### Fixed
