@@ -1160,8 +1160,17 @@ class TrayPopup(_DialogHostMixin, QWidget):
                     text_chars=_POPUP_INDEX_TEXT_CHARS,
                 )
             )
+            # Pass the live connection. Without it the engine has no FTS route
+            # and completion falls back to scoring the whole in-memory pool,
+            # which on the measured corpus moved the *median* popup query from
+            # ~0.5 ms to ~49 ms — on the Qt GUI thread, behind the 300 ms
+            # debounce.
             tasks = self._search_engine.search(
-                q, all_tasks, limit=20, conn=None, use_vector=False
+                q,
+                all_tasks,
+                limit=20,
+                conn=getattr(self.db, "_conn", None),
+                use_vector=False,
             )
             # Show tasks immediately, entities arrive async
             merged = [{**t, "_is_entity": False} for t in tasks]

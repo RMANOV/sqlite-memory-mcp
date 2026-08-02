@@ -40,9 +40,12 @@ mcp = FastMCP(
         "entity/observation/relation CRUD, FTS5 search, task management, "
         "session persistence, entity linking, intelligence v2, "
         "bridge sync, and knowledge collaboration. For tasks/notes, "
+        "query_tasks returns live work by default: done/archived/cancelled rows are "
+        "excluded unless you pass an explicit status or include_completed=True. "
         "use find_by_title when only a remembered phrase is known; it searches "
         "across tasks, notes, and entities over title/name, description, notes, observations, "
-        "and project regardless of status, section, or project filters, with confidence gating. "
+        "and project regardless of section, type, or project filters, with confidence gating; "
+        "finished rows stay reachable but always rank below live work. "
         "put the main long-form body in description by default; "
         "use notes only for auxiliary/internal metadata."
     ),

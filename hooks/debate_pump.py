@@ -810,8 +810,15 @@ def _machine_live_worker_count(topics: list[str]) -> int:
     empty, so a worker that outlived the old pump would not count toward
     max_concurrent_workers — a restarted pump could exceed the cap. This
     DB-backed count reconciles the in-process view with reality (workers
-    proven live by pid+create_time in their spawn receipt)."""
-    live: set[str] = set()
+    proven live by pid+create_time in their spawn receipt).
+
+    The census key is the claim key ``(topic_id, role, worker_session_id)``,
+    not the bare id: ``worker_session_id`` is minted per
+    ``(topic_id, role, parent_session_id)`` counter, so the same
+    ``<parent>-W1`` legitimately exists in several topics at once. Unioning
+    bare ids collapsed those distinct live workers into one and under-counted
+    the census — the one direction that can breach the cap."""
+    live: set[tuple[str, str, str]] = set()
     for topic_id in _active_topic_ids(topics):
         try:
             live |= _live_worker_session_ids(topic_id)
@@ -829,13 +836,17 @@ def _safe_machine_live_worker_count(topics: list[str]) -> int:
         return len(CHILDREN)
 
 
-def _live_worker_session_ids(topic_id: str) -> set[str]:
-    """Resolve live derived workers from their durable real-spawn receipts."""
+def _live_worker_session_ids(topic_id: str) -> set[tuple[str, str, str]]:
+    """Resolve live derived workers from their durable real-spawn receipts.
+
+    Returns ``(topic_id, role, worker_session_id)`` claim keys — the identity
+    ``debate_worker_claims`` is actually unique on. Callers that need bare
+    session ids for a single topic project the third element."""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            "SELECT c.worker_session_id, w.details_json "
+            "SELECT c.topic_id, c.role, c.worker_session_id, w.details_json "
             "FROM debate_worker_claims c "
             "LEFT JOIN debate_wake_log w ON w.wake_id = ("
             " SELECT w2.wake_id FROM debate_wake_log w2 "
@@ -850,7 +861,7 @@ def _live_worker_session_ids(topic_id: str) -> set[str]:
         ).fetchall()
     finally:
         con.close()
-    live: set[str] = set()
+    live: set[tuple[str, str, str]] = set()
     for row in rows:
         try:
             details = json.loads(row["details_json"] or "{}")
@@ -863,7 +874,13 @@ def _live_worker_session_ids(topic_id: str) -> set[str]:
         except (KeyError, TypeError, ValueError):
             create_time = None  # legacy receipt without identity — pid-only check
         if pid > 0 and _pid_is_live_agent(pid, create_time):
-            live.add(str(row["worker_session_id"]))
+            live.add(
+                (
+                    str(row["topic_id"]),
+                    str(row["role"]),
+                    str(row["worker_session_id"]),
+                )
+            )
     return live
 
 
@@ -881,7 +898,9 @@ def _recover_stale_worker_claims(
     older_than_ts = _claim_reclaim_cutoff(stale_seconds)
     for topic_id in _active_topic_ids(topics):
         try:
-            live = _live_worker_session_ids(topic_id)
+            # recover_stale_worker_claims() scans one topic and matches bare
+            # ids, so project the claim keys back down to session ids.
+            live = {sid for _t, _role, sid in _live_worker_session_ids(topic_id)}
             with get_conn_immediate() as conn:
                 out = recover_stale_worker_claims(
                     conn,

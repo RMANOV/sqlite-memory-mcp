@@ -937,9 +937,8 @@ CREATE TABLE IF NOT EXISTS debate_role_bindings (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drb_one_active
     ON debate_role_bindings(topic_id, role)
     WHERE state = 'active';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_drb_one_active_session
-    ON debate_role_bindings(topic_id, session_id)
-    WHERE state = 'active';
+-- idx_drb_one_active_session is created by the migration below only after
+-- legacy duplicate active bindings have been reconciled deterministically.
 CREATE INDEX IF NOT EXISTS idx_drb_session
     ON debate_role_bindings(session_id);
 CREATE INDEX IF NOT EXISTS idx_drb_topic_state
@@ -1439,6 +1438,18 @@ _MIGRATIONS = [
         "UNION ALL SELECT id, 'description', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions) "
         "UNION ALL SELECT id, 'notes', updated_at, '' FROM tasks WHERE id NOT IN (SELECT task_id FROM task_field_versions)",
         "seed task_field_versions from existing tasks (v2.0.0)",
+    ),
+    (
+        "SELECT 1 WHERE NOT EXISTS ("
+        "SELECT 1 FROM task_field_versions versions "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM tasks WHERE tasks.id = versions.task_id"
+        ") LIMIT 1)",
+        "DELETE FROM task_field_versions "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM tasks WHERE tasks.id = task_field_versions.task_id"
+        ")",
+        "prune orphan task_field_versions rows (v3.13.2)",
     ),
     (
         "SELECT 1 FROM pragma_table_info('tasks') WHERE name='reminder_at'",
@@ -2023,10 +2034,37 @@ _MIGRATIONS = [
     (
         "SELECT 1 FROM sqlite_master WHERE type='index' "
         "AND name='idx_drb_one_active_session'",
-        "CREATE UNIQUE INDEX idx_drb_one_active_session "
-        "ON debate_role_bindings(topic_id, session_id) "
-        "WHERE state = 'active'",
-        "one active role per topic/session index (event delivery)",
+        """
+        WITH ranked_active_bindings AS (
+            SELECT rowid AS binding_rowid,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY topic_id, session_id
+                       ORDER BY updated_at DESC, created_at DESC,
+                                generation DESC, role ASC
+                   ) AS keep_rank
+            FROM debate_role_bindings
+            WHERE state = 'active'
+        )
+        UPDATE debate_role_bindings
+        SET state = 'retired',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            retired_at = COALESCE(
+                retired_at,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            reason = reason ||
+                ' | migration: retired legacy duplicate active session, '
+                || 'kept most-recent binding'
+        WHERE rowid IN (
+            SELECT binding_rowid
+            FROM ranked_active_bindings
+            WHERE keep_rank > 1
+        );
+        CREATE UNIQUE INDEX idx_drb_one_active_session
+            ON debate_role_bindings(topic_id, session_id)
+            WHERE state = 'active';
+        """,
+        "reconcile legacy duplicate sessions and enforce one active role",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='debate_wake_log'",
@@ -2359,7 +2397,9 @@ def _repair_memory_fts_triggers(conn: sqlite3.Connection) -> None:
                 END
                 """
             )
-        logger.info("Migration applied: repaired %s trigger", name)
+        # DEBUG for the same reason as the migration loop in init_db: trigger
+        # repair is routine start-up maintenance, not an operational event.
+        logger.debug("Migration applied: repaired %s trigger", name)
 
 
 def _backfill_manual_link_decisions(conn: sqlite3.Connection) -> None:
@@ -2497,6 +2537,9 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
         _create_debate_message_indexes_and_triggers(conn)
         return
 
+    foreign_key_baseline = {
+        tuple(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()
+    }
     old_count = int(conn.execute("SELECT COUNT(*) FROM debate_messages").fetchone()[0])
     conn.execute("DROP TABLE IF EXISTS debate_messages_v1_new")
     conn.execute(
@@ -2567,10 +2610,15 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE debate_messages")
     conn.execute("ALTER TABLE debate_messages_v1_new RENAME TO debate_messages")
     _create_debate_message_indexes_and_triggers(conn)
-    fk_problem = conn.execute("PRAGMA foreign_key_check").fetchone()
-    if fk_problem is not None:
+    foreign_keys_after = {
+        tuple(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()
+    }
+    new_foreign_key_problems = foreign_keys_after - foreign_key_baseline
+    if new_foreign_key_problems:
+        fk_problem = sorted(new_foreign_key_problems, key=repr)[0]
         raise RuntimeError(
-            f"debate_messages debate/v1 migration failed foreign-key check: {tuple(fk_problem)}"
+            "debate_messages debate/v1 migration introduced foreign-key violation: "
+            f"{fk_problem}"
         )
     logger.info(
         "Migration applied: debate_messages debate/v1 envelope (%d rows preserved)",
@@ -2593,11 +2641,23 @@ def init_db(db_path: str | None = None) -> None:
         for stmt in _split_schema_sql(_SCHEMA_SQL):
             raw.execute(stmt)
         # Run migrations under same EXCLUSIVE lock (SM-01 fix: prevents race)
+        #
+        # Per-migration lines are DEBUG. With the full migration list re-checked
+        # on every process start across ~10 server processes, this loop was
+        # measured as 39% of the shared log window. The aggregate below carries
+        # the INFO signal: whether anything changed at all, which is the
+        # operational question. The individual descriptions stay available at
+        # DEBUG for diagnosis.
+        applied: list[str] = []
         for check_q, migrate_q, desc in _MIGRATIONS:
             if not raw.execute(check_q).fetchone():
                 for stmt in _split_schema_sql(migrate_q):
                     raw.execute(stmt)
-                logger.info("Migration applied: %s", desc)
+                logger.debug("Migration applied: %s", desc)
+                applied.append(desc)
+        if applied:
+            shown = ", ".join(applied[:3]) + ("…" if len(applied) > 3 else "")
+            logger.info("Migrations applied: %d (%s)", len(applied), shown)
         _migrate_debate_messages_v1(raw)
         _repair_memory_fts_triggers(raw)
         _backfill_manual_link_decisions(raw)

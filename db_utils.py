@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import logging
+import logging.handlers
 import math
 import mimetypes
 import os
@@ -22,7 +23,10 @@ import subprocess
 import sys
 import threading
 import tempfile
+import time
 import uuid
+from collections import Counter
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -579,23 +583,281 @@ def _copy_attachment_file(src: Path, dst: Path) -> None:
     os.replace(tmp_path, dst)
 
 
-def setup_logger(name: str, log_file: str = "server.log") -> logging.Logger:
-    """Configure file logger. Idempotent — safe to call multiple times."""
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Read a non-negative int from the environment, ignoring malformed values."""
+    try:
+        value = int((os.environ.get(name) or "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Truthy/falsy environment flag; unset or blank yields ``default``."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"} if raw else default
+
+
+# The shared sink used to be an unbounded ``logging.FileHandler``: every module
+# that did not name its own file appended to a single ``server.log`` that grew
+# to 110 MB / 1.2 M lines over 154 days, on the same filesystem as the database.
+# An unbounded writer beside the DB is an SQLITE_FULL hazard, so cap it the way
+# task_tray.py already does.
+_LOG_MAX_BYTES_DEFAULT = 8 * 1024 * 1024
+_LOG_BACKUP_COUNT_DEFAULT = 5
+
+
+def _log_limits() -> tuple[int, int]:
+    """Rotation bounds, re-read from the environment on every call.
+
+    Reading these only at import time made ``SQLITE_MEMORY_LOG_MAX_BYTES`` and
+    ``SQLITE_MEMORY_LOG_BACKUP_COUNT`` unsettable by anything that imports this
+    module before setting them — including any test that wants to prove the
+    bound is honoured.
+    """
+    return (
+        _env_int("SQLITE_MEMORY_LOG_MAX_BYTES", _LOG_MAX_BYTES_DEFAULT, minimum=0),
+        _env_int("SQLITE_MEMORY_LOG_BACKUP_COUNT", _LOG_BACKUP_COUNT_DEFAULT, minimum=1),
+    )
+
+
+# Snapshot of the above for callers that want the values without a call. These
+# are the *import-time* reading; ``setup_logger`` does not use them.
+LOG_MAX_BYTES, LOG_BACKUP_COUNT = _log_limits()
+
+# Per-process sinks are the default, deliberately: see _log_file_name.
+LOG_PER_PROCESS_DEFAULT = True
+
+# `maxBytes * (backupCount + 1)` bounds ONE process's family of files. Nothing
+# bounded the set of families: every restart of every server mints a new PID and
+# therefore a new `server.<pid>.log` lineage, and no code path ever removed a
+# dead one. The rotation fix traded "bounded but lossy" for "lossless but
+# unbounded", which on a months-old install is the same SQLITE_FULL hazard beside
+# the database that motivated bounding the log in the first place, just slower.
+# 64 MiB is eight full single-process families at the 8 MiB default.
+_LOG_TOTAL_BYTES_DEFAULT = 64 * 1024 * 1024
+
+
+def _log_file_name(log_file: str) -> str:
+    """Give each process its own sink unless explicitly told not to.
+
+    ``RotatingFileHandler`` is not multi-process safe, and this codebase has a
+    genuinely multi-process sink — though not the one an earlier draft of this
+    docstring named. Each MCP server names its own file (``server.py`` ->
+    ``server.log``, ``task_server.py`` -> ``task_server.log``, and so on for all
+    ten), so no single *server* log has many writers. The shared one is
+    ``premium_runtime.py``, which calls ``setup_logger("sqlite-premium",
+    "premium_runtime.log")`` at *module* level and is imported by nine modules,
+    eight of them servers — so every one of those processes holds an open
+    handler on the same file.
+
+    When one of them rolls over it renames ``premium_runtime.log`` to
+    ``premium_runtime.log.1`` while the others keep writing through file
+    descriptors that now point at the renamed inode; the next rollover renames a
+    fresh file over the top of it and their records are gone. Bounding a shared
+    file and rotating it safely are mutually exclusive without a cross-process
+    lock, so the sink stops being shared: default *on*.
+
+    The cost is honest — one file per process lifetime instead of one file
+    overall, so restarts accumulate ``server.<pid>.log`` files (each still
+    bounded by ``max_bytes * (backup_count + 1)``) and ``grep server.log`` must
+    become ``grep server*.log``. ``SQLITE_MEMORY_LOG_PER_PROCESS=0`` restores
+    the single shared sink, which is only safe with rotation disabled
+    (``SQLITE_MEMORY_LOG_MAX_BYTES=0``).
+    """
+    if not _env_flag("SQLITE_MEMORY_LOG_PER_PROCESS", LOG_PER_PROCESS_DEFAULT):
+        return log_file
+    stem, dot, ext = log_file.rpartition(".")
+    return f"{stem}.{os.getpid()}.{ext}" if dot else f"{log_file}.{os.getpid()}"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """True unless the PID is provably gone.
+
+    Every ambiguous answer is 'alive'. A false 'alive' keeps a log file that
+    could have been deleted; a false 'dead' deletes a file a running server is
+    writing to. Only ``ProcessLookupError`` is unambiguous, and even that is
+    subject to PID reuse — which also errs toward keeping.
+    """
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # EPERM: alive, owned by someone else
+    return True
+
+
+_PER_PROCESS_LOG_RE = re.compile(
+    r"^(?P<stem>.+)\.(?P<pid>[1-9]\d*)\.log(?:\.(?P<rotation>[1-9]\d*))?$"
+)
+
+
+def _per_process_log_identity(name: str) -> tuple[str, int] | None:
+    """Return ``(stem, pid)`` for a logger-owned per-process log name.
+
+    All production callers pass a ``*.log`` sink to :func:`setup_logger`, and
+    :func:`_log_file_name` rewrites it to ``<stem>.<pid>.log``. Rotation adds a
+    final numeric suffix. Parsing that grammar centrally avoids the classic
+    ``server.4711.log.1`` mistake where the rotation index is read as PID 1.
+
+    Legacy shared names (``server.log``), archives and non-log artifacts do not
+    match, so the retention sweep cannot reach them.
+    """
+    match = _PER_PROCESS_LOG_RE.match(name)
+    if match is None:
+        return None
+    return match.group("stem"), int(match.group("pid"))
+
+
+def _sweep_orphan_logs(log_path: Path, budget: int) -> None:
+    """Bound all logger-owned families in the directory, not one log stem.
+
+    Deletes every logger-owned file belonging to a dead PID, oldest process
+    first, until the directory-wide total fits *budget*. Grouping by PID (not
+    by log stem) means one retired server lifetime is reclaimed as a unit even
+    when it wrote ``server``, ``premium_runtime`` and another named sink.
+    Three properties make this safe to run from
+    logger setup, where a raised exception would take a server down with it:
+
+    * A family whose PID is alive — or merely unprovable — is never a
+      candidate, so no running process loses the file under its open fd.
+    * This process's own family is excluded outright, before liveness even
+      enters into it.
+    * Every filesystem error is swallowed. Two servers starting at once will
+      race on the same unlink; the loser gets ``FileNotFoundError`` and that is
+      a correct outcome, not a failure.
+
+    If the live families alone exceed the budget nothing is deleted and a
+    warning is emitted — the honest report, since the alternative is deleting a
+    log someone is writing.
+    """
+    if budget <= 0:
+        return
+    if _per_process_log_identity(log_path.name) is None:
+        return
+    mine = os.getpid()
+    try:
+        entries = list(log_path.parent.iterdir())
+    except OSError:
+        return
+
+    families: dict[int, list[tuple[Path, int, float]]] = {}
+    for entry in entries:
+        identity = _per_process_log_identity(entry.name)
+        if identity is None:
+            continue
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        _, pid = identity
+        families.setdefault(pid, []).append((entry, stat.st_size, stat.st_mtime))
+
+    total = sum(size for group in families.values() for _, size, _ in group)
+    if total <= budget:
+        return
+
+    dead = sorted(
+        (
+            (max(mtime for _, _, mtime in group), pid, group)
+            for pid, group in families.items()
+            if pid != mine and not _pid_is_alive(pid)
+        ),
+        key=lambda item: item[0],
+    )
+    for _, _, group in dead:
+        if total <= budget:
+            break
+        for path, size, _ in group:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total -= size
+    if total > budget:
+        _log.warning(
+            "log directory %s is %d B over the %d B budget and every remaining "
+            "family belongs to a live process",
+            log_path.parent,
+            total - budget,
+            budget,
+        )
+
+
+def setup_logger(
+    name: str,
+    log_file: str = "server.log",
+    *,
+    max_bytes: int | None = None,
+    backup_count: int | None = None,
+) -> logging.Logger:
+    """Configure a size-bounded rotating file logger. Idempotent.
+
+    Two bounds, because one is not enough. ``max_bytes * (backup_count + 1)``
+    caps ONE process's family of files; the sink is per-process by default
+    because rotating a shared one loses records (see :func:`_log_file_name`).
+    That leaves the number of families unbounded — one per server restart
+    forever — so :func:`_sweep_orphan_logs` caps the directory as a whole at
+    ``SQLITE_MEMORY_LOG_TOTAL_BYTES`` by deleting dead PIDs' families oldest
+    first. Pass ``max_bytes=0`` to opt out of rotation entirely (legacy
+    behaviour); set the total to 0 to opt out of the sweep.
+
+    ``max_bytes``/``backup_count`` default to ``SQLITE_MEMORY_LOG_MAX_BYTES``
+    and ``SQLITE_MEMORY_LOG_BACKUP_COUNT``, read on each call rather than at
+    import.
+    """
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     if not logger.handlers:
-        candidates = [
-            Path.home() / ".claude" / "memory" / log_file,
-            Path(tempfile.gettempdir()) / "sqlite-memory-mcp" / log_file,
+        env_limit, env_keep = _log_limits()
+        limit = env_limit if max_bytes is None else int(max_bytes)
+        # backupCount=0 makes RotatingFileHandler re-open in append mode instead
+        # of truncating, i.e. it would never actually bound the file.
+        keep = env_keep if backup_count is None else int(backup_count)
+        limit = max(0, limit)
+        keep = max(1, keep)
+        resolved = _log_file_name(log_file)
+        candidates = []
+        # Escape hatch read at call time, not import time. The test suite has no
+        # log isolation and writes straight into the operator's live
+        # ~/.claude/memory/server.log; with rotation enabled that means a test
+        # run renames the operator's log files. `SQLITE_MEMORY_LOG_DIR=$(mktemp -d)`
+        # in front of pytest keeps runs out of the live directory entirely.
+        override = (os.environ.get("SQLITE_MEMORY_LOG_DIR") or "").strip()
+        if override:
+            candidates.append(Path(override) / resolved)
+        candidates += [
+            Path.home() / ".claude" / "memory" / resolved,
+            Path(tempfile.gettempdir()) / "sqlite-memory-mcp" / resolved,
         ]
         for log_path in candidates:
             try:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
-                fh = logging.FileHandler(log_path, encoding="utf-8")
+                fh = logging.handlers.RotatingFileHandler(
+                    log_path,
+                    maxBytes=limit,
+                    backupCount=keep,
+                    encoding="utf-8",
+                )
             except OSError:
                 continue
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             logger.addHandler(fh)
+            # Bound the directory across processes, not just this one. Done
+            # after the handler exists so a sweep that somehow fails still
+            # leaves a working logger, and only in the directory we actually
+            # won — the fallbacks below are not ours to prune.
+            _sweep_orphan_logs(
+                log_path,
+                _env_int(
+                    "SQLITE_MEMORY_LOG_TOTAL_BYTES",
+                    _LOG_TOTAL_BYTES_DEFAULT,
+                    minimum=0,
+                ),
+            )
             break
         if not logger.handlers:
             logger.addHandler(logging.NullHandler())
@@ -763,6 +1025,437 @@ def bulk_conn(db_path: str | None = None):
         checkpoint_after_commit=True,
     ) as conn:
         yield conn
+
+
+# ── Durability: physical backups ─────────────────────────────────────────
+#
+# The git bridge is a lossy *projection*, not a backup: 53 of 86 tables have no
+# bridge representation at all (memory_events, task_field_versions, the whole
+# debate substrate). This is the only crash-consistent, whole-database copy in
+# the system.
+#
+# ``sqlite3.Connection.backup()`` is used deliberately instead of
+# ``shutil.copy``: under WAL a byte copy of ``memory.db`` alone silently drops
+# everything still in ``-wal``, and a copy of all three files taken
+# non-atomically while a writer is live is not crash-consistent. The backup API
+# takes a read snapshot through the pager, so the produced file is a single,
+# self-contained, consistent database.
+
+# Deliberately a *dedicated* subdirectory, not ~/.claude/memory/backups itself:
+# that directory already holds hand-made snapshots (439 MB memory.db files next
+# to multi-GB git bundles). Rolling retention must only ever be able to delete
+# generations this function created, so it gets a namespace it owns outright.
+BACKUP_ROOT = os.environ.get(
+    "SQLITE_MEMORY_BACKUP_DIR",
+    os.path.expanduser("~/.claude/memory/backups/auto"),
+)
+BACKUP_GENERATIONS = _env_int("SQLITE_MEMORY_BACKUP_GENERATIONS", 7, minimum=1)
+
+BACKUP_MANIFEST_VERSION = 1
+_BACKUP_STAMP_FMT = "%Y%m%dT%H%M%SZ"
+_BACKUP_GENERATION_RE = re.compile(r"^\d{8}T\d{6}Z(-[A-Za-z0-9._-]+)?$")
+_BACKUP_DB_NAME = "memory.db"
+_BACKUP_MANIFEST_NAME = "manifest.json"
+_BACKUP_INCOMING_PREFIX = ".incoming-"
+_BACKUP_INCOMING_MAX_AGE = 24 * 3600
+_BACKUP_DIR_MODE = 0o700
+_BACKUP_FILE_MODE = 0o600
+_BACKUP_READONLY_MARKERS = ("readonly", "read-only", "attempt to write")
+# How many same-second name collisions `_reserve_generation` will step around.
+# Generations are stamped to the second, so this is only reached by a caller
+# looping faster than that; a hundred is far past any real backup cadence and
+# still bounded, so a runaway loop fails loudly instead of filling the disk.
+_BACKUP_COLLISION_LIMIT = 100
+
+
+class BackupError(RuntimeError):
+    """A backup could not be produced, or the produced file failed verification."""
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _connect_readonly(db_path: str, timeout: float = 30.0) -> sqlite3.Connection:
+    """Open an existing database through SQLite's own read-only VFS.
+
+    ``PRAGMA query_only=ON`` is *not* sufficient and was measured to be wrong.
+    It rejects SQL writes, but a normally-opened handle is still a full member
+    of the WAL, so closing it as the last connection runs SQLite's automatic
+    checkpoint — which rewrites ``memory.db`` and unlinks ``-wal``/``-shm``.
+    Measured 2026-08-02 against a 4.1 MB hot WAL: the source sha256 changed and
+    both sidecars disappeared, i.e. the backup mutated the database it was
+    reading. ``mode=ro`` is enforced by the VFS below the pager: no checkpoint
+    runs and the source comes out byte-identical.
+
+    Neither mode can open a database whose WAL needs recovery when the
+    *directory* is unwritable; callers that must not fail there retry with a
+    writable handle.
+    """
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(f"Database does not exist: {db_path}")
+    # as_uri() percent-encodes '?', '#' and spaces, which SQLite would otherwise
+    # parse as URI syntax rather than as part of the filename.
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    return sqlite3.connect(uri, uri=True, isolation_level=None, timeout=timeout)
+
+
+def _sha256_file(path: str, chunk: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def inspect_database(db_path: str, *, row_counts: bool = True) -> dict[str, Any]:
+    """Return quick_check status, schema object counts and per-table row counts."""
+    # Same read-only VFS as the backup source handle: inspecting a database must
+    # never checkpoint it, and must never create one that was not there.
+    conn = _connect_readonly(db_path)
+    try:
+        quick_check = [str(r[0]) for r in conn.execute("PRAGMA quick_check;").fetchall()]
+        objects = conn.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY type, name"
+        ).fetchall()
+        by_type: Counter[str] = Counter(str(row[0]) for row in objects)
+        tables = [
+            str(row[1])
+            for row in objects
+            if row[0] == "table" and not str(row[1]).startswith("sqlite_")
+        ]
+        counts: dict[str, int | None] = {}
+        unreadable: dict[str, str] = {}
+        if row_counts:
+            for table in tables:
+                try:
+                    counts[table] = int(
+                        conn.execute(
+                            f"SELECT COUNT(*) FROM {_quote_ident(table)}"
+                        ).fetchone()[0]
+                    )
+                except sqlite3.Error as exc:
+                    # e.g. a vec0/fts5 virtual table whose module is not loaded.
+                    counts[table] = None
+                    unreadable[table] = str(exc)
+        return {
+            "quick_check": quick_check,
+            "quick_check_ok": quick_check == ["ok"],
+            "schema_objects": len(objects),
+            "schema_objects_by_type": dict(sorted(by_type.items())),
+            "table_count": len(tables),
+            "row_counts": counts,
+            "total_rows": sum(v for v in counts.values() if v is not None),
+            "unreadable_tables": unreadable,
+        }
+    finally:
+        conn.close()
+
+
+def _backup_to(src: sqlite3.Connection, dest_path: str, pages: int) -> None:
+    dest = sqlite3.connect(dest_path, isolation_level=None, timeout=30)
+    try:
+        src.backup(dest, pages=pages)
+        # The copy inherits journal_mode=WAL from the source, which would leave
+        # a -wal/-shm pair beside the artifact. Collapse it so each generation
+        # is one self-contained file that can be moved with plain cp/rsync.
+        dest.execute("PRAGMA journal_mode=DELETE;")
+    finally:
+        dest.close()
+
+
+def _prune_stale_incoming(root: Path, now_ts: float) -> None:
+    for child in root.glob(f"{_BACKUP_INCOMING_PREFIX}*"):
+        try:
+            if child.is_dir() and now_ts - child.stat().st_mtime > _BACKUP_INCOMING_MAX_AGE:
+                shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _is_own_generation(path: Path) -> bool:
+    """True only for a directory this module wrote.
+
+    Retention deletes whatever this returns, so it is intentionally paranoid:
+    the name must be a generation stamp, both files must be present, and the
+    manifest must parse and carry our version marker. Anything the operator
+    dropped into the directory by hand fails at least one of those tests and is
+    therefore never a deletion candidate.
+    """
+    if not path.is_dir() or not _BACKUP_GENERATION_RE.match(path.name):
+        return False
+    if not (path / _BACKUP_DB_NAME).is_file():
+        return False
+    manifest = path / _BACKUP_MANIFEST_NAME
+    if not manifest.is_file():
+        return False
+    try:
+        return "manifest_version" in json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+
+
+def _reserve_generation(root: Path, generation: str) -> Path:
+    """Claim a generation directory name atomically, destroying nothing.
+
+    ``mkdir`` is the directory-level ``O_EXCL``: it either creates the name or
+    raises ``FileExistsError``, with no window in which two processes both
+    believe they own it. An *empty* directory is still a valid rename target —
+    ``rename(2)`` replaces an empty destination directory with a directory — so
+    publishing stays the single atomic step it was.
+
+    What this replaces: the publish used to ``shutil.rmtree`` a colliding
+    generation and then rename over the hole. Generations are named by the
+    second, so two runs in the same second collide routinely, and between those
+    two calls a verified backup was gone while its replacement was not yet in
+    place. A crash, a full disk or an ``EXDEV`` there left the operator with one
+    *fewer* backup than before they ran a backup — the exact opposite of the
+    operation's purpose. Disambiguating the name costs a directory entry.
+
+    It also removes the need to reason about whether a colliding directory is
+    ours: nothing is deleted, so a directory the operator dropped in by hand is
+    simply stepped around instead of inspected and refused.
+    """
+    for attempt in range(_BACKUP_COLLISION_LIMIT):
+        candidate = root / (generation if attempt == 0 else f"{generation}-{attempt + 1}")
+        try:
+            candidate.mkdir(mode=_BACKUP_DIR_MODE)
+        except FileExistsError:
+            continue
+        return candidate
+    raise BackupError(
+        f"Could not claim a generation name under {root}: {generation} and "
+        f"{_BACKUP_COLLISION_LIMIT - 1} disambiguated variants are all taken"
+    )
+
+
+def list_backups(backup_dir: str | None = None) -> list[str]:
+    """Return absolute generation directories written by us, oldest first."""
+    root = Path(backup_dir or BACKUP_ROOT)
+    if not root.is_dir():
+        return []
+    return sorted(str(p) for p in root.iterdir() if _is_own_generation(p))
+
+
+def create_backup(
+    db_path: str | None = None,
+    *,
+    backup_dir: str | None = None,
+    generations: int | None = None,
+    label: str | None = None,
+    pages: int = 0,
+    row_counts: bool = True,
+    checksum: bool = True,
+    timeout: float = 30.0,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Take one verified, crash-consistent generation of ``db_path``.
+
+    Writes ``<backup_dir>/<UTC stamp>[-label]/`` containing ``memory.db`` and a
+    ``manifest.json`` (per-table row counts, schema object count, sha256), both
+    mode 0600 inside a 0700 directory. The generation directory is assembled
+    under a hidden ``.incoming-*`` name and renamed into place only after
+    ``PRAGMA quick_check`` passes, so a half-written generation is never
+    mistaken for a good one. The oldest generations beyond ``generations`` are
+    then removed; the generation just written is never a removal candidate.
+
+    The source is opened ``mode=ro`` and is left byte-identical, sidecars
+    included. The single exception is a source whose WAL needs recovery: that
+    cannot be read at all without writing, so it is retried with a writable
+    handle rather than leaving the operator with no backup.
+
+    This function is deliberately *not* wired to a timer or to server startup —
+    scheduling is a separate, reviewed decision.
+
+    Raises ``BackupError`` if the source is missing or the copy fails
+    verification. Returns the manifest.
+    """
+    source = os.path.abspath(db_path or DB_PATH)
+    root = Path(backup_dir or BACKUP_ROOT)
+    keep = BACKUP_GENERATIONS if generations is None else int(generations)
+    if keep < 1:
+        raise ValueError("generations must be >= 1")
+
+    started = time.monotonic()
+    stamp_dt = now or datetime.now(timezone.utc)
+    suffix = ""
+    if label:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")
+        if cleaned:
+            suffix = f"-{cleaned[:40]}"
+    generation = f"{stamp_dt.strftime(_BACKUP_STAMP_FMT)}{suffix}"
+
+    created_root = not root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    if created_root:
+        # Only tighten a directory we just created — never re-permission one the
+        # operator already owns and may share with other tooling.
+        try:
+            os.chmod(root, _BACKUP_DIR_MODE)
+        except OSError:
+            pass
+    _prune_stale_incoming(root, time.time())
+
+    final: Path | None = None
+    # A PID + second is not unique inside one process: two scheduler threads or
+    # a retry racing the original call would choose the same staging path, and
+    # the old pre-flight ``rmtree`` let either invocation delete the other's
+    # in-progress backup. ``mkdtemp`` is the staging equivalent of the
+    # directory-level O_EXCL used for the final generation reservation.
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f"{_BACKUP_INCOMING_PREFIX}{os.getpid()}-{generation}-",
+            dir=root,
+        )
+    )
+    dest_file = staging / _BACKUP_DB_NAME
+
+    try:
+        try:
+            src = _connect_readonly(source, timeout)
+        except FileNotFoundError as exc:
+            raise BackupError(str(exc)) from exc
+        try:
+            try:
+                _backup_to(src, str(dest_file), pages)
+            except sqlite3.OperationalError as exc:
+                if not any(m in str(exc).lower() for m in _BACKUP_READONLY_MARKERS):
+                    raise
+                # A crashed writer can leave a WAL that must be recovered before
+                # it can be read, and recovery is a write. Retry once with a
+                # writable handle rather than failing exactly when a backup
+                # matters — this is the one path that may touch the source.
+                #
+                # Status change worth knowing: under the previous `query_only`
+                # handle SQLite recovered such a WAL silently, so this branch was
+                # effectively dead. Under `mode=ro` it is the designed live path,
+                # and it is the ONLY place `create_backup` opens the operator's
+                # database writable. It is also still untested — a hot 4.1 MB WAL
+                # (with and without `-shm`) was handled by `mode=ro` without ever
+                # raising a readonly marker, so the trigger is narrower than the
+                # comment above might suggest, but it is no longer unreachable.
+                src.close()
+                for leftover in staging.iterdir():
+                    leftover.unlink(missing_ok=True)
+                src = sqlite3.connect(source, isolation_level=None, timeout=timeout)
+                _backup_to(src, str(dest_file), pages)
+        finally:
+            src.close()
+
+        os.chmod(dest_file, _BACKUP_FILE_MODE)
+        report = inspect_database(str(dest_file), row_counts=row_counts)
+        if not report["quick_check_ok"]:
+            raise BackupError(
+                f"quick_check failed on {dest_file}: {report['quick_check']}"
+            )
+
+        # Claim the published name BEFORE writing the manifest, so the manifest
+        # can name the directory it will actually live in. A same-second
+        # collision changes that name, and a manifest that disagreed with its
+        # own path would make `verify_backup` and the operator's own bookkeeping
+        # disagree about which generation is which.
+        final = _reserve_generation(root, generation)
+
+        manifest: dict[str, Any] = {
+            "manifest_version": BACKUP_MANIFEST_VERSION,
+            "generation": final.name,
+            "created_at": stamp_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "label": label,
+            "source_path": source,
+            "source_bytes": os.path.getsize(source),
+            "backup_file": _BACKUP_DB_NAME,
+            "backup_bytes": os.path.getsize(dest_file),
+            "sha256": _sha256_file(str(dest_file)) if checksum else None,
+            "sqlite_version": sqlite3.sqlite_version,
+            "python_version": sys.version.split()[0],
+            "duration_seconds": round(time.monotonic() - started, 3),
+            **report,
+        }
+        manifest_file = staging / _BACKUP_MANIFEST_NAME
+        manifest_file.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.chmod(manifest_file, _BACKUP_FILE_MODE)
+
+        os.replace(staging, final)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        if final is not None:
+            # `rmdir`, never `rmtree`. It removes only an empty directory, so
+            # this can retract the placeholder we reserved and can never delete
+            # a published generation — including on the path where `os.replace`
+            # itself is what failed.
+            try:
+                final.rmdir()
+            except OSError:
+                pass
+        raise
+
+    manifest["path"] = str(final)
+    manifest["backup_path"] = str(final / _BACKUP_DB_NAME)
+
+    # Retention sorts by name, and the name is a timestamp. A clock that steps
+    # backwards (an NTP correction landing mid-backup) therefore put the *new*
+    # generation at the head of the list, where it deleted itself and returned
+    # `pruned=[<the generation just created>]` with `path` pointing at a
+    # directory that no longer existed — a silent no-op reported as success.
+    # The generation we just wrote is excluded from the candidates outright.
+    existing = list_backups(str(root))
+    final_str = str(final)
+    candidates = [p for p in existing if p != final_str]
+    room = keep - 1 if len(candidates) < len(existing) else keep
+    pruned: list[str] = []
+    for stale in candidates[: max(0, len(candidates) - max(0, room))]:
+        shutil.rmtree(stale, ignore_errors=True)
+        pruned.append(stale)
+    if not final.is_dir():
+        # Unreachable via retention now; a concurrent backup process could still
+        # remove it. Better a loud failure than a manifest naming a dead path.
+        raise BackupError(f"Backup disappeared during retention: {final}")
+    manifest["pruned"] = pruned
+    manifest["generations_kept"] = list_backups(str(root))
+    return manifest
+
+
+def verify_backup(generation_path: str) -> dict[str, Any]:
+    """Re-check a stored generation against its own manifest.
+
+    A manifest that nobody ever re-reads is a promise, not a guarantee — this
+    re-runs ``quick_check``, re-hashes the file and diffs the row counts.
+    """
+    gen = Path(generation_path)
+    db_file = gen / _BACKUP_DB_NAME
+    manifest_file = gen / _BACKUP_MANIFEST_NAME
+    problems: list[str] = []
+    if not db_file.is_file():
+        raise BackupError(f"No backup database at {db_file}")
+    if not manifest_file.is_file():
+        raise BackupError(f"No manifest at {manifest_file}")
+
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    report = inspect_database(str(db_file), row_counts=True)
+    if not report["quick_check_ok"]:
+        problems.append(f"quick_check: {report['quick_check']}")
+    if manifest.get("sha256"):
+        actual = _sha256_file(str(db_file))
+        if actual != manifest["sha256"]:
+            problems.append(f"sha256 mismatch: {actual} != {manifest['sha256']}")
+    if manifest.get("schema_objects") != report["schema_objects"]:
+        problems.append(
+            f"schema objects: {report['schema_objects']} != "
+            f"{manifest.get('schema_objects')}"
+        )
+    recorded = manifest.get("row_counts") or {}
+    for table, expected in recorded.items():
+        actual_rows = report["row_counts"].get(table)
+        if actual_rows != expected:
+            problems.append(f"rows[{table}]: {actual_rows} != {expected}")
+    missing = set(report["row_counts"]) - set(recorded)
+    if recorded and missing:
+        problems.append(f"tables absent from manifest: {sorted(missing)}")
+    return {"path": str(gen), "ok": not problems, "problems": problems, **report}
 
 
 # ── Git helpers ──────────────────────────────────────────────────────────
@@ -2585,19 +3278,187 @@ def export_relations(
 
 # ── Text helpers ──────────────────────────────────────────────────────────
 
-STOPWORDS = frozenset(
+# Fixed English list, kept only as the bootstrap used before a corpus has been
+# measured. Against a majority-Bulgarian corpus it is close to dead weight.
+#
+# Measured 2026-08-02 against the production corpus (tasks + observations in
+# ~/.claude/memory/memory.db), not reproducible from this diff: 77.9% Bulgarian,
+# 3 552 786 token instances, of which this list removed 86 193 (2.4%) while the
+# Bulgarian function words that sail straight through it accounted for 187 226
+# (7.0%) — 2.9x more than it removes. That inflated floor is what pushed
+# random-pair Jaccard p99 to 0.1509 against a 0.15 threshold.
+#
+# ``learn_similarity_stopwords()`` replaces it with a measured, language-
+# agnostic document-frequency cutoff that self-tunes to whatever the operator
+# actually writes in. tests/test_db_utils_durability.py reproduces the effect on
+# a synthetic bilingual corpus, which is what the diff *can* demonstrate.
+BOOTSTRAP_STOPWORDS = frozenset(
     "the a an is are was were be been being have has had do does did "
     "will would shall should may might can could and or but if then "
     "else for of in on at to from by with".split()
 )
 
+# Back-compat alias for callers that imported the old name.
+STOPWORDS = BOOTSTRAP_STOPWORDS
 
-def tokenize_for_similarity(text: str) -> set[str]:
-    """Extract meaningful tokens from text for Jaccard similarity."""
+MIN_SIMILARITY_TOKEN_LENGTH = 3
+# A term carried by more than a quarter of documents discriminates nothing,
+# whatever language it happens to be in.
+DF_STOPWORD_MAX_RATIO = 0.25
+# Below this many documents a DF ratio is noise, not a measurement.
+DF_STOPWORD_MIN_DOCUMENTS = 50
+DF_CORPUS_LIMIT = 20_000
+
+_DF_CORPUS_SQL = (
+    "SELECT COALESCE(title, '') || ' ' || COALESCE(description, '') || ' ' "
+    "|| COALESCE(notes, '') FROM tasks",
+    "SELECT content FROM observations",
+)
+
+_similarity_stopwords: frozenset[str] | None = None
+_similarity_stopword_stats: dict[str, Any] = {}
+_similarity_stopwords_lock = threading.Lock()
+
+
+def _similarity_terms(text: str) -> list[str]:
+    """Length-filtered lowercase word tokens — the only language-neutral filter."""
     if not text:
-        return set()
-    words = re.findall(r"\w+", text.lower())
-    return {w for w in words if len(w) >= 3 and w not in STOPWORDS}
+        return []
+    return [
+        w
+        for w in re.findall(r"\w+", text.lower())
+        if len(w) >= MIN_SIMILARITY_TOKEN_LENGTH
+    ]
+
+
+def build_df_stopwords(
+    documents: Iterable[str],
+    *,
+    max_df_ratio: float = DF_STOPWORD_MAX_RATIO,
+    min_documents: int = DF_STOPWORD_MIN_DOCUMENTS,
+) -> frozenset[str]:
+    """Terms whose document frequency exceeds ``max_df_ratio`` of the corpus.
+
+    Language-agnostic by construction: a Bulgarian filler and an English one are
+    both just high-DF terms. Returns an empty set when the corpus is too small
+    for the ratio to carry information, so callers can keep a bootstrap list.
+    """
+    if not 0.0 < max_df_ratio <= 1.0:
+        raise ValueError("max_df_ratio must be in (0, 1]")
+    document_frequency: Counter[str] = Counter()
+    total = 0
+    for document in documents:
+        terms = set(_similarity_terms(document or ""))
+        if not terms:
+            continue
+        total += 1
+        document_frequency.update(terms)
+    if total < max(1, min_documents):
+        return frozenset()
+    cutoff = max_df_ratio * total
+    return frozenset(
+        term for term, freq in document_frequency.items() if freq > cutoff
+    )
+
+
+def _iter_corpus(conn: sqlite3.Connection, limit: int) -> Iterator[str]:
+    seen = 0
+    for sql in _DF_CORPUS_SQL:
+        if seen >= limit:
+            return
+        try:
+            cursor = conn.execute(f"{sql} LIMIT {int(limit - seen)}")
+        except sqlite3.Error:
+            continue  # table absent in this database — skip, do not fail
+        for row in cursor:
+            value = row[0]
+            if value:
+                yield str(value)
+            seen += 1
+
+
+def active_similarity_stopwords() -> frozenset[str]:
+    """The stopword set currently in force: learned if available, else bootstrap."""
+    learned = _similarity_stopwords
+    return BOOTSTRAP_STOPWORDS if learned is None else learned
+
+
+def similarity_stopword_stats() -> dict[str, Any]:
+    """Diagnostics for the installed set (empty while the bootstrap is in use)."""
+    return dict(_similarity_stopword_stats)
+
+
+def set_similarity_stopwords(
+    stopwords: Iterable[str] | None, *, stats: dict[str, Any] | None = None
+) -> None:
+    """Install (or, with ``None``, drop back to the bootstrap) the active set."""
+    global _similarity_stopwords, _similarity_stopword_stats
+    with _similarity_stopwords_lock:
+        _similarity_stopwords = None if stopwords is None else frozenset(stopwords)
+        _similarity_stopword_stats = dict(stats or {})
+
+
+def learn_similarity_stopwords(
+    documents: Iterable[str] | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
+    db_path: str | None = None,
+    max_df_ratio: float = DF_STOPWORD_MAX_RATIO,
+    min_documents: int = DF_STOPWORD_MIN_DOCUMENTS,
+    limit: int = DF_CORPUS_LIMIT,
+    install: bool = True,
+) -> dict[str, Any]:
+    """Measure the DF cutoff once and install it process-wide.
+
+    Give it ``documents`` (any iterable of strings), an open ``conn``, or a
+    ``db_path``. Nothing is installed when the corpus is smaller than
+    ``min_documents`` — the bootstrap list stays in force rather than leaving
+    similarity with no floor at all.
+
+    Deliberately explicit: this never opens :data:`DB_PATH` behind the caller's
+    back and never runs schema initialization.
+    """
+    owned: sqlite3.Connection | None = None
+    try:
+        if documents is None:
+            if conn is None:
+                target = db_path or DB_PATH
+                owned = _connect_readonly(target)
+                conn = owned
+            corpus = list(_iter_corpus(conn, limit))
+        else:
+            corpus = [d for d in documents if d]
+    finally:
+        if owned is not None:
+            owned.close()
+
+    total = sum(1 for d in corpus if _similarity_terms(d))
+    learned = build_df_stopwords(
+        corpus, max_df_ratio=max_df_ratio, min_documents=min_documents
+    )
+    stats: dict[str, Any] = {
+        "documents": total,
+        "max_df_ratio": max_df_ratio,
+        "min_documents": min_documents,
+        "stopwords": len(learned),
+        "installed": False,
+        "sample": sorted(learned)[:25],
+        "learned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if install and total >= max(1, min_documents):
+        set_similarity_stopwords(learned, stats={**stats, "installed": True})
+        stats["installed"] = True
+    return stats
+
+
+def tokenize_for_similarity(
+    text: str, *, stopwords: Iterable[str] | None = None
+) -> set[str]:
+    """Extract meaningful tokens from text for Jaccard similarity."""
+    active = (
+        active_similarity_stopwords() if stopwords is None else frozenset(stopwords)
+    )
+    return {w for w in _similarity_terms(text) if w not in active}
 
 
 def fts_query(raw: str, *, join: str = "OR") -> str:

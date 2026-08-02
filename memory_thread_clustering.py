@@ -57,7 +57,11 @@ class SparseMemoryGraph:
 
 
 def _safe_task_fts_query(text: str) -> str:
-    tokens = sorted(tokenize_for_similarity(text))[:64]
+    # Same cap policy as ``link_suggestions._safe_fts_query``: take the 64
+    # *longest* tokens.  Codepoint order sorts all ASCII before all Cyrillic,
+    # which silently stripped the Bulgarian content words out of the
+    # ``tasks_fts`` probe.  ``w`` keeps ties deterministic.
+    tokens = sorted(tokenize_for_similarity(text), key=lambda w: (-len(w), w))[:64]
     return fts_query(" ".join(tokens)) if tokens else ""
 
 

@@ -76,7 +76,12 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def _safe_fts_query(text: str) -> str:
-    tokens = sorted(tokenize_for_similarity(text))[:64]
+    # Select the 64 *longest* tokens, not the 64 first by codepoint.  Plain
+    # ``sorted`` puts every ASCII token ahead of every Cyrillic one, so on a
+    # Bulgarian corpus the cap filled with digits and Latin noise and the query
+    # reached ``memory_fts`` carrying no Cyrillic at all.  Length is the
+    # available proxy for content words here; ``w`` keeps ties deterministic.
+    tokens = sorted(tokenize_for_similarity(text), key=lambda w: (-len(w), w))[:64]
     return fts_query(" ".join(tokens)) if tokens else ""
 
 

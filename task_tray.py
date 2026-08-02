@@ -127,6 +127,9 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 _TAB_PAGE_SIZE = 200
 _TRAY_READY_REVIEW_LIMIT = 50
 _TRAY_SUGGESTED_LIMIT = _env_int("SQLITE_MEMORY_TRAY_SUGGESTED_LIMIT", 50, 1)
+# Resident fuzzy index is capped for RSS. The cap admits the most recently
+# updated rows (see build_bounded_index_rows); everything it cannot hold stays
+# reachable through the on-disk tasks_fts/BM25 and substring passes.
 _TRAY_SEARCH_INDEX_LIMIT = _env_int("SQLITE_MEMORY_TRAY_SEARCH_INDEX_LIMIT", 300, 1)
 _TRAY_INDEX_TEXT_CHARS = _env_int("SQLITE_MEMORY_TRAY_INDEX_TEXT_CHARS", 800, 80)
 _TRAY_RSS_LOG_MB = _env_int("SQLITE_MEMORY_TRAY_RSS_LOG_MB", 512, 0)
@@ -201,7 +204,11 @@ def _current_rss_mb() -> float:
 
 
 def _tray_search_index_rows(*groups: list[dict]) -> list[dict]:
-    """Build a bounded, lightweight search-index projection for the tray."""
+    """Build a bounded, lightweight search-index projection for the tray.
+
+    Input arrives ``created_at ASC`` from the DAO; the projection keeps the
+    newest rows, never the head of that input.
+    """
     return build_bounded_index_rows(
         *groups,
         limit=_TRAY_SEARCH_INDEX_LIMIT,

@@ -158,10 +158,13 @@ mcp = FastMCP(
     instructions=(
         "Task management tools for SQLite-backed persistent memory. "
         "Create, update, query, and digest tasks. "
+        "query_tasks returns live work by default: done/archived/cancelled rows are "
+        "excluded unless you pass an explicit status or include_completed=True. "
         "Use find_by_title when only a remembered phrase is known: it searches tasks, notes, "
         "and entities across title/name, description, notes, observations, and project "
-        "regardless of status, section, or project filters, using retrieval contract "
-        f"{RETRIEVAL_CONTRACT_VERSION} with confidence gating. "
+        "regardless of section, type, or project filters, using retrieval contract "
+        f"{RETRIEVAL_CONTRACT_VERSION} with confidence gating; finished rows stay "
+        "reachable but always rank below live work. "
         "Use upsert_note_by_title_project for idempotent research/decision notes "
         "when a repeated agent run must update an existing title/project instead of "
         "creating duplicates. "
@@ -605,6 +608,7 @@ def query_tasks(
     limit: int = 50,
     sort_by: str = "",
     sort_order: str = "",
+    include_completed: bool = False,
 ) -> str:
     """Query tasks with optional filters. Returns markdown table.
 
@@ -612,6 +616,15 @@ def query_tasks(
     overdue_only=True shows only tasks past due_date.
     search: full-text search across title, description, notes.
     summary_only=True omits description/notes (faster).
+
+    Liveness default: finished rows (done/archived/cancelled) keep their
+        due_date, so an unfiltered query would otherwise be dominated by
+        completed work under the priority/due_date default order. Unless the
+        caller names a ``status`` explicitly, or sets include_completed=True,
+        finished rows are excluded. ``overdue_only`` keeps its historical
+        unconditional exclusion — finished work is never "overdue".
+    include_completed: opt back in to done/archived/cancelled rows when no
+        explicit ``status`` filter is given (e.g. for history/audit views).
 
     sort_by: optional column to sort by. Empty ("") preserves the default
         ordering (priority critical-first, then due_date ASC NULLS LAST,
@@ -654,6 +667,12 @@ def query_tasks(
         params.append(type)
     if overdue_only:
         conditions.append("t.due_date < date('now')")
+    # Liveness guard. Without it the caller-argument loop above can leave
+    # ``WHERE 1=1``, and because completed tasks retain their due_date the
+    # default order (priority, then due_date ASC NULLS LAST) buries live work
+    # behind finished rows. An explicit ``status`` means the caller already
+    # named the lifecycle they want, so it is left untouched.
+    if overdue_only or not (status or include_completed):
         conditions.append(f"t.status NOT IN ({_EXCL_PH})")
         params.extend(_TASK_ACTIVE_EXCLUSIONS)
 
@@ -837,6 +856,13 @@ def _lookup_rows(
         candidate_ids = _lookup_prefilter_ids(conn, query, candidate_limit)
 
     if candidate_ids is None:
+        # No status filter here, deliberately. The liveness sort key already
+        # guarantees a finished row never outranks a live one, so excluding
+        # them buys nothing for ranking. It would only change behaviour in the
+        # one case where there is no live answer at all — turning a
+        # low-confidence closed match into "no result". This is the last-resort
+        # recall path of a system whose job is remembering past work, so
+        # dropping finished rows from it costs more than it returns.
         task_rows = conn.execute(f"SELECT {_LOOKUP_TASK_COLUMNS} FROM tasks").fetchall()
         entity_rows = conn.execute(
             f"SELECT {_LOOKUP_ENTITY_COLUMNS} FROM entities"
@@ -981,6 +1007,17 @@ def _score_lookup_candidates(
     return matches
 
 
+def _lookup_liveness(item: dict[str, Any]) -> int:
+    """Liveness term for lookup ordering: 0 for finished task-lifecycle rows.
+
+    Deliberately outside ``retrieval_contract.SURFACE_SCORE_RULES``: scoring
+    stays a pure text-surface function of the query, and status only breaks the
+    ordering of already-scored matches. Entities carry no lifecycle status, so
+    they are never demoted as stale.
+    """
+    return 0 if (item.get("status") or "") in _TASK_ACTIVE_EXCLUSIONS else 1
+
+
 @mcp.tool()
 def find_by_title(title_fragment: str, limit: int = 20) -> str:
     """Find tasks, notes, or entities by partial title or remembered phrase.
@@ -988,7 +1025,10 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
     This is the cross-surface lookup tool when the caller only remembers a
     phrase, not the storage surface. It searches across task titles,
     descriptions, notes, projects, entity names, and entity observations.
-    It ignores task status, section, type, and project filters.
+    It applies no section, type, or project filter. Finished rows
+    (done/archived/cancelled) stay reachable on every path, including the
+    unbounded full-scan fallback; they are never excluded, only ranked below
+    live work.
 
     Args:
         title_fragment: Any distinctive substring or remembered phrase.
@@ -1025,12 +1065,14 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
                 task_rows, entity_rows, obs_by_entity, query
             )
 
+    # Liveness leads the sort key: a stale row never outranks a live one, no
+    # matter how well it scores. Score then recency decide within a liveness
+    # band; Python's stable sort keeps equal keys in deterministic row order.
     matches.sort(
         key=lambda item: (
+            _lookup_liveness(item),
             float(item.get("score") or 0.0),
-            1 if item.get("kind") in {"task", "note"} else 0,
             item.get("updated_at") or "",
-            item.get("created_at") or "",
         ),
         reverse=True,
     )

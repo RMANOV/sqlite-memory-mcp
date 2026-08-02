@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import json
 import logging
+import re
 import sqlite3
 from datetime import date
 from typing import Any
@@ -317,14 +318,74 @@ def _ready_reason_primary(reason_codes: list[str]) -> str:
     )
 
 
+# Inflected forms an operator actually writes. Word-boundary anchoring alone
+# turns every inflection into a silent false *negative*: "two blockers remain"
+# stopped matching ``blocker`` entirely, so the blocked state and its blocker
+# list were lost, not merely downgraded. ``_READING_MARKERS`` already carried
+# this precedent by hand (``reading`` *and* ``readings``); this table
+# generalises it.
+#
+# Forms are enumerated rather than expressed as a suffix character class on
+# purpose: every accepted string stays greppable, so widening one term can
+# never leak into another. Only unambiguous forms are listed — ``import``
+# gains "imported"/"importer" but never "important"/"importance", and
+# ``bridge`` gains nothing, because "bridged" was one of the false positives
+# the word-boundary fix was written to kill.
+_MARKER_INFLECTIONS: dict[str, tuple[str, ...]] = {
+    "blocker": ("blockers",),
+    "commitment": ("commitments",),
+    "deadline": ("deadlines",),
+    "duplicate": ("duplicates",),
+    "import": ("imports", "imported", "importer", "importers"),
+    "machine": ("machines",),
+    "permission": ("permissions",),
+    "reopen": ("reopens", "reopened", "reopening"),
+    "stale": ("staleness",),
+    "sync": ("syncs", "synced", "syncing", "unsynced"),
+}
+
+
+def _marker_pattern(*terms: str) -> re.Pattern[str]:
+    """Compile one word-boundary alternation over literal marker terms.
+
+    Every classifier below used ``marker in text`` substring matching, which
+    fired on incidental prose: ``pin`` matched "mapping"/"opinion"/"shaping",
+    ``sync`` matched "asynchronous", ``bridge`` matched "bridged". Anchoring
+    each term with ``\\b`` removes that whole collision class. Patterns are
+    compiled once at import, never per call.
+
+    Each term is expanded through ``_MARKER_INFLECTIONS`` first, so a plural or
+    participle the operator wrote still matches the marker it inflects.
+
+    Terms are ordered longest-first so an underscored/hyphenated variant is
+    tried before its own prefix (``surface_until`` before ``surface``) — ``_``
+    is a word character, so the short prefix alone can never close the
+    boundary there. Ordering is fully deterministic (length, then term).
+    """
+    expanded = [
+        form for term in terms for form in (term, *_MARKER_INFLECTIONS.get(term, ()))
+    ]
+    ordered = sorted(dict.fromkeys(expanded), key=lambda term: (-len(term), term))
+    return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in ordered) + r")\b")
+
+
 _BLOCKER_TERMS = (
-    ("needs_user_decision", ("under-specified", "underspecified", "acceptance rule")),
-    ("missing_input", ("missing input", "needs input", "permission", "awaiting")),
-    ("unsafe_without_verification", ("unsafe", "verify first", "verification")),
-    ("external_dependency", ("waiting on", "external dependency")),
-    ("blocked_by", ("blocked by", "blocker")),
+    (
+        "needs_user_decision",
+        _marker_pattern("under-specified", "underspecified", "acceptance rule"),
+    ),
+    (
+        "missing_input",
+        _marker_pattern("missing input", "needs input", "permission", "awaiting"),
+    ),
+    (
+        "unsafe_without_verification",
+        _marker_pattern("unsafe", "verify first", "verification"),
+    ),
+    ("external_dependency", _marker_pattern("waiting on", "external dependency")),
+    ("blocked_by", _marker_pattern("blocked by", "blocker")),
 )
-_READING_MARKERS = (
+_READING_MARKERS = _marker_pattern(
     "reading",
     "readings",
     "mama-reading",
@@ -333,37 +394,87 @@ _READING_MARKERS = (
     "epub",
 )
 
+# ── Intent markers ─────────────────────────────────────────────────────────
+# These encode what the *operator* declared about a task, not what the task
+# happens to talk about. Matched against the whole body as bare words they
+# inverted their own meaning — a task whose notes merely discussed pinning or
+# mentioned a superseded design was read as an explicit user instruction.
+#
+# The discriminator is the marker's *form*, not the field it sits in. A
+# structured directive (`surface_until=…`, the `curated-reading` label) is
+# machine-shaped: nobody writes it by accident, so it is honoured wherever it
+# appears — including `description`, which this server's tool contract names
+# as "the default primary body for task/note content" and is therefore exactly
+# where an operator types a pin. Scoping those to the title made pinned tasks
+# vanish outright: `section=someday` / `project=readings` rows whose
+# description carried a live `surface_until=` fell through the someday and
+# reading gates into `excluded`.
+#
+# A bare English word ("we should pin the weights once the corpus settles") is
+# a thought, not an instruction, and stays restricted to the declared surface.
+_SURFACE_DIRECTIVE_MARKERS = _marker_pattern("surface_until", "curated-reading")
+_SURFACE_MARKERS = _marker_pattern("pin", "pinned", "surface")
+# `duplicate` travels with cleanup_candidate/superseded: it is the same class
+# of operator label and is at least as collision-prone in body prose.
+_CLEANUP_MARKERS = _marker_pattern("cleanup_candidate", "superseded", "duplicate")
+
+# ── Topical markers: full-body scope (description/notes included) ──────────
+_BRIDGE_MARKERS = _marker_pattern("bridge")
+_BRIDGE_SYNC_MARKERS = _marker_pattern("sync", "updated_at", "import", "churn")
+_DELIVERY_MARKERS = _marker_pattern("delivery", "ship", "release", "deadline")
+_COMMITMENT_MARKERS = _marker_pattern("external commitment", "commitment", "apply")
+_MACHINE_MARKERS = _marker_pattern("machine", "thermal", "bridge", "tray", "sync")
+_STALE_MARKERS = _marker_pattern("stale", "unresolved")
+_CONFUSED_MARKERS = _marker_pattern("done_but_recently_confused")
+_REOPEN_MARKERS = _marker_pattern("reopen_requested_by_user", "reopen")
+
 
 def _ready_task_text(task: dict[str, Any]) -> str:
+    """Full task body — topical signals may legitimately live in the prose."""
     return " ".join(
         str(task.get(k) or "")
         for k in ("title", "description", "notes", "project", "section")
     ).casefold()
 
 
+def _ready_intent_text(task: dict[str, Any]) -> str:
+    """Declared surface for *bare-word* intent markers: the task title.
+
+    Section is joined in as well, but `TASK_SECTIONS` is a closed vocabulary
+    (inbox/today/next/someday/waiting/done) and none of those strings contains
+    a marker, so in practice this is title-only today; the field stays in the
+    join so a future section label is honoured without another edit.
+
+    Structured directives are deliberately *not* read from here — see
+    `_ready_has_explicit_surface`: `surface_until=` is an instruction whichever
+    field it lands in.
+    """
+    return " ".join(str(task.get(k) or "") for k in ("title", "section")).casefold()
+
+
 def _ready_is_reading(task: dict[str, Any]) -> bool:
-    text = _ready_task_text(task)
-    return any(marker in text for marker in _READING_MARKERS)
+    return bool(_READING_MARKERS.search(_ready_task_text(task)))
 
 
 def _ready_has_explicit_surface(task: dict[str, Any]) -> bool:
-    text = _ready_task_text(task)
-    return any(
-        marker in text
-        for marker in (
-            "pin",
-            "pinned",
-            "surface",
-            "surface_until",
-            "curated-reading",
-        )
+    """True when the operator asked for this task to stay visible.
+
+    Two tiers, split by marker form: a structured directive counts anywhere in
+    the task body, a bare prose word only on the declared intent surface.
+    """
+    return bool(_SURFACE_DIRECTIVE_MARKERS.search(_ready_task_text(task))) or bool(
+        _SURFACE_MARKERS.search(_ready_intent_text(task))
     )
+
+
+def _ready_is_cleanup_candidate(task: dict[str, Any]) -> bool:
+    return bool(_CLEANUP_MARKERS.search(_ready_intent_text(task)))
 
 
 def _ready_bridge_sync_caution(task: dict[str, Any]) -> bool:
     text = _ready_task_text(task)
-    return "bridge" in text and any(
-        marker in text for marker in ("sync", "updated_at", "import", "churn")
+    return bool(_BRIDGE_MARKERS.search(text)) and bool(
+        _BRIDGE_SYNC_MARKERS.search(text)
     )
 
 
@@ -374,8 +485,8 @@ def _infer_ready_blockers(task: dict[str, Any]) -> list[dict[str, str]]:
     if task.get("section") == "waiting":
         blockers.append({"category": "waiting_on", "detail": "section=waiting"})
 
-    for category, terms in _BLOCKER_TERMS:
-        if any(term in text for term in terms):
+    for category, pattern in _BLOCKER_TERMS:
+        if pattern.search(text):
             blockers.append({"category": category, "detail": "matched task text"})
 
     seen: set[tuple[str, str]] = set()
@@ -405,23 +516,23 @@ def _ready_reason_codes(
         codes.append("explicit_user_correction")
     if task.get("section") == "waiting" or task.get("reminder_at"):
         codes.append("waiting_followup_date")
-    if any(term in text for term in ("delivery", "ship", "release", "deadline")):
+    if _DELIVERY_MARKERS.search(text):
         codes.append("active_delivery_pressure")
-    if any(term in text for term in ("external commitment", "commitment", "apply")):
+    if _COMMITMENT_MARKERS.search(text):
         codes.append("external_commitment_risk")
-    if any(term in text for term in ("machine", "thermal", "bridge", "tray", "sync")):
+    if _MACHINE_MARKERS.search(text):
         codes.append("machine_anomaly_open")
-    if "stale" in text or "unresolved" in text:
+    if _STALE_MARKERS.search(text):
         codes.append("stale_but_unresolved")
     if _ready_bridge_sync_caution(task):
         codes.append("bridge_sync_caution")
     if _ready_is_reading(task):
         codes.append("reading_surface")
-    if "cleanup_candidate" in text or "superseded" in text or "duplicate" in text:
+    if _ready_is_cleanup_candidate(task):
         codes.append("cleanup_candidate")
-    if "done_but_recently_confused" in text:
+    if _CONFUSED_MARKERS.search(text):
         codes.append("done_but_recently_confused")
-    if "reopen_requested_by_user" in text or "reopen" in text:
+    if _REOPEN_MARKERS.search(text):
         codes.append("reopen_requested_by_user")
     if _infer_ready_blockers(task):
         codes.append("blocked_by_open_item")
@@ -501,21 +612,30 @@ def _ready_state(
             return "suggested_ready"
         return "excluded"
 
-    if "cleanup_candidate" in reason_codes:
-        return "cleanup_candidate"
+    # ── Parked or blocked wins over everything below ──────────────────────
+    # A live task that is blocked is blocked, not ready: liveness must never
+    # empty the blocked/waiting bucket. section='waiting' is the one explicit
+    # field whose purpose is to park a task; `blockers` already carries a
+    # waiting_on entry for it, so the two agree by construction.
+    if section == "waiting":
+        return "waiting"
     if blockers:
         return (
             "waiting"
             if any(b["category"] == "waiting_on" for b in blockers)
             else "blocked"
         )
-    if section == "waiting":
-        return "waiting"
-    if (
-        status == "in_progress"
-        or section == "today"
-        or (due is not None and due <= today)
-    ):
+
+    # ── Explicit liveness outranks the text-inferred cleanup label ────────
+    # This single swap is the whole ordering defect: status and section are set
+    # deliberately, by the user or by tooling acting on the user's instruction,
+    # while `cleanup_candidate` is merely read out of the task's own words. A
+    # keyword must not bury work the operator marked as running.
+    if status == "in_progress" or section == "today":
+        return "ready_now"
+    if "cleanup_candidate" in reason_codes:
+        return "cleanup_candidate"
+    if due is not None and due <= today:
         return "ready_now"
     if section == "someday" and not _ready_has_explicit_surface(task) and due is None:
         return "excluded"

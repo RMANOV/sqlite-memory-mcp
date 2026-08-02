@@ -24,6 +24,18 @@ except ImportError:
 # Words shorter than this are not indexed (articles, prepositions)
 _MIN_WORD_LEN = 2
 
+# BM25 ranks the whole tasks table, but callers hand us a pool (one tray tab,
+# active+done, …) and everything outside it is dropped after the query. Ask
+# for more rows than we keep so that filtering cannot starve the result.
+_FTS_POOL_OVERFETCH = 4
+_FTS_OVERFETCH_CAP = 500
+
+
+def _fts_fetch_limit(limit: int) -> int:
+    """Rows to pull from BM25 before filtering down to the caller's pool."""
+    bounded = max(1, int(limit))
+    return max(bounded, min(bounded * _FTS_POOL_OVERFETCH, _FTS_OVERFETCH_CAP))
+
 
 def _scored_fallback(tasks, query, limit):
     """Substring-scored fallback with rank=0.0 for API consistency."""
@@ -31,6 +43,44 @@ def _scored_fallback(tasks, query, limit):
     return [
         {**t, "rank": 0.0} for t, s in sorted(scored, key=lambda x: -x[1]) if s > 0
     ][:limit]
+
+
+def _project_and_top_up(
+    rows: list[dict], tasks: list[dict], query: str, limit: int
+) -> list[dict]:
+    """Return ranked rows in the caller's shape, completed by literal hits.
+
+    FTS5 and vector queries select their own storage-oriented row shapes.  A
+    caller may deliberately omit fields (``summary_only``) or carry fields the
+    search tables do not select (for example ``created_at``), so raw search
+    rows must never escape this boundary.  Project them onto the supplied pool
+    and retain only ranking metadata, then use the substring scorer to recover
+    prefix/infix matches that token-based FTS cannot see.
+    """
+    pool_by_id = {task.get("id"): task for task in tasks if task.get("id") is not None}
+    projected: list[dict] = []
+    for row in rows:
+        task_id = row.get("id")
+        pool_row = pool_by_id.get(task_id)
+        if pool_row is None:
+            continue
+        shaped = dict(pool_row)
+        for field in ("rank", "distance"):
+            if field in row:
+                shaped[field] = row[field]
+        projected.append(shaped)
+
+    merged: list[dict] = []
+    seen: set[str | None] = set()
+    for row in (*projected, *_scored_fallback(tasks, query, limit)):
+        task_id = row.get("id")
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        merged.append(row)
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 # SmartKey config: corpus IDF high, markov off, personal CVM active
@@ -68,15 +118,33 @@ _INDEX_FIELDS = (
 )
 
 
+def _index_recency_key(task: dict) -> str:
+    """Freshness key for index admission. Newest sorts highest.
+
+    ``updated_at`` is the tray's own freshness signal; ``created_at`` covers
+    rows that carry no update stamp. Both are ISO-8601, so a plain string
+    compare is the correct chronological compare. Rows with neither collapse
+    to "" and keep their incoming order (the sort is stable).
+    """
+    return str(task.get("updated_at") or task.get("created_at") or "")
+
+
 def build_bounded_index_rows(
     *groups: list[dict],
     limit: int = 300,
     text_chars: int = 800,
 ) -> list[dict]:
-    """Return a deduplicated, bounded projection safe for a resident index."""
+    """Return a deduplicated, bounded projection safe for a resident index.
+
+    When the input exceeds *limit* the **most recently touched** rows win.
+    Callers feed this from a DAO ordered ``created_at ASC``, so taking the
+    head of the input would pin the index to the oldest rows and make
+    everything recent unfindable — the exact opposite of what a search box
+    over a task list is for.
+    """
     bounded_limit = max(1, int(limit))
     bounded_text = max(1, int(text_chars))
-    rows: list[dict] = []
+    candidates: list[dict] = []
     seen: set[str] = set()
     for group in groups:
         for task in group:
@@ -84,15 +152,19 @@ def build_bounded_index_rows(
             if not task_id or task_id in seen:
                 continue
             seen.add(task_id)
-            row = {}
-            for field in _INDEX_FIELDS:
-                value = task.get(field)
-                if isinstance(value, str) and len(value) > bounded_text:
-                    value = value[:bounded_text]
-                row[field] = value
-            rows.append(row)
-            if len(rows) >= bounded_limit:
-                return rows
+            candidates.append(task)
+    if len(candidates) > bounded_limit:
+        candidates.sort(key=_index_recency_key, reverse=True)
+        del candidates[bounded_limit:]
+    rows: list[dict] = []
+    for task in candidates:
+        row = {}
+        for field in _INDEX_FIELDS:
+            value = task.get(field)
+            if isinstance(value, str) and len(value) > bounded_text:
+                value = value[:bounded_text]
+            row[field] = value
+        rows.append(row)
     return rows
 
 
@@ -358,16 +430,17 @@ class TaskSearchEngine:
 
             if fts_results is not None and vec_results:
                 # RRF merge FTS5 + vector, filter to task pool
-                merged = task_rrf_merge(fts_results, vec_results)
-                task_ids = {t["id"] for t in tasks}
-                return [t for t in merged if t["id"] in task_ids][:limit]
+                ranked = task_rrf_merge(fts_results, vec_results)
             elif fts_results is not None:
-                return fts_results
+                ranked = fts_results
             elif vec_results:
-                task_ids = {t["id"] for t in tasks}
-                return [t for t in vec_results if t["id"] in task_ids][:limit]
-            # Final fallback: improved substring scoring
-            return _scored_fallback(tasks, query, limit)
+                ranked = vec_results
+            else:
+                ranked = []
+            # The optional native engine is absent in core-only installs.  Do
+            # not let that environment leak raw FTS/vector row shapes or lose
+            # literal prefix/infix hits that the substring fallback can see.
+            return _project_and_top_up(ranked, tasks, query, limit)
 
         query_words = _tokenize(query)
         if not query_words:
@@ -397,10 +470,6 @@ class TaskSearchEngine:
                     task_scores[tid] = task_scores.get(tid, 0) + confidence
                     task_hits[tid] = task_hits.get(tid, 0) + 1
 
-        if not task_scores:
-            # SmartKey found nothing — fallback to substring
-            return _scored_fallback(tasks, query, limit)
-
         n_query_words = len(query_words)
 
         # Boost tasks that match ALL query words (AND logic)
@@ -411,7 +480,102 @@ class TaskSearchEngine:
 
         # Sort by score descending
         ranked_ids = sorted(task_scores, key=lambda tid: -task_scores[tid])[:limit]
-        return [task_map[tid] for tid in ranked_ids if tid in task_map]
+        results = [task_map[tid] for tid in ranked_ids if tid in task_map]
+        return self._recover_literal_matches(
+            results, query, tasks, limit, conn, task_map
+        )
+
+    def _recover_literal_matches(
+        self,
+        results: list[dict],
+        query: str,
+        tasks: list[dict],
+        limit: int,
+        conn: sqlite3.Connection | None,
+        indexed: dict[str, dict],
+    ) -> list[dict]:
+        """Repair a fuzzy answer the bounded resident index could not complete.
+
+        The index holds only the freshest rows, so a pool row outside it stays
+        invisible to the fuzzy pass however well it matches — and a quota
+        filled with stale or partial hits used to suppress the safety net
+        entirely. Two AND-gated passes recover the missing rows; both require
+        every query word to be present, so neither can add noise:
+
+        * the on-disk FTS5/BM25 index, which covers every task row for about a
+          millisecond, and is therefore consulted whenever the resident index
+          falls short of the pool;
+        * the substring scorer, which needs no index but must lower-case the
+          pool's whole text, so it is spent only when the cheaper passes left
+          the answer without a single literal match, or short of *limit*.
+
+        Merge order follows the strength of the evidence: fuzzy hits that are
+        themselves literal matches first, which keeps SmartKey's CVM ranking,
+        then the recovered rows, then fuzzy-only hits, the weakest claim on a
+        slot but still the answer to a typo.
+        """
+        fts_rows = None
+        if conn is not None and indexed and any(t.get("id") not in indexed for t in tasks):
+            # `indexed` guards the caller that never built a resident index at
+            # all: task_server.query_tasks never calls rebuild_index, so both
+            # `_inverted` and `_task_map` stay empty and the membership test is
+            # vacuously true.  Without this guard BM25 displaces the substring
+            # pass for *every* search — FTS5 matches whole tokens where
+            # score_task matches infixes, so inflected hits vanish, and the FTS
+            # row shape drops `created_at` and re-inflates `summary_only`
+            # payloads.  An engine with no resident index has no fuzzy answer to
+            # complete, so it must fall through to the literal path.
+            #
+            # OR-broadening stays off: this completes a ranked answer rather
+            # than standing in as the last resort.
+            fts_rows = self._fts5_search(conn, query, tasks, limit, broaden=False)
+        # Project recovered rows back onto the caller's own pool rows so every
+        # merged row keeps the caller's shape (`created_at` present, and an
+        # honoured `summary_only`).  Rows the pool does not know stay as-is.
+        pool_by_id = {t.get("id"): t for t in tasks if t.get("id") is not None}
+        recovered = [
+            {**pool_by_id[r["id"]], "rank": r["rank"]} if r.get("id") in pool_by_id else r
+            for r in (fts_rows or [])
+        ]
+
+        literal: list[dict] = []
+        fuzzy_only: list[dict] = []
+        for row in results:
+            (literal if score_task(row, query) > 0 else fuzzy_only).append(row)
+
+        # Gate the substring pass on what the merge below will actually YIELD,
+        # not on whether the FTS pass was consulted.  Two reasons the old
+        # `fts_rows is None` test could not carry that weight:
+        #
+        # * `_fts5_search` returns None when the index is unavailable AND `[]`
+        #   when it matched only rows this caller's view excludes.  `[] is None`
+        #   is False, so a pass that recovered nothing counted as one that had
+        #   already succeeded, and the substring pass was skipped.
+        # * A single FTS hit satisfied the same test as a full quota, so an
+        #   answer one row long stayed one row long.
+        #
+        # Both left the caller short of rows the substring pass was holding —
+        # the same query with `conn=None` returned MORE than with a live `conn`,
+        # which makes the search strictly worse for having an index.  Summing
+        # the two list lengths would repeat the error in a smaller way: rows
+        # found by both passes collapse in the merge, so the sum over-counts.
+        distinct = {row.get("id") for row in (*literal, *recovered, *fuzzy_only)}
+        if not (literal or recovered) or len(distinct) < limit:
+            recovered = recovered + _scored_fallback(tasks, query, limit)
+        if not recovered:
+            return results
+
+        merged: list[dict] = []
+        seen: set[str | None] = set()
+        for row in (*literal, *recovered, *fuzzy_only):
+            row_id = row.get("id")
+            if row_id in seen:
+                continue
+            seen.add(row_id)
+            merged.append(row)
+            if len(merged) >= limit:
+                break
+        return merged
 
     @staticmethod
     def _fts5_search(
@@ -419,14 +583,20 @@ class TaskSearchEngine:
         query: str,
         tasks: list[dict],
         limit: int,
+        broaden: bool = True,
     ) -> list[dict] | None:
-        """FTS5 BM25 search. Returns ranked results or None on failure."""
+        """FTS5 BM25 search. Returns ranked results or None on failure.
+
+        *broaden* controls the OR retry used when the AND query matches
+        nothing; callers that already hold a ranked answer switch it off.
+        """
         tokens = query.split()
         if not tokens:
             return None
         # AND logic: all tokens must match for precise results
         escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
         fts_q = " AND ".join(escaped)
+        fetch = _fts_fetch_limit(limit)
         try:
             rows = conn.execute(
                 "SELECT t.id, t.title, t.description, t.notes, t.status, "
@@ -435,12 +605,12 @@ class TaskSearchEngine:
                 "FROM tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid "
                 "WHERE tasks_fts MATCH ? "
                 "ORDER BY rank LIMIT ?",
-                (fts_q, limit),
+                (fts_q, fetch),
             ).fetchall()
         except sqlite3.Error:
             log.debug("FTS5 search failed for %r, falling back", query, exc_info=True)
             return None
-        if not rows:
+        if not rows and broaden:
             # FTS5 found nothing with AND — try OR as broadening
             fts_q_or = " OR ".join(escaped)
             try:
@@ -451,7 +621,7 @@ class TaskSearchEngine:
                     "FROM tasks_fts JOIN tasks t ON tasks_fts.rowid = t.rowid "
                     "WHERE tasks_fts MATCH ? "
                     "ORDER BY rank LIMIT ?",
-                    (fts_q_or, limit),
+                    (fts_q_or, fetch),
                 ).fetchall()
             except sqlite3.Error as e:
                 log.debug("FTS5 fallback failed: %s", e, exc_info=True)
