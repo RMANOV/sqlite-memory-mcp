@@ -45,6 +45,44 @@ def _scored_fallback(tasks, query, limit):
     ][:limit]
 
 
+def _project_and_top_up(
+    rows: list[dict], tasks: list[dict], query: str, limit: int
+) -> list[dict]:
+    """Return ranked rows in the caller's shape, completed by literal hits.
+
+    FTS5 and vector queries select their own storage-oriented row shapes.  A
+    caller may deliberately omit fields (``summary_only``) or carry fields the
+    search tables do not select (for example ``created_at``), so raw search
+    rows must never escape this boundary.  Project them onto the supplied pool
+    and retain only ranking metadata, then use the substring scorer to recover
+    prefix/infix matches that token-based FTS cannot see.
+    """
+    pool_by_id = {task.get("id"): task for task in tasks if task.get("id") is not None}
+    projected: list[dict] = []
+    for row in rows:
+        task_id = row.get("id")
+        pool_row = pool_by_id.get(task_id)
+        if pool_row is None:
+            continue
+        shaped = dict(pool_row)
+        for field in ("rank", "distance"):
+            if field in row:
+                shaped[field] = row[field]
+        projected.append(shaped)
+
+    merged: list[dict] = []
+    seen: set[str | None] = set()
+    for row in (*projected, *_scored_fallback(tasks, query, limit)):
+        task_id = row.get("id")
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        merged.append(row)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 # SmartKey config: corpus IDF high, markov off, personal CVM active
 _ENGINE_CONFIG = json.dumps(
     {
@@ -392,16 +430,17 @@ class TaskSearchEngine:
 
             if fts_results is not None and vec_results:
                 # RRF merge FTS5 + vector, filter to task pool
-                merged = task_rrf_merge(fts_results, vec_results)
-                task_ids = {t["id"] for t in tasks}
-                return [t for t in merged if t["id"] in task_ids][:limit]
+                ranked = task_rrf_merge(fts_results, vec_results)
             elif fts_results is not None:
-                return fts_results
+                ranked = fts_results
             elif vec_results:
-                task_ids = {t["id"] for t in tasks}
-                return [t for t in vec_results if t["id"] in task_ids][:limit]
-            # Final fallback: improved substring scoring
-            return _scored_fallback(tasks, query, limit)
+                ranked = vec_results
+            else:
+                ranked = []
+            # The optional native engine is absent in core-only installs.  Do
+            # not let that environment leak raw FTS/vector row shapes or lose
+            # literal prefix/infix hits that the substring fallback can see.
+            return _project_and_top_up(ranked, tasks, query, limit)
 
         query_words = _tokenize(query)
         if not query_words:

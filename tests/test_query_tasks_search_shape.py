@@ -46,6 +46,14 @@ def task_env(tmp_path, monkeypatch):
     monkeypatch.setattr(task_server, "_get_conn", conn_factory)
     monkeypatch.setattr(task_server, "_get_write_conn", conn_factory)
     monkeypatch.setattr(task_server, "_vec_sync_task_safe", lambda task_id: None)
+    # Exercise the core-only installation used by CI.  A locally installed
+    # native SmartKey extension must not hide defects in the no-engine branch.
+    search_engine = task_server.TaskSearchEngine()
+    with search_engine._state_lock:
+        search_engine._engine = None
+        search_engine._inverted = {}
+        search_engine._task_map = {}
+    monkeypatch.setattr(task_server, "_search_engine", search_engine)
     return db_path
 
 
