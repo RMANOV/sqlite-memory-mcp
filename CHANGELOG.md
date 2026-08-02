@@ -4,6 +4,16 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.13.2
+
+### Fixed
+
+- **Orphan task field-version cleanup.** Startup now removes
+  `task_field_versions` rows whose parent task no longer exists. The cleanup is
+  idempotent and preserves every version row with a live parent; configured
+  production connections continue to enforce the existing `ON DELETE CASCADE`
+  foreign key so new hard deletes cannot recreate the orphan set.
+
 ## v3.13.1
 
 ### Fixed

@@ -1440,6 +1440,18 @@ _MIGRATIONS = [
         "seed task_field_versions from existing tasks (v2.0.0)",
     ),
     (
+        "SELECT 1 WHERE NOT EXISTS ("
+        "SELECT 1 FROM task_field_versions versions "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM tasks WHERE tasks.id = versions.task_id"
+        ") LIMIT 1)",
+        "DELETE FROM task_field_versions "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM tasks WHERE tasks.id = task_field_versions.task_id"
+        ")",
+        "prune orphan task_field_versions rows (v3.13.2)",
+    ),
+    (
         "SELECT 1 FROM pragma_table_info('tasks') WHERE name='reminder_at'",
         "ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT NULL",
         "tasks.reminder_at column (v2.1.0)",
