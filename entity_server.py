@@ -278,8 +278,14 @@ def find_entity_overlaps(
                 if not cand_tokens:
                     continue
 
-                s_tok = set(sorted(src_tokens)[:500])
-                c_tok = set(sorted(cand_tokens)[:500])
+                # Longest-first, not codepoint order. Plain ``sorted`` puts
+                # every ASCII token ahead of every Cyrillic one, so on a
+                # Bulgarian corpus the cap fills with digits and Latin noise
+                # and the overlap is computed over the wrong half of the text.
+                # Same policy as link_suggestions._safe_fts_query and
+                # memory_thread_clustering; ``w`` keeps ties deterministic.
+                s_tok = set(sorted(src_tokens, key=lambda w: (-len(w), w))[:500])
+                c_tok = set(sorted(cand_tokens, key=lambda w: (-len(w), w))[:500])
                 intersection = s_tok & c_tok
                 union_set = s_tok | c_tok
                 jaccard = len(intersection) / len(union_set) if union_set else 0.0

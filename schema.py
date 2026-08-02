@@ -2397,7 +2397,9 @@ def _repair_memory_fts_triggers(conn: sqlite3.Connection) -> None:
                 END
                 """
             )
-        logger.info("Migration applied: repaired %s trigger", name)
+        # DEBUG for the same reason as the migration loop in init_db: trigger
+        # repair is routine start-up maintenance, not an operational event.
+        logger.debug("Migration applied: repaired %s trigger", name)
 
 
 def _backfill_manual_link_decisions(conn: sqlite3.Connection) -> None:
@@ -2639,11 +2641,23 @@ def init_db(db_path: str | None = None) -> None:
         for stmt in _split_schema_sql(_SCHEMA_SQL):
             raw.execute(stmt)
         # Run migrations under same EXCLUSIVE lock (SM-01 fix: prevents race)
+        #
+        # Per-migration lines are DEBUG. With the full migration list re-checked
+        # on every process start across ~10 server processes, this loop was
+        # measured as 39% of the shared log window. The aggregate below carries
+        # the INFO signal: whether anything changed at all, which is the
+        # operational question. The individual descriptions stay available at
+        # DEBUG for diagnosis.
+        applied: list[str] = []
         for check_q, migrate_q, desc in _MIGRATIONS:
             if not raw.execute(check_q).fetchone():
                 for stmt in _split_schema_sql(migrate_q):
                     raw.execute(stmt)
-                logger.info("Migration applied: %s", desc)
+                logger.debug("Migration applied: %s", desc)
+                applied.append(desc)
+        if applied:
+            shown = ", ".join(applied[:3]) + ("…" if len(applied) > 3 else "")
+            logger.info("Migrations applied: %d (%s)", len(applied), shown)
         _migrate_debate_messages_v1(raw)
         _repair_memory_fts_triggers(raw)
         _backfill_manual_link_decisions(raw)

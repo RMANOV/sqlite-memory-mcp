@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -286,7 +287,10 @@ def test_setup_logger_falls_back_when_primary_log_path_is_unwritable(monkeypatch
     logger = logging.getLogger(logger_name)
     logger.handlers.clear()
 
-    original_file_handler = logging.FileHandler
+    # setup_logger builds a bounded RotatingFileHandler, not a plain
+    # FileHandler — patch the symbol it actually calls, or the injected
+    # failure never fires and the fallback chain is never exercised.
+    original_file_handler = logging.handlers.RotatingFileHandler
     calls = {"count": 0}
 
     def flaky_file_handler(*args, **kwargs):
@@ -295,7 +299,7 @@ def test_setup_logger_falls_back_when_primary_log_path_is_unwritable(monkeypatch
             raise PermissionError("denied")
         return original_file_handler(*args, **kwargs)
 
-    monkeypatch.setattr(logging, "FileHandler", flaky_file_handler)
+    monkeypatch.setattr(logging.handlers, "RotatingFileHandler", flaky_file_handler)
 
     logger = db_utils.setup_logger(logger_name, "fallback-test.log")
 
