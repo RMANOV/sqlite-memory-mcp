@@ -821,7 +821,7 @@ def _machine_live_worker_count(topics: list[str]) -> int:
     live: set[tuple[str, str, str]] = set()
     for topic_id in _active_topic_ids(topics):
         try:
-            live |= _live_worker_session_ids(topic_id)
+            live |= _live_worker_claim_keys(topic_id)
         except Exception as exc:
             _log("machine_live_worker_count_failed", topic_id=topic_id, error=repr(exc))
     return len(live)
@@ -836,12 +836,27 @@ def _safe_machine_live_worker_count(topics: list[str]) -> int:
         return len(CHILDREN)
 
 
-def _live_worker_session_ids(topic_id: str) -> set[tuple[str, str, str]]:
+def _live_worker_session_ids(topic_id: str) -> set[str]:
+    """Live derived worker session ids for ONE topic.
+
+    This is the original contract and it is kept deliberately. The census fix
+    needed the full claim key, and an earlier revision changed this function's
+    return type to supply it — which silently broke every caller that treats
+    the result as a set of ids, including
+    ``tests/test_debate_windows_adapter.py``. That test is ``@windows_only``,
+    so it skips on this machine and the suite stayed green while the contract
+    was broken. Cross-topic callers use :func:`_live_worker_claim_keys`
+    instead; within a single topic the id alone is already unique.
+    """
+    return {sid for _topic, _role, sid in _live_worker_claim_keys(topic_id)}
+
+
+def _live_worker_claim_keys(topic_id: str) -> set[tuple[str, str, str]]:
     """Resolve live derived workers from their durable real-spawn receipts.
 
     Returns ``(topic_id, role, worker_session_id)`` claim keys — the identity
     ``debate_worker_claims`` is actually unique on. Callers that need bare
-    session ids for a single topic project the third element."""
+    session ids for a single topic use :func:`_live_worker_session_ids`."""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
@@ -899,8 +914,8 @@ def _recover_stale_worker_claims(
     for topic_id in _active_topic_ids(topics):
         try:
             # recover_stale_worker_claims() scans one topic and matches bare
-            # ids, so project the claim keys back down to session ids.
-            live = {sid for _t, _role, sid in _live_worker_session_ids(topic_id)}
+            # ids, which is exactly what this helper returns.
+            live = _live_worker_session_ids(topic_id)
             with get_conn_immediate() as conn:
                 out = recover_stale_worker_claims(
                     conn,

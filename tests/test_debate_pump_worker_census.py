@@ -115,8 +115,8 @@ def test_same_worker_id_in_two_topics_counts_as_two_live_workers(
     )
     _only_pids_live(monkeypatch, {4001, 4002})
 
-    keys = debate_pump._live_worker_session_ids("T_ALPHA")
-    keys |= debate_pump._live_worker_session_ids("T_BETA")
+    keys = debate_pump._live_worker_claim_keys("T_ALPHA")
+    keys |= debate_pump._live_worker_claim_keys("T_BETA")
     assert keys == {
         ("T_ALPHA", "EXECUTOR", "cc-parent-W1"),
         ("T_BETA", "EXECUTOR", "cc-parent-W1"),
@@ -124,6 +124,10 @@ def test_same_worker_id_in_two_topics_counts_as_two_live_workers(
 
     # The pre-fix union — kept as an explicit witness of the regression.
     assert len({worker for _topic, _role, worker in keys}) == 1
+
+    # And the per-topic helper still speaks bare ids, which is the contract
+    # the Windows adapter and recover_stale_worker_claims depend on.
+    assert debate_pump._live_worker_session_ids("T_ALPHA") == {"cc-parent-W1"}
 
     assert debate_pump._machine_live_worker_count(["T_ALPHA", "T_BETA"]) == 2
     assert debate_pump._safe_machine_live_worker_count(["T_ALPHA", "T_BETA"]) == 2
@@ -144,11 +148,15 @@ def test_same_worker_id_in_two_roles_of_one_topic_counts_twice(
     )
     _only_pids_live(monkeypatch, {5001, 5002})
 
-    assert debate_pump._live_worker_session_ids("T_ONE") == {
+    assert debate_pump._live_worker_claim_keys("T_ONE") == {
         ("T_ONE", "ADVOCATE", "codex-p-W1"),
         ("T_ONE", "EXECUTOR", "codex-p-W1"),
     }
     assert debate_pump._machine_live_worker_count(["T_ONE"]) == 2
+
+    # Two roles collapse to one id at the per-topic surface — that is correct
+    # for the bare-id contract, and precisely why the census cannot use it.
+    assert debate_pump._live_worker_session_ids("T_ONE") == {"codex-p-W1"}
 
 
 # ── guards: the liveness probe itself is unchanged ──────────────────────────

@@ -72,14 +72,29 @@ def _project_and_top_up(
 
     merged: list[dict] = []
     seen: set[str | None] = set()
-    for row in (*projected, *_scored_fallback(tasks, query, limit)):
-        task_id = row.get("id")
-        if task_id in seen:
-            continue
-        seen.add(task_id)
-        merged.append(row)
-        if len(merged) >= limit:
-            break
+
+    def _absorb(candidates) -> bool:
+        """Take rows until the quota is full. Returns True once it is."""
+        for row in candidates:
+            task_id = row.get("id")
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            merged.append(row)
+            if len(merged) >= limit:
+                return True
+        return len(merged) >= limit
+
+    # The substring scorer is deliberately NOT part of a single unpacked
+    # sequence here. Spelling this as `(*projected, *_scored_fallback(...))`
+    # evaluates the fallback eagerly, so every query paid an O(n_tasks)
+    # lower-casing pass over the whole pool even when the ranked hits already
+    # filled the quota and the loop discarded the result at the first `break`.
+    # Cheapest on core-only installs, where this is the ONLY search path.
+    # Output is unchanged: the fallback contributed nothing in exactly the
+    # cases it is now skipped in.
+    if not _absorb(projected):
+        _absorb(_scored_fallback(tasks, query, limit))
     return merged
 
 

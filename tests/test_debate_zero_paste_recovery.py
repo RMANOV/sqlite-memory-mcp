@@ -290,10 +290,16 @@ def test_machine_live_worker_count_uses_db_not_process(conn, tmp_path, monkeypat
     )
     # Simulate a fresh pump process: CHILDREN empty, but a live worker exists
     # in the DB. The machine-wide count must find it via the spawn receipt.
+    #
+    # Patch the CLAIM-KEY helper — that is what the census calls. Patching the
+    # bare-id helper used to pass here for the wrong reason: the census unions
+    # whatever the stub returns, so a set holding one string counted as one
+    # worker even though the census's own identity is the (topic, role, id)
+    # triple. Same number, different reason, and it hid the real contract.
     monkeypatch.setattr(
         debate_pump,
-        "_live_worker_session_ids",
-        lambda topic_id: {claim["worker_session_id"]},
+        "_live_worker_claim_keys",
+        lambda topic_id: {(topic_id, "WORKER", claim["worker_session_id"])},
     )
     assert debate_pump._machine_live_worker_count([topic]) == 1
     assert debate_pump._machine_live_worker_count([]) == 1  # resolves active topics
