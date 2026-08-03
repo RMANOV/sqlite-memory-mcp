@@ -5307,6 +5307,11 @@ def _resolve_task_status_authority(
         )
 
     seen_events: set[str] = set()
+    # INVARIANT: any status event carrying a local HLC becomes the exported
+    # authority for that task. Write one only when this machine really is the
+    # author -- a merge absorbs someone else's authorship and must stamp the
+    # authority it accepted, or the export claims a write that never happened
+    # here and reverts the peer's next edit.
     for event in (
         (event_by_id or {}).get(source_event_id) if source_event_id else None,
         event_head,
@@ -6277,6 +6282,9 @@ def merge_import_tasks(
 
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
+            # Authority absorbed from the remote side, per field, so the audit
+            # event below can be stamped with it instead of minting a local one.
+            merged_authority: dict[str, tuple[str, str, int]] = {}
             materialization_repairs: set[str] = set()
             local_status_state = local_status_authority.get(local_id)
             local_status_value = _normalize_task_status_value(
@@ -6515,6 +6523,17 @@ def merge_import_tasks(
                     )
                     if local_val != remote_val:
                         fields_to_update[field] = remote_val
+                        # Remember whose write this is. Guarded on remote_order
+                        # because a legacy peer without a packed clock yields 0,
+                        # and passing logical_clock=0 makes record_memory_event
+                        # fall back to a fresh local clock while machine_id and
+                        # event_ts would stay remote -- an incoherent hybrid.
+                        if remote_order:
+                            merged_authority[field] = (
+                                remote_ts,
+                                remote_by,
+                                remote_order,
+                            )
                         semantic_update_timestamps.append(remote_ts or fallback_ts)
                         updated_fields += 1
                         record_memory_conflict(
@@ -6610,12 +6629,29 @@ def merge_import_tasks(
                             *materialization_repairs,
                         }:
                             continue
+                        # A merge absorbs a peer's write; it does not author
+                        # one. Stamping the ledger row with the winning remote
+                        # HLC stops this event from outranking the authority
+                        # that produced it and being re-exported as a newer
+                        # local write, which reverts the peer's next edit.
+                        # None reproduces the pre-fix behaviour exactly.
+                        authority = merged_authority.get(merged_field)
                         record_memory_event(
                             conn,
                             event_type="merge",
                             aggregate_kind="task",
                             aggregate_id=local_id,
                             field_name=merged_field,
+                            machine_id=authority[1] if authority else None,
+                            event_ts=authority[0] if authority else None,
+                            logical_clock=authority[2] if authority else None,
+                            # Marks authorship the local machine absorbed
+                            # rather than originated, so a peer receiving an
+                            # event that claims its own authorship can tell
+                            # the two apart.
+                            payload={"synthetic_authority": True}
+                            if authority
+                            else None,
                             new_value=str(safe_fields[merged_field])
                             if safe_fields[merged_field] is not None
                             else None,
