@@ -5188,6 +5188,19 @@ def _build_event_lookup_by_id(
     return lookup
 
 
+# A merge/repair event records THAT a reconciliation happened; it does not
+# author a value. Treating one as authority let a fresh local clock outrank the
+# very write it was describing, so the export claimed a local write that never
+# happened here and the peer's next genuine edit was reverted.
+_BOOKKEEPING_EVENT_TYPES = frozenset({"merge", "repair"})
+
+
+def _is_bookkeeping_event(event: dict[str, Any] | None) -> bool:
+    if not event:
+        return False
+    return str(event.get("event_type") or "") in _BOOKKEEPING_EVENT_TYPES
+
+
 def _build_task_field_event_heads(
     events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
     field_name: str,
@@ -5199,6 +5212,10 @@ def _build_task_field_event_heads(
         if (
             event.get("aggregate_kind") != "task"
             or event.get("field_name") != field_name
+            # Excluded while CHOOSING the head, not afterwards: a bookkeeping
+            # event can outrank a genuine one, and discarding it later would
+            # take the authoring event ranked below it down with it.
+            or _is_bookkeeping_event(event)
         ):
             continue
         aggregate_id = str(event.get("aggregate_id") or "")
@@ -5227,8 +5244,8 @@ def _load_memory_events_by_id(
         return {}
     placeholders = ",".join("?" * len(event_ids))
     rows = conn.execute(
-        "SELECT event_id, aggregate_id, field_name, machine_id, logical_clock, "
-        "event_ts, new_value FROM memory_events WHERE event_id IN ("
+        "SELECT event_id, event_type, aggregate_id, field_name, machine_id, "
+        "logical_clock, event_ts, new_value FROM memory_events WHERE event_id IN ("
         + placeholders
         + ")",
         tuple(event_ids),
@@ -5245,8 +5262,9 @@ def _load_task_field_event_heads(
         return {}
     placeholders = ",".join("?" * len(task_ids))
     rows = conn.execute(
-        "SELECT event_id, aggregate_id, field_name, machine_id, logical_clock, "
-        "event_ts, new_value FROM memory_events WHERE aggregate_kind = 'task' "
+        "SELECT event_id, event_type, aggregate_id, field_name, machine_id, "
+        "logical_clock, event_ts, new_value FROM memory_events "
+        "WHERE aggregate_kind = 'task' "
         "AND field_name = ? AND aggregate_id IN (" + placeholders + ")",
         (field_name, *task_ids),
     ).fetchall()
@@ -5254,6 +5272,10 @@ def _load_task_field_event_heads(
     for row in rows:
         aggregate_id = row["aggregate_id"]
         candidate = dict(row)
+        # See _build_task_field_event_heads: excluded during head selection so
+        # a bookkeeping event cannot shadow the authoring event beneath it.
+        if _is_bookkeeping_event(candidate):
+            continue
         current = heads.get(aggregate_id)
         if current is None or _event_sort_key(
             candidate.get("event_ts"),
@@ -5307,16 +5329,17 @@ def _resolve_task_status_authority(
         )
 
     seen_events: set[str] = set()
-    # INVARIANT: any status event carrying a local HLC becomes the exported
-    # authority for that task. Write one only when this machine really is the
-    # author -- a merge absorbs someone else's authorship and must stamp the
-    # authority it accepted, or the export claims a write that never happened
-    # here and reverts the peer's next edit.
+    # INVARIANT: only an event that ACTUALLY AUTHORED the value may become the
+    # exported authority. Bookkeeping events (merge/repair) record that a
+    # reconciliation happened and carry a fresh local clock, so admitting them
+    # let the local machine claim a write it never made. Both head builders
+    # already exclude them; this covers the event_by_id candidate, which
+    # bypasses both, and any future caller.
     for event in (
         (event_by_id or {}).get(source_event_id) if source_event_id else None,
         event_head,
     ):
-        if not event:
+        if not event or _is_bookkeeping_event(event):
             continue
         event_id = str(event.get("event_id") or "")
         if event_id and event_id in seen_events:
@@ -6282,9 +6305,6 @@ def merge_import_tasks(
 
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
-            # Authority absorbed from the remote side, per field, so the audit
-            # event below can be stamped with it instead of minting a local one.
-            merged_authority: dict[str, tuple[str, str, int]] = {}
             materialization_repairs: set[str] = set()
             local_status_state = local_status_authority.get(local_id)
             local_status_value = _normalize_task_status_value(
@@ -6523,17 +6543,6 @@ def merge_import_tasks(
                     )
                     if local_val != remote_val:
                         fields_to_update[field] = remote_val
-                        # Remember whose write this is. Guarded on remote_order
-                        # because a legacy peer without a packed clock yields 0,
-                        # and passing logical_clock=0 makes record_memory_event
-                        # fall back to a fresh local clock while machine_id and
-                        # event_ts would stay remote -- an incoherent hybrid.
-                        if remote_order:
-                            merged_authority[field] = (
-                                remote_ts,
-                                remote_by,
-                                remote_order,
-                            )
                         semantic_update_timestamps.append(remote_ts or fallback_ts)
                         updated_fields += 1
                         record_memory_conflict(
@@ -6629,29 +6638,20 @@ def merge_import_tasks(
                             *materialization_repairs,
                         }:
                             continue
-                        # A merge absorbs a peer's write; it does not author
-                        # one. Stamping the ledger row with the winning remote
-                        # HLC stops this event from outranking the authority
-                        # that produced it and being re-exported as a newer
-                        # local write, which reverts the peer's next edit.
-                        # None reproduces the pre-fix behaviour exactly.
-                        authority = merged_authority.get(merged_field)
+                        # Bookkeeping: this records THAT the merge happened.
+                        # It keeps a fresh local clock deliberately -- stamping
+                        # it with the absorbed remote (machine_id, clock) would
+                        # collide with the peer's own event, which the pull has
+                        # already imported, and violate the unique index on
+                        # memory_events(machine_id, logical_clock). It cannot
+                        # claim authority any more because the resolver skips
+                        # bookkeeping event types.
                         record_memory_event(
                             conn,
                             event_type="merge",
                             aggregate_kind="task",
                             aggregate_id=local_id,
                             field_name=merged_field,
-                            machine_id=authority[1] if authority else None,
-                            event_ts=authority[0] if authority else None,
-                            logical_clock=authority[2] if authority else None,
-                            # Marks authorship the local machine absorbed
-                            # rather than originated, so a peer receiving an
-                            # event that claims its own authorship can tell
-                            # the two apart.
-                            payload={"synthetic_authority": True}
-                            if authority
-                            else None,
                             new_value=str(safe_fields[merged_field])
                             if safe_fields[merged_field] is not None
                             else None,

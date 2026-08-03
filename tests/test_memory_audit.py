@@ -423,3 +423,52 @@ def test_maybe_run_memory_audit_respects_schedule(conn):
 
     assert first["audit_version"] == "memory_audit_v2"
     assert second["status"] == "skipped_due"
+
+
+def test_repair_event_is_not_export_authority(conn):
+    """A repair records that a replay happened; it must not become authority.
+
+    Its fresh local clock used to outrank the peer-authored head it replayed,
+    so the export claimed a local write and the peer's closure was reverted.
+    """
+    from db_utils import (
+        MACHINE_ID,
+        _pack_logical_clock,
+        canonicalize_exported_task_statuses,
+    )
+
+    ts = "2026-03-31T08:00:00+00:00"
+    head_ts = "2026-04-01T09:00:00+00:00"
+    head_clock = _pack_logical_clock(1_760_000_000_000, 4)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, section, type, "
+        "created_at, updated_at) VALUES ('task-repair-authority', 'Repair me', "
+        "'not_started', 'medium', 'inbox', 'task', ?, ?)",
+        (ts, ts),
+    )
+    conn.execute(
+        "INSERT INTO memory_events (event_id, event_type, aggregate_kind, "
+        "aggregate_id, field_name, machine_id, tool_name, logical_clock, "
+        "event_ts, new_value) "
+        "VALUES ('peer-status-1','task_field_set','task','task-repair-authority',"
+        "'status','fedora','peer.test',?,?,'done')",
+        (head_clock, head_ts),
+    )
+
+    result = rebuild_task_from_events(conn, "task-repair-authority", repair=True)
+    assert "status" in result["repaired_fields"]
+
+    repair_event = conn.execute(
+        "SELECT machine_id, logical_clock FROM memory_events "
+        "WHERE aggregate_id='task-repair-authority' AND field_name='status' "
+        "AND event_type='repair'"
+    ).fetchone()
+    assert repair_event is not None, "bookkeeping is still recorded"
+    assert repair_event["machine_id"] == MACHINE_ID
+    assert repair_event["logical_clock"] > head_clock
+
+    exported = [{"id": "task-repair-authority", "status": "done", "_field_ts": {}}]
+    canonicalize_exported_task_statuses(conn, exported)
+    entry = exported[0]["_field_ts"]["status"]
+    assert entry[1] == "fedora", "repair must not become the exported authority"
+    assert entry[2] == head_clock
