@@ -4,6 +4,29 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.13.4
+
+### Fixed
+
+- **Bookkeeping events are no longer export authority.** `merge` and `repair`
+  events record *that* a reconciliation happened; they do not author a value.
+  The status-authority resolver nevertheless ranked them alongside real writes,
+  so a bookkeeping event carrying a fresh local clock outranked the write it was
+  describing and the export claimed authorship this machine never had — silently
+  reverting a peer's edit on the next sync. They are now excluded while the
+  event head is chosen (both the local and the remote builder) and again in the
+  resolver, which also covers lookups by `source_event_id`. Excluding them only
+  in the resolver would let a bookkeeping event win head selection and take the
+  authoring event ranked below it down with it.
+- **Withdrawn: stamping merge events with absorbed authority (v3.13.3).** That
+  approach wrote a foreign `(machine_id, logical_clock)` pair, which collides
+  with the peer's own event under the unique index on
+  `memory_events(machine_id, logical_clock)` — reachable in production because a
+  pull imports peer events before merging tasks. Reproduced for `notes`, `title`
+  and `priority`; `status` was immune only because a peer status event in the
+  ledger makes the field a materialization repair, so no merge event is written.
+  Bookkeeping events go back to fresh local clocks, which is now harmless.
+
 ## v3.13.3
 
 ### Fixed
