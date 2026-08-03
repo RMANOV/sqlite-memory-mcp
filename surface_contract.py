@@ -225,6 +225,12 @@ TASK_HYDRATION_SURFACE_CONTRACT: dict[str, dict[str, bool]] = {
         "import": True,
         "bootstrap": True,
     },
+    "_link_tombstones": {
+        "bridge_index": False,
+        "bridge_task_file": True,
+        "import": True,
+        "bootstrap": True,
+    },
     "_tombstone": {
         "bridge_index": True,
         "bridge_task_file": True,

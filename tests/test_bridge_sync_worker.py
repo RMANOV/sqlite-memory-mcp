@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import timedelta
 
 import pytest
 
@@ -1430,7 +1431,7 @@ def test_bridge_sync_worker_merges_ui_profile_and_pushes_without_db_changes(
     assert any(args[0] == "commit" for args in git_calls)
 
 
-def test_bridge_sync_worker_records_last_push_at_from_payload_timestamp(
+def test_bridge_sync_worker_records_last_push_at_from_export_snapshot(
     tmp_path, monkeypatch
 ):
     db_path = str(tmp_path / "memory.db")
@@ -1444,11 +1445,35 @@ def test_bridge_sync_worker_records_last_push_at_from_payload_timestamp(
     def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
         return _cp(args)
 
+    real_stream = bridge_sync_worker.write_memory_events_file_streaming
+    # Pin the snapshot so the watermark can be asserted by equality rather than
+    # inferred from ordering.
+    snapshot_at = "2026-08-04T10:00:00+00:00"
+    monkeypatch.setattr(bridge_sync_worker, "now_iso", lambda: snapshot_at)
+
+    def make_payload_time_later(conn, repo_dir):
+        monkeypatch.setattr(
+            bridge_sync_worker,
+            "now_iso",
+            lambda: "2099-01-01T00:00:00+00:00",
+        )
+        return real_stream(conn, repo_dir)
+
     monkeypatch.setattr(
         bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
     )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
     monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
     monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "write_memory_events_file_streaming",
+        make_payload_time_later,
+    )
     monkeypatch.setattr(
         bridge_sync_worker.subprocess,
         "run",
@@ -1467,7 +1492,335 @@ def test_bridge_sync_worker_records_last_push_at_from_payload_timestamp(
         ).fetchone()["value"]
 
     assert result["pushed"] is True
-    assert stored == payload["pushed_at"]
+    assert stored < payload["pushed_at"]
+    # The exact invariant, not just the ordering: the watermark is the export
+    # snapshot rewound by the margin. Catches a silently removed margin.
+    assert (
+        stored
+        == (
+            db_utils.parse_iso_datetime_for_compare(snapshot_at)
+            - timedelta(seconds=bridge_sync_worker.INCREMENTAL_WATERMARK_MARGIN_SECONDS)
+        ).isoformat()
+    )
+
+
+def test_bridge_sync_worker_reexports_change_written_after_export_snapshot(
+    tmp_path, monkeypatch
+):
+    """A write after the DB snapshot must wake the next incremental push."""
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        now = db_utils.now_iso()
+        conn.execute(
+            "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("task-1", "before", now, now),
+        )
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        return _cp(args)
+
+    real_stream = bridge_sync_worker.write_memory_events_file_streaming
+    mutation_at = {}
+
+    def write_then_mutate(conn, repo_dir):
+        with sqlite3.connect(db_path, isolation_level=None) as writer:
+            changed_at = db_utils.now_iso()
+            writer.execute(
+                "UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?",
+                ("after", changed_at, "task-1"),
+            )
+        mutation_at["value"] = changed_at
+        # This is called after the export snapshot and before payload construction.
+        monkeypatch.setattr(
+            bridge_sync_worker,
+            "now_iso",
+            lambda: "2099-01-01T00:00:00+00:00",
+        )
+        return real_stream(conn, repo_dir)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker, "write_memory_events_file_streaming", write_then_mutate
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    first = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        stored = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+        ).fetchone()[0]
+
+    assert first["pushed"] is True
+    assert payload["tasks"][0]["title"] == "before"
+    assert stored < mutation_at["value"]
+    assert stored < payload["pushed_at"]
+
+    second = bridge_sync_worker.main(
+        force=False, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+
+    assert second.get("skipped") is not True
+    assert second["pushed"] is True
+
+
+def test_bridge_sync_worker_watermark_is_rewound_behind_the_export_snapshot(
+    tmp_path, monkeypatch
+):
+    """A write stamped just before the snapshot but committed after it survives.
+
+    Such a row is invisible to the export that is running, and without the
+    margin it also sorts below the watermark that export writes — so it would
+    never be exported by any later run either.
+    """
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    first = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert first["pushed"] is True
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+        ).fetchone()["value"]
+    margin = timedelta(seconds=bridge_sync_worker.INCREMENTAL_WATERMARK_MARGIN_SECONDS)
+    # Half a margin past the recorded watermark is half a margin BEFORE the
+    # export snapshot it was rewound from. Deliberately no assertion on this
+    # value: with no margin it collapses onto the watermark, and the test must
+    # then fail on the behaviour below rather than on its own setup.
+    raced_at = (
+        db_utils.parse_iso_datetime_for_compare(stored) + margin / 2
+    ).isoformat()
+
+    # The writer that lost the race: stamped inside the margin, committed late.
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("raced-task", "raced", raced_at, raced_at),
+        )
+
+    second = bridge_sync_worker.main(
+        force=False, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert second.get("skipped") is not True
+    assert second["pushed"] is True
+    exported = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+    assert "raced-task" in {t["id"] for t in exported["tasks"]}
+
+
+def test_bridge_sync_worker_audit_state_alone_never_triggers_a_push(
+    tmp_path, monkeypatch
+):
+    """The sync's own bookkeeping row must not schedule the next sync.
+
+    ``memory_audit_state`` is written by the sync and re-imported from its own
+    payload, always stamped inside the watermark margin — as a trigger it would
+    queue a redundant full push, ledger and all, after every real one. It stays
+    a counter (diagnostics) and stays in the payload; it just stops voting.
+    """
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    first = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert first["pushed"] is True
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+        ).fetchone()["value"]
+        summary = db_utils.bridge_change_summary(conn, stored)
+    # (a) The self-write really is inside the window — otherwise this test would
+    # pass for the wrong reason — and it really is the only thing in there.
+    assert summary["changed_memory_audit_state"] == 1
+    assert [
+        name
+        for name, count in summary.items()
+        if count and name not in bridge_sync_worker._NON_TRIGGER_COUNTERS
+    ] == []
+
+    second = bridge_sync_worker.main(
+        force=False, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert second.get("skipped") is True
+
+    # (c) Excluded from the push decision, never from the payload: a real change
+    # must still carry the audit state to peers.
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        now = db_utils.now_iso()
+        conn.execute(
+            "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("real-change", "real", now, now),
+        )
+    third = bridge_sync_worker.main(
+        force=False, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert third.get("skipped") is not True
+    assert third["pushed"] is True
+    audit_state = json.loads(
+        (bridge_dir / "extended_memory" / "memory_audit_state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert audit_state, "audit state must still travel in the export payload"
+
+
+def test_bridge_sync_worker_wakes_on_collaborator_removal_marker(tmp_path, monkeypatch):
+    """A hard-deleted collaborator leaves no timestamp for the fast path.
+
+    ``team_manifest`` is generated from row *presence*, so an ``added_at``
+    counter can never see a removal. The dirty marker written in the same
+    transaction as the DELETE is the only signal, and this asserts the
+    counterfactual too: without it the run really does skip.
+    """
+    db_path = str(tmp_path / "memory.db")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    init_db(db_path)
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        # Dated well outside the watermark margin, so the un-marked run below
+        # really does skip and the counterfactual has meaning.
+        conn.execute(
+            "INSERT INTO collaborators (github_user, trust_level, added_at) "
+            "VALUES ('alice', 'read_write', '2026-01-01T00:00:00+00:00')"
+        )
+
+    def fake_git_run(repo_dir, *args, timeout=30):
+        return _cp(args)
+
+    def fake_git_retry(repo_dir, *args, max_retries=3, timeout=30):
+        return _cp(args)
+
+    monkeypatch.setattr(
+        bridge_sync_worker, "ensure_bridge_repo_ready", lambda repo: (True, None)
+    )
+    monkeypatch.setattr(
+        bridge_sync_worker,
+        "ensure_bridge_git_identity",
+        lambda repo: {"changed": False},
+    )
+    monkeypatch.setattr(bridge_sync_worker, "git_run", fake_git_run)
+    monkeypatch.setattr(bridge_sync_worker, "git_retry", fake_git_retry)
+    monkeypatch.setattr(
+        bridge_sync_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    def _manifest():
+        payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+        return payload["team_manifest"]["collaborators"]
+
+    first = bridge_sync_worker.main(
+        force=True, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert first["pushed"] is True
+    assert _manifest() == ["alice"]
+
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'last_push_at'"
+        ).fetchone()["value"]
+        conn.execute("DELETE FROM collaborators WHERE github_user = 'alice'")
+        # The removal is invisible to every row-presence counter: this is the
+        # causal claim, asserted where it is deterministic. (Whether the run
+        # happens to skip also depends on unrelated churn, so it is not the
+        # assertion to hang this on.)
+        assert (
+            db_utils.bridge_change_summary(conn, stored)["changed_collaborators"] == 0
+        )
+
+        db_utils.mark_bridge_payload_dirty(conn, db_utils.now_iso())
+        assert (
+            db_utils.bridge_change_summary(conn, stored)[
+                "changed_bridge_payload_marker"
+            ]
+            == 1
+        )
+
+    marked = bridge_sync_worker.main(
+        force=False, bridge_repo=str(bridge_dir), db_path=db_path
+    )
+    assert marked.get("skipped") is not True
+    assert marked["pushed"] is True
+    assert _manifest() == []
 
 
 def test_bridge_sync_worker_aborts_push_when_task_merge_raises_db_lock(

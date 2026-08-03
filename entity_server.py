@@ -17,6 +17,8 @@ from db_utils import (
     fts_query as _fts_query,
     tokenize_for_similarity as _tokenize,
     fts_sync_entity as _fts_sync,
+    now_iso,
+    record_task_entity_link_tombstone,
     setup_logger,
     TaskDAO,
 )
@@ -431,6 +433,19 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
             "FROM task_entity_links WHERE entity_id = ?",
             (src_id,),
         ).fetchall()
+        merge_link_at = now_iso()
+        for link in src_links:
+            # The source entity is deleted below.  Preserve each old exported
+            # name as a link tombstone before the FK cascade can erase it.
+            record_task_entity_link_tombstone(
+                conn,
+                task_id=link["task_id"],
+                entity_name=source["name"],
+                link_type=link["link_type"],
+                score=link["score"],
+                created_at=link["created_at"],
+                deleted_at=merge_link_at,
+            )
         tgt_linked_task_ids = {
             r["task_id"]
             for r in conn.execute(
@@ -445,7 +460,7 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
                     tgt_id,
                     link_type=link["link_type"],
                     score=link["score"],
-                    created_at=link["created_at"],
+                    created_at=merge_link_at,
                 )
 
         # 4. Delete source entity (CASCADE cleans orphan observations/relations/links)
