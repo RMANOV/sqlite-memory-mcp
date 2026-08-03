@@ -1452,6 +1452,24 @@ _MIGRATIONS = [
         "prune orphan task_field_versions rows (v3.13.2)",
     ),
     (
+        # A future-dated packed HLC outranks every legitimate write forever,
+        # and _clamp_field_version_clock only clamps in memory for one merge,
+        # so the row stays poisoned on disk and is re-exported to every peer.
+        # 65536 == 1 << _HLC_COUNTER_BITS; the modulo keeps the counter, so
+        # intra-machine ordering survives. The +5s tolerance mirrors
+        # _clamp_field_version_clock exactly -- one rule, no threshold drift.
+        "SELECT 1 WHERE NOT EXISTS ("
+        "SELECT 1 FROM task_field_versions "
+        "WHERE updated_order > "
+        "((CAST(strftime('%s','now') AS INTEGER) + 5) * 1000) * 65536)",
+        "UPDATE task_field_versions "
+        "SET updated_order = (CAST(strftime('%s','now') AS INTEGER) * 1000) * 65536 "
+        "+ (updated_order % 65536) "
+        "WHERE updated_order > "
+        "((CAST(strftime('%s','now') AS INTEGER) + 5) * 1000) * 65536",
+        "clamp future task_field_versions.updated_order clocks (v3.13.3)",
+    ),
+    (
         "SELECT 1 FROM pragma_table_info('tasks') WHERE name='reminder_at'",
         "ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT NULL",
         "tasks.reminder_at column (v2.1.0)",
