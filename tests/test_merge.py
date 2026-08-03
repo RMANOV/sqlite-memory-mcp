@@ -27,8 +27,6 @@ from db_utils import (
     _pack_logical_clock,
     _store_task_field_version,
     canonicalize_exported_task_statuses,
-    export_memory_events,
-    import_memory_events,
     merge_import_tasks,
     now_iso,
     upsert_field_versions,
