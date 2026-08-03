@@ -4,6 +4,27 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.13.3
+
+### Fixed
+
+- **Merge events no longer claim local authorship.** Absorbing a peer's field
+  write recorded an audit event stamped with a fresh local logical clock. That
+  synthetic event then outranked the field version it came from, so the export
+  advertised the local machine as the author of a value it never wrote and the
+  peer's next genuine edit was silently reverted on the next sync. The event is
+  now stamped with the authority it absorbed, and carries
+  `payload.synthetic_authority` so a peer receiving an event that claims its own
+  authorship can tell it apart from the original. Peers that send no packed
+  clock keep the previous behaviour unchanged. The effect was status-only,
+  because only `status` is canonicalised on export.
+- **Future field-version clocks are clamped at startup.** A future-dated packed
+  logical clock in `task_field_versions.updated_order` outranks every later
+  write permanently; the existing clamp applied only in memory for the duration
+  of a single merge, so the row stayed poisoned on disk, warned on every sync,
+  and was re-exported to every peer. Startup now pulls such rows back while
+  preserving their counter, using the same tolerance as the runtime clamp.
+
 ## v3.13.2
 
 ### Fixed

@@ -1,11 +1,15 @@
-"""Task field-version referential-integrity regressions."""
+"""Task field-version referential-integrity and clock-clamp regressions."""
 
 from __future__ import annotations
 
 import sqlite3
+import time
 
 from db_utils import get_conn
 from schema import init_db
+
+_COUNTER_BITS = 16
+_COUNTER_MASK = (1 << _COUNTER_BITS) - 1
 
 
 def _insert_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -15,12 +19,25 @@ def _insert_task(conn: sqlite3.Connection, task_id: str) -> None:
     )
 
 
-def _insert_version(conn: sqlite3.Connection, task_id: str, field_name: str) -> None:
+def _insert_version(
+    conn: sqlite3.Connection,
+    task_id: str,
+    field_name: str,
+    updated_order: int = 0,
+) -> None:
     conn.execute(
         "INSERT INTO task_field_versions "
-        "(task_id,field_name,updated_at,updated_by) VALUES (?,?,?,?)",
-        (task_id, field_name, "2026-01-01T00:00:00Z", "test"),
+        "(task_id,field_name,updated_at,updated_by,updated_order) VALUES (?,?,?,?,?)",
+        (task_id, field_name, "2026-01-01T00:00:00Z", "test", updated_order),
     )
+
+
+def _order_of(conn: sqlite3.Connection, task_id: str, field_name: str) -> int:
+    return conn.execute(
+        "SELECT updated_order FROM task_field_versions "
+        "WHERE task_id=? AND field_name=?",
+        (task_id, field_name),
+    ).fetchone()[0]
 
 
 def test_init_db_prunes_only_orphan_task_field_versions(tmp_path):
@@ -70,3 +87,56 @@ def test_configured_connection_cascades_task_field_versions(tmp_path):
         ).fetchone()[0]
 
     assert remaining == 0
+
+
+def test_init_db_clamps_future_field_version_clocks(tmp_path):
+    """A future packed HLC must be pulled back to now, keeping its counter.
+
+    Left alone it outranks every legitimate write forever and is re-exported
+    to every peer, so `_clamp_field_version_clock`'s in-memory clamp never
+    stops firing. The boundary row guards the +5s tolerance: if someone
+    narrows it later, this test fails instead of silently clamping rows the
+    runtime clamp still considers sane.
+    """
+    db_path = tmp_path / "future-field-version-clocks.db"
+    init_db(str(db_path))
+
+    now_ms = int(time.time() * 1000)
+    future_order = ((now_ms + 30 * 365 * 24 * 3600 * 1000) << _COUNTER_BITS) | 7
+    past_order = ((now_ms - 86_400_000) << _COUNTER_BITS) | 3
+    boundary_order = ((now_ms + 3_000) << _COUNTER_BITS) | 11
+
+    conn = sqlite3.connect(db_path)
+    _insert_task(conn, "clock-task")
+    _insert_version(conn, "clock-task", "title", future_order)
+    _insert_version(conn, "clock-task", "status", past_order)
+    _insert_version(conn, "clock-task", "notes", boundary_order)
+    conn.commit()
+    conn.close()
+
+    init_db(str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    clamped = _order_of(conn, "clock-task", "title")
+    still_future = conn.execute(
+        "SELECT COUNT(*) FROM task_field_versions WHERE updated_order > "
+        "((CAST(strftime('%s','now') AS INTEGER) + 5) * 1000) * 65536"
+    ).fetchone()[0]
+
+    assert clamped < future_order
+    assert (clamped >> _COUNTER_BITS) <= now_ms + 5_000
+    assert clamped & _COUNTER_MASK == 7, "counter must survive the clamp"
+    assert _order_of(conn, "clock-task", "status") == past_order
+    assert _order_of(conn, "clock-task", "notes") == boundary_order, (
+        "rows inside the +5s tolerance must be left alone"
+    )
+    assert still_future == 0
+    conn.close()
+
+    init_db(str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    assert _order_of(conn, "clock-task", "title") == clamped, (
+        "guard must stop firing once no future row remains"
+    )
+    conn.close()

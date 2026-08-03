@@ -21,10 +21,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from db_utils import (
+    MACHINE_ID,
     _decode_logical_clock,
     _field_version_sort_key,
     _pack_logical_clock,
     _store_task_field_version,
+    canonicalize_exported_task_statuses,
+    export_memory_events,
+    import_memory_events,
     merge_import_tasks,
     now_iso,
     upsert_field_versions,
@@ -33,13 +37,7 @@ from db_utils import (
 # ── Fixture ───────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def conn(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    c = sqlite3.connect(db_path, isolation_level=None)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    c.executescript("""
+_SCHEMA = """
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT,
             status TEXT DEFAULT 'not_started', section TEXT DEFAULT 'inbox',
@@ -83,7 +81,20 @@ def conn(tmp_path):
             machine_id TEXT PRIMARY KEY, last_clock INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
-    """)
+"""
+
+
+def _make_conn(db_path):
+    c = sqlite3.connect(str(db_path), isolation_level=None)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    c.executescript(_SCHEMA)
+    return c
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = _make_conn(tmp_path / "test.db")
     yield c
     c.close()
 
@@ -1804,3 +1815,208 @@ def test_merge_records_conflict_objects(conn):
     # review, so it is recorded resolved with a resolution timestamp.
     assert row["status"] == "resolved"
     assert row["resolved_at"] is not None
+
+
+# ── Merge authority: a merge absorbs a write, it does not author one ─────
+
+
+_REMOTE_TS = "2026-07-20T10:00:00+00:00"
+_LOCAL_TS = "2026-07-19T10:00:00+00:00"
+
+
+def _remote_status_win(task_id, remote_order, *, with_null_fill=False):
+    """Remote payload whose status field outranks the local one."""
+    # 5th element carries the value: without it the legacy-value guard keeps
+    # the local field and no merge happens at all.
+    field_ts = {
+        "status": [_REMOTE_TS, "fedora", remote_order, "fedora-status-1", "done"]
+    }
+    remote = {
+        "id": task_id,
+        "title": "Authority",
+        "status": "done",
+        "type": "task",
+        "created_at": _LOCAL_TS,
+        "updated_at": _REMOTE_TS,
+        "_field_ts": field_ts,
+    }
+    if with_null_fill:
+        # Deliberately NO _field_ts entry: with one, the LWW loop claims the
+        # field and it never reaches the NULL-fill path we want to exercise.
+        remote["description"] = "adopted into a local NULL"
+    return remote
+
+
+def _seed_local(conn, task_id, local_order):
+    _ensure_field_event_columns(conn)
+    _insert_task(conn, task_id, status="in_progress", updated_at=_LOCAL_TS)
+    _store_task_field_version(
+        conn,
+        task_id,
+        "status",
+        updated_at=_LOCAL_TS,
+        updated_by=MACHINE_ID,
+        old_value=None,
+        new_value="in_progress",
+        updated_order=local_order,
+        source_event_id="local-status-1",
+    )
+
+
+def _merge_events(conn, task_id, field):
+    return conn.execute(
+        "SELECT * FROM memory_events WHERE aggregate_id=? AND field_name=? "
+        "AND event_type='merge'",
+        (task_id, field),
+    ).fetchall()
+
+
+def test_merge_event_carries_remote_field_authority(conn):
+    """The audit event must carry the authority it absorbed, not a fresh local one.
+
+    Before the fix it was stamped with a fresh local HLC, which then outranked
+    the remote field version on export and reverted the peer's next edit.
+    """
+    task_id = "task-authority"
+    local_order = _pack_logical_clock(1_750_000_000_000, 1)
+    remote_order = _pack_logical_clock(1_760_000_000_000, 4)
+    _seed_local(conn, task_id, local_order)
+
+    merge_import_tasks(
+        conn,
+        [_remote_status_win(task_id, remote_order, with_null_fill=True)],
+        import_content=True,
+    )
+
+    rows = _merge_events(conn, task_id, "status")
+    assert len(rows) == 1
+    assert rows[0]["machine_id"] == "fedora"
+    assert rows[0]["logical_clock"] == remote_order
+    assert rows[0]["event_ts"] == _REMOTE_TS
+    assert '"synthetic_authority": true' in (rows[0]["payload_json"] or "")
+
+    # NULL-fill is a LOCAL decision (adopting content into a local NULL), so it
+    # must keep local authorship and stay out of merged_authority.
+    filled = _merge_events(conn, task_id, "description")
+    assert len(filled) == 1
+    assert filled[0]["machine_id"] == MACHINE_ID
+    assert filled[0]["payload_json"] in (None, "")
+
+
+def test_merge_does_not_export_local_authority_for_absorbed_status(conn):
+    """The regression that caused the incident: export claimed a local write."""
+    task_id = "task-export-authority"
+    local_order = _pack_logical_clock(1_750_000_000_000, 1)
+    remote_order = _pack_logical_clock(1_760_000_000_000, 4)
+    _seed_local(conn, task_id, local_order)
+
+    merge_import_tasks(conn, [_remote_status_win(task_id, remote_order)])
+
+    exported = [
+        {"id": task_id, "status": _task(conn, task_id)["status"], "_field_ts": {}}
+    ]
+    canonicalize_exported_task_statuses(conn, exported)
+    entry = exported[0]["_field_ts"]["status"]
+
+    assert exported[0]["status"] == "done"
+    assert entry[1] == "fedora", "export must not claim local authorship"
+    assert entry[2] == remote_order
+
+
+def test_merge_event_keeps_local_clock_for_legacy_peer_without_order(conn):
+    """A legacy peer sends no packed clock; stamping it would be incoherent."""
+    task_id = "task-legacy-peer"
+    _ensure_field_event_columns(conn)
+    _insert_task(conn, task_id, status="in_progress", updated_at=_LOCAL_TS)
+
+    remote = {
+        "id": task_id,
+        "title": "Authority",
+        "status": "done",
+        "type": "task",
+        "created_at": _LOCAL_TS,
+        "updated_at": _REMOTE_TS,
+        # Carries the value (so the legacy-value guard lets it through) but
+        # no packed clock: updated_order parses to 0.
+        "_field_ts": {"status": [_REMOTE_TS, "legacy-peer", 0, None, "done"]},
+    }
+    merge_import_tasks(conn, [remote])
+
+    rows = _merge_events(conn, task_id, "status")
+    assert len(rows) == 1
+    assert rows[0]["machine_id"] == MACHINE_ID
+    assert rows[0]["logical_clock"] > 0
+    assert rows[0]["payload_json"] in (None, "")
+
+
+def test_absorbed_authority_event_round_trips_to_peer_without_inverting(
+    conn, tmp_path
+):
+    """Export/import the absorbed-authority event back to the machine it names.
+
+    export_memory_events has no machine filter and the peer dedupes on
+    event_id, so the peer receives a SECOND event claiming its own authorship
+    with a clock it already used. Value and clock are identical, so the
+    resolved authority must not move.
+    """
+    task_id = "task-round-trip"
+    local_order = _pack_logical_clock(1_750_000_000_000, 1)
+    remote_order = _pack_logical_clock(1_760_000_000_000, 4)
+    _seed_local(conn, task_id, local_order)
+    merge_import_tasks(conn, [_remote_status_win(task_id, remote_order)])
+
+    # The peer already holds its own original write for the same field.
+    peer = _make_conn(tmp_path / "peer.db")
+    _ensure_field_event_columns(peer)
+    _insert_task(peer, task_id, status="done", updated_at=_REMOTE_TS)
+    _store_task_field_version(
+        peer,
+        task_id,
+        "status",
+        updated_at=_REMOTE_TS,
+        updated_by="fedora",
+        old_value=None,
+        new_value="done",
+        updated_order=remote_order,
+        source_event_id="fedora-status-1",
+    )
+    peer.execute(
+        "INSERT INTO memory_events (event_id, event_type, aggregate_kind, "
+        "aggregate_id, field_name, machine_id, logical_clock, event_ts, new_value) "
+        "VALUES ('fedora-status-1','task_field_set','task',?,'status','fedora',?,?,'done')",
+        (task_id, remote_order, _REMOTE_TS),
+    )
+
+    before = [
+        {"id": task_id, "status": _task(peer, task_id)["status"], "_field_ts": {}}
+    ]
+    canonicalize_exported_task_statuses(peer, before)
+
+    import_memory_events(peer, export_memory_events(conn))
+
+    after = [
+        {"id": task_id, "status": _task(peer, task_id)["status"], "_field_ts": {}}
+    ]
+    canonicalize_exported_task_statuses(peer, after)
+
+    # (в) Deliberately NOT asserting event_id: both events share the sort key
+    # (1, logical_clock, machine_id) and the head is picked with a strict `>`
+    # over unordered SQL rows, so which id wins is not deterministic. Value,
+    # machine_id and clock are identical in both, which is what LWW consumes.
+    assert after[0]["status"] == before[0]["status"] == "done"
+    assert after[0]["_field_ts"]["status"][1] == "fedora"
+    assert after[0]["_field_ts"]["status"][2] == remote_order
+
+    synthetic = peer.execute(
+        "SELECT payload_json FROM memory_events "
+        "WHERE aggregate_id=? AND field_name='status' AND event_type='merge'",
+        (task_id,),
+    ).fetchall()
+    assert len(synthetic) == 1
+    assert '"synthetic_authority": true' in (synthetic[0]["payload_json"] or "")
+
+    original = peer.execute(
+        "SELECT payload_json FROM memory_events WHERE event_id='fedora-status-1'"
+    ).fetchone()
+    assert original["payload_json"] in (None, "")
+    peer.close()
