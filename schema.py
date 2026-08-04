@@ -233,6 +233,21 @@ CREATE TABLE IF NOT EXISTS task_entity_links (
 );
 CREATE INDEX IF NOT EXISTS idx_tel_entity ON task_entity_links(entity_id);
 
+-- A link removal must remain transportable after the live link row is gone.
+-- The tombstone is keyed by the stable exported entity name so it survives
+-- entity-id differences between bridge peers.
+CREATE TABLE IF NOT EXISTS task_entity_link_tombstones (
+    task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    entity_name TEXT NOT NULL,
+    link_type  TEXT NOT NULL DEFAULT 'manual',
+    score      REAL DEFAULT NULL,
+    created_at TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, entity_name)
+);
+CREATE INDEX IF NOT EXISTS idx_tel_tombstone_task
+    ON task_entity_link_tombstones(task_id, deleted_at);
+
 CREATE TABLE IF NOT EXISTS entity_aliases (
     entity_id        INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     alias            TEXT    NOT NULL,
@@ -1500,6 +1515,24 @@ _MIGRATIONS = [
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tel_entity'",
         "CREATE INDEX idx_tel_entity ON task_entity_links(entity_id)",
         "idx_tel_entity index (v2.2.0)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_entity_link_tombstones'",
+        "CREATE TABLE task_entity_link_tombstones ("
+        "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
+        "entity_name TEXT NOT NULL, "
+        "link_type TEXT NOT NULL DEFAULT 'manual', "
+        "score REAL DEFAULT NULL, "
+        "created_at TEXT NOT NULL, "
+        "deleted_at TEXT NOT NULL, "
+        "PRIMARY KEY (task_id, entity_name))",
+        "task_entity_link_tombstones table (v3.13.5)",
+    ),
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tel_tombstone_task'",
+        "CREATE INDEX idx_tel_tombstone_task "
+        "ON task_entity_link_tombstones(task_id, deleted_at)",
+        "idx_tel_tombstone_task index (v3.13.5)",
     ),
     (
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_attachments'",

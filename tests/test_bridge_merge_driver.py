@@ -845,3 +845,184 @@ def test_dominating_status_clock_strictly_outranks_inputs():
     # Must strictly exceed BOTH inputs on the packed sort axis.
     assert order > bmd._packed_order_of(ours, "status")
     assert order > bmd._packed_order_of(theirs, "status")
+
+
+# ── (g) task-entity link union ───────────────────────────────────────────────
+#
+# An unlink travels in its own ``_link_tombstones`` key so a peer on an older
+# build ignores it instead of importing it as a live link. The driver is the
+# git-level second line of defense for that record, exactly as it already is for
+# task tombstones.
+
+
+def _link(name, created_at, deleted_at=None, link_type="manual"):
+    record = {
+        "name": name,
+        "link_type": link_type,
+        "score": None,
+        "created_at": created_at,
+    }
+    if deleted_at is not None:
+        record["deleted_at"] = deleted_at
+    return record
+
+
+def _linked(tid, *records):
+    """Build a task with each record routed into its own wire bucket."""
+    task = _task(tid, _links=[r for r in records if not _deleted(r)])
+    tombstones = [r for r in records if _deleted(r)]
+    if tombstones:
+        task["_link_tombstones"] = tombstones
+    return task
+
+
+def _deleted(record):
+    return isinstance(record, dict) and bool(record.get("deleted_at"))
+
+
+def _merged_links(merged):
+    """Every surviving record, whichever bucket it ended up in."""
+    return {
+        r["name"]: r
+        for r in merged.get("_links", []) + merged.get("_link_tombstones", [])
+    }
+
+
+def test_g_link_union_keeps_both_sides():
+    """Each side's exclusive link must survive — a union, not a replacement."""
+    ours = _collection(_linked("t1", _link("Alpha", "2026-08-01T10:00:00Z")))
+    theirs = _collection(_linked("t1", _link("Beta", "2026-08-02T10:00:00Z")))
+    merged = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
+    assert [record["name"] for record in merged["_links"]] == ["Alpha", "Beta"]
+    assert "_link_tombstones" not in merged
+
+
+def test_g_link_tombstone_beats_older_active():
+    ours = _collection(_linked("t1", _link("Alpha", "2026-08-01T10:00:00Z")))
+    theirs = _collection(
+        _linked("t1", _link("Alpha", "2026-08-01T10:00:00Z", "2026-08-02T10:00:00Z"))
+    )
+    merged = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
+    assert merged["_links"] == []
+    assert merged["_link_tombstones"][0]["deleted_at"] == "2026-08-02T10:00:00Z"
+
+
+def test_g_link_tombstone_wins_equal_timestamp_from_either_side():
+    """Equal clocks must resolve to the deletion no matter which side holds it."""
+    same = "2026-08-02T10:00:00Z"
+    active = _collection(_linked("t1", _link("Alpha", same)))
+    deleted = _collection(_linked("t1", _link("Alpha", same, same)))
+    for ours, theirs in ((active, deleted), (deleted, active)):
+        merged = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
+        records = _merged_links(merged)
+        assert list(records) == ["Alpha"]
+        assert records["Alpha"].get("deleted_at") == same
+
+
+def test_g_unparsable_link_timestamp_ranks_lowest_not_newest():
+    """A corrupt clock must not out-rank a valid tombstone.
+
+    ``_iso_to_epoch_ms`` substitutes ``now()`` for anything it cannot parse, so
+    routing link records through it would let a garbled active record silently
+    reopen a deleted link.
+    """
+    corrupt = _link("Alpha", "not-a-timestamp")
+    valid_tombstone = _link("Alpha", "2026-08-01T10:00:00Z", "2026-08-02T10:00:00Z")
+    assert bmd._link_event_key(corrupt) < bmd._link_event_key(valid_tombstone)
+
+    ours = _collection(_linked("t1", corrupt))
+    theirs = _collection(_linked("t1", valid_tombstone))
+    merged = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
+    assert merged["_link_tombstones"][0]["deleted_at"] == "2026-08-02T10:00:00Z"
+
+
+def test_g_link_merge_ignores_malformed_records():
+    ours = _collection(_task("t1", _links=["not-a-record", {"no": "name"}]))
+    theirs = _collection(_linked("t1", _link("Alpha", "2026-08-02T10:00:00Z")))
+    merged = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
+    assert [record["name"] for record in merged["_links"]] == ["Alpha"]
+
+
+def test_g_missing_tombstone_key_is_not_an_error():
+    """Snapshots written before v3.13.5 carry no ``_link_tombstones`` at all."""
+    ours = _collection(_task("t1", _links=[_link("Alpha", "2026-08-01T10:00:00Z")]))
+    theirs = _collection(_task("t1", _links=[_link("Alpha", "2026-08-02T10:00:00Z")]))
+    merged = _by_id(bmd.reconcile_task_collection(ours, theirs))["t1"]
+    assert merged["_links"][0]["created_at"] == "2026-08-02T10:00:00Z"
+    assert "_link_tombstones" not in merged
+
+
+def test_g_link_tombstone_survives_single_task_file_merge(tmp_path):
+    """The production route: links live in ``tasks/<id>.json``, not index.json."""
+    base = tmp_path / "b.json"
+    ours = tmp_path / "o.json"
+    theirs = tmp_path / "t.json"
+    base.write_text("{}", encoding="utf-8")
+    ours.write_text(
+        json_dumps(
+            _linked(
+                "t1",
+                _link("Alpha", "2026-08-01T10:00:00Z"),
+                _link("Beta", "2026-08-01T11:00:00Z"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    theirs.write_text(
+        json_dumps(
+            _linked(
+                "t1", _link("Alpha", "2026-08-01T10:00:00Z", "2026-08-02T10:00:00Z")
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        bmd.run_merge_driver(str(base), str(ours), str(theirs), single_task=True) == 0
+    )
+
+    records = _merged_links(json_loads(ours.read_text(encoding="utf-8")))
+    assert records["Alpha"]["deleted_at"] == "2026-08-02T10:00:00Z"
+    assert "deleted_at" not in records["Beta"]
+
+
+def test_g_link_tombstone_survives_real_git_merge(git_bridge):
+    repo, git = git_bridge
+    _write(
+        repo,
+        "index.json",
+        _collection(_linked("t1", _link("Alpha", "2026-08-01T10:00:00Z"))),
+    )
+    git("add", "index.json", ".gitattributes")
+    git("commit", "-qm", "base")
+
+    git("checkout", "-q", "-b", "remote")
+    _write(
+        repo,
+        "index.json",
+        _collection(
+            _linked(
+                "t1", _link("Alpha", "2026-08-01T10:00:00Z", "2026-08-02T10:00:00Z")
+            )
+        ),
+    )
+    git("commit", "-qam", "remote unlinks Alpha")
+
+    git("checkout", "-q", "main")
+    _write(
+        repo,
+        "index.json",
+        _collection(
+            _linked(
+                "t1",
+                _link("Alpha", "2026-08-01T10:00:00Z"),
+                _link("Beta", "2026-08-01T11:00:00Z"),
+            )
+        ),
+    )
+    git("commit", "-qam", "local adds Beta")
+    git("merge", "remote", "-m", "merge")
+
+    records = _merged_links(_by_id(_read(repo, "index.json"))["t1"])
+    assert records["Alpha"]["deleted_at"] == "2026-08-02T10:00:00Z"
+    assert "deleted_at" not in records["Beta"]

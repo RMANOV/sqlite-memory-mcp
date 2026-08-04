@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ from db_utils import (
     json_dumps,
     json_loads,
     now_iso,
+    parse_iso_datetime_for_compare,
 )
 
 # git config section/name for the driver. Registered programmatically because
@@ -197,6 +199,68 @@ def _dominating_status_clock(
     return updated_at, MACHINE_ID, dominating_order
 
 
+def _link_event_key(link: dict[str, Any]) -> tuple[datetime, int]:
+    """Return an LWW key for one exported task/entity link record.
+
+    Uses ``parse_iso_datetime_for_compare`` — the *same* comparator the DB-side
+    import path uses — so a git-level merge and a bridge import can never rank
+    the same pair of records differently. It is also fail-closed: a missing or
+    unparsable timestamp sorts as the minimum rather than as "now", which
+    ``_iso_to_epoch_ms`` would have done, letting a corrupt record outrank a
+    valid tombstone.
+    """
+    raw_ts = str(link.get("deleted_at") or link.get("created_at") or "")
+    # A deletion wins an equal timestamp so a stale active record cannot reopen
+    # a link after an external Git merge.
+    return parse_iso_datetime_for_compare(raw_ts), int(bool(link.get("deleted_at")))
+
+
+def _merge_task_links(
+    ours: list[dict[str, Any]] | None, theirs: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """Union task links by exported entity name using the same LWW rule as DB."""
+    chosen: dict[str, dict[str, Any]] = {}
+    for source in (ours or [], theirs or []):
+        if not isinstance(source, list):
+            continue
+        for link in source:
+            if not isinstance(link, dict) or not link.get("name"):
+                continue
+            name = str(link["name"])
+            current = chosen.get(name)
+            if current is None or _link_event_key(link) >= _link_event_key(current):
+                chosen[name] = dict(link)
+    return [chosen[name] for name in sorted(chosen)]
+
+
+_LINK_KEYS = ("_links", "_link_tombstones")
+
+
+def _all_link_records(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Both wire buckets as one list — the LWW rule does not care which."""
+    records: list[dict[str, Any]] = []
+    for key in _LINK_KEYS:
+        value = task.get(key)
+        if isinstance(value, list):
+            records.extend(value)
+    return records
+
+
+def _apply_merged_links(
+    target: dict[str, Any], ours: dict[str, Any], theirs: dict[str, Any]
+) -> None:
+    """Reconcile both link buckets and split the winners back into each."""
+    if not any(key in side for key in _LINK_KEYS for side in (ours, theirs)):
+        return
+    merged = _merge_task_links(_all_link_records(ours), _all_link_records(theirs))
+    target["_links"] = [r for r in merged if not r.get("deleted_at")]
+    tombstones = [r for r in merged if r.get("deleted_at")]
+    if tombstones:
+        target["_link_tombstones"] = tombstones
+    else:
+        target.pop("_link_tombstones", None)
+
+
 # ── core reconcile ──────────────────────────────────────────────────────────
 
 
@@ -245,6 +309,7 @@ def reconcile_task_pair(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[st
             "value": base["status"],
         }
         base["_field_ts"] = merged_fts
+        _apply_merged_links(base, ours, theirs)
         base["updated_at"] = max(base.get("updated_at", "") or "", dom_at)
         return base
 
@@ -262,6 +327,7 @@ def reconcile_task_pair(ours: dict[str, Any], theirs: dict[str, Any]) -> dict[st
         if _field_key(theirs, field) > _field_key(ours, field):
             merged[field] = theirs[field]
     merged["_field_ts"] = merged_fts
+    _apply_merged_links(merged, ours, theirs)
     # Keep the freshest top-level updated_at so downstream consumers see progress.
     merged["updated_at"] = max(
         ours.get("updated_at", "") or "", theirs.get("updated_at", "") or ""

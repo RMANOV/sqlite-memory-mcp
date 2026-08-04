@@ -424,7 +424,18 @@ METADATA_FIELDS = (
 )
 
 CONTENT_FIELDS = ("description", "notes")
-TASK_FILE_HYDRATION_FIELDS = ("_attachments", "_field_ts", "_links", "_tombstone")
+# ``_link_tombstones`` is a SEPARATE wire key rather than a ``deleted_at`` entry
+# inside ``_links``: a peer on an older build imports ``_links`` with
+# INSERT OR IGNORE and would turn the deletion record back into a live link.
+# An unknown key is ignored instead, so the removal simply does not propagate
+# until that peer upgrades.
+TASK_FILE_HYDRATION_FIELDS = (
+    "_attachments",
+    "_field_ts",
+    "_links",
+    "_link_tombstones",
+    "_tombstone",
+)
 
 CONTENT_SHRINK_GUARD_MIN_CHARS = 1000
 CONTENT_SHRINK_GUARD_RATIO = 0.5
@@ -617,7 +628,9 @@ def _log_limits() -> tuple[int, int]:
     """
     return (
         _env_int("SQLITE_MEMORY_LOG_MAX_BYTES", _LOG_MAX_BYTES_DEFAULT, minimum=0),
-        _env_int("SQLITE_MEMORY_LOG_BACKUP_COUNT", _LOG_BACKUP_COUNT_DEFAULT, minimum=1),
+        _env_int(
+            "SQLITE_MEMORY_LOG_BACKUP_COUNT", _LOG_BACKUP_COUNT_DEFAULT, minimum=1
+        ),
     )
 
 
@@ -1114,7 +1127,9 @@ def inspect_database(db_path: str, *, row_counts: bool = True) -> dict[str, Any]
     # never checkpoint it, and must never create one that was not there.
     conn = _connect_readonly(db_path)
     try:
-        quick_check = [str(r[0]) for r in conn.execute("PRAGMA quick_check;").fetchall()]
+        quick_check = [
+            str(r[0]) for r in conn.execute("PRAGMA quick_check;").fetchall()
+        ]
         objects = conn.execute(
             "SELECT type, name FROM sqlite_master "
             "WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY type, name"
@@ -1168,7 +1183,10 @@ def _backup_to(src: sqlite3.Connection, dest_path: str, pages: int) -> None:
 def _prune_stale_incoming(root: Path, now_ts: float) -> None:
     for child in root.glob(f"{_BACKUP_INCOMING_PREFIX}*"):
         try:
-            if child.is_dir() and now_ts - child.stat().st_mtime > _BACKUP_INCOMING_MAX_AGE:
+            if (
+                child.is_dir()
+                and now_ts - child.stat().st_mtime > _BACKUP_INCOMING_MAX_AGE
+            ):
                 shutil.rmtree(child, ignore_errors=True)
         except OSError:
             continue
@@ -1218,7 +1236,9 @@ def _reserve_generation(root: Path, generation: str) -> Path:
     simply stepped around instead of inspected and refused.
     """
     for attempt in range(_BACKUP_COLLISION_LIMIT):
-        candidate = root / (generation if attempt == 0 else f"{generation}-{attempt + 1}")
+        candidate = root / (
+            generation if attempt == 0 else f"{generation}-{attempt + 1}"
+        )
         try:
             candidate.mkdir(mode=_BACKUP_DIR_MODE)
         except FileExistsError:
@@ -2020,6 +2040,32 @@ def _sqlite_has_column(
     # row_factory=sqlite3.Row set or returns plain tuples (bin/task opens a
     # raw connection without row_factory).
     return any(r[1] == column_name for r in rows)
+
+
+BRIDGE_PAYLOAD_DIRTY_AT_KEY = "bridge_payload_dirty_at"
+TASK_ENTITY_LINK_TOMBSTONES_TABLE = "task_entity_link_tombstones"
+
+
+def mark_bridge_payload_dirty(
+    conn: sqlite3.Connection, timestamp: str | None = None
+) -> str | None:
+    """Mark a non-row bridge payload change for the incremental gate.
+
+    Some generated payload sections (for example ``team_manifest``) can change
+    when a source row is removed, so their row-presence timestamp is no longer
+    available to the fast path.  The marker is intentionally not cleared: a
+    successful push advances ``last_push_at`` to its export snapshot and makes
+    the old marker naturally fall out of the next comparison.
+    """
+    if not _sqlite_table_exists(conn, "bridge_meta"):
+        return None
+    ts = timestamp or now_iso()
+    conn.execute(
+        "INSERT INTO bridge_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (BRIDGE_PAYLOAD_DIRTY_AT_KEY, ts),
+    )
+    return ts
 
 
 def normalize_dashboard_kind(kind: str) -> str:
@@ -2988,6 +3034,16 @@ def bridge_change_summary(
         "changed_truth_links": 0,
         "changed_events": 0,
         "changed_audit_issues": 0,
+        "changed_observations": 0,
+        "changed_task_field_versions": 0,
+        "changed_task_entity_links": 0,
+        "changed_task_attachments": 0,
+        "changed_collaborators": 0,
+        "changed_claim_evidence": 0,
+        "changed_memory_artifacts": 0,
+        "changed_memory_conflicts": 0,
+        "changed_memory_audit_state": 0,
+        "changed_bridge_payload_marker": 0,
         "ready_public_entities": 0,
         "ready_public_tasks": 0,
     }
@@ -3081,6 +3137,71 @@ def bridge_change_summary(
             (since_ts,),
         ).fetchone()[0]
 
+    if _sqlite_table_exists(conn, "observations"):
+        values["changed_observations"] = conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "task_field_versions"):
+        values["changed_task_field_versions"] = conn.execute(
+            "SELECT COUNT(*) FROM task_field_versions WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "task_entity_links"):
+        values["changed_task_entity_links"] = conn.execute(
+            "SELECT COUNT(*) FROM task_entity_links WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+    if _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE):
+        values["changed_task_entity_links"] += conn.execute(
+            "SELECT COUNT(*) FROM task_entity_link_tombstones WHERE deleted_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "task_attachments"):
+        values["changed_task_attachments"] = conn.execute(
+            "SELECT COUNT(*) FROM task_attachments WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "collaborators"):
+        values["changed_collaborators"] = conn.execute(
+            "SELECT COUNT(*) FROM collaborators WHERE added_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "claim_evidence"):
+        values["changed_claim_evidence"] = conn.execute(
+            "SELECT COUNT(*) FROM claim_evidence WHERE created_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "memory_artifacts"):
+        values["changed_memory_artifacts"] = conn.execute(
+            "SELECT COUNT(*) FROM memory_artifacts WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "memory_conflicts"):
+        values["changed_memory_conflicts"] = conn.execute(
+            "SELECT COUNT(*) FROM memory_conflicts WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "memory_audit_state"):
+        values["changed_memory_audit_state"] = conn.execute(
+            "SELECT COUNT(*) FROM memory_audit_state WHERE updated_at > ?",
+            (since_ts,),
+        ).fetchone()[0]
+
+    if _sqlite_table_exists(conn, "bridge_meta"):
+        values["changed_bridge_payload_marker"] = conn.execute(
+            "SELECT COUNT(*) FROM bridge_meta WHERE key = ? AND value > ?",
+            (BRIDGE_PAYLOAD_DIRTY_AT_KEY, since_ts),
+        ).fetchone()[0]
+
     return values
 
 
@@ -3116,6 +3237,60 @@ def _timestamp_is_newer(candidate_ts: str | None, baseline_ts: str | None) -> bo
     return parse_iso_datetime_for_compare(
         candidate_ts
     ) > parse_iso_datetime_for_compare(baseline_ts)
+
+
+def record_task_entity_link_tombstone(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    entity_name: str,
+    link_type: str = "manual",
+    score: float | None = None,
+    created_at: str,
+    deleted_at: str,
+) -> bool:
+    """Record a task/entity unlink using a transportable LWW tombstone."""
+    if not _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE):
+        return False
+    existing = conn.execute(
+        "SELECT deleted_at FROM task_entity_link_tombstones "
+        "WHERE task_id = ? AND entity_name = ?",
+        (task_id, entity_name),
+    ).fetchone()
+    if existing is not None and not _timestamp_is_newer(
+        deleted_at, existing["deleted_at"]
+    ):
+        return False
+    conn.execute(
+        "INSERT INTO task_entity_link_tombstones "
+        "(task_id, entity_name, link_type, score, created_at, deleted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(task_id, entity_name) DO UPDATE SET "
+        "link_type = excluded.link_type, score = excluded.score, "
+        "created_at = excluded.created_at, deleted_at = excluded.deleted_at",
+        (task_id, entity_name, link_type, score, created_at, deleted_at),
+    )
+    return True
+
+
+def clear_task_entity_link_tombstone(
+    conn: sqlite3.Connection, *, task_id: str, entity_name: str, created_at: str
+) -> bool:
+    """Clear an older unlink marker when a newer link is created."""
+    if not _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE):
+        return False
+    existing = conn.execute(
+        "SELECT deleted_at FROM task_entity_link_tombstones "
+        "WHERE task_id = ? AND entity_name = ?",
+        (task_id, entity_name),
+    ).fetchone()
+    if existing is None or not _timestamp_is_newer(created_at, existing["deleted_at"]):
+        return False
+    conn.execute(
+        "DELETE FROM task_entity_link_tombstones WHERE task_id = ? AND entity_name = ?",
+        (task_id, entity_name),
+    )
+    return True
 
 
 def _max_iso_timestamp(*timestamps: str | None) -> str:
@@ -3356,9 +3531,7 @@ def build_df_stopwords(
     if total < max(1, min_documents):
         return frozenset()
     cutoff = max_df_ratio * total
-    return frozenset(
-        term for term, freq in document_frequency.items() if freq > cutoff
-    )
+    return frozenset(term for term, freq in document_frequency.items() if freq > cutoff)
 
 
 def _iter_corpus(conn: sqlite3.Connection, limit: int) -> Iterator[str]:
@@ -3885,6 +4058,17 @@ class TaskDAO:
     ) -> None:
         """Create or update a task↔entity link."""
         ts = created_at or now_iso()
+        if _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE):
+            entity_row = conn.execute(
+                "SELECT name FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if entity_row is not None:
+                clear_task_entity_link_tombstone(
+                    conn,
+                    task_id=task_id,
+                    entity_name=entity_row["name"],
+                    created_at=ts,
+                )
         conn.execute(
             "INSERT INTO task_entity_links "
             "(task_id, entity_id, link_type, score, created_at) "
@@ -3897,7 +4081,27 @@ class TaskDAO:
 
     @staticmethod
     def unlink_entity(conn: sqlite3.Connection, task_id: str, entity_id: int) -> int:
-        """Remove a task↔entity link. Returns rowcount."""
+        """Remove a task↔entity link and leave a bridge-visible tombstone."""
+        if _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE):
+            row = conn.execute(
+                "SELECT e.name, tel.link_type, tel.score, tel.created_at "
+                "FROM task_entity_links AS tel "
+                "JOIN entities AS e ON e.id = tel.entity_id "
+                "WHERE tel.task_id = ? AND tel.entity_id = ?",
+                (task_id, entity_id),
+            ).fetchone()
+            if row is None:
+                return 0
+            deleted_at = now_iso()
+            record_task_entity_link_tombstone(
+                conn,
+                task_id=task_id,
+                entity_name=row["name"],
+                link_type=row["link_type"],
+                score=row["score"],
+                created_at=row["created_at"],
+                deleted_at=deleted_at,
+            )
         return conn.execute(
             "DELETE FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
             (task_id, entity_id),
@@ -5587,6 +5791,51 @@ def export_task_files(
             }
         )
 
+    # A removed live row is represented by a separate tombstone table.  Merge
+    # both sources into one record per task/entity name so an inconsistent
+    # active+tombstone pair cannot emit duplicate wire entries.  Equal clocks
+    # deliberately prefer the tombstone (deletion must not resurrect).
+    if _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE):
+        tombstone_rows = conn.execute(
+            "SELECT task_id, entity_name, link_type, score, created_at, deleted_at "
+            "FROM task_entity_link_tombstones "
+            "WHERE task_id IN ({})".format(ph),
+            task_ids,
+        ).fetchall()
+
+        def _link_record_wins(candidate: dict, current: dict) -> bool:
+            candidate_ts = candidate.get("deleted_at") or candidate.get("created_at")
+            current_ts = current.get("deleted_at") or current.get("created_at")
+            if _timestamp_is_newer(candidate_ts, current_ts):
+                return True
+            if _timestamp_is_newer(current_ts, candidate_ts):
+                return False
+            return bool(candidate.get("deleted_at")) and not bool(
+                current.get("deleted_at")
+            )
+
+        for tr in tombstone_rows:
+            candidate = {
+                "name": tr["entity_name"],
+                "link_type": tr["link_type"],
+                "score": tr["score"],
+                "created_at": tr["created_at"],
+                "deleted_at": tr["deleted_at"],
+            }
+            records = link_map.setdefault(tr["task_id"], [])
+            existing_index = next(
+                (
+                    index
+                    for index, current in enumerate(records)
+                    if current.get("name") == candidate["name"]
+                ),
+                None,
+            )
+            if existing_index is None:
+                records.append(candidate)
+            elif _link_record_wins(candidate, records[existing_index]):
+                records[existing_index] = candidate
+
     attachment_map: dict[str, list[dict]] = {}
     active_attachment_paths: set[str] = set()
     if _sqlite_table_exists(conn, "task_attachments"):
@@ -5626,7 +5875,13 @@ def export_task_files(
     for tid in task_ids:
         task = task_map[tid]
         task["_field_ts"] = fv_map.get(tid, {})
-        task["_links"] = link_map.get(tid, [])
+        # One canonical record per entity name, then split by kind so an old
+        # peer reading only ``_links`` sees the live links and nothing else.
+        canonical_links = link_map.get(tid, [])
+        task["_links"] = [r for r in canonical_links if not r.get("deleted_at")]
+        link_tombstones = [r for r in canonical_links if r.get("deleted_at")]
+        if link_tombstones:
+            task["_link_tombstones"] = link_tombstones
         task["_attachments"] = attachment_map.get(tid, [])
         tasks_for_export.append(task)
 
@@ -6717,9 +6972,26 @@ def merge_import_tasks(
                 )
             new_count += 1
 
-    # Import task-entity links from remote tasks (reuse `now` from above)
+    # Import task-entity links from remote tasks (reuse `now` from above).
+    # New peers use a separate tombstone table; old schemas retain the original
+    # INSERT OR IGNORE behavior until their normal schema migration runs.
+    has_link_tombstones = _sqlite_table_exists(conn, TASK_ENTITY_LINK_TOMBSTONES_TABLE)
+
+    def _remote_link_event_wins(
+        remote_ts: str, remote_deleted: bool, local_ts: str, local_deleted: bool
+    ) -> bool:
+        if _timestamp_is_newer(remote_ts, local_ts):
+            return True
+        if _timestamp_is_newer(local_ts, remote_ts):
+            return False
+        return remote_deleted and not local_deleted
+
     for rt in remote_tasks:
-        remote_links = rt.get("_links")
+        # A missing ``_link_tombstones`` key means "no deletions", never an
+        # error — snapshots written before v3.13.5 simply do not carry it.
+        remote_links = list(rt.get("_links") or []) + list(
+            rt.get("_link_tombstones") or []
+        )
         if not remote_links:
             continue
         tid = rt.get("id", "")
@@ -6734,10 +7006,91 @@ def merge_import_tasks(
             ename = link.get("name")
             if not ename:
                 continue
+            remote_created_at = str(link.get("created_at") or now)
+            remote_deleted_at = link.get("deleted_at")
+            if remote_deleted_at is not None:
+                remote_deleted_at = str(remote_deleted_at)
+
             entity = conn.execute(
                 "SELECT id FROM entities WHERE name = ?", (ename,)
             ).fetchone()
-            if not entity:
+
+            if has_link_tombstones:
+                local_tombstone = conn.execute(
+                    "SELECT link_type, score, created_at, deleted_at "
+                    "FROM task_entity_link_tombstones "
+                    "WHERE task_id = ? AND entity_name = ?",
+                    (tid, ename),
+                ).fetchone()
+                local_active = None
+                if entity is not None:
+                    local_active = conn.execute(
+                        "SELECT link_type, score, created_at "
+                        "FROM task_entity_links WHERE task_id = ? AND entity_id = ?",
+                        (tid, entity["id"]),
+                    ).fetchone()
+
+                local_event_ts = ""
+                local_event_deleted = False
+                if local_active is not None:
+                    local_event_ts = str(local_active["created_at"] or "")
+                if local_tombstone is not None and (
+                    not local_event_ts
+                    or _remote_link_event_wins(
+                        str(local_tombstone["deleted_at"] or ""),
+                        True,
+                        local_event_ts,
+                        False,
+                    )
+                ):
+                    local_event_ts = str(local_tombstone["deleted_at"] or "")
+                    local_event_deleted = True
+
+                if remote_deleted_at:
+                    if local_event_ts and not _remote_link_event_wins(
+                        remote_deleted_at,
+                        True,
+                        local_event_ts,
+                        local_event_deleted,
+                    ):
+                        continue
+                    if entity is not None:
+                        conn.execute(
+                            "DELETE FROM task_entity_links "
+                            "WHERE task_id = ? AND entity_id = ?",
+                            (tid, entity["id"]),
+                        )
+                    record_task_entity_link_tombstone(
+                        conn,
+                        task_id=tid,
+                        entity_name=ename,
+                        link_type=str(link.get("link_type") or "manual"),
+                        score=link.get("score"),
+                        created_at=remote_created_at,
+                        deleted_at=remote_deleted_at,
+                    )
+                    continue
+
+                if local_event_ts and not _remote_link_event_wins(
+                    remote_created_at,
+                    False,
+                    local_event_ts,
+                    local_event_deleted,
+                ):
+                    continue
+                if entity is None:
+                    continue
+                TaskDAO.link_entity(
+                    conn,
+                    tid,
+                    entity["id"],
+                    link_type=link.get("link_type", "auto"),
+                    score=link.get("score"),
+                    created_at=remote_created_at,
+                )
+                continue
+
+            if entity is None:
                 continue
             conn.execute(
                 "INSERT OR IGNORE INTO task_entity_links "
@@ -6748,7 +7101,7 @@ def merge_import_tasks(
                     entity["id"],
                     link.get("link_type", "auto"),
                     link.get("score"),
-                    link.get("created_at", now),
+                    remote_created_at,
                 ),
             )
 

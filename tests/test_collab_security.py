@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import collab_server
 import db_utils
+from db_utils import bridge_change_summary
 from schema import init_db
 
 
@@ -65,6 +66,40 @@ def test_share_knowledge_rejects_unknown_collaborators(collab_env):
     )
 
     assert result["error"] == "Unknown collaborator(s): bob"
+
+
+def test_manage_collaborators_remove_marks_bridge_payload_dirty(
+    collab_env, monkeypatch
+):
+    before = "2026-08-03T10:00:00+00:00"
+    after = "2026-08-03T10:01:00+00:00"
+    monkeypatch.setattr(collab_server, "_now", lambda: after)
+    with sqlite3.connect(collab_env, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO collaborators (github_user, trust_level, added_at) "
+            "VALUES ('alice', 'read_write', ?)",
+            (before,),
+        )
+        conn.execute(
+            "INSERT INTO bridge_meta(key, value) VALUES ('last_push_at', ?)",
+            (before,),
+        )
+
+    result = json.loads(
+        collab_server.manage_collaborators.fn(action="remove", github_user="alice")
+    )
+
+    assert result == {"removed": "alice"}
+    with sqlite3.connect(collab_env, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        summary = bridge_change_summary(conn, before)
+        marker = conn.execute(
+            "SELECT value FROM bridge_meta WHERE key = 'bridge_payload_dirty_at'"
+        ).fetchone()
+    assert summary["changed_collaborators"] == 0
+    assert summary["changed_bridge_payload_marker"] == 1
+    assert marker["value"] == after
 
 
 def _cp(args, returncode=0, stdout="", stderr=""):

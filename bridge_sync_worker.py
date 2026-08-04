@@ -40,6 +40,7 @@ from db_utils import (
     serialize_entity,
     export_relations,
     now_iso,
+    parse_iso_datetime_for_compare,
     sanitize_task_enums,
     # v2.0.0: Bridge Sync v2 — per-field LWW
     json_loads as _json_loads,
@@ -97,6 +98,19 @@ log = logging.getLogger("bridge_sync_worker")
 
 
 _SAFETY_THRESHOLD = 10  # Block sync if this many descriptions would be removed
+# How far the incremental watermark is rewound behind the export read snapshot.
+# Covers a writer whose ``updated_at`` stamp precedes the snapshot while its
+# COMMIT lands after it — invisible to that export, and below an un-rewound
+# watermark, so never exported at all. See the write site for the trade-off.
+INCREMENTAL_WATERMARK_MARGIN_SECONDS = 10
+# Counters that must never, on their own, decide that a push is needed.
+# ``memory_audit_state`` is written by the sync itself and comes straight back
+# through the import, always stamped inside the margin window above — leaving it
+# in the trigger set would schedule a redundant full push (streamed event ledger
+# included) after every real one. The counter stays in the summary for
+# diagnostics; only the push DECISION ignores it, and the row still travels in
+# the export payload whenever a genuine change causes a push.
+_NON_TRIGGER_COUNTERS = frozenset({"changed_memory_audit_state"})
 _SYNC_THREAD_LOCK = threading.Lock()
 _GIT_PULL_TIMEOUT = 120
 _GIT_PUSH_TIMEOUT = 300
@@ -1167,7 +1181,12 @@ def _main_locked(
                     ui_profile_pending = _ui_profile_changed(
                         shared_path, machine_id, ui_profile
                     )
-                    if not any(change_summary.values()) and not ui_profile_pending:
+                    triggers = [
+                        count
+                        for name, count in change_summary.items()
+                        if name not in _NON_TRIGGER_COUNTERS
+                    ]
+                    if not any(triggers) and not ui_profile_pending:
                         log.info(
                             "No changes since %s — skipping export+push", last_push_at
                         )
@@ -1198,6 +1217,10 @@ def _main_locked(
     # Phase 3b: Export (read-only, separate short transaction)
     extended_memory: dict[str, list] = {}
     with get_conn(_db_path) as conn:
+        # This is the incremental watermark, deliberately distinct from the
+        # payload timestamp below. It is captured before the first export read
+        # and therefore cannot advance past a write that this snapshot missed.
+        export_snapshot_at = now_iso()
         _progress(progress_callback, 20, "Exporting entities...")
         entities_out, entity_ids = _export_entities(conn, entity_project_prefix)
         _progress(progress_callback, 30, "Exporting relations...")
@@ -1416,16 +1439,26 @@ def _main_locked(
                 delay,
             )
 
-    # Record last_push_at so incremental check can skip next time, and stamp the
-    # tombstones that were just pushed (push-aware retention). Stamping uses the
-    # exact id list export_task_files returned for THIS push, so only tombstones
-    # actually in the payload become Tier-2 hard-delete eligible.
+    # Record the read-snapshot watermark that this push actually contains,
+    # rewound by a small margin. ``payload['pushed_at']`` intentionally remains
+    # the transport/merge timestamp, while tombstones retain its delivery time.
+    #
+    # The margin closes the residual race: a writer stamps ``updated_at`` a few
+    # milliseconds before the export pins its read snapshot but commits just
+    # after it. That row is invisible to THIS export and would also sort below
+    # an un-rewound watermark, so the next run would skip it — permanently.
+    # Re-examining the window costs one redundant push after each real one,
+    # because the merge is idempotent LWW; not re-examining it costs data.
+    watermark_at = (
+        parse_iso_datetime_for_compare(export_snapshot_at)
+        - timedelta(seconds=INCREMENTAL_WATERMARK_MARGIN_SECONDS)
+    ).isoformat()
     if pushed:
         with get_conn(_db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO bridge_meta(key, value) "
                 "VALUES('last_push_at', ?)",
-                (payload["pushed_at"],),
+                (watermark_at,),
             )
             mark_tombstones_pushed(conn, exported_task_ids, payload["pushed_at"])
 

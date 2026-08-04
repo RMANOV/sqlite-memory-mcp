@@ -4,6 +4,71 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## v3.13.5
+
+### Fixed
+
+- **Incremental bridge watermark now matches the exported snapshot.** A full
+  export can stream the large event ledger for long enough that a local write
+  lands after its read snapshot but before `shared.json` receives `pushed_at`.
+  The next run previously used that later transport timestamp and silently
+  skipped the missed write. `last_push_at` is now captured before the first
+  export read; transport `pushed_at` remains the actual payload time and keeps
+  its merge-driver tie-break meaning.
+- **The incremental watermark is rewound behind the export snapshot.** A writer
+  can stamp `updated_at` a moment before the export pins its read snapshot and
+  commit a moment after it: that row is invisible to the running export and
+  would also sort below an un-rewound watermark, so no later run would ever
+  export it either. `last_push_at` is now `export_snapshot_at` minus
+  `INCREMENTAL_WATERMARK_MARGIN_SECONDS` (10s). Re-examining the window can cost
+  a redundant push; the merge is idempotent last-writer-wins, so that costs
+  bytes, while not re-examining it costs data.
+- **`memory_audit_state` no longer votes on whether to push.** The sync writes
+  that row itself and imports it straight back from its own payload, always
+  stamped inside the margin window — as a trigger it queued a redundant full
+  push, streamed event ledger included, after every real one. It is excluded
+  from the push *decision* only: the counter stays in `bridge_change_summary`
+  for diagnostics, and the row still travels in the export payload whenever a
+  genuine change causes a push.
+- **Expanded the time-based bridge change summary for all nine previously
+  uncounted export inputs:** observations, task field versions, task/entity
+  links, task attachments, collaborators, claim evidence, memory artifacts,
+  memory conflicts, and memory-audit state. These signals prevent incremental
+  skip for timestamped creates and updates that alter generated bridge files.
+- **Task/entity unlinks are now transportable.** A row-presence timestamp
+  cannot represent a row that is gone, so `changed_task_entity_links` could
+  never see a removal and a peer never learned the link had been cut. Unlinking
+  now writes a `task_entity_link_tombstones` row — keyed by the exported entity
+  *name*, which is stable across peers unlike `entity_id`, and FK-bound to
+  `tasks` only so it survives an entity merge or delete. Exactly one canonical
+  record exists per task/entity name; it travels in a **new `_link_tombstones`
+  wire key** rather than as a `deleted_at` entry inside `_links`, so a peer on
+  an older build ignores an unknown key instead of importing the deletion as a
+  live link. The DB import and the git merge driver read both keys, treat a
+  missing `_link_tombstones` as "no deletions", and resolve records with the
+  same last-writer-wins rule, where an **equal timestamp resolves to the
+  deletion** so a stale active record can never resurrect a cut link. A re-link
+  must be strictly newer than the tombstone to clear it.
+- **Collaborator removal wakes the incremental gate.** `team_manifest` is
+  generated from row presence, so a hard `DELETE` from `collaborators` left the
+  fast path with nothing to compare and the stale manifest stayed published.
+  `manage_collaborators(remove)` now writes a `bridge_payload_dirty_at` marker
+  in the same transaction as the delete; the marker is never cleared explicitly
+  and falls out of the comparison once a later push snapshot overtakes it.
+- **Entity merge is visible to the bridge.** Merging entities now records a
+  link tombstone for the absorbed source name before the FK cascade erases the
+  live rows, and stamps the re-link to the target with the merge time so the
+  change out-ranks any peer's older record of it.
+
+### Known limitation
+
+- **Link deletions converge only between peers on v3.13.5 or newer.** A peer on
+  an older build does not read `deleted_at`; it imports the tombstone record
+  through `INSERT OR IGNORE` and recreates the link locally, which then returns
+  on the next round trip. Upgrade every machine in a bridge before relying on
+  unlink replication. This mirrors the v3.13.4 sequencing note and is a
+  transport-compatibility limit, not a bridge block.
+
 ## v3.13.4
 
 ### Fixed

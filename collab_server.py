@@ -22,6 +22,7 @@ from db_utils import (
     apply_task_mutation as _apply_task_mutation,
     get_conn as _get_conn,
     get_entity_id as _get_entity_id,
+    mark_bridge_payload_dirty as _mark_bridge_payload_dirty,
     fts_query as _fts_query,
     fts_sync_entity as _fts_sync,
     now_iso as _now,
@@ -333,12 +334,15 @@ def manage_collaborators(
             cur = conn.execute(
                 "DELETE FROM collaborators WHERE github_user = ?", (github_user,)
             )
-            # Also clean up sharing rules targeting this user
+            if cur.rowcount == 0:
+                return _error(f"Collaborator '{github_user}' not found")
+            # Also clean up sharing rules targeting this user.  The marker is
+            # written in the same transaction so a removal cannot be skipped by
+            # the bridge fast path after the row has disappeared.
             conn.execute(
                 "DELETE FROM sharing_rules WHERE target_user = ?", (github_user,)
             )
-            if cur.rowcount == 0:
-                return _error(f"Collaborator '{github_user}' not found")
+            _mark_bridge_payload_dirty(conn, _now())
             logger.info("manage_collaborators: removed %s", github_user)
             return json.dumps({"removed": github_user})
 
