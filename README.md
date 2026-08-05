@@ -1,5 +1,7 @@
 # SQLite Memory MCP Server
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2FRMANOV%2Fsqlite-memory-mcp.svg)](https://mcptoplist.com/server/glama%2FRMANOV%2Fsqlite-memory-mcp)
+
 ## Governed cross-agent memory for coding agents
 
 Claude and Codex can share one provenance-rich knowledge graph with approval-aware promotion workflows.
