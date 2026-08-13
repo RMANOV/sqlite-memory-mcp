@@ -430,11 +430,13 @@ Share knowledge graph entities between machines (e.g., personal laptop + work co
 ### How it works
 
 1. Tag entities for sharing by setting `project` to any value starting with `"shared"` (e.g., `"shared"`, `"shared:trading"`, `"shared:hooks"`)
-2. `bridge_push()` first runs a bridge repo safety preflight, then exports shared data to `shared.json`, `shared.js`, `index.json`, `tasks/`, and `entities/`, and finally commits and pushes. The v2 payload also includes shared tasks.
+2. `bridge_push()` first runs a bridge repo safety preflight, then exports shared data to `shared.json`, `index.json`, `tasks/`, and `entities/`, and finally commits and pushes. The v2 payload also includes shared tasks. (`shared.js` — a `window.__BRIDGE_DATA__` mirror of `shared.json` — was derived, never public API, and had no consumer; it is no longer generated or pushed, and a stale tracked copy is untracked automatically.)
 3. `bridge_pull()` on the other machine also runs the same repo safety preflight, does `git pull`, and imports new entities/observations/relations. Task metadata comes from `index.json`, while `description` and `notes` are hydrated from per-task files before the LWW merge. Shared knowledge, public knowledge, and imported ratings are accepted only when they stay bound to a known collaborator identity.
 4. `bridge_status()` shows what's in sync vs only-local vs only-remote
 
-Auto-sync only overwrites bridge-generated artifacts (`shared.json`, `index.json`, `tasks/`, `entities/`, `public_knowledge/`, `shared.js`). If the bridge repo contains user-managed dirty files such as `index.html`, or if generated artifacts were replaced with symlinks/escaped paths, sync now blocks instead of discarding or following them.
+Auto-sync only overwrites bridge-generated artifacts (`shared.json`, `index.json`, `tasks/`, `entities/`, `public_knowledge/`, plus legacy `shared.js` leftovers). If the bridge repo contains user-managed dirty files such as `index.html`, or if generated artifacts were replaced with symlinks/escaped paths, sync now blocks instead of discarding or following them.
+
+If `index.json` is missing or unreadable while `shared.json` still carries tasks, the sync fails closed: the legacy shared.json fallback has no tombstone manifest, so merging it could resurrect deletions made on other peers. The pull reports `legacy_fallback_blocked` and a full sync refuses to push.
 
 ### Setup
 

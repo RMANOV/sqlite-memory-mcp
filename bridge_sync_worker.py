@@ -347,13 +347,6 @@ def _tmp_write_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.tmp")
 
 
-def _write_shared_js(shared_path: Path, payload_text: str) -> None:
-    js_path = shared_path.with_name("shared.js")
-    tmp_path = _tmp_write_path(js_path)
-    tmp_path.write_text(f"window.__BRIDGE_DATA__ = {payload_text};", encoding="utf-8")
-    os.replace(tmp_path, js_path)
-
-
 def _git_detail(result: subprocess.CompletedProcess) -> str:
     return (result.stderr or result.stdout or "").strip() or "unknown git error"
 
@@ -364,13 +357,34 @@ def _ensure_stage_dirs(bridge_dir: str) -> None:
             (Path(bridge_dir) / rel_path.rstrip("/")).mkdir(parents=True, exist_ok=True)
 
 
+def _untrack_legacy_shared_js(bridge_dir: str) -> subprocess.CompletedProcess:
+    """Drop the retired shared.js mirror from the git index (idempotent).
+
+    shared.js was a ``window.__BRIDGE_DATA__ = <shared.json>`` wrapper — a
+    byte-identical ~24 MB duplicate force-added past .gitignore on every push
+    with no consumer (the Kanban index.html is self-contained and loads
+    nothing). The writer is gone; this removes the stale tracked copy so the
+    transport commit stops carrying it. ``--ignore-unmatch`` makes the call a
+    zero-exit no-op once untracked, so a non-zero return code always marks a
+    real git failure (index.lock contention, permissions) — the caller must
+    treat it as fatal, or a stale tracked copy would ride the next commit.
+    The on-disk leftover stays classified as a generated artifact, so
+    repo-ready cleanup may discard it without blocking a sync.
+    """
+    return git_run(bridge_dir, "rm", "--cached", "--ignore-unmatch", "-q", "shared.js")
+
+
 def _stage_generated_bridge_artifacts(bridge_dir: str) -> subprocess.CompletedProcess:
-    """Stage generated bridge artifacts without force-adding ignored large files."""
-    normal_paths = tuple(path for path in BRIDGE_GIT_STAGE_PATHS if path != "shared.js")
-    add_result = git_run(bridge_dir, "add", *normal_paths)
-    if add_result.returncode != 0:
-        return add_result
-    return git_run(bridge_dir, "add", "-f", "shared.js")
+    """Stage generated bridge artifacts; nothing is force-added past .gitignore.
+
+    Fails closed: when untracking the legacy shared.js fails, its result is
+    returned unchanged (non-zero), so the caller blocks before staging,
+    commit, and push instead of committing the stale tracked copy.
+    """
+    untrack_result = _untrack_legacy_shared_js(bridge_dir)
+    if untrack_result.returncode != 0:
+        return untrack_result
+    return git_run(bridge_dir, "add", *BRIDGE_GIT_STAGE_PATHS)
 
 
 def _ui_profile_changed(
@@ -1006,7 +1020,7 @@ def _main_locked(
     # Resolve task artifacts before the extended-memory import so the streaming
     # ledger reader retains only event IDs actually referenced by task LWW
     # metadata (plus one causal head per relevant aggregate).
-    remote_tasks, _loaded_from_index = load_remote_tasks_for_merge(
+    remote_tasks, loaded_from_index = load_remote_tasks_for_merge(
         bridge_dir,
         remote_payload,
         log,
@@ -1034,7 +1048,23 @@ def _main_locked(
     with get_conn(_db_path) as conn:
         _progress(progress_callback, 15, "Importing remote tasks...")
         merge_failed = False
-        if remote_tasks:
+        legacy_fallback_blocked = False
+        if remote_tasks and not loaded_from_index:
+            # Fail closed: the legacy shared.json fallback carries active rows
+            # only — no tombstone manifest. Merging it looks like success while
+            # remote deletions stay invisible, and the push that follows would
+            # resurrect them. A missing/unreadable index.json alongside a
+            # non-empty task payload is a broken transport, not a mergeable one.
+            merge_failed = True
+            legacy_fallback_blocked = True
+            log.error(
+                "sync blocked: index.json missing or unreadable while "
+                "shared.json carries %d tasks; the legacy fallback has no "
+                "tombstone manifest — failing closed instead of merging "
+                "active-only state",
+                len(remote_tasks),
+            )
+        elif remote_tasks:
             try:
                 new_t, upd_t = merge_import_tasks(
                     conn,
@@ -1054,15 +1084,21 @@ def _main_locked(
     # Task import transaction closed — DB lock released
 
     if merge_failed and not pull_only:
+        reason = (
+            "index.json missing/unreadable; legacy shared.json fallback "
+            "is not tombstone-safe"
+            if legacy_fallback_blocked
+            else "task merge failed (DB lock contention)"
+        )
         log.error(
-            "sync aborted: task merge failed — local DB has not absorbed "
-            "remote tombstones; pushing stale state would resurrect "
-            "deletions made on other peers"
+            "sync aborted: %s — local DB has not absorbed remote tombstones; "
+            "pushing stale state would resurrect deletions made on other peers",
+            reason,
         )
         _progress(
             progress_callback,
             -1,
-            "BLOCKED: task merge failed (DB lock contention). "
+            f"BLOCKED: {reason}. "
             "Tombstones from other peers not absorbed; push aborted.",
         )
         return {
@@ -1072,6 +1108,10 @@ def _main_locked(
             "imported_new": new_t,
             "imported_updated": upd_t,
             "blocked_by_merge_failure": True,
+            "legacy_fallback_blocked": legacy_fallback_blocked,
+            # Downstream reporters (bridge_server, hook notifications) show
+            # this instead of a generic "push was blocked".
+            "message": reason,
         }
 
     if pull_only:
@@ -1087,6 +1127,7 @@ def _main_locked(
             "pull_only": True,
             "imported_new": new_t,
             "imported_updated": upd_t,
+            "legacy_fallback_blocked": legacy_fallback_blocked,
         }
 
     audit_summary: dict | None = None
@@ -1325,7 +1366,6 @@ def _main_locked(
         tmp_shared_path = _tmp_write_path(shared_path)
         tmp_shared_path.write_text(payload_json, encoding="utf-8")
         os.replace(tmp_shared_path, shared_path)
-        _write_shared_js(shared_path, payload_json)
     except OSError as exc:
         message = f"generated bridge file write failed: {exc}"
         log.error(message)
@@ -1370,7 +1410,14 @@ def _main_locked(
     add_result = _stage_generated_bridge_artifacts(bridge_dir)
     if add_result.returncode != 0:
         detail = _git_detail(add_result)
-        message = f"git add failed: {detail}"
+        # The staging step can fail on either of its two git calls; name the
+        # right one so an operator debugging index.lock sees the true step.
+        failed_step = (
+            "git untrack of legacy shared.js failed"
+            if add_result.args and "rm" in add_result.args
+            else "git add failed"
+        )
+        message = f"{failed_step}: {detail}"
         log.error("bridge sync %s", message)
         _progress(progress_callback, -1, f"BLOCKED: {message}")
         return {

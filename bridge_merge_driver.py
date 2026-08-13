@@ -90,7 +90,6 @@ _GITATTRIBUTES_MANAGED_LINES = (
     "index.json merge=bridge-reconcile diff=json",
     "tasks/*.json merge=bridge-reconcile diff=json",
     "# Derived/generated artifacts: rebuilt from the DB on next export.",
-    "shared.js merge=union",
     "entities_index.json merge=union diff=json",
     "entities/*.json merge=union diff=json",
     "extended_memory/*.json merge=union diff=json",
@@ -99,6 +98,8 @@ _GITATTRIBUTES_MANAGED_LINES = (
 
 # Generated bridge artifacts that are safe to discard / rebuild from the DB if
 # they get stuck in an unmerged (UU) state without an active sequence operation.
+# shared.js stays listed as a legacy leftover only: it is no longer generated,
+# but a stale copy inherited from an old checkout must heal, never block.
 _GENERATED_UNMERGED_HEALABLE = frozenset(
     {
         "shared.json",

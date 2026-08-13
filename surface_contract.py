@@ -260,14 +260,10 @@ BRIDGE_ARTIFACT_SURFACE_CONTRACT: dict[str, dict[str, Any]] = {
         "pages_publish": True,
         "legacy_fallback": True,
     },
-    "shared.js": {
-        "export": True,
-        "pull": False,
-        "bootstrap": False,
-        "git_stage": True,
-        "pages_publish": True,
-        "legacy_fallback": False,
-    },
+    # shared.js (a window.__BRIDGE_DATA__ mirror of shared.json) was removed
+    # from the contract: derived, never public API, no consumer — the Kanban
+    # index.html is self-contained. It is no longer generated, staged, or
+    # published; leftover copies are cleaned up as legacy generated artifacts.
     "index.json": {
         "export": True,
         "pull": True,

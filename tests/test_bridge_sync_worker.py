@@ -732,10 +732,10 @@ def test_bridge_repo_ready_discards_extended_memory_artifacts(monkeypatch):
 
 def test_tmp_write_path_uses_distinct_target_names(tmp_path):
     shared_json = tmp_path / "shared.json"
-    shared_js = tmp_path / "shared.js"
+    index_json = tmp_path / "index.json"
 
     assert bridge_sync_worker._tmp_write_path(shared_json).name == "shared.json.tmp"
-    assert bridge_sync_worker._tmp_write_path(shared_js).name == "shared.js.tmp"
+    assert bridge_sync_worker._tmp_write_path(index_json).name == "index.json.tmp"
 
 
 def test_bridge_repo_ready_recovers_detached_head(monkeypatch):
@@ -1072,7 +1072,7 @@ def test_bridge_sync_worker_pull_conflict_fails_closed_without_reset(
     assert git_calls == []
 
 
-def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
+def test_bridge_sync_worker_prunes_shared_js_and_keeps_transport(tmp_path, monkeypatch):
     db_path = str(tmp_path / "memory.db")
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -1126,15 +1126,35 @@ def test_bridge_sync_worker_writes_and_stages_shared_js(tmp_path, monkeypatch):
         force=True, bridge_repo=str(bridge_dir), db_path=db_path
     )
 
-    shared_js = (bridge_dir / "shared.js").read_text(encoding="utf-8")
-
     assert result["pushed"] is True
-    assert shared_js.startswith("window.__BRIDGE_DATA__ = ")
-    assert any(args[0] == "add" and "shared.js" in args for args in git_calls)
-    assert any(args[:2] == ("add", "-f") for args in git_calls)
-    assert not any(
-        args[:2] == ("add", "-f") and "extended_memory/" in args for args in git_calls
-    )
+
+    # shared.js is fully pruned from the export surface: never written,
+    # never staged, and nothing is force-added past .gitignore anymore.
+    assert not (bridge_dir / "shared.js").exists()
+    assert not (bridge_dir / "shared.js.tmp").exists()
+    assert not any(args[0] == "add" and "shared.js" in args for args in git_calls)
+    assert not any(args[:2] == ("add", "-f") for args in git_calls)
+
+    # A stale tracked copy inherited from an old checkout is untracked
+    # idempotently on every sync.
+    assert ("rm", "--cached", "--ignore-unmatch", "-q", "shared.js") in git_calls
+
+    # Transport invariants: shared.json, index.json, and tasks/*.json are
+    # still produced, parseable, and carry the task.
+    payload = json.loads((bridge_dir / "shared.json").read_text(encoding="utf-8"))
+    assert any(t.get("id") == "task-001" for t in payload["tasks"])
+    index_doc = json.loads((bridge_dir / "index.json").read_text(encoding="utf-8"))
+    assert any(t.get("id") == "task-001" for t in index_doc["tasks"])
+    task_files = list((bridge_dir / "tasks").glob("*.json"))
+    assert task_files, "expected per-task transport files"
+    for task_file in task_files:
+        json.loads(task_file.read_text(encoding="utf-8"))
+
+    # The staged set is exactly the surface-contract stage list.
+    add_calls = [args for args in git_calls if args[0] == "add"]
+    assert add_calls
+    assert set(add_calls[-1][1:]) == set(bridge_sync_worker.BRIDGE_GIT_STAGE_PATHS)
+
     assert peer_calls and peer_calls[0][0] == db_path
     assert result["assigned_task_recipients"] == 1
     assert result["knowledge_shared"] == 2
