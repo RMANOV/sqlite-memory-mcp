@@ -4,6 +4,42 @@ All notable changes to `sqlite-memory-mcp` are recorded here. This file
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/) and the
 project uses semantic-ish versioning on the `3.x` line.
 
+## Unreleased
+
+### Removed
+
+- **`shared.js` is no longer generated, staged, or published.** The file was a
+  `window.__BRIDGE_DATA__ = <shared.json>` wrapper — a byte-identical ~24 MB
+  duplicate force-added past `.gitignore` on every push. It was derived, never
+  public API, and had no consumer: the Kanban `index.html` is fully
+  self-contained (no fetch, no script src, no `__BRIDGE_DATA__` reference).
+  The writer, the `git add -f` staging special-case, the surface-contract
+  entry, and the managed `.gitattributes` line are all gone. A stale tracked
+  copy is untracked automatically (`git rm --cached --ignore-unmatch`) on the
+  next sync; on-disk leftovers stay classified as generated artifacts so
+  cleanup discards them instead of blocking. Transport artifacts
+  (`shared.json`, `index.json`, `tasks/*.json`) are unaffected.
+
+### Fixed
+
+- **The legacy shared.json task fallback now fails closed on the transport
+  path.** When `index.json` is missing or unreadable while `shared.json` still
+  carries tasks, the sync previously merged active-only rows — remote
+  tombstones were invisible in that mode, and the push that followed could
+  resurrect deletions made on other peers. The merge is now refused
+  (`legacy_fallback_blocked`), a full sync aborts before push, and a fresh
+  empty bridge repo (no tasks anywhere) still initializes normally. The same
+  gate covers a manifest that parses but carries no `"tasks"` list (e.g. `{}`):
+  every real export writes the key as a list, so its absence marks a broken
+  manifest, not an empty one. Blocked results now carry `message`, so
+  downstream reporters show the actual cause instead of a generic
+  "push was blocked".
+- **A failed shared.js untrack blocks the sync instead of being ignored.**
+  `git rm --cached --ignore-unmatch` exits non-zero only on a real git
+  failure (index.lock contention, permissions). That result is now propagated
+  from the staging step, so the sync stops before staging/commit/push rather
+  than committing the stale tracked 24 MB copy the prune exists to remove.
+
 ## v3.13.5
 
 ### Fixed

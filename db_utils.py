@@ -1485,7 +1485,7 @@ log = logging.getLogger(__name__)
 BRIDGE_GENERATED_FILES = frozenset(
     {
         "shared.json",
-        "shared.js",
+        "shared.js",  # legacy leftover: writer removed; stale copies discard, never block
         "index.json",
         "entities_index.json",
         "kanban_payload.json",  # render-only derived mirror (v3.12.4); regenerated each export
@@ -1496,7 +1496,7 @@ BRIDGE_GENERATED_TEMP_FILES = frozenset(
     {
         "shared.tmp",  # legacy temp path used by older bridge writers
         "shared.json.tmp",
-        "shared.js.tmp",
+        "shared.js.tmp",  # legacy leftover from the removed shared.js writer
         "index.json.tmp",
         "entities_index.json.tmp",
     }
@@ -7411,6 +7411,13 @@ def load_remote_tasks_for_merge(
     """Load bridge tasks, hydrating per-task content and falling back on manifest errors.
 
     Returns (tasks, loaded_from_index_json).
+
+    The ``loaded_from_index_json=False`` legacy fallback (shared.json task
+    arrays) is NOT tombstone-safe: shared.json carries active rows only, so
+    remote deletions are invisible in that mode. Render/inspection callers may
+    use the fallback data; the transport merge path MUST fail closed on
+    (tasks, False) instead of merging active-only state and pushing over
+    unseen tombstones.
     """
     index_path = Path(bridge_dir) / "index.json"
     if not index_path.exists():
@@ -7426,10 +7433,22 @@ def load_remote_tasks_for_merge(
             )
         return collect_legacy_bridge_tasks(payload), False
 
+    raw_tasks = idx_data.get("tasks")
+    if not isinstance(raw_tasks, list):
+        # A manifest without a task list is a broken manifest, not an empty
+        # one: every real export writes "tasks" as a list (possibly []).
+        # Trusting e.g. {} as authoritative-empty would push over rows the
+        # merge never absorbed — same harm class as a missing index.json.
+        if logger is not None:
+            logger.warning(
+                "index.json carries no task list (tasks=%s); treating the "
+                "manifest as unreadable and falling back to shared.json tasks",
+                type(raw_tasks).__name__,
+            )
+        return collect_legacy_bridge_tasks(payload), False
+
     source_machine_id = idx_data.get("machine_id") or payload.get("machine_id")
-    remote_tasks = [
-        dict(task) for task in idx_data.get("tasks", []) if isinstance(task, dict)
-    ]
+    remote_tasks = [dict(task) for task in raw_tasks if isinstance(task, dict)]
     enriched = 0
     for task in remote_tasks:
         task.setdefault("_source_machine_id", source_machine_id)
