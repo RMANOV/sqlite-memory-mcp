@@ -239,6 +239,8 @@ def pack_entities(
     m: int = RECALL_M,
     coverage: float | None = None,
     jump: float | None = None,
+    envelope: dict | None = None,
+    extra_accounting: dict | None = None,
 ) -> tuple[list[dict], dict]:
     """Fill ``budget`` wire characters, widest-first, and account for it.
 
@@ -281,16 +283,24 @@ def pack_entities(
             candidate_degraded,
             coverage,
             jump,
+            extra_accounting,
         )
-        if _wire_size(candidate, trial) > budget and packed:
+        if _wire_size(candidate, trial, envelope) > budget and packed:
             break
         packed, degraded = candidate, candidate_degraded
         observations_returned += len(texts)
 
     accounting = _accounting(
-        entities, packed, observations_returned, budget, degraded, coverage, jump
+        entities,
+        packed,
+        observations_returned,
+        budget,
+        degraded,
+        coverage,
+        jump,
+        extra_accounting,
     )
-    accounting["wire_bytes"] = _wire_value(_wire_size(packed, accounting))
+    accounting["wire_chars"] = _wire_value(_wire_size(packed, accounting, envelope))
     return packed, accounting
 
 
@@ -302,6 +312,7 @@ def _accounting(
     degraded: list[dict],
     coverage: float | None,
     jump: float | None,
+    extra: dict | None = None,
 ) -> dict:
     status = "DEGRADED" if degraded else "OK"
     if status == "OK" and (coverage is not None or jump is not None):
@@ -314,8 +325,8 @@ def _accounting(
         "entities_returned": len(packed),
         "observations_returned": observations,
         "truncated": len(packed) < len(considered),
-        "budget_wire_bytes": budget,
-        "wire_bytes": _wire_value(0),
+        "budget_wire_chars": budget,
+        "wire_chars": _wire_value(0),
         "status": status,
         "degraded": degraded,
     }
@@ -323,22 +334,32 @@ def _accounting(
         block["coverage"] = coverage
     if jump is not None:
         block["jump"] = jump
+    if extra:
+        block.update(extra)
     return block
 
 
 def _wire_value(size: int) -> str:
     """Zero-padded so the field's own width never shifts what it measures.
 
-    ``wire_bytes`` lives inside the payload it describes. An integer would
+    ``wire_chars`` lives inside the payload it describes. An integer would
     change length as the value changes, so the measurement and the emitted
     value would disagree. A fixed-width string keeps one serialisation exact.
     """
     return str(size).zfill(_WIRE_FIELD_WIDTH)
 
 
-def _wire_size(entities: list[dict], accounting: dict) -> int:
-    return len(
-        json.dumps(
-            {"entities": entities, "_accounting": accounting}, ensure_ascii=False
-        )
-    )
+def _wire_size(
+    entities: list[dict], accounting: dict, envelope: dict | None = None
+) -> int:
+    """Measure the payload the caller will actually emit.
+
+    ``envelope`` carries the caller's own top-level keys (``query`` and the
+    like). Measuring without them under-counts, so the reported size would
+    describe a payload nobody sends — the exact self-description failure this
+    field exists to prevent.
+    """
+    payload = dict(envelope or {})
+    payload["entities"] = entities
+    payload["_accounting"] = accounting
+    return len(json.dumps(payload, ensure_ascii=False))

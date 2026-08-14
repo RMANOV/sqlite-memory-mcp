@@ -173,10 +173,10 @@ class TestBudgetCap:
         """Cyrillic is 2 bytes/char in UTF-8; the accounting must not drift."""
         out, acct = pack_entities(entities(20), evidence=set(), query_terms=["мапинг"])
         payload = json.dumps({"entities": out, "_accounting": acct}, ensure_ascii=False)
-        assert int(acct["wire_bytes"]) == len(payload)
-        assert int(acct["wire_bytes"]) < len(payload.encode("utf-8"))
+        assert int(acct["wire_chars"]) == len(payload)
+        assert int(acct["wire_chars"]) < len(payload.encode("utf-8"))
         # fixed width: the field sits inside the payload it measures
-        assert len(acct["wire_bytes"]) == 7
+        assert len(acct["wire_chars"]) == 7
 
     def test_under_cap_is_not_truncated(self):
         out, acct = pack_entities(
@@ -184,20 +184,20 @@ class TestBudgetCap:
         )
         assert acct["truncated"] is False
         assert acct["entities_returned"] == 2
-        assert int(acct["wire_bytes"]) < RECALL_WIRE_BUDGET
+        assert int(acct["wire_chars"]) < RECALL_WIRE_BUDGET
 
     def test_over_cap_is_truncated_and_within_budget(self):
         out, acct = pack_entities(
             entities(60), evidence=set(), query_terms=["x"], budget=4000
         )
         assert acct["truncated"] is True
-        assert int(acct["wire_bytes"]) <= 4000
+        assert int(acct["wire_chars"]) <= 4000
         assert 0 < acct["entities_returned"] < 60
 
     def test_default_budget_is_the_frozen_constant(self):
         _, acct = pack_entities(entities(60), evidence=set(), query_terms=["x"])
-        assert acct["budget_wire_bytes"] == RECALL_WIRE_BUDGET
-        assert int(acct["wire_bytes"]) <= RECALL_WIRE_BUDGET
+        assert acct["budget_wire_chars"] == RECALL_WIRE_BUDGET
+        assert int(acct["wire_chars"]) <= RECALL_WIRE_BUDGET
 
     def test_entity_count_is_an_outcome_not_a_constant(self):
         _, small = pack_entities(

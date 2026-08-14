@@ -33,6 +33,32 @@ from db_utils import (
 )
 from premium_runtime import maybe_mount_premium_extensions
 from link_suggestions import normalize_phrase as _normalize_link_phrase
+from recall_budget import (
+    RECALL_PREFIX,
+    RECALL_WIRE_BUDGET,
+    ProbeSchemaError,
+    evidence_ids,
+    fts_probe_spec,
+    pack_entities,
+)
+
+# Candidate pool handed to the budget. K is an outcome of the budget, not a
+# constant: the pool is deliberately wider than any expected return so that
+# `entities_returned` keeps moving when the budget moves.
+_RECALL_POOL = 50
+
+
+def _query_terms(raw: str) -> list[str]:
+    """Terms used only to centre the truncation window on the match.
+
+    Deliberately not a matcher: evidence comes from the FTS probe, which uses
+    the index's own tokenizer. This split is why no Python normalisation is
+    needed here.
+    """
+    import re
+
+    return [t for t in re.split(r"[^\wЀ-ӿ]+", raw) if len(t) > 1]
+
 
 # Optional vector search (graceful fallback to FTS5-only)
 try:
@@ -604,7 +630,11 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
 
 
 @mcp.tool()
-def search_nodes(query: str, project: str | None = None) -> str:
+def search_nodes(
+    query: str,
+    project: str | None = None,
+    budget: int = RECALL_WIRE_BUDGET,
+) -> str:
     """Search the knowledge graph using hybrid BM25 + semantic search.
 
     When sqlite-vec is installed, combines FTS5 keyword matching with vector
@@ -649,7 +679,27 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 logger.debug("Vector search failed: %s", e, exc_info=True)
 
         if not rows:
-            return json.dumps({"entities": [], "query": query}, ensure_ascii=False)
+            # Scoped label: this server indexes the SQLite graph only. The
+            # markdown memory index is invisible here, so "no results" must
+            # not be stated globally.
+            return json.dumps(
+                {
+                    "entities": [],
+                    "query": query,
+                    "_accounting": {
+                        "entities_considered": 0,
+                        "entities_returned": 0,
+                        "observations_returned": 0,
+                        "truncated": False,
+                        "budget_wire_chars": budget,
+                        "wire_chars": "0000000",
+                        "status": "NO_RESULTS_IN_GRAPH",
+                        "degraded": [],
+                        "refills": 0,
+                    },
+                },
+                ensure_ascii=False,
+            )
 
         reranked = None
         try:
@@ -666,48 +716,107 @@ def search_nodes(query: str, project: str | None = None) -> str:
         except (ImportError, sqlite3.OperationalError) as e:
             logger.warning("Rerank failed: %s", e)
 
-        if reranked:
-            eids = [r["eid"] for r in reranked]
-        else:
-            eids = [r["eid"] for r in rows[:50]]
+        ranked = reranked if reranked else rows[:_RECALL_POOL]
+        eids = [r["eid"] for r in ranked]
 
+        # Everything below reads inside this one transaction: the rowids and
+        # the text they name must come from the same snapshot, or an id could
+        # point at a row that changed between the two reads.
         ph = ",".join("?" * len(eids))
         obs_rows = conn.execute(
-            f"SELECT entity_id, content FROM observations "
-            f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+            f"SELECT id, entity_id, LENGTH(content) AS len, "
+            f"substr(content, 1, {RECALL_PREFIX}) AS head "
+            f"FROM observations WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
             eids,
         ).fetchall()
 
-        obs_by_eid: dict[int, list[str]] = {}
+        obs_by_eid: dict[int, list[dict[str, Any]]] = {}
         for o in obs_rows:
-            obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
+            obs_by_eid.setdefault(o["entity_id"], []).append(
+                {"id": o["id"], "content": o["head"], "len": o["len"]}
+            )
 
-        results = []
-        if reranked:
-            for r in reranked:
-                entity: dict[str, Any] = {
-                    "name": r["name"],
-                    "entityType": r["entity_type"],
-                    "observations": obs_by_eid.get(r["eid"], []),
+        # Ask the tokenizer which observations actually match. Never imitate
+        # it: four Python normalisations were refuted against this same path.
+        evidence: set[int] = set()
+        refills = 0
+        try:
+            spec = fts_probe_spec(conn, "memory_fts")
+            probe_rows = [
+                (o["id"], o["content"]) for lst in obs_by_eid.values() for o in lst
+            ]
+            evidence = evidence_ids(probe_rows, fts_q, spec)
+
+            # One refill, and only for entities whose prefix hid the match.
+            # After it the full text is in hand, so a second pass has nothing
+            # left to fetch.
+            need = [
+                o["id"]
+                for lst in obs_by_eid.values()
+                if not any(x["id"] in evidence for x in lst)
+                for o in lst
+                if o["len"] > RECALL_PREFIX
+            ]
+            if need:
+                refills = 1
+                nph = ",".join("?" * len(need))
+                full = {
+                    r["id"]: r["content"]
+                    for r in conn.execute(
+                        f"SELECT id, content FROM observations WHERE id IN ({nph})",
+                        need,
+                    )
                 }
-                if r["project"]:
-                    entity["project"] = r["project"]
+                for lst in obs_by_eid.values():
+                    for o in lst:
+                        if o["id"] in full:
+                            o["content"] = full[o["id"]]
+                evidence |= evidence_ids(
+                    [(oid, text) for oid, text in full.items()], fts_q, spec
+                )
+        except ProbeSchemaError as exc:
+            # No silent "no evidence": the packer will mark every entity
+            # not_found and the status becomes DEGRADED.
+            logger.warning("evidence probe unavailable: %s", exc)
+
+        candidates: list[dict[str, Any]] = []
+        for r in ranked:
+            entity: dict[str, Any] = {
+                "id": r["eid"],
+                "name": r["name"],
+                "entityType": r["entity_type"],
+                "observations": obs_by_eid.get(r["eid"], []),
+            }
+            if r["project"]:
+                entity["project"] = r["project"]
+            if reranked:
                 entity["_score"] = r["_score"]
-                results.append(entity)
-        else:
-            for r in rows[:50]:
-                entity = {
-                    "name": r["name"],
-                    "entityType": r["entity_type"],
-                    "observations": obs_by_eid.get(r["eid"], []),
-                }
-                if r["project"]:
-                    entity["project"] = r["project"]
-                results.append(entity)
+            candidates.append(entity)
+
+    # `envelope` and `extra_accounting` are handed in *before* measuring, not
+    # bolted on after: a field added post-hoc makes the reported size describe
+    # a payload that was never sent.
+    results, accounting = pack_entities(
+        candidates,
+        evidence=evidence,
+        query_terms=_query_terms(query),
+        budget=budget,
+        envelope={"query": query},
+        extra_accounting={"refills": refills},
+    )
 
     _record_entity_access_best_effort(eids, "search_nodes")
-    logger.info("search_nodes: query=%r matched=%d", query, len(results))
-    return json.dumps({"entities": results, "query": query}, ensure_ascii=False)
+    logger.info(
+        "search_nodes: query=%r considered=%d returned=%d wire=%s",
+        query,
+        accounting["entities_considered"],
+        accounting["entities_returned"],
+        accounting["wire_chars"],
+    )
+    return json.dumps(
+        {"entities": results, "query": query, "_accounting": accounting},
+        ensure_ascii=False,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
