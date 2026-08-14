@@ -47,6 +47,69 @@ from recall_budget import (
 # `entities_returned` keeps moving when the budget moves.
 _RECALL_POOL = 50
 
+# Graph expansion. Seeds anchor the proximity boost; neighbours widen the pool
+# to entities the query could not reach lexically at all.
+_RECALL_EXPAND_SEEDS = 10
+_RECALL_EXPAND_HOPS = 1
+_RECALL_EXPAND_CAP = 200
+
+
+def _expand_by_relations(
+    conn: sqlite3.Connection, rows: list[Any], seeds: list[int]
+) -> list[Any]:
+    """Add entities one edge away from the seeds, in deterministic order.
+
+    Boosting graph proximity is not enough on its own: a neighbour that shares
+    no query term never enters the candidate pool, so there is nothing for the
+    boost to lift. The pool has to widen first.
+
+    All relation types are followed. With ~0.7 edges per entity there is
+    nothing for a type filter to usefully exclude, and an arbitrary filter
+    would be a constant nobody measured.
+    """
+    if not seeds or _RECALL_EXPAND_HOPS < 1:
+        return rows
+    known = {r["eid"] for r in rows}
+    ph = ",".join("?" * len(seeds))
+    try:
+        neighbours = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT to_id FROM relations WHERE from_id IN ({ph}) "
+                f"UNION SELECT DISTINCT from_id FROM relations WHERE to_id IN ({ph}) "
+                "ORDER BY 1",
+                seeds + seeds,
+            )
+        ]
+    except sqlite3.Error as exc:
+        logger.debug("relation expansion skipped: %s", exc)
+        return rows
+
+    room = _RECALL_EXPAND_CAP - len(rows)
+    fresh = [n for n in neighbours if n not in known][: max(0, room)]
+    if not fresh:
+        return rows
+
+    nph = ",".join("?" * len(fresh))
+    added = [
+        # Rank 0.0 is deliberate: a neighbour has no BM25 evidence of its own,
+        # so it enters on structure alone and must not outrank a real match.
+        {
+            "eid": r["id"],
+            "name": r["name"],
+            "entity_type": r["entity_type"],
+            "project": r["project"],
+            "rank": 0.0,
+        }
+        for r in conn.execute(
+            f"SELECT id, name, entity_type, project FROM entities "
+            f"WHERE id IN ({nph}) ORDER BY id",
+            fresh,
+        )
+    ]
+    logger.debug("relation expansion: +%d neighbours", len(added))
+    return list(rows) + added
+
 
 def _query_terms(raw: str) -> list[str]:
     """Terms used only to centre the truncation window on the match.
@@ -701,6 +764,12 @@ def search_nodes(
                 ensure_ascii=False,
             )
 
+        # The seeds are what the query itself found. They serve two purposes
+        # that were both dormant: they are the anchors for graph proximity,
+        # and the origin of the 1-hop expansion.
+        seeds = [r["eid"] for r in rows[:_RECALL_EXPAND_SEEDS]]
+        rows = _expand_by_relations(conn, rows, seeds)
+
         reranked = None
         try:
             from smart_retrieval import rerank_entities
@@ -710,8 +779,10 @@ def search_nodes(
                 rows,
                 current_project=project,
                 session_id=None,
-                query_entity_ids=None,
-                limit=50,
+                # Passing None here left GRAPH_BOOST_1HOP/2HOP unreachable:
+                # the whole hop-scoring block sits behind `if query_entity_ids`.
+                query_entity_ids=seeds,
+                limit=_RECALL_POOL,
             )
         except (ImportError, sqlite3.OperationalError) as e:
             logger.warning("Rerank failed: %s", e)
