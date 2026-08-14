@@ -161,11 +161,15 @@ def _db_tool(
                     result = func(conn, *args, **kwargs)
                 if after_commit is not None:
                     after_commit()
-                return json.dumps(result)
+                return json.dumps(result, ensure_ascii=False)
             except Exception as exc:  # noqa: BLE001 - MCP error boundary
                 logger.error("%s failed: %s", func.__name__, exc, exc_info=True)
                 mapped = error_mapper(exc)
-                return mapped if isinstance(mapped, str) else json.dumps(mapped)
+                return (
+                    mapped
+                    if isinstance(mapped, str)
+                    else json.dumps(mapped, ensure_ascii=False)
+                )
 
         wrapped.__signature__ = signature.replace(  # type: ignore[attr-defined]
             parameters=parameters[1:],
@@ -651,14 +655,20 @@ def _reflect_error_response(exc: Exception, *, error_type: str | None = None) ->
     """Map exceptions to Dreams-style error envelopes."""
     if isinstance(exc, _ReflectionStateError):
         return json.dumps(
-            {"error": str(exc), "error_type": error_type or "internal_error"}
+            {"error": str(exc), "error_type": error_type or "internal_error"},
+            ensure_ascii=False,
         )
-    return json.dumps({"error": str(exc), "error_type": "internal_error"})
+    return json.dumps(
+        {"error": str(exc), "error_type": "internal_error"}, ensure_ascii=False
+    )
 
 
 def _reflect_transition_error_response(exc: Exception) -> str:
     if isinstance(exc, _ReflectionStateError):
-        return json.dumps({"error": str(exc), "error_type": "invalid_state_transition"})
+        return json.dumps(
+            {"error": str(exc), "error_type": "invalid_state_transition"},
+            ensure_ascii=False,
+        )
     return _reflect_error_response(exc)
 
 
@@ -670,13 +680,17 @@ def _reflect_run_error_response(exc: Exception) -> str:
             if message.startswith("run_not_found")
             else "invalid_state_transition"
         )
-        return json.dumps({"error": message, "error_type": error_type})
+        return json.dumps(
+            {"error": message, "error_type": error_type}, ensure_ascii=False
+        )
     return _reflect_error_response(exc)
 
 
 def _reflect_argument_error_response(exc: Exception) -> str:
     if isinstance(exc, _ReflectionStateError):
-        return json.dumps({"error": str(exc), "error_type": "invalid_argument"})
+        return json.dumps(
+            {"error": str(exc), "error_type": "invalid_argument"}, ensure_ascii=False
+        )
     return _reflect_error_response(exc)
 
 
@@ -714,7 +728,8 @@ def reflect_start(
                     f"instructions too long: {len(instructions)} > {_MAX_INSTRUCTIONS}"
                 ),
                 "error_type": "instructions_too_long",
-            }
+            },
+            ensure_ascii=False,
         )
 
     run_id: str | None = None
@@ -789,7 +804,8 @@ def reflect_start(
                                 "status": "failed",
                                 "error_type": "candidate_limit_exceeded",
                                 "candidates_persisted": persisted,
-                            }
+                            },
+                            ensure_ascii=False,
                         )
 
             _dao_finish_run(
@@ -813,7 +829,8 @@ def reflect_start(
                     "status": "completed",
                     "candidates_persisted": persisted,
                     "summary": report["summary"],
-                }
+                },
+                ensure_ascii=False,
             )
     except _ReflectionStateError as exc:
         logger.warning("reflect_start state error: %s", exc)
@@ -1039,7 +1056,9 @@ def reflect_discard(conn, run_id: str) -> str:
 
 def _filesystem_error_response(exc: Exception) -> str:
     if isinstance(exc, OSError):
-        return json.dumps({"error": str(exc), "error_type": "filesystem_error"})
+        return json.dumps(
+            {"error": str(exc), "error_type": "filesystem_error"}, ensure_ascii=False
+        )
     return _reflect_error_response(exc)
 
 
@@ -1150,13 +1169,15 @@ def _debate_error_response(exc: Exception) -> str:
         payload = {"error": str(exc), "error_type": exc.error_type}
         if getattr(exc, "details", None):
             payload["details"] = exc.details
-        return json.dumps(payload)
+        return json.dumps(payload, ensure_ascii=False)
     if isinstance(exc, _ProtocolV1Error):
         payload = {"error": str(exc), "error_type": exc.error_type}
         if exc.details:
             payload["details"] = exc.details
-        return json.dumps(payload)
-    return json.dumps({"error": str(exc), "error_type": "internal_error"})
+        return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(
+        {"error": str(exc), "error_type": "internal_error"}, ensure_ascii=False
+    )
 
 
 def _debate_gate_denied_response(verdict: dict[str, object]) -> str:
@@ -1166,7 +1187,8 @@ def _debate_gate_denied_response(verdict: dict[str, object]) -> str:
             "error": f"debate_protocol_gate_denied: {reason}",
             "error_type": "premium_gate_denied",
             "gate": verdict,
-        }
+        },
+        ensure_ascii=False,
     )
 
 
@@ -1263,7 +1285,7 @@ def debate_init(
                 len(out["roles"]),
                 len(seeded_bindings),
             )
-            return json.dumps(out)
+            return json.dumps(out, ensure_ascii=False)
     except _DebateError as exc:
         logger.info("debate_init rejected: %s", exc)
         return _debate_error_response(exc)
@@ -1568,7 +1590,9 @@ def debate_protocol_maintain(topic_ids_csv: str = "") -> str:
             recovered = _debate_role_sweep_dao(conn, topic_ids=topic_ids)
         if recovered:
             _signal_wake_after_commit()
-        return json.dumps({"timed_out": timed_out, "role_recoveries": recovered})
+        return json.dumps(
+            {"timed_out": timed_out, "role_recoveries": recovered}, ensure_ascii=False
+        )
     except Exception as exc:
         return _debate_error_response(exc)
 

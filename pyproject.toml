@@ -85,6 +85,8 @@ py-modules = [
     "premium_task_tray",
     "recurring_tasks",
     "reflection",
+    "query_classification",
+    "recall_budget",
     "reflection_apply",
     "reflection_dao",
     "retrieval_contract",

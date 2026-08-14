@@ -33,6 +33,149 @@ from db_utils import (
 )
 from premium_runtime import maybe_mount_premium_extensions
 from link_suggestions import normalize_phrase as _normalize_link_phrase
+from query_classification import STOPWORD_LIST_VERSION, classify_query
+from recall_budget import (
+    RECALL_PREFIX,
+    RECALL_WIRE_BUDGET,
+    ProbeSchemaError,
+    evidence_ids,
+    fts_probe_spec,
+    pack_entities,
+    rank_jump,
+    term_coverage,
+)
+
+# Candidate pool handed to the budget. K is an outcome of the budget, not a
+# constant: the pool is deliberately wider than any expected return so that
+# `entities_returned` keeps moving when the budget moves.
+_RECALL_POOL = 50
+
+# Graph expansion. Seeds anchor the proximity boost; neighbours widen the pool
+# to entities the query could not reach lexically at all.
+_RECALL_EXPAND_SEEDS = 10
+_RECALL_EXPAND_HOPS = 1
+_RECALL_EXPAND_CAP = 200
+
+
+def _expand_by_relations(
+    conn: sqlite3.Connection, rows: list[Any], seeds: list[int]
+) -> list[Any]:
+    """Add entities one edge away from the seeds, in deterministic order.
+
+    Boosting graph proximity is not enough on its own: a neighbour that shares
+    no query term never enters the candidate pool, so there is nothing for the
+    boost to lift. The pool has to widen first.
+
+    All relation types are followed. With ~0.7 edges per entity there is
+    nothing for a type filter to usefully exclude, and an arbitrary filter
+    would be a constant nobody measured.
+    """
+    if not seeds or _RECALL_EXPAND_HOPS < 1:
+        return rows
+    known = {r["eid"] for r in rows}
+    ph = ",".join("?" * len(seeds))
+    try:
+        neighbours = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT to_id FROM relations WHERE from_id IN ({ph}) "
+                f"UNION SELECT DISTINCT from_id FROM relations WHERE to_id IN ({ph}) "
+                "ORDER BY 1",
+                seeds + seeds,
+            )
+        ]
+    except sqlite3.Error as exc:
+        logger.debug("relation expansion skipped: %s", exc)
+        return rows
+
+    room = _RECALL_EXPAND_CAP - len(rows)
+    fresh = [n for n in neighbours if n not in known][: max(0, room)]
+    if not fresh:
+        return rows
+
+    nph = ",".join("?" * len(fresh))
+    added = [
+        # Rank 0.0 is deliberate: a neighbour has no BM25 evidence of its own,
+        # so it enters on structure alone and must not outrank a real match.
+        {
+            "eid": r["id"],
+            "name": r["name"],
+            "entity_type": r["entity_type"],
+            "project": r["project"],
+            "rank": 0.0,
+        }
+        for r in conn.execute(
+            f"SELECT id, name, entity_type, project FROM entities "
+            f"WHERE id IN ({nph}) ORDER BY id",
+            fresh,
+        )
+    ]
+    logger.debug("relation expansion: +%d neighbours", len(added))
+    return list(rows) + added
+
+
+def _search_payload(
+    query: str,
+    candidates: list[dict[str, Any]],
+    budget: int,
+    evidence: set[int],
+    refills: int,
+    coverage: float | None = None,
+    jump: float | None = None,
+) -> str:
+    """The single exit for search_nodes, empty result included.
+
+    Two return paths meant two hand-built accounting blocks, and the second one
+    was already missing fields the first had. One constructor makes that class
+    of drift impossible rather than merely unlikely.
+
+    `query_status` labels the *question*; `status` describes the *result*.
+    Separate fields stop "your query was vague" from being read as "the payload
+    is degraded", and the reverse.
+    """
+    qclass = classify_query(query)
+    extra: dict[str, Any] = {
+        "refills": refills,
+        "query_status": qclass.status,
+        "meaningful_terms": len(qclass.terms),
+        "stopword_list": STOPWORD_LIST_VERSION,
+    }
+    if not candidates:
+        # Scoped deliberately: this server indexes the SQLite graph. The
+        # markdown memory index is invisible to it, so "no results" must not
+        # be stated globally.
+        #
+        # Set here rather than after packing: "NO_RESULTS_IN_GRAPH" is longer
+        # than "OK", so assigning it post-measurement would leave wire_chars
+        # describing a shorter payload than the one sent.
+        extra["status"] = "NO_RESULTS_IN_GRAPH"
+
+    # envelope and extra are handed in *before* measuring: a field bolted on
+    # afterwards makes the reported size describe a payload that was never
+    # sent.
+    results, accounting = pack_entities(
+        candidates,
+        evidence=evidence,
+        query_terms=qclass.terms,
+        budget=budget,
+        coverage=coverage,
+        jump=jump,
+        envelope={"query": query},
+        extra_accounting=extra,
+    )
+
+    logger.info(
+        "search_nodes: query=%r considered=%d returned=%d wire=%s",
+        query,
+        accounting["entities_considered"],
+        accounting["entities_returned"],
+        accounting["wire_chars"],
+    )
+    return json.dumps(
+        {"entities": results, "query": query, "_accounting": accounting},
+        ensure_ascii=False,
+    )
+
 
 # Optional vector search (graceful fallback to FTS5-only)
 try:
@@ -278,7 +421,9 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
     logger.info(
         "create_entities: %d created out of %d requested", created, len(entities)
     )
-    return json.dumps({"created": created, "total_requested": len(entities)})
+    return json.dumps(
+        {"created": created, "total_requested": len(entities)}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -345,7 +490,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                     pass
 
     logger.info("add_observations: %d observations added", added)
-    return json.dumps({"added": added})
+    return json.dumps({"added": added}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -402,7 +547,9 @@ def create_relations(relations: list[dict[str, Any]]) -> str:
     logger.info(
         "create_relations: %d created out of %d requested", created, len(relations)
     )
-    return json.dumps({"created": created, "total_requested": len(relations)})
+    return json.dumps(
+        {"created": created, "total_requested": len(relations)}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -444,7 +591,7 @@ def delete_entities(entityNames: list[str]) -> str:
             deleted += 1
 
     logger.info("delete_entities: %d deleted", deleted)
-    return json.dumps({"deleted": deleted})
+    return json.dumps({"deleted": deleted}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -492,7 +639,7 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
                     logger.debug("vec_sync(%s) skipped: %s", eid, exc, exc_info=True)
 
     logger.info("delete_observations: %d deleted", deleted)
-    return json.dumps({"deleted": deleted})
+    return json.dumps({"deleted": deleted}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -533,7 +680,7 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
                 )
 
     logger.info("delete_relations: %d deleted", deleted)
-    return json.dumps({"deleted": deleted})
+    return json.dumps({"deleted": deleted}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -589,7 +736,8 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
             "relations": relations_out,
             "total": total,
             "has_more": offset + limit < total,
-        }
+        },
+        ensure_ascii=False,
     )
 
 
@@ -599,7 +747,11 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
 
 
 @mcp.tool()
-def search_nodes(query: str, project: str | None = None) -> str:
+def search_nodes(
+    query: str,
+    project: str | None = None,
+    budget: int = RECALL_WIRE_BUDGET,
+) -> str:
     """Search the knowledge graph using hybrid BM25 + semantic search.
 
     When sqlite-vec is installed, combines FTS5 keyword matching with vector
@@ -644,7 +796,21 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 logger.debug("Vector search failed: %s", e, exc_info=True)
 
         if not rows:
-            return json.dumps({"entities": [], "query": query})
+            # Built through the same packer as every other exit, so the
+            # accounting shape cannot drift between the empty and non-empty
+            # paths. A second hand-rolled block here was already missing
+            # fields the main path had.
+            return _search_payload(query, [], budget, set(), 0)
+
+        # The seeds are what the query itself found. They serve two purposes
+        # that were both dormant: they are the anchors for graph proximity,
+        # and the origin of the 1-hop expansion.
+        seeds = [r["eid"] for r in rows[:_RECALL_EXPAND_SEEDS]]
+        # Measured on the BM25 ranks, before reranking replaces them with a
+        # composite score: the signal was characterised on `memory_fts.rank`
+        # and means nothing against a different scale.
+        jump = rank_jump([float(r["rank"]) for r in rows[:2]])
+        rows = _expand_by_relations(conn, rows, seeds)
 
         reranked = None
         try:
@@ -655,54 +821,102 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 rows,
                 current_project=project,
                 session_id=None,
-                query_entity_ids=None,
-                limit=50,
+                # Passing None here left GRAPH_BOOST_1HOP/2HOP unreachable:
+                # the whole hop-scoring block sits behind `if query_entity_ids`.
+                query_entity_ids=seeds,
+                limit=_RECALL_POOL,
             )
         except (ImportError, sqlite3.OperationalError) as e:
             logger.warning("Rerank failed: %s", e)
 
-        if reranked:
-            eids = [r["eid"] for r in reranked]
-        else:
-            eids = [r["eid"] for r in rows[:50]]
+        ranked = reranked if reranked else rows[:_RECALL_POOL]
+        eids = [r["eid"] for r in ranked]
 
+        # Everything below reads inside this one transaction: the rowids and
+        # the text they name must come from the same snapshot, or an id could
+        # point at a row that changed between the two reads.
         ph = ",".join("?" * len(eids))
         obs_rows = conn.execute(
-            f"SELECT entity_id, content FROM observations "
-            f"WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
+            f"SELECT id, entity_id, LENGTH(content) AS len, "
+            f"substr(content, 1, {RECALL_PREFIX}) AS head "
+            f"FROM observations WHERE entity_id IN ({ph}) ORDER BY entity_id, id",
             eids,
         ).fetchall()
 
-        obs_by_eid: dict[int, list[str]] = {}
+        obs_by_eid: dict[int, list[dict[str, Any]]] = {}
         for o in obs_rows:
-            obs_by_eid.setdefault(o["entity_id"], []).append(o["content"])
+            obs_by_eid.setdefault(o["entity_id"], []).append(
+                {"id": o["id"], "content": o["head"], "len": o["len"]}
+            )
 
-        results = []
-        if reranked:
-            for r in reranked:
-                entity: dict[str, Any] = {
-                    "name": r["name"],
-                    "entityType": r["entity_type"],
-                    "observations": obs_by_eid.get(r["eid"], []),
+        # Ask the tokenizer which observations actually match. Never imitate
+        # it: four Python normalisations were refuted against this same path.
+        evidence: set[int] = set()
+        refills = 0
+        coverage: float | None = None
+        _classified_terms = classify_query(query).terms
+        try:
+            spec = fts_probe_spec(conn, "memory_fts")
+            probe_rows = [
+                (o["id"], o["content"]) for lst in obs_by_eid.values() for o in lst
+            ]
+            evidence = evidence_ids(probe_rows, fts_q, spec)
+
+            # One refill, and only for entities whose prefix hid the match.
+            # After it the full text is in hand, so a second pass has nothing
+            # left to fetch.
+            need = [
+                o["id"]
+                for lst in obs_by_eid.values()
+                if not any(x["id"] in evidence for x in lst)
+                for o in lst
+                if o["len"] > RECALL_PREFIX
+            ]
+            if need:
+                refills = 1
+                nph = ",".join("?" * len(need))
+                full = {
+                    r["id"]: r["content"]
+                    for r in conn.execute(
+                        f"SELECT id, content FROM observations WHERE id IN ({nph})",
+                        need,
+                    )
                 }
-                if r["project"]:
-                    entity["project"] = r["project"]
+                for lst in obs_by_eid.values():
+                    for o in lst:
+                        if o["id"] in full:
+                            o["content"] = full[o["id"]]
+                evidence |= evidence_ids(
+                    [(oid, text) for oid, text in full.items()], fts_q, spec
+                )
+            # Telemetry, computed here because it needs the same probe and
+            # the same snapshot. It labels the response and never trims it.
+            owner = {o["id"]: eid for eid, lst in obs_by_eid.items() for o in lst}
+            probe_rows = [
+                (o["id"], o["content"]) for lst in obs_by_eid.values() for o in lst
+            ]
+            coverage = term_coverage(probe_rows, owner, _classified_terms, spec)
+        except ProbeSchemaError as exc:
+            # No silent "no evidence": the packer will mark every entity
+            # not_found and the status becomes DEGRADED.
+            logger.warning("evidence probe unavailable: %s", exc)
+
+        candidates: list[dict[str, Any]] = []
+        for r in ranked:
+            entity: dict[str, Any] = {
+                "id": r["eid"],
+                "name": r["name"],
+                "entityType": r["entity_type"],
+                "observations": obs_by_eid.get(r["eid"], []),
+            }
+            if r["project"]:
+                entity["project"] = r["project"]
+            if reranked:
                 entity["_score"] = r["_score"]
-                results.append(entity)
-        else:
-            for r in rows[:50]:
-                entity = {
-                    "name": r["name"],
-                    "entityType": r["entity_type"],
-                    "observations": obs_by_eid.get(r["eid"], []),
-                }
-                if r["project"]:
-                    entity["project"] = r["project"]
-                results.append(entity)
+            candidates.append(entity)
 
     _record_entity_access_best_effort(eids, "search_nodes")
-    logger.info("search_nodes: query=%r matched=%d", query, len(results))
-    return json.dumps({"entities": results, "query": query})
+    return _search_payload(query, candidates, budget, evidence, refills, coverage, jump)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -736,7 +950,9 @@ def open_nodes(names: list[str]) -> str:
         )
 
     _record_entity_access_best_effort(found_ids, "open_nodes")
-    return json.dumps({"entities": entities_out, "relations": relations_out})
+    return json.dumps(
+        {"entities": entities_out, "relations": relations_out}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
