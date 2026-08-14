@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from xml.sax.saxutils import escape
 from pathlib import Path
 
@@ -36,6 +38,12 @@ HEARTBEAT_PATH = Path(
 DISABLE_FILE = Path(os.path.expanduser("~/.claude/memory/debate_wake.disable"))
 SLEEP_FILE = Path(os.path.expanduser("~/.claude/memory/debate_wake.sleep_until"))
 HEARTBEAT_FRESH_SECONDS = 90
+PROGRESS_STALL_SECONDS = int(
+    os.environ.get("DEBATE_PUMP_PROGRESS_STALL_SECONDS", "600")
+)
+WORKER_LEASE_GRACE_SECONDS = int(
+    os.environ.get("DEBATE_PUMP_WORKER_LEASE_GRACE_SECONDS", "60")
+)
 # Two independent executor lanes may run together; the resource governor can
 # still lower this cap under real memory/load pressure.  Serializing at 1 made
 # correctly addressed EXECUTOR_1 / EXECUTOR_2 work wait behind each other.
@@ -47,6 +55,12 @@ PUMP_ARGS = [
     "2",
     "--max-workers-per-scan",
     "2",
+    "--worker-claim-recovery-seconds",
+    "120",
+    "--worker-claim-recovery-interval",
+    "30",
+    "--worker-claim-recovery-min-age-seconds",
+    "60",
     "--mcp-prefix",
     "mcp__sqlite_unified__",
     "--action-kind",
@@ -272,6 +286,95 @@ def pump_state() -> dict[str, object]:
     }
 
 
+def _progress_health(state: dict[str, object]) -> dict[str, object]:
+    """Check forward progress, not just that the resident process is alive.
+
+    A fresh heartbeat can coexist with a dead worker claim at the cursor.  The
+    old doctor treated that as PASS, which made a stuck pump look healthy.  We
+    only read the DB and deliberately fail closed when the progress evidence
+    cannot be read.
+    """
+    heartbeat = state.get("heartbeat")
+    if not isinstance(heartbeat, dict):
+        return {"ok": False, "reason": "missing_heartbeat"}
+    last_ts = str(heartbeat.get("last_ts") or "")
+    last_msg_id = str(heartbeat.get("last_msg_id") or "")
+    if not last_ts or not last_msg_id:
+        return {"ok": False, "reason": "missing_cursor"}
+    try:
+        cursor_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+        cursor_age = max(0.0, (datetime.now(timezone.utc) - cursor_dt).total_seconds())
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "invalid_cursor", "last_ts": last_ts}
+
+    db_path = Path(
+        os.path.expanduser(
+            os.environ.get("SQLITE_MEMORY_DB", "~/.claude/memory/memory.db")
+        )
+    ).resolve()
+    active_claims: list[dict[str, object]] = []
+    try:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as con:
+            pending_after_cursor = int(
+                con.execute(
+                    "SELECT COUNT(*) FROM debate_messages "
+                    "WHERE ts > ? OR (ts = ? AND msg_id > ?)",
+                    (last_ts, last_ts, last_msg_id),
+                ).fetchone()[0]
+            )
+            rows = con.execute(
+                "SELECT topic_id, role, trigger_msg_id, heartbeat_at "
+                "FROM debate_worker_claims WHERE state = 'active'"
+            ).fetchall()
+            for topic_id, role, trigger_msg_id, heartbeat_at in rows:
+                active_claims.append(
+                    {
+                        "topic_id": str(topic_id),
+                        "role": str(role),
+                        "trigger_msg_id": str(trigger_msg_id),
+                        "heartbeat_at": str(heartbeat_at or ""),
+                    }
+                )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "database_read_failed",
+            "error": repr(exc),
+        }
+
+    live_children = int(heartbeat.get("live_children") or 0)
+    stale_claims: list[dict[str, object]] = []
+    now = datetime.now(timezone.utc)
+    for claim in active_claims:
+        try:
+            claim_dt = datetime.fromisoformat(
+                str(claim["heartbeat_at"]).replace("Z", "+00:00")
+            )
+            claim_age = max(0.0, (now - claim_dt).total_seconds())
+        except (TypeError, ValueError):
+            claim_age = float("inf")
+        if live_children == 0 and claim_age >= WORKER_LEASE_GRACE_SECONDS:
+            stale_claims.append({**claim, "age_seconds": round(claim_age, 1)})
+
+    reasons: list[str] = []
+    if pending_after_cursor and cursor_age >= PROGRESS_STALL_SECONDS:
+        reasons.append("cursor_stalled")
+    if stale_claims:
+        reasons.append("dead_active_worker_claim")
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "last_ts": last_ts,
+        "last_msg_id": last_msg_id,
+        "cursor_age_seconds": round(cursor_age, 1),
+        "pending_after_cursor": pending_after_cursor,
+        "active_claims": len(active_claims),
+        "stale_claims": stale_claims,
+        "live_children": live_children,
+    }
+
+
 def cmd_install(*, start: bool = True) -> int:
     xml_path = ROOT / "systemd" / "user" / "SqliteMemoryDebatePump.xml"
     xml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +487,7 @@ def cmd_stop(*, timeout_seconds: float = 20.0) -> int:
 def cmd_status() -> int:
     query = _schtasks(["/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"])
     state = pump_state()
+    progress = _progress_health(state)
     task_registered = not query.get("returncode")
     run_key = _run_key_installed()
     print(
@@ -396,6 +500,7 @@ def cmd_status() -> int:
                 if task_registered
                 else ("run_key" if run_key else "none"),
                 "pump_state": state,
+                "progress": progress,
                 "kill_switches": {
                     "disable_file": DISABLE_FILE.exists(),
                     "sleep_until_file": SLEEP_FILE.exists(),
@@ -407,7 +512,11 @@ def cmd_status() -> int:
         )
     )
     autostart_ok = task_registered or run_key
-    return 0 if autostart_ok and state.get("state") == "running" else 1
+    return (
+        0
+        if autostart_ok and state.get("state") == "running" and progress.get("ok")
+        else 1
+    )
 
 
 def cmd_uninstall() -> int:
@@ -470,6 +579,7 @@ def cmd_doctor() -> int:
         else ("run_key" if run_key else "none"),
     }
     checks["pump_running"] = {"ok": state.get("state") == "running", **state}
+    checks["progress"] = _progress_health(state)
     checks["kill_switches"] = {
         "disable_file": DISABLE_FILE.exists(),
         "sleep_until_file": SLEEP_FILE.exists(),
@@ -481,6 +591,7 @@ def cmd_doctor() -> int:
         "resource_budget",
         "autostart",
         "pump_running",
+        "progress",
     )
     ok = all(
         bool(checks[key].get("ok"))

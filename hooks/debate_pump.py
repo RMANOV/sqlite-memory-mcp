@@ -1305,7 +1305,7 @@ def main() -> int:
     parser.add_argument(
         "--worker-claim-recovery-seconds",
         type=int,
-        default=int(os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_SECONDS", "900")),
+        default=int(os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_SECONDS", "120")),
         help="retire dead wake-worker claims older than this; <=0 disables",
     )
     parser.add_argument(
@@ -1318,7 +1318,7 @@ def main() -> int:
         "--worker-claim-recovery-min-age-seconds",
         type=int,
         default=int(
-            os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_MIN_AGE_SECONDS", "120")
+            os.environ.get("DEBATE_WORKER_CLAIM_RECOVERY_MIN_AGE_SECONDS", "60")
         ),
         help="DAO guard against too-recent worker recovery cutoffs",
     )
