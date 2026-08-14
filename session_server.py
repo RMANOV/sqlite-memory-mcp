@@ -79,7 +79,7 @@ def session_save(
             action = "created"
 
     logger.info("session_save: %s session %s", action, session_id)
-    return json.dumps({"action": action, "session_id": session_id})
+    return json.dumps({"action": action, "session_id": session_id}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -115,7 +115,9 @@ def session_recall(last_n: int = 5) -> str:
         }
         sessions.append(session)
 
-    return json.dumps({"sessions": sessions, "count": len(sessions)})
+    return json.dumps(
+        {"sessions": sessions, "count": len(sessions)}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -212,7 +214,9 @@ def search_by_project(query: str, project: str) -> str:
         project,
         len(results),
     )
-    return json.dumps({"entities": results, "query": query, "project": project})
+    return json.dumps(
+        {"entities": results, "query": query, "project": project}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -260,7 +264,7 @@ def knowledge_health(
             "claims_promoted": len(report["promoted"]),
         }
 
-    return json.dumps(report)
+    return json.dumps(report, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -287,7 +291,7 @@ def resume_context(
 
     with _get_conn() as conn:
         result = _resume_context(conn, session_id, include_open_questions)
-        return json.dumps(result)
+        return json.dumps(result, ensure_ascii=False)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────

@@ -97,7 +97,7 @@ def link_task_entity(task_id: str, entity_name: str) -> str:
             (task_id, entity_id),
         ).fetchone()
         result["created_at"] = link_row["created_at"] if link_row else None
-        return json.dumps(result)
+        return json.dumps(result, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -137,11 +137,12 @@ def unlink_task_entity(task_id: str, entity_name: str) -> str:
                     "removed": True,
                     "decision_recorded": "rejected",
                     "decision_id": result["decision_id"],
-                }
+                },
+                ensure_ascii=False,
             )
         removed = TaskDAO.unlink_entity(conn, task_id, entity_id)
 
-        return json.dumps({"removed": removed > 0})
+        return json.dumps({"removed": removed > 0}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -154,7 +155,7 @@ def get_task_links(task_id: str) -> str:
     """Get all knowledge graph entities linked to a task."""
     with _get_conn() as conn:
         links = TaskDAO.get_task_links(conn, task_id)
-        return json.dumps({"task_id": task_id, "links": links})
+        return json.dumps({"task_id": task_id, "links": links}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -171,7 +172,9 @@ def get_entity_tasks(entity_name: str) -> str:
             return _error(f"Entity '{entity_name}' not found")
 
         tasks = TaskDAO.get_entity_tasks(conn, entity_id)
-        return json.dumps({"entity_name": entity_name, "tasks": tasks})
+        return json.dumps(
+            {"entity_name": entity_name, "tasks": tasks}, ensure_ascii=False
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -201,7 +204,7 @@ def suggest_task_links(
             return _error(str(exc))
         result["accept_tool"] = "link_task_entity"
         result["undo_auto_tool"] = "unlink_task_entity"
-        return json.dumps(result)
+        return json.dumps(result, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -307,7 +310,7 @@ def find_entity_overlaps(
 
         overlaps.sort(key=lambda x: x["score"], reverse=True)
 
-        return json.dumps({"overlaps": overlaps[:limit]})
+        return json.dumps({"overlaps": overlaps[:limit]}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -380,7 +383,7 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
         }
 
         if dry_run:
-            return json.dumps(preview)
+            return json.dumps(preview, ensure_ascii=False)
 
         # 1. Move unique observations
         conn.execute(
@@ -472,7 +475,7 @@ def merge_entities(source_name: str, target_name: str, dry_run: bool = True) -> 
 
         preview["merged"] = True
         preview["dry_run"] = False
-        return json.dumps(preview)
+        return json.dumps(preview, ensure_ascii=False)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────

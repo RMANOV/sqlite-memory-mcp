@@ -278,7 +278,9 @@ def create_entities(entities: list[dict[str, Any]]) -> str:
     logger.info(
         "create_entities: %d created out of %d requested", created, len(entities)
     )
-    return json.dumps({"created": created, "total_requested": len(entities)})
+    return json.dumps(
+        {"created": created, "total_requested": len(entities)}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -345,7 +347,7 @@ def add_observations(observations: list[dict[str, Any]]) -> str:
                     pass
 
     logger.info("add_observations: %d observations added", added)
-    return json.dumps({"added": added})
+    return json.dumps({"added": added}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -402,7 +404,9 @@ def create_relations(relations: list[dict[str, Any]]) -> str:
     logger.info(
         "create_relations: %d created out of %d requested", created, len(relations)
     )
-    return json.dumps({"created": created, "total_requested": len(relations)})
+    return json.dumps(
+        {"created": created, "total_requested": len(relations)}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -444,7 +448,7 @@ def delete_entities(entityNames: list[str]) -> str:
             deleted += 1
 
     logger.info("delete_entities: %d deleted", deleted)
-    return json.dumps({"deleted": deleted})
+    return json.dumps({"deleted": deleted}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -492,7 +496,7 @@ def delete_observations(deletions: list[dict[str, Any]]) -> str:
                     logger.debug("vec_sync(%s) skipped: %s", eid, exc, exc_info=True)
 
     logger.info("delete_observations: %d deleted", deleted)
-    return json.dumps({"deleted": deleted})
+    return json.dumps({"deleted": deleted}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -533,7 +537,7 @@ def delete_relations(relations: list[dict[str, Any]]) -> str:
                 )
 
     logger.info("delete_relations: %d deleted", deleted)
-    return json.dumps({"deleted": deleted})
+    return json.dumps({"deleted": deleted}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -589,7 +593,8 @@ def read_graph(offset: int = 0, limit: int = 500) -> str:
             "relations": relations_out,
             "total": total,
             "has_more": offset + limit < total,
-        }
+        },
+        ensure_ascii=False,
     )
 
 
@@ -644,7 +649,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
                 logger.debug("Vector search failed: %s", e, exc_info=True)
 
         if not rows:
-            return json.dumps({"entities": [], "query": query})
+            return json.dumps({"entities": [], "query": query}, ensure_ascii=False)
 
         reranked = None
         try:
@@ -702,7 +707,7 @@ def search_nodes(query: str, project: str | None = None) -> str:
 
     _record_entity_access_best_effort(eids, "search_nodes")
     logger.info("search_nodes: query=%r matched=%d", query, len(results))
-    return json.dumps({"entities": results, "query": query})
+    return json.dumps({"entities": results, "query": query}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -736,7 +741,9 @@ def open_nodes(names: list[str]) -> str:
         )
 
     _record_entity_access_best_effort(found_ids, "open_nodes")
-    return json.dumps({"entities": entities_out, "relations": relations_out})
+    return json.dumps(
+        {"entities": entities_out, "relations": relations_out}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

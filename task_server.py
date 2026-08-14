@@ -229,12 +229,14 @@ def create_task_or_note(
         recurring=recurring,
         reminder_at=reminder_at,
     ):
-        return json.dumps({"error": err})
+        return json.dumps({"error": err}, ensure_ascii=False)
 
     with _get_write_conn() as conn:
         if parent_id:
             if not TaskDAO.exists(conn, parent_id):
-                return json.dumps({"error": f"Parent task {parent_id} not found"})
+                return json.dumps(
+                    {"error": f"Parent task {parent_id} not found"}, ensure_ascii=False
+                )
         _create_task_with_ledger(
             conn,
             task_id,
@@ -257,7 +259,8 @@ def create_task_or_note(
 
     logger.info("create_task_or_note: %s (%s)", title, task_id)
     return json.dumps(
-        {"task_id": task_id, "title": title, "type": type, "status": "not_started"}
+        {"task_id": task_id, "title": title, "type": type, "status": "not_started"},
+        ensure_ascii=False,
     )
 
 
@@ -295,7 +298,7 @@ def upsert_note_by_title_project(
     """
     title = (title or "").strip()
     if not title:
-        return json.dumps({"error": "title is required"})
+        return json.dumps({"error": "title is required"}, ensure_ascii=False)
 
     project_value = project.strip() if project else None
     create_section = section or "next"
@@ -305,14 +308,14 @@ def upsert_note_by_title_project(
         priority=create_priority,
         type="note",
     ):
-        return json.dumps({"error": err})
+        return json.dumps({"error": err}, ensure_ascii=False)
     update_validation = {
         key: value
         for key, value in {"section": section, "priority": priority}.items()
         if value
     }
     if update_validation and (err := _validate_task_fields(**update_validation)):
-        return json.dumps({"error": err})
+        return json.dumps({"error": err}, ensure_ascii=False)
 
     now = _now()
     embed_task_id: str | None = None
@@ -328,7 +331,8 @@ def upsert_note_by_title_project(
                         "type": "note",
                         "action": "existing",
                         "matched_on": "normalized_title_project",
-                    }
+                    },
+                    ensure_ascii=False,
                 )
 
             updates: dict[str, Any] = {}
@@ -349,7 +353,8 @@ def upsert_note_by_title_project(
                         "type": "note",
                         "action": "existing",
                         "matched_on": "normalized_title_project",
-                    }
+                    },
+                    ensure_ascii=False,
                 )
 
             result = _apply_task_mutation(
@@ -404,7 +409,7 @@ def upsert_note_by_title_project(
         title,
         response["task_id"],
     )
-    return json.dumps(response)
+    return json.dumps(response, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -469,7 +474,9 @@ def update_task(
         elif v:  # non-empty string = update
             updates[k] = v
     if not updates:
-        return json.dumps({"error": "No fields to update. Pass non-empty values."})
+        return json.dumps(
+            {"error": "No fields to update. Pass non-empty values."}, ensure_ascii=False
+        )
 
     val_fields = {
         k: v
@@ -487,7 +494,7 @@ def update_task(
         and v is not None
     }
     if err := _validate_task_fields(**val_fields):
-        return json.dumps({"error": err})
+        return json.dumps({"error": err}, ensure_ascii=False)
 
     updates["updated_at"] = _now()
 
@@ -501,7 +508,9 @@ def update_task(
             tool_name="sqlite-tasks.update_task",
         )
         if result.get("updated", 0) == 0 and result.get("missing"):
-            return json.dumps({"error": f"Task {task_id} not found"})
+            return json.dumps(
+                {"error": f"Task {task_id} not found"}, ensure_ascii=False
+            )
         # Re-embed if content fields changed
         if {"title", "description", "notes"} & set(result.get("changed_fields", ())):
             reembed = True
@@ -509,7 +518,9 @@ def update_task(
     if reembed:
         _vec_sync_task_safe(task_id)
     logger.info("update_task: %s updated %s", task_id, list(updates.keys()))
-    return json.dumps({"updated": task_id, "fields": list(updates.keys())})
+    return json.dumps(
+        {"updated": task_id, "fields": list(updates.keys())}, ensure_ascii=False
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -642,7 +653,7 @@ def query_tasks(
     """
     order_clause, sort_err = _build_query_tasks_order(sort_by, sort_order)
     if sort_err is not None:
-        return json.dumps({"error": sort_err})
+        return json.dumps({"error": sort_err}, ensure_ascii=False)
 
     conditions: list[str] = []
     params: list[Any] = []
@@ -744,7 +755,8 @@ def query_tasks(
 
     if not rows:
         return json.dumps(
-            {"tasks": [], "count": 0, "total": total, "message": "No tasks match"}
+            {"tasks": [], "count": 0, "total": total, "message": "No tasks match"},
+            ensure_ascii=False,
         )
 
     lines = [
@@ -772,7 +784,7 @@ def query_tasks(
     if total > offset + limit:
         result["has_more"] = True
         result["next_offset"] = offset + limit
-    return json.dumps(result)
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1037,7 +1049,8 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
     query = (title_fragment or "").strip()
     if not query:
         return json.dumps(
-            {"matches": [], "count": 0, "message": "Empty title fragment"}
+            {"matches": [], "count": 0, "message": "Empty title fragment"},
+            ensure_ascii=False,
         )
 
     limit = max(1, min(int(limit), 100))
@@ -1116,7 +1129,8 @@ def find_by_title(title_fragment: str, limit: int = 20) -> str:
             "lookup_strategy": strategy,
             "markdown": "\n".join(lines) if matches else "",
             "message": None if matches else "No title matches",
-        }
+        },
+        ensure_ascii=False,
     )
 
 
@@ -1186,7 +1200,8 @@ def task_digest(
             "digest": "\n".join(lines),
             "active_count": len(active),
             "overdue_count": len(overdue),
-        }
+        },
+        ensure_ascii=False,
     )
 
 
@@ -1200,7 +1215,9 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
     Moves tasks with status='done' and updated_at older than threshold to 'archived'.
     """
     if older_than_days < 0:
-        return json.dumps({"error": "older_than_days must be non-negative"})
+        return json.dumps(
+            {"error": "older_than_days must be non-negative"}, ensure_ascii=False
+        )
 
     with _get_write_conn() as conn:
         affected_ids = TaskDAO.archive_done(conn, older_than_days)
@@ -1211,7 +1228,8 @@ def archive_done_tasks(older_than_days: int = 7) -> str:
         older_than_days,
     )
     return json.dumps(
-        {"archived": len(affected_ids), "threshold_days": older_than_days}
+        {"archived": len(affected_ids), "threshold_days": older_than_days},
+        ensure_ascii=False,
     )
 
 
@@ -1225,9 +1243,13 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
     Only bumps tasks with priority lower than target.
     """
     if target_priority not in _TASK_PRIORITIES:
-        return json.dumps({"error": f"Invalid priority: {target_priority}"})
+        return json.dumps(
+            {"error": f"Invalid priority: {target_priority}"}, ensure_ascii=False
+        )
     if _TASK_PRIORITIES.index(target_priority) == 0:
-        return json.dumps({"bumped": 0, "message": "No lower priorities to bump"})
+        return json.dumps(
+            {"bumped": 0, "message": "No lower priorities to bump"}, ensure_ascii=False
+        )
 
     with _get_write_conn() as conn:
         bumped = TaskDAO.bump_overdue_priority(
@@ -1237,7 +1259,9 @@ def bump_overdue_priority(target_priority: str = "high") -> str:
         )
 
     logger.info("bump_overdue_priority: %d bumped to %s", len(bumped), target_priority)
-    return json.dumps({"bumped": len(bumped), "target_priority": target_priority})
+    return json.dumps(
+        {"bumped": len(bumped), "target_priority": target_priority}, ensure_ascii=False
+    )
 
 
 def _strip_ready_task_payload(record: dict[str, Any]) -> dict[str, Any]:
