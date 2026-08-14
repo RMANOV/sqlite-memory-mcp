@@ -684,16 +684,77 @@ def _log_file_name(log_file: str) -> str:
     return f"{stem}.{os.getpid()}.{ext}" if dot else f"{log_file}.{os.getpid()}"
 
 
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Windows liveness, because ``os.kill`` cannot be used to ask.
+
+    CPython implements ``os.kill`` on Windows with ``TerminateProcess``; signal
+    0 is not special-cased, so ``os.kill(pid, 0)`` *terminates* the process it
+    claims to probe. It also raises a bare ``OSError`` rather than
+    ``ProcessLookupError`` for a PID that is gone, so the POSIX branch below
+    read every dead PID as alive and the directory budget never applied here at
+    all.
+
+    ``GetExitCodeProcess`` answers properly, and unlike a bare
+    ``OpenProcess`` success it also reports a terminated-but-still-handled
+    process as dead. Ambiguity still resolves to 'alive': a process that really
+    exited with code 259 is indistinguishable from a running one, and keeping
+    its log is the harmless side of that mistake.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Declared, not defaulted: ctypes returns c_int for an undeclared
+        # function, which truncates a 64-bit HANDLE. A truncated handle passes
+        # the `if not handle` check and is then closed by the wrong value — a
+        # leak that only appears once handle values grow past 2**31.
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # No such process is the ONE unambiguous answer; access denied and
+            # everything else mean it exists, or that we cannot tell.
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return True
+
+
 def _pid_is_alive(pid: int) -> bool:
     """True unless the PID is provably gone.
 
     Every ambiguous answer is 'alive'. A false 'alive' keeps a log file that
     could have been deleted; a false 'dead' deletes a file a running server is
-    writing to. Only ``ProcessLookupError`` is unambiguous, and even that is
-    subject to PID reuse — which also errs toward keeping.
+    writing to. Only a definitive 'no such process' is unambiguous, and even
+    that is subject to PID reuse — which also errs toward keeping.
     """
     if pid <= 0:
         return True
+    if sys.platform == "win32":
+        return _windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1219,9 +1280,12 @@ def _reserve_generation(root: Path, generation: str) -> Path:
 
     ``mkdir`` is the directory-level ``O_EXCL``: it either creates the name or
     raises ``FileExistsError``, with no window in which two processes both
-    believe they own it. An *empty* directory is still a valid rename target —
-    ``rename(2)`` replaces an empty destination directory with a directory — so
-    publishing stays the single atomic step it was.
+    believe they own it. On POSIX an *empty* directory is still a valid rename
+    target — ``rename(2)`` replaces an empty destination directory with a
+    directory — so publishing stays the single atomic step it was. Windows has
+    no such operation and reaches the same guarantee differently; see
+    :func:`_publish_generation`. Either way the reserved name is never given
+    back, because freeing it is what lets a concurrent backup steal it.
 
     What this replaces: the publish used to ``shutil.rmtree`` a colliding
     generation and then rename over the hole. Generations are named by the
@@ -1248,6 +1312,47 @@ def _reserve_generation(root: Path, generation: str) -> Path:
         f"Could not claim a generation name under {root}: {generation} and "
         f"{_BACKUP_COLLISION_LIMIT - 1} disambiguated variants are all taken"
     )
+
+
+def _publish_generation(staging: Path, final: Path) -> None:
+    """Move the staged generation onto the name reserved for it.
+
+    On POSIX this is one step: ``rename(2)`` replaces an *empty* destination
+    directory, so reserving the name and publishing into it never leaves a
+    gap. Windows offers no equivalent — ``MoveFileEx`` rejects
+    ``MOVEFILE_REPLACE_EXISTING`` for directories outright and fails with
+    ``ACCESS_DENIED`` — so the reservation that makes this safe on POSIX is
+    exactly what made every backup here fail on Windows.
+
+    Withdrawing the placeholder to free the name is NOT the answer: two
+    concurrent backups then race for it, and the second can reclaim the name
+    between the first one's ``rmdir`` and its ``rename``. That window is not
+    theoretical — it is what
+    ``test_concurrent_same_process_backups_use_distinct_staging`` catches.
+
+    So on Windows the reserved directory is never given up. Its *contents* are
+    moved in instead, with the manifest last. Publishing stops being atomic at
+    the filesystem level and becomes atomic at the level that actually decides:
+    :func:`_is_own_generation` requires both ``memory.db`` and a readable
+    manifest, so a half-moved directory is not a generation to `list_backups`,
+    to retention, or to the operator. A move interrupted midway therefore
+    leaves something inert rather than something mistakable for a good backup —
+    the property the staging dance existed to guarantee.
+
+    Per-file moves also keep using ``os.replace``, so the failure injected by
+    ``test_a_failed_publish_never_destroys_the_previous_generation`` still lands
+    on the real publish step.
+    """
+    if sys.platform != "win32":
+        os.replace(staging, final)
+        return
+
+    # False sorts before True: the manifest is moved last, always.
+    for item in sorted(
+        staging.iterdir(), key=lambda p: p.name == _BACKUP_MANIFEST_NAME
+    ):
+        os.replace(item, final / item.name)
+    staging.rmdir()
 
 
 def list_backups(backup_dir: str | None = None) -> list[str]:
@@ -1399,7 +1504,7 @@ def create_backup(
         )
         os.chmod(manifest_file, _BACKUP_FILE_MODE)
 
-        os.replace(staging, final)
+        _publish_generation(staging, final)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         if final is not None:

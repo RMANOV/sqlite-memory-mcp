@@ -28,9 +28,11 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -122,6 +124,144 @@ def test_two_backups_in_the_same_second_both_survive(tmp_path):
     assert len(list_backups(str(root))) == 2
 
 
+def test_the_publish_contract_holds_end_to_end(tmp_path, monkeypatch):
+    """One test for the whole publish contract, because the parts interact.
+
+    Windows cannot rename a directory onto an existing one, so the reserved
+    name cannot be replaced the way ``rename(2)`` replaces it on POSIX. Freeing
+    the reservation first is not an option either — that reopens the race two
+    concurrent writers are guaranteed to hit. The contents are therefore moved
+    into the reserved directory with the manifest last, which moves atomicity
+    from the filesystem to the completeness rule: a generation is only a
+    generation once it has BOTH the database and a readable manifest.
+
+    Four claims, asserted together because separately they can each pass while
+    the guarantee is broken:
+
+    1. two concurrent writers each publish a distinct, verifiable generation;
+    2. no published generation is ever incomplete;
+    3. the manifest is the last thing to arrive;
+    4. a directory holding only the database is not a generation to the reader.
+    """
+    src = tmp_path / "memory.db"
+    _make_db(src, rows=50)
+    root = tmp_path / "b"
+
+    arrivals: list[str] = []
+    arrivals_lock = threading.Lock()
+    real_replace = os.replace
+
+    def recording_replace(a, b, *args, **kwargs):
+        result = real_replace(a, b, *args, **kwargs)
+        if str(b).startswith(str(root)):
+            dest = Path(str(b))
+            with arrivals_lock:
+                arrivals.append((dest.parent.name, dest.name))
+        return result
+
+    monkeypatch.setattr(db_utils.os, "replace", recording_replace)
+
+    barrier = threading.Barrier(2)
+    real_backup_to = db_utils._backup_to
+
+    def synchronized_backup(src_conn, dest_path, pages):
+        barrier.wait(timeout=30)
+        return real_backup_to(src_conn, dest_path, pages)
+
+    monkeypatch.setattr(db_utils, "_backup_to", synchronized_backup)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        made = [
+            f.result(timeout=60)
+            for f in [
+                pool.submit(create_backup, str(src), backup_dir=str(root), now=FIXED)
+                for _ in range(2)
+            ]
+        ]
+
+    # 1. Two concurrent writers, two distinct generations, both verifiable.
+    assert len({item["path"] for item in made}) == 2
+    for item in made:
+        assert verify_backup(item["path"])["ok"] is True
+
+    # 2. Nothing incomplete was published, and nothing extra appeared.
+    published = list_backups(str(root))
+    assert len(published) == 2, f"unexpected generations on disk: {published}"
+    for path in published:
+        assert (Path(path) / "memory.db").is_file()
+        assert (Path(path) / "manifest.json").is_file()
+
+    # 3. The manifest arrives last. On POSIX the directory moves in one step,
+    #    so there is nothing to order; the guarantee there is the rename itself.
+    if sys.platform == "win32":
+        assert arrivals, "no per-file moves were observed"
+        per_generation: dict[str, list[str]] = {}
+        for generation, filename in arrivals:
+            per_generation.setdefault(generation, []).append(filename)
+        assert len(per_generation) == 2, f"expected two generations: {arrivals}"
+        # Per directory, not globally: with two writers interleaving, a global
+        # "last entry is a manifest" would pass even if one generation had
+        # published its manifest before its database.
+        for generation, order in per_generation.items():
+            assert order[-1] == "manifest.json", (
+                f"{generation} did not receive its manifest last: {order}"
+            )
+            assert "memory.db" in order[:-1], (
+                f"{generation} published a manifest without the database "
+                f"already in place: {order}"
+            )
+
+    # 4. The completeness rule is what the reader actually enforces.
+    half = root / "20260101T000000Z"
+    half.mkdir()
+    (half / "memory.db").write_bytes(b"not a real database")
+    assert db_utils._is_own_generation(half) is False, (
+        "a directory with a database but no manifest was accepted as a "
+        "generation — the property that replaces filesystem atomicity"
+    )
+    assert str(half) not in list_backups(str(root))
+
+
+def test_a_crash_mid_publish_leaves_no_readable_broken_generation(
+    tmp_path, monkeypatch
+):
+    """The crash window for the per-file publish, made deterministic.
+
+    The manifest lands last precisely so that dying in the middle produces
+    something the reader refuses, rather than a directory that looks like a
+    verified backup and is not.
+    """
+    src = tmp_path / "memory.db"
+    _make_db(src, rows=20)
+    root = tmp_path / "b"
+
+    good = create_backup(str(src), backup_dir=str(root), now=FIXED)
+    good_sha = _sha(good["backup_path"])
+
+    real_replace = os.replace
+
+    def die_before_the_manifest(a, b, *args, **kwargs):
+        if str(b).endswith("manifest.json") and str(b).startswith(str(root)):
+            raise OSError(28, "No space left on device")
+        return real_replace(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(db_utils.os, "replace", die_before_the_manifest)
+
+    with pytest.raises(OSError):
+        create_backup(str(src), backup_dir=str(root), now=FIXED)
+
+    # The generation that existed before is untouched and still verifies.
+    assert os.path.exists(good["backup_path"])
+    assert _sha(good["backup_path"]) == good_sha
+    assert verify_backup(good["path"])["ok"] is True
+
+    # And nothing the failed run left behind is readable as a generation.
+    for path in list_backups(str(root)):
+        assert verify_backup(path)["ok"] is True, (
+            f"a broken generation is being reported as valid: {path}"
+        )
+
+
 def test_concurrent_same_process_backups_use_distinct_staging(tmp_path, monkeypatch):
     """PID + timestamp is not unique when two scheduler threads overlap."""
     src = tmp_path / "memory.db"
@@ -191,7 +331,9 @@ def test_a_foreign_directory_on_the_name_is_stepped_around_not_deleted(tmp_path)
 
     made = create_backup(str(src), backup_dir=str(root), now=FIXED)
 
-    assert (squatter / "operator-notes.txt").read_text(encoding="utf-8") == "do not delete"
+    assert (squatter / "operator-notes.txt").read_text(
+        encoding="utf-8"
+    ) == "do not delete"
     assert made["path"] != str(squatter)
     assert verify_backup(made["path"])["ok"] is True
 
@@ -220,7 +362,9 @@ def _inject_readonly_once(monkeypatch, probe: list | None = None):
     return calls
 
 
-def test_the_wal_recovery_retry_escalates_from_readonly_to_writable(tmp_path, monkeypatch):
+def test_the_wal_recovery_retry_escalates_from_readonly_to_writable(
+    tmp_path, monkeypatch
+):
     """Proves both halves of the branch's claim, not just that it retried."""
     src = tmp_path / "memory.db"
     _make_db(src)
