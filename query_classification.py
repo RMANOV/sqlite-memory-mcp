@@ -229,8 +229,9 @@ def classify_query(raw: str) -> QueryClass:
 
     if len(terms) == 1:
         # The jump rule inverts for a single meaningful token: a good one-word
-        # query *should* have a standout top hit. Applying it would reject
-        # `Крестън` (24% jump), the very query most likely to be intended.
+        # query *should* have a standout top hit. Applying it would reject the
+        # proper-noun query measured at a 24% jump — the very query most likely
+        # to be intended.
         return QueryClass(
             status="OK",
             terms=terms,

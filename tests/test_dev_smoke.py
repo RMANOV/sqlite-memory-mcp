@@ -183,12 +183,16 @@ class TestPhasesHoldTogether:
         assert seen["session_id"] is None, "deferred capability, not a silent revival"
 
     def test_s4_holdout_queries_are_returned_not_suppressed(self, graph, monkeypatch):
-        """The three queries that scored 0/15, 0/5 and 0/5 on blind labelling."""
+        """The three queries that scored 0/15, 0/5 and 0/5 on blind labelling.
+
+        Published as structure-preserving stand-ins; see the provenance note in
+        ``test_query_classification.py``.
+        """
         monkeypatch.setattr(S, "_VEC_AVAILABLE", False)
         for query in (
-            "Google Calendar МОРЕ 2026 Семейни",
-            "job search curator инструкция",
-            "READINGS LIST CURATOR Структуриран промпт",
+            "Google Calendar ПРОЕКТ 2026 Тримесечни",
+            "task list curator инструкция",
+            "ARCHIVE LIST CURATOR Структуриран промпт",
         ):
             payload = _check_invariants(_call(S.search_nodes, query))
             assert payload["_accounting"]["status"] != "NO_RELEVANT_RESULTS"

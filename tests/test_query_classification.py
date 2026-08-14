@@ -11,6 +11,11 @@ queries — a strong jump means a *good* match there. Hiding a real answer costs
 more than showing a weak one, so the signals label the response and never trim
 it. That direction is the opposite of the one chosen for tokenizer parity, and
 deliberately so: the cheaper error differs per gate.
+
+**Fixture provenance.** The blind labelling ran against a private corpus of
+real logged queries. The literals below are structure-preserving stand-ins:
+same token counts, same script mix, same year/date placement, different words.
+Where a docstring cites a measured figure, it was measured on the original.
 """
 
 import os
@@ -61,8 +66,8 @@ class TestStopwords:
         [
             "mapping",
             "studio",
-            "kreston",
-            "крестън",
+            "ledger",
+            "регистър",
             "мапинг",
             "одит",
             "баланс",
@@ -91,11 +96,11 @@ class TestStopwords:
 
 class TestMeaningfulTerms:
     def test_strips_stopwords_and_years(self):
-        assert meaningful_terms("Google Calendar МОРЕ 2026 Семейни") == [
+        assert meaningful_terms("Google Calendar ПРОЕКТ 2026 Тримесечни") == [
             "Google",
             "Calendar",
-            "МОРЕ",
-            "Семейни",
+            "ПРОЕКТ",
+            "Тримесечни",
         ]
 
     def test_keeps_domain_terms(self):
@@ -119,10 +124,11 @@ class TestClassification:
     def test_single_token_skips_the_jump_rule(self):
         """A good one-word query *should* have a standout top hit.
 
-        Applying the jump rule here would reject `Крестън` (24% jump), which
-        is exactly the query most likely to be meant.
+        Applying the jump rule here would reject the single-token proper-noun
+        query measured at a 24% jump — exactly the query most likely to be
+        meant.
         """
-        result = classify_query("Крестън")
+        result = classify_query("Балкан")
         assert result.applies_jump is False
         assert result.status == "OK"
 
@@ -138,9 +144,9 @@ class TestTelemetryNeverSuppresses:
     @pytest.mark.parametrize(
         "query",
         [
-            "Google Calendar МОРЕ 2026 Семейни",
-            "job search curator инструкция",
-            "READINGS LIST CURATOR Структуриран промпт",
+            "Google Calendar ПРОЕКТ 2026 Тримесечни",
+            "task list curator инструкция",
+            "ARCHIVE LIST CURATOR Структуриран промпт",
         ],
     )
     def test_the_three_measured_noise_queries_are_not_suppressed(self, query):
@@ -154,12 +160,12 @@ class TestTelemetryNeverSuppresses:
         assert result.suppress is False
 
     def test_no_status_value_means_suppression(self):
-        for query in ("за на", "2026", "Крестън", "Мапинг Студио"):
+        for query in ("за на", "2026", "Балкан", "Мапинг Студио"):
             assert classify_query(query).suppress is False
 
     def test_status_values_are_enumerated(self):
         allowed = {"OK", "AMBIGUOUS_QUERY"}
-        for query in ("за на", "2026", "Крестън", "Мапинг Студио тест"):
+        for query in ("за на", "2026", "Балкан", "Мапинг Студио тест"):
             assert classify_query(query).status in allowed
 
 

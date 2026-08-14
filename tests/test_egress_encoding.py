@@ -16,6 +16,12 @@ Two invariants are asserted here, and they pull in opposite directions:
    comparison — bridge diff, hashes, dedup — silently disagrees.
 
 ``session_server.py`` holds one of each, three lines apart.
+
+**Fixture provenance.** The measurements cited across this branch were taken on
+a private corpus of real logged queries. The literals published here are
+structure-preserving stand-ins — same script mix, token count and character
+classes, different words. A reader cannot reproduce the exact figures without
+that corpus, and could not have anyway.
 """
 
 import ast
@@ -45,7 +51,10 @@ PERSISTENCE_SITES = {
     ("session_server.py", "session_save"),
 }
 
-CYRILLIC_SAMPLE = "Оборотна ведомост №5 — Крестън БулМар ООД"
+# Structure matters here, not the words: Cyrillic letters, a `№` sign, an
+# em-dash and a digit all take different numbers of wire characters once
+# escaped. The company is fictional on purpose — see the note above.
+CYRILLIC_SAMPLE = "Оборотна ведомост №5 — Примерна Фирма ООД"
 
 
 def _dumps_calls(path: pathlib.Path):
