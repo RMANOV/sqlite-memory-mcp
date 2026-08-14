@@ -31,6 +31,34 @@ IS_WINDOWS = sys.platform == "win32"
 windows_only = pytest.mark.skipif(not IS_WINDOWS, reason="Windows adapter behavior")
 
 
+def _real_ddl(*tables: str) -> str:
+    """Return the production CREATE TABLE statements for ``tables``.
+
+    Hand-rolled fixture tables drift. This one did: ``debate_worker_claims``
+    grew a ``role`` column -- part of its UNIQUE key, and the very column
+    ``_live_worker_claim_keys`` selects -- while the miniature here kept four
+    columns, so correct pump code failed against a stale fixture. Reading the
+    real DDL makes that class of failure impossible rather than unlikely.
+
+    Foreign keys in these statements stay inert: SQLite leaves
+    ``PRAGMA foreign_keys`` off, so the referenced tables need not exist.
+    """
+    import re
+
+    import schema
+
+    statements = schema._split_schema_sql(schema._SCHEMA_SQL)
+    out = []
+    for table in tables:
+        pattern = re.compile(
+            rf"CREATE TABLE (?:IF NOT EXISTS )?{re.escape(table)}\b", re.IGNORECASE
+        )
+        match = next((s for s in statements if pattern.search(s)), None)
+        assert match is not None, f"no CREATE TABLE for {table} in schema._SCHEMA_SQL"
+        out.append(match.rstrip().rstrip(";") + ";")
+    return "\n".join(out)
+
+
 @pytest.fixture()
 def isolated_wake_events(monkeypatch):
     """Unique kernel event names per test run: the production pump waits on
@@ -156,30 +184,29 @@ def test_pump_restart_does_not_retire_live_worker(tmp_path, monkeypatch):
 
     db = tmp_path / "wake.db"
     con = sqlite3.connect(db)
-    con.executescript(
-        """
-        CREATE TABLE debate_worker_claims (
-            topic_id TEXT, worker_session_id TEXT, trigger_msg_id TEXT, state TEXT
-        );
-        CREATE TABLE debate_wake_log (
-            wake_id TEXT, trigger_msg_id TEXT, topic_id TEXT, recipient TEXT,
-            target_role TEXT, target_session_id TEXT, target_runtime TEXT,
-            binding_generation INTEGER, action TEXT, result TEXT,
-            schema_version TEXT, details_json TEXT, created_at TEXT
-        );
-        """
-    )
+    con.executescript(_real_ddl("debate_worker_claims", "debate_wake_log"))
+
     import psutil
 
     me = psutil.Process(os.getpid())
     details = json.dumps({"pid": os.getpid(), "create_time": me.create_time()})
+    # Named columns, not positional: a positional INSERT is the other half of
+    # the drift, silently binding the wrong values once a column is added.
     con.execute(
-        "INSERT INTO debate_worker_claims VALUES ('T1','cc-x-W1','m1','active')"
+        "INSERT INTO debate_worker_claims "
+        "(topic_id, role, parent_session_id, trigger_msg_id, worker_session_id,"
+        " state, claimed_at, heartbeat_at) "
+        "VALUES ('T1','EXEC','cc-parent','m1','cc-x-W1','active',"
+        "        '2026-07-21T00:00:00Z','2026-07-21T00:00:00Z')"
     )
     con.execute(
-        "INSERT INTO debate_wake_log VALUES "
-        "('w1','m1','T1','EXEC','EXEC','cc-x-W1','cc',NULL,"
-        "'external_agent_spawn','real_spawn','v1',?, '2026-07-21T00:00:00Z')",
+        "INSERT INTO debate_wake_log "
+        "(wake_id, trigger_msg_id, topic_id, recipient, target_role,"
+        " target_session_id, target_runtime, action, result, schema_version,"
+        " details_json, created_at) "
+        "VALUES ('w1','m1','T1','EXEC','EXEC','cc-x-W1','cc',"
+        "        'external_agent_spawn','real_spawn','v1',?,"
+        "        '2026-07-21T00:00:00Z')",
         (details,),
     )
     con.commit()

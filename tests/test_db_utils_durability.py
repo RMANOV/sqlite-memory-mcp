@@ -129,9 +129,12 @@ def test_backup_produces_verified_generation(tmp_path):
 
     backup_file = tmp_path / "b" / manifest["generation"] / "memory.db"
     assert backup_file.is_file()
-    assert json.loads(
-        (backup_file.parent / "manifest.json").read_text(encoding="utf-8")
-    )["total_rows"] == 1000
+    assert (
+        json.loads((backup_file.parent / "manifest.json").read_text(encoding="utf-8"))[
+            "total_rows"
+        ]
+        == 1000
+    )
     # Single self-contained file — no WAL sidecars to forget when restoring.
     # Their absence proves nothing on its own: SQLite removes them on a clean
     # last-connection close whatever the journal mode is, so this assertion held
@@ -148,6 +151,16 @@ def test_backup_produces_verified_generation(tmp_path):
     assert verify_backup(str(backup_file.parent))["ok"] is True
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Windows cannot represent these bits: chmod(0o700) reads back as 0o777 "
+        "and chmod(0o600) as 0o666, because only the read-only flag is real "
+        "there. create_backup still issues the chmod calls, but owner-only "
+        "access on Windows would require ACLs, and NOTHING here provides it — "
+        "this is skipped as unenforceable, not as satisfied."
+    ),
+)
 def test_backup_uses_0600_files_in_a_0700_directory(tmp_path):
     src = tmp_path / "memory.db"
     _make_db(src, rows=10).close()
@@ -345,7 +358,9 @@ def test_a_backdated_generation_never_prunes_itself(tmp_path):
         now=datetime(2026, 7, 31, tzinfo=timezone.utc),
     )
     assert os.path.exists(lone["path"])
-    assert [os.path.basename(p) for p in list_backups(str(root))] == ["20260731T000000Z"]
+    assert [os.path.basename(p) for p in list_backups(str(root))] == [
+        "20260731T000000Z"
+    ]
 
 
 def test_retention_never_deletes_foreign_directories(tmp_path):
@@ -470,7 +485,9 @@ def test_setup_logger_installs_a_rotating_handler(isolated_home):
         logger.handlers.clear()
 
 
-def test_rotation_bounds_are_read_at_call_time_not_import_time(isolated_home, monkeypatch):
+def test_rotation_bounds_are_read_at_call_time_not_import_time(
+    isolated_home, monkeypatch
+):
     """``SQLITE_MEMORY_LOG_MAX_BYTES`` used to be unsettable by anything.
 
     It was read into a module constant at import, so no caller that had already
@@ -539,7 +556,9 @@ def test_log_growth_is_bounded(isolated_home):
     total = sum(f.stat().st_size for f in files)
 
     assert [f.name for f in files] == [stem, f"{stem}.1", f"{stem}.2"]
-    assert not (log_dir / "server.log").exists(), "wrote to the shared multi-process sink"
+    assert not (log_dir / "server.log").exists(), (
+        "wrote to the shared multi-process sink"
+    )
     assert total <= 2048 * 3 * 1.1, f"unbounded: {total} bytes in {files}"
     # Unrotated, 4000 x ~90 byte records would be well over 300 KB.
     assert total < 100_000
