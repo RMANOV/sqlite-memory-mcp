@@ -33,6 +33,7 @@ from db_utils import (
 )
 from premium_runtime import maybe_mount_premium_extensions
 from link_suggestions import normalize_phrase as _normalize_link_phrase
+from query_classification import STOPWORD_LIST_VERSION, classify_query
 from recall_budget import (
     RECALL_PREFIX,
     RECALL_WIRE_BUDGET,
@@ -111,16 +112,63 @@ def _expand_by_relations(
     return list(rows) + added
 
 
-def _query_terms(raw: str) -> list[str]:
-    """Terms used only to centre the truncation window on the match.
+def _search_payload(
+    query: str,
+    candidates: list[dict[str, Any]],
+    budget: int,
+    evidence: set[int],
+    refills: int,
+) -> str:
+    """The single exit for search_nodes, empty result included.
 
-    Deliberately not a matcher: evidence comes from the FTS probe, which uses
-    the index's own tokenizer. This split is why no Python normalisation is
-    needed here.
+    Two return paths meant two hand-built accounting blocks, and the second one
+    was already missing fields the first had. One constructor makes that class
+    of drift impossible rather than merely unlikely.
+
+    `query_status` labels the *question*; `status` describes the *result*.
+    Separate fields stop "your query was vague" from being read as "the payload
+    is degraded", and the reverse.
     """
-    import re
+    qclass = classify_query(query)
+    extra: dict[str, Any] = {
+        "refills": refills,
+        "query_status": qclass.status,
+        "meaningful_terms": len(qclass.terms),
+        "stopword_list": STOPWORD_LIST_VERSION,
+    }
+    if not candidates:
+        # Scoped deliberately: this server indexes the SQLite graph. The
+        # markdown memory index is invisible to it, so "no results" must not
+        # be stated globally.
+        #
+        # Set here rather than after packing: "NO_RESULTS_IN_GRAPH" is longer
+        # than "OK", so assigning it post-measurement would leave wire_chars
+        # describing a shorter payload than the one sent.
+        extra["status"] = "NO_RESULTS_IN_GRAPH"
 
-    return [t for t in re.split(r"[^\wЀ-ӿ]+", raw) if len(t) > 1]
+    # envelope and extra are handed in *before* measuring: a field bolted on
+    # afterwards makes the reported size describe a payload that was never
+    # sent.
+    results, accounting = pack_entities(
+        candidates,
+        evidence=evidence,
+        query_terms=qclass.terms,
+        budget=budget,
+        envelope={"query": query},
+        extra_accounting=extra,
+    )
+
+    logger.info(
+        "search_nodes: query=%r considered=%d returned=%d wire=%s",
+        query,
+        accounting["entities_considered"],
+        accounting["entities_returned"],
+        accounting["wire_chars"],
+    )
+    return json.dumps(
+        {"entities": results, "query": query, "_accounting": accounting},
+        ensure_ascii=False,
+    )
 
 
 # Optional vector search (graceful fallback to FTS5-only)
@@ -742,27 +790,11 @@ def search_nodes(
                 logger.debug("Vector search failed: %s", e, exc_info=True)
 
         if not rows:
-            # Scoped label: this server indexes the SQLite graph only. The
-            # markdown memory index is invisible here, so "no results" must
-            # not be stated globally.
-            return json.dumps(
-                {
-                    "entities": [],
-                    "query": query,
-                    "_accounting": {
-                        "entities_considered": 0,
-                        "entities_returned": 0,
-                        "observations_returned": 0,
-                        "truncated": False,
-                        "budget_wire_chars": budget,
-                        "wire_chars": "0000000",
-                        "status": "NO_RESULTS_IN_GRAPH",
-                        "degraded": [],
-                        "refills": 0,
-                    },
-                },
-                ensure_ascii=False,
-            )
+            # Built through the same packer as every other exit, so the
+            # accounting shape cannot drift between the empty and non-empty
+            # paths. A second hand-rolled block here was already missing
+            # fields the main path had.
+            return _search_payload(query, [], budget, set(), 0)
 
         # The seeds are what the query itself found. They serve two purposes
         # that were both dormant: they are the anchors for graph proximity,
@@ -864,30 +896,8 @@ def search_nodes(
                 entity["_score"] = r["_score"]
             candidates.append(entity)
 
-    # `envelope` and `extra_accounting` are handed in *before* measuring, not
-    # bolted on after: a field added post-hoc makes the reported size describe
-    # a payload that was never sent.
-    results, accounting = pack_entities(
-        candidates,
-        evidence=evidence,
-        query_terms=_query_terms(query),
-        budget=budget,
-        envelope={"query": query},
-        extra_accounting={"refills": refills},
-    )
-
     _record_entity_access_best_effort(eids, "search_nodes")
-    logger.info(
-        "search_nodes: query=%r considered=%d returned=%d wire=%s",
-        query,
-        accounting["entities_considered"],
-        accounting["entities_returned"],
-        accounting["wire_chars"],
-    )
-    return json.dumps(
-        {"entities": results, "query": query, "_accounting": accounting},
-        ensure_ascii=False,
-    )
+    return _search_payload(query, candidates, budget, evidence, refills)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
