@@ -106,25 +106,64 @@ class TestNeighbourExpansionChangesResults:
         assert payload["_accounting"]["status"] == "DEGRADED"
 
 
+def _spy_rerank(monkeypatch, seen):
+    import smart_retrieval
+
+    original = smart_retrieval.rerank_entities
+
+    def spy(conn, rows, **kwargs):
+        seen.update(kwargs)
+        return original(conn, rows, **kwargs)
+
+    monkeypatch.setattr("smart_retrieval.rerank_entities", spy)
+
+
 class TestGraphBoostChangesRanking:
     def test_query_entity_ids_reach_the_reranker(self, linked_corpus, monkeypatch):
         """Assert the argument is non-empty at the call, not merely present."""
-        seen = {}
-        import smart_retrieval
-
-        original = smart_retrieval.rerank_entities
-
-        def spy(conn, rows, **kwargs):
-            seen["query_entity_ids"] = kwargs.get("query_entity_ids")
-            seen["session_id"] = kwargs.get("session_id")
-            return original(conn, rows, **kwargs)
-
+        seen: dict = {}
         monkeypatch.setattr(S, "_VEC_AVAILABLE", False)
-        monkeypatch.setattr("smart_retrieval.rerank_entities", spy)
+        _spy_rerank(monkeypatch, seen)
         _call(S.search_nodes, "Полярис")
         assert seen.get("query_entity_ids"), (
             "graph proximity stays dead when this is None"
         )
+
+
+class TestSessionSignalIsStillDead:
+    """Of the two dormant signals, only graph proximity was revived.
+
+    ``SESSION_BOOST`` (2.0) needs a ``session_id`` that maps to a row in
+    ``sessions`` carrying ``active_files``. MCP tool calls do not carry any
+    session identity, and ``server.py`` has no accessor for one — the word
+    "session" appears there only in a docstring. Reviving it would mean
+    inventing a way to thread session context into every read tool, which the
+    frozen spec rules out.
+
+    This test exists so the gap is visible in the suite rather than implied by
+    its absence. It fails the moment someone starts passing a real session id,
+    which is correct: that is a spec change, not an implementation detail.
+    """
+
+    def test_session_id_is_deliberately_none(self, linked_corpus, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(S, "_VEC_AVAILABLE", False)
+        _spy_rerank(monkeypatch, seen)
+        _call(S.search_nodes, "Полярис")
+        assert "session_id" in seen, "the argument must still be passed explicitly"
+        assert seen["session_id"] is None, (
+            "session boost is knowingly inactive; activating it requires a "
+            "session-context mechanism and a spec decision, not a quiet change"
+        )
+
+    def test_server_has_no_session_accessor(self):
+        """Pins the reason: there is nothing cheap to pass."""
+        import inspect
+
+        source = inspect.getsource(S)
+        # Only the docstring mentions sessions; no lookup, no parameter.
+        assert "current_session" not in source
+        assert "get_session_id" not in source
 
 
 class TestDeterminism:
