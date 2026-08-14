@@ -41,6 +41,8 @@ from recall_budget import (
     evidence_ids,
     fts_probe_spec,
     pack_entities,
+    rank_jump,
+    term_coverage,
 )
 
 # Candidate pool handed to the budget. K is an outcome of the budget, not a
@@ -118,6 +120,8 @@ def _search_payload(
     budget: int,
     evidence: set[int],
     refills: int,
+    coverage: float | None = None,
+    jump: float | None = None,
 ) -> str:
     """The single exit for search_nodes, empty result included.
 
@@ -154,6 +158,8 @@ def _search_payload(
         evidence=evidence,
         query_terms=qclass.terms,
         budget=budget,
+        coverage=coverage,
+        jump=jump,
         envelope={"query": query},
         extra_accounting=extra,
     )
@@ -800,6 +806,10 @@ def search_nodes(
         # that were both dormant: they are the anchors for graph proximity,
         # and the origin of the 1-hop expansion.
         seeds = [r["eid"] for r in rows[:_RECALL_EXPAND_SEEDS]]
+        # Measured on the BM25 ranks, before reranking replaces them with a
+        # composite score: the signal was characterised on `memory_fts.rank`
+        # and means nothing against a different scale.
+        jump = rank_jump([float(r["rank"]) for r in rows[:2]])
         rows = _expand_by_relations(conn, rows, seeds)
 
         reranked = None
@@ -843,6 +853,8 @@ def search_nodes(
         # it: four Python normalisations were refuted against this same path.
         evidence: set[int] = set()
         refills = 0
+        coverage: float | None = None
+        _classified_terms = classify_query(query).terms
         try:
             spec = fts_probe_spec(conn, "memory_fts")
             probe_rows = [
@@ -877,6 +889,13 @@ def search_nodes(
                 evidence |= evidence_ids(
                     [(oid, text) for oid, text in full.items()], fts_q, spec
                 )
+            # Telemetry, computed here because it needs the same probe and
+            # the same snapshot. It labels the response and never trims it.
+            owner = {o["id"]: eid for eid, lst in obs_by_eid.items() for o in lst}
+            probe_rows = [
+                (o["id"], o["content"]) for lst in obs_by_eid.values() for o in lst
+            ]
+            coverage = term_coverage(probe_rows, owner, _classified_terms, spec)
         except ProbeSchemaError as exc:
             # No silent "no evidence": the packer will mark every entity
             # not_found and the status becomes DEGRADED.
@@ -897,7 +916,7 @@ def search_nodes(
             candidates.append(entity)
 
     _record_entity_access_best_effort(eids, "search_nodes")
-    return _search_payload(query, candidates, budget, evidence, refills)
+    return _search_payload(query, candidates, budget, evidence, refills, coverage, jump)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

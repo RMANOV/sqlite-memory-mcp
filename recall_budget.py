@@ -184,6 +184,70 @@ def evidence_ids(
         probe.close()
 
 
+def term_coverage(
+    rows: list[tuple[int, str]],
+    owner: dict[int, int],
+    terms: list[str],
+    spec: ProbeSpec,
+) -> float | None:
+    """Median share of query terms each candidate entity actually matches.
+
+    Recorded, never acted on. The threshold that would use it sat 0.3% from
+    flipping on a hold-out set, so this is a number to look at, not a gate.
+    Computed through the same probe as the evidence set, for the same reason:
+    a Python approximation of the tokenizer would disagree with the index.
+
+    ``owner`` maps observation id to entity id.
+    """
+    if not rows or len(terms) < 2:
+        return None
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute(spec.create_sql("probe"))
+        placeholders = ", ".join("?" for _ in spec.columns)
+        blanks = [""] * (len(spec.columns) - 1)
+        probe.executemany(
+            f"INSERT INTO probe(rowid, {', '.join(spec.columns)}) "
+            f"VALUES (?, {placeholders})",
+            [(rid, *blanks, text) for rid, text in rows],
+        )
+        hits: dict[int, set[str]] = {}
+        for term in terms:
+            try:
+                matched = probe.execute(
+                    "SELECT rowid FROM probe WHERE probe MATCH ?", (f'"{term}"',)
+                ).fetchall()
+            except sqlite3.Error:
+                continue
+            for (oid,) in matched:
+                eid = owner.get(oid)
+                if eid is not None:
+                    hits.setdefault(eid, set()).add(term)
+        if not hits:
+            return 0.0
+        shares = sorted(len(v) / len(terms) for v in hits.values())
+        return shares[len(shares) // 2]
+    except sqlite3.Error:
+        return None
+    finally:
+        probe.close()
+
+
+def rank_jump(ranks: list[float]) -> float | None:
+    """Relative gap between the best and second-best score.
+
+    BM25 ranks are negative, hence the absolute values. Also telemetry: the
+    signal *inverts* for short proper-noun queries, where a wide gap means the
+    top hit genuinely stands out rather than that it matched by accident.
+    """
+    if len(ranks) < 2:
+        return None
+    first, second = abs(ranks[0]), abs(ranks[1])
+    if first <= 0:
+        return None
+    return (first - second) / first
+
+
 def window_around(text: str, positions: list[int], cap: int = RECALL_WINDOW) -> str:
     """Slice ``cap`` characters centred on the first match position.
 
