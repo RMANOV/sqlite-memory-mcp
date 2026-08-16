@@ -225,11 +225,12 @@ def test_the_publish_contract_holds_end_to_end(tmp_path, monkeypatch):
 def test_a_crash_mid_publish_leaves_no_readable_broken_generation(
     tmp_path, monkeypatch
 ):
-    """The crash window for the per-file publish, made deterministic.
+    """The crash window for the platform-specific publish, made deterministic.
 
-    The manifest lands last precisely so that dying in the middle produces
-    something the reader refuses, rather than a directory that looks like a
-    verified backup and is not.
+    Windows moves the manifest last, while POSIX publishes the already-complete
+    staging directory with one atomic rename. Fail at that platform's actual
+    publish step and make sure the failed run cannot damage the prior
+    generation.
     """
     src = tmp_path / "memory.db"
     _make_db(src, rows=20)
@@ -240,12 +241,23 @@ def test_a_crash_mid_publish_leaves_no_readable_broken_generation(
 
     real_replace = os.replace
 
-    def die_before_the_manifest(a, b, *args, **kwargs):
-        if str(b).endswith("manifest.json") and str(b).startswith(str(root)):
+    def die_during_publish(a, b, *args, **kwargs):
+        destination = Path(b)
+        if sys.platform == "win32":
+            # The manifest is deliberately moved last on Windows, so this is
+            # the middle-of-publish failure point there.
+            is_publish_step = (
+                destination.name == "manifest.json"
+                and destination.parent.parent == root
+            )
+        else:
+            # POSIX publishes the complete staging directory in one rename.
+            is_publish_step = destination.parent == root and Path(a).is_dir()
+        if is_publish_step:
             raise OSError(28, "No space left on device")
         return real_replace(a, b, *args, **kwargs)
 
-    monkeypatch.setattr(db_utils.os, "replace", die_before_the_manifest)
+    monkeypatch.setattr(db_utils.os, "replace", die_during_publish)
 
     with pytest.raises(OSError):
         create_backup(str(src), backup_dir=str(root), now=FIXED)
