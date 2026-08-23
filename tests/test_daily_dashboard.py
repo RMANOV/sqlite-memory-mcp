@@ -556,3 +556,43 @@ def test_empty_dashboard_hidden_and_today_is_start_tab(qapp, tmp_path):
             settings.remove("active_tab_key")
         else:
             settings.setValue("active_tab_key", old_active_tab_key)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bin/task is a POSIX shell entrypoint")
+def test_bin_task_fb_authors_with_the_existing_human_binding(tmp_path):
+    """Refutation round 2: when HUMAN is already bound to another session id,
+    fb must author the Q as THAT session (ensure_active_role's return), not
+    the env/default id — otherwise the public author gate rejects it."""
+    db_path = tmp_path / "memory.db"
+    conn = _conn(db_path)
+    topic_id = dash_topic_id()
+    conn.execute(
+        "INSERT INTO debates "
+        "(topic_id, title, state, created_at, created_by_role, roles_json, metadata_json) "
+        "VALUES (?, 'Daily', 'ACTIVE', ?, 'CONDUCTOR', "
+        "'[{\"role\":\"HUMAN\",\"session_id\":\"human-other1\"}]', NULL)",
+        (topic_id, now_iso()),
+    )
+    from debate import bind_role_session
+
+    bind_role_session(conn, topic_id=topic_id, role="HUMAN", session_id="human-other1", reason="primary")
+    conn.close()
+    home = tmp_path / "home"
+    (home / ".claude" / "memory").mkdir(parents=True)
+    env = os.environ.copy()
+    env.update({"HOME": str(home), "TASK_DB": str(db_path)})
+    env.pop("SQLITE_MEMORY_DASH_HUMAN_SESSION", None)
+
+    script = Path(__file__).resolve().parents[1] / "bin" / "task"
+    run = subprocess.run(
+        [str(script), "fb", "task-alp", "operator says adjust"],
+        env=env, text=True, capture_output=True,
+    )
+    assert run.returncode == 0, run.stderr[-800:]
+
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    msg = conn.execute(
+        "SELECT author_session_id, provenance_class FROM debate_messages WHERE role='HUMAN'"
+    ).fetchone()
+    assert tuple(msg) == ("human-other1", "parent")

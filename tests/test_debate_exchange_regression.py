@@ -166,6 +166,9 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
         addressed_to=["CONDUCTOR"],
         reply_to=terminal_trigger["msg_id"],
         vehicle="analysis",
+        # Reply ownership (2026-08-23): a worker-scoped trigger needs an
+        # attributed author — this is the worker's own terminal.
+        author_session_id=terminal_claim["worker_session_id"],
     )
     stale = (
         (datetime.now(timezone.utc) - timedelta(minutes=20))
@@ -205,7 +208,10 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
     assert states[terminal_claim["worker_session_id"]] == "completed"
     assert states[orphan_claim["worker_session_id"]] == "retired"
     assert states[live_claim["worker_session_id"]] == "active"
-    assert out["completed_count"] == 1
+    # Reply ownership (2026-08-23): the terminal worker's claim was completed
+    # ATOMICALLY by its own terminal INSERT (ack = its message), so recovery
+    # finds nothing left to complete — it only retires the orphan.
+    assert out["completed_count"] == 0
     assert out["retired_count"] == 1
     assert out["skipped_live_count"] == 1
     assert (

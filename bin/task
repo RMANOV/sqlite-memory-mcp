@@ -335,7 +335,7 @@ topic_id = dash_topic_id()
 human_session = os.environ.get('SQLITE_MEMORY_DASH_HUMAN_SESSION') or 'human-rmanov'
 conductor_default = os.environ.get('SQLITE_MEMORY_DASH_CONDUCTOR_SESSION') or 'cc-conductor'
 with get_conn_immediate(os.environ['TASK_DB']) as conn:
-    ensure_active_role(conn, topic_id, 'HUMAN', human_session)
+    human_session = ensure_active_role(conn, topic_id, 'HUMAN', human_session)
     ensure_active_role(conn, topic_id, 'CONDUCTOR', conductor_default)
     result = debate_post_with_recipients(
         conn,
@@ -346,6 +346,7 @@ with get_conn_immediate(os.environ['TASK_DB']) as conn:
         body=f'Human feedback for {os.environ[\"FB_TASK\"]}: {os.environ[\"FB_TEXT\"]}',
         addressed_to=['CONDUCTOR'],
         vehicle='analysis',
+        author_session_id=human_session,
     )
 print(f'sent to conductor: {result[\"msg_id\"]}')
 "

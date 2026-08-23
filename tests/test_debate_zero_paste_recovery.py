@@ -218,6 +218,9 @@ def test_trigger_terminal_and_demand_semantics(conn, tmp_path, monkeypatch):
         body="done",
         addressed_to=["CONDUCTOR"],
         reply_to=trigger,
+        # Reply ownership: the worker is dead/retired, so the reply that makes
+        # the trigger terminal comes from the bound parent session.
+        author_session_id="cc-worker_x",
     )
     assert debate_pump._trigger_is_terminal(trigger, suppressed) is True
     assert debate_pump._estimate_worker_demand(trigger, suppressed) == 0
@@ -523,6 +526,8 @@ def test_pump_holds_cursor_until_trigger_is_terminal(conn, tmp_path, monkeypatch
         body="done",
         addressed_to=["CONDUCTOR"],
         reply_to=trigger,
+        # Reply ownership: attributed reply (bound parent of the WORKER role).
+        author_session_id="cc-worker_x",
     )
     monkeypatch.setattr(debate_pump, "STOP", False, raising=False)
     assert debate_pump.main() == 0

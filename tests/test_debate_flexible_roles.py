@@ -674,6 +674,7 @@ def test_wrapper_add_role_then_addressed_post_delivers(wrapper_db):
             kind="STATUS",
             body="advocate online?",
             addressed_to_csv="ADVOCATE",
+            author_session_id="codex-cond20260531",
         )
     )
     assert "error_type" not in posted

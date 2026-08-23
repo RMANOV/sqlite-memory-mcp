@@ -180,6 +180,7 @@ def test_debate_existing_topic_post_and_signal_stay_ungated(debate_db, monkeypat
             kind="Q",
             body="CONDUCTOR -> ADVOCATE question",
             addressed_to_csv="ADVOCATE",
+            author_session_id="codex-cond20260531",
         )
     )
     a = json.loads(
@@ -191,6 +192,7 @@ def test_debate_existing_topic_post_and_signal_stay_ungated(debate_db, monkeypat
             body="ADVOCATE -> EXECUTOR_1 answer",
             addressed_to_csv="EXECUTOR_1",
             reply_to=q["msg_id"],
+            author_session_id="codex-adv20260531",
         )
     )
     pending = json.loads(

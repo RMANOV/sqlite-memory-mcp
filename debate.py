@@ -28,6 +28,7 @@ from debate_protocol_v1 import (
     PROTOCOL_VERSION as DEBATE_PROTOCOL_V1,
     SEMANTIC_KINDS,
     ProtocolV1Error,
+    _resolve_author_session as _protocol_v1_resolve_author_session,
     configure_topic as _protocol_v1_configure_topic,
     preflight_post as _protocol_v1_preflight_post,
     record_post as _protocol_v1_record_post,
@@ -770,6 +771,234 @@ def _terminal_reply_for_trigger(
     ).fetchone()
 
 
+# ── Reply ownership / author provenance (2026-08-23) ─────────────────────
+# Coverage stays role-level (``_terminal_reply_for_trigger`` above: pump,
+# dispatch, stale recovery ask "did anyone of the role answer?").  OWNERSHIP
+# is per provenance class: one worker terminal + one parent terminal per
+# trigger, parent-final.  The single ownership query starts from reply_to
+# (partial index idx_debmsg_reply_to), no ORDER BY — see
+# tests/test_debate_reply_ownership.py::test_ownership_lookup_uses_reply_to_index...
+TERMINAL_KINDS = (
+    "A",
+    "STATUS",
+    "CLAIM",
+    "CHALLENGE",
+    "EVIDENCE",
+    "REBUT",
+    "CONCEDE",
+    "VERIFY",
+    "DISSENT",
+    "ESCALATE",
+)
+TERMINAL_KINDS_SQL = "(" + ", ".join(f"'{k}'" for k in TERMINAL_KINDS) + ")"
+OWNERSHIP_LOOKUP_SQL = (
+    "SELECT author_session_id, provenance_class FROM debate_messages "
+    "WHERE topic_id = ? AND role = ? AND reply_to = ? "
+    f"AND kind IN {TERMINAL_KINDS_SQL}"
+)
+PROVENANCE_CLASSES = ("parent", "worker", "legacy", "unattributed")
+
+
+def _ownership_classes(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
+) -> set[str]:
+    """Provenance classes of the terminal replies already on a trigger."""
+    return {
+        str(row["provenance_class"])
+        for row in conn.execute(OWNERSHIP_LOOKUP_SQL, (topic_id, role, trigger_msg_id))
+    }
+
+
+def _worker_claim_rows_for_session(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, session_id: str
+) -> list[tuple[str, str]]:
+    """``(trigger_msg_id, state)`` of every claim this worker ever held —
+    live rows in any state plus reaped rows (``debate_worker_reap_log``), so a
+    reaped claim still classifies its author as the worker of its trigger."""
+    rows = [
+        (str(r["trigger_msg_id"]), str(r["state"]))
+        for r in conn.execute(
+            "SELECT trigger_msg_id, state FROM debate_worker_claims "
+            "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+            (topic_id, role, session_id),
+        )
+    ]
+    rows.extend(
+        (str(r["trigger_msg_id"]), "reaped")
+        for r in conn.execute(
+            "SELECT trigger_msg_id FROM debate_worker_reap_log "
+            "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+            (topic_id, role, session_id),
+        )
+    )
+    return rows
+
+
+def _trigger_is_worker_scoped(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
+) -> bool:
+    """A trigger is worker-scoped once any worker was ever claimed for it —
+    live claim (any state), reaped claim, or a worker-class terminal."""
+    if _worker_claim_exists(
+        conn, topic_id=topic_id, role=role, trigger_msg_id=trigger_msg_id
+    ):
+        return True
+    if conn.execute(
+        "SELECT 1 FROM debate_worker_reap_log "
+        "WHERE topic_id = ? AND role = ? AND trigger_msg_id = ? LIMIT 1",
+        (topic_id, role, trigger_msg_id),
+    ).fetchone():
+        return True
+    return "worker" in _ownership_classes(
+        conn, topic_id=topic_id, role=role, trigger_msg_id=trigger_msg_id
+    )
+
+
+def _active_primary_binding(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, session_id: str
+) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM debate_role_bindings "
+            "WHERE topic_id = ? AND role = ? AND session_id = ? AND state = 'active' "
+            "LIMIT 1",
+            (topic_id, role, session_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _is_lifecycle_retired_holder(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, session_id: str
+) -> bool:
+    """True iff ``session_id`` held the role's binding that the RESOLVED
+    transition retired (reason ``topic_resolved…``) and the topic is still
+    RESOLVED — the only session allowed to drive RESOLVED → ARCHIVED without
+    a fresh binding.  Any other retired/rotated binding stays rejected."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM debate_role_bindings b JOIN debates d ON d.topic_id = b.topic_id "
+            "WHERE b.topic_id = ? AND b.role = ? AND b.session_id = ? "
+            "AND b.state = 'retired' AND b.reason LIKE 'topic_resolved%' "
+            "AND d.state = 'RESOLVED' LIMIT 1",
+            (topic_id, role, session_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _resolve_author_provenance(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    author_session_id: str | None,
+    reply_to: str | None,
+    internal_unattributed: bool,
+    kind: str = "",
+) -> tuple[str | None, str]:
+    """Authorize the author and derive its provenance class (D1'/D2/D4/R1–R4).
+
+    Returns ``(author_session_id, provenance_class)`` to persist.  Order is
+    load-bearing: authorization happens here, BEFORE any duplicate/protocol
+    classification, so an unauthorized id always surfaces as
+    ``ROLE_UNAVAILABLE`` and never as ``terminal_reply_duplicate``.
+
+    * ``internal_unattributed`` — trusted DAO-internal system rows only
+      (never exposed by a public tool): ``(NULL, 'unattributed')``.
+    * author supplied — must own an active binding or an active worker claim
+      of the role (``_resolve_author_session``); then: ``worker`` iff the
+      session held a claim (live/any state or reaped) for ``reply_to`` — or,
+      with ``reply_to=None`` (D4), its single active claim; ``parent`` iff it
+      is an active primary binding; otherwise ``provenance_unresolvable``.
+    * author absent — on a worker-scoped trigger: ``author_session_required``
+      (R1, fail-closed, never a silent parent).  Otherwise the D1' compat
+      contract is kept for in-process bare-ledger callers (tests, tooling):
+      exactly one active binding → that session as ``parent``; no active
+      binding → ``(NULL, 'unattributed')`` (never an ownership slot);
+      several → required.  Public writers (MCP tools, CLI) enforce the
+      author themselves, so this path is unreachable from outside the
+      process — it is a declared deviation from the strict contract letter.
+    * lifecycle holder — ``transition_state(RESOLVED)`` retires the role
+      bindings in the same transaction, so the session that resolved the
+      topic would otherwise be locked out of the ARCHIVED step.  For
+      ``kind='STATE'`` on a RESOLVED topic, the role's binding retired with
+      reason ``topic_resolved…`` is accepted as ``parent``.
+    """
+    if internal_unattributed:
+        if author_session_id:
+            raise DebateError(
+                "internal_unattributed_with_author: internal rows carry no author",
+                error_type="invalid_author",
+            )
+        return None, "unattributed"
+
+    worker_scoped = reply_to is not None and _trigger_is_worker_scoped(
+        conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
+    )
+
+    if not author_session_id:
+        if worker_scoped:
+            raise DebateError(
+                f"author_session_required: {reply_to} is a worker-scoped trigger; "
+                "pass author_session_id so the reply can be attributed",
+                error_type="author_session_required",
+            )
+        bindings = conn.execute(
+            "SELECT session_id FROM debate_role_bindings "
+            "WHERE topic_id = ? AND role = ? AND state = 'active' LIMIT 2",
+            (topic_id, role),
+        ).fetchall()
+        if len(bindings) == 1:
+            return str(bindings[0]["session_id"]), "parent"
+        if not bindings:
+            # D1' compat (declared deviation): bare in-process callers on a
+            # role with NO active binding get an unattributed row.  Never an
+            # ownership slot; unreachable from MCP/CLI (public gate).  Kept
+            # because ~250 legacy test sites post bare before binding.
+            return None, "unattributed"
+        raise DebateError(
+            f"author_session_required: role {role} has {len(bindings)} active "
+            "bindings; pass author_session_id",
+            error_type="author_session_required",
+        )
+
+    if kind == "STATE" and _is_lifecycle_retired_holder(
+        conn, topic_id=topic_id, role=role, session_id=author_session_id
+    ):
+        return author_session_id, "parent"
+    try:
+        resolved = _protocol_v1_resolve_author_session(
+            conn, topic_id=topic_id, role=role, author_session_id=author_session_id
+        )
+    except ProtocolV1Error as exc:
+        _raise_protocol_error(exc)
+    assert resolved == author_session_id
+
+    claims = _worker_claim_rows_for_session(
+        conn, topic_id=topic_id, role=role, session_id=resolved
+    )
+    if claims:
+        if reply_to is None:
+            active = [t for t, state in claims if state == "active"]
+            if len(active) == 1:
+                return resolved, "worker"
+        elif any(trigger == reply_to for trigger, _state in claims):
+            return resolved, "worker"
+        # A worker id is never a parent, even if a binding happens to exist.
+        raise DebateError(
+            f"provenance_unresolvable: {resolved} is a worker of another trigger",
+            error_type="provenance_unresolvable",
+        )
+    if _active_primary_binding(conn, topic_id=topic_id, role=role, session_id=resolved):
+        return resolved, "parent"
+    raise DebateError(
+        f"provenance_unresolvable: {resolved} is neither a bound parent nor a "
+        "worker of this trigger",
+        error_type="provenance_unresolvable",
+    )
+
+
 def _dispatch_still_covers_trigger(
     conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
 ) -> bool:
@@ -839,6 +1068,101 @@ def _retire_worker_claims_for_parent_sessions(
         (now, topic_id, role, *sessions),
     )
     return int(cur.rowcount or 0)
+
+
+def _covering_terminal_class(
+    conn: sqlite3.Connection, *, topic_id: str, role: str, trigger_msg_id: str
+) -> str | None:
+    """Provenance class of the terminal that covers ``trigger_msg_id`` for
+    claim-lifecycle purposes — ``parent``/``worker``/``legacy`` only.  An
+    ``unattributed`` system row never covers a claim (mirrors the admission
+    guard in ``claim_worker_session``, so a claim retired here can never be
+    REQUEUEd behind a system note).  Preference: parent, then legacy, then
+    worker (a foreign worker's terminal)."""
+    rows = conn.execute(
+        OWNERSHIP_LOOKUP_SQL, (topic_id, role, trigger_msg_id)
+    ).fetchall()
+    classes = {str(r["provenance_class"]) for r in rows}
+    for cls in ("parent", "legacy", "worker"):
+        if cls in classes:
+            return cls
+    return None
+
+
+def _own_worker_terminal(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+    trigger_msg_id: str,
+) -> sqlite3.Row | None:
+    """The worker's OWN terminal reply on its trigger (provenance 'worker')."""
+    return conn.execute(
+        "SELECT msg_id, ts FROM debate_messages "
+        "WHERE topic_id = ? AND role = ? AND reply_to = ? "
+        "AND author_session_id = ? AND provenance_class = 'worker' "
+        f"AND kind IN {TERMINAL_KINDS_SQL} "
+        "ORDER BY ts ASC, msg_id ASC LIMIT 1",
+        (topic_id, role, trigger_msg_id, worker_session_id),
+    ).fetchone()
+
+
+def _retire_worker_claims_for_trigger(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    trigger_msg_id: str,
+    now: str,
+    closed_by: str,
+) -> int:
+    """Parent-final (C2): retire every ACTIVE claim for the trigger in the
+    caller's transaction, recording why; ``ack_msg_id`` stays NULL — a parent
+    message is never a worker acknowledgement."""
+    rows = conn.execute(
+        "SELECT worker_session_id, details_json FROM debate_worker_claims "
+        "WHERE topic_id = ? AND role = ? AND trigger_msg_id = ? AND state = 'active'",
+        (topic_id, role, trigger_msg_id),
+    ).fetchall()
+    for row in rows:
+        details = _claim_details_dict(row)
+        details["closed_by"] = closed_by
+        details["closed_at"] = now
+        conn.execute(
+            "UPDATE debate_worker_claims SET state = 'retired', heartbeat_at = ?, "
+            "completed_at = ?, ack_msg_id = NULL, details_json = ? "
+            "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
+            (now, now, json_dumps(details), topic_id, role, row["worker_session_id"]),
+        )
+    return len(rows)
+
+
+def _complete_worker_claim_with_own_terminal(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    role: str,
+    worker_session_id: str,
+    trigger_msg_id: str,
+    ack_msg_id: str,
+    now: str,
+) -> dict[str, Any] | None:
+    """Worker terminal (C2): complete the worker's exact active claim for the
+    trigger with ITS OWN message as the acknowledgement, atomically with the
+    INSERT.  Returns the claim row dict (None when no live row exists, e.g.
+    a post under a reaped claim, which authorization already rejects)."""
+    conn.execute(
+        "UPDATE debate_worker_claims SET state = 'completed', "
+        "completed_at = ?, heartbeat_at = ?, ack_msg_id = ? "
+        "WHERE topic_id = ? AND role = ? AND worker_session_id = ? "
+        "AND trigger_msg_id = ? AND state = 'active'",
+        (now, now, ack_msg_id, topic_id, role, worker_session_id, trigger_msg_id),
+    )
+    row = _worker_claim_for_session(
+        conn, topic_id=topic_id, role=role, worker_session_id=worker_session_id
+    )
+    return _claim_row_dict(row) if row is not None else None
 
 
 def _complete_nonstanding_decision_claims_for_reply(
@@ -942,7 +1266,9 @@ def claim_worker_session(
     trigger_msg_id: str,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Idempotently allocate a derived ``-W<n>`` worker for one trigger.
+    """Allocate a derived ``-W<n>`` worker for one trigger (idempotent while the
+    trigger is open; once a terminal closed it the call fails closed with
+    ``trigger_closed_by_parent`` / ``worker_slot_consumed`` — never a REQUEUE).
 
     The parent binding remains the role authority. This row is a scoped
     execution claim only; workers get their own cursor and inherit read
@@ -1009,6 +1335,24 @@ def claim_worker_session(
         raise DebateError(
             f"worker_trigger_unaddressed: {trigger_msg_id}",
             error_type="worker_trigger_unaddressed",
+        )
+
+    # ── Reply-ownership admission (D5, 2026-08-23) — BEFORE the existing/
+    # REQUEUE lookup: a trigger the parent already answered is closed to
+    # workers for good, and a trigger a worker already answered has no worker
+    # slot left.  Both facts live in debate_messages, so they survive reaping.
+    owned = _ownership_classes(
+        conn, topic_id=topic_id, role=role, trigger_msg_id=trigger_msg_id
+    )
+    if "parent" in owned:
+        raise DebateError(
+            f"trigger_closed_by_parent: {trigger_msg_id} already has a parent terminal",
+            error_type="trigger_closed_by_parent",
+        )
+    if "worker" in owned or "legacy" in owned:
+        raise DebateError(
+            f"worker_slot_consumed: {trigger_msg_id} already has a worker terminal",
+            error_type="worker_slot_consumed",
         )
 
     now = now_iso()
@@ -1306,7 +1650,10 @@ def recover_stale_worker_claims(
     This recovery path is conservative:
 
     * a live worker session is skipped;
-    * a terminal same-role A/STATUS completes the claim with its ack;
+    * the worker's OWN terminal (provenance 'worker') completes the claim with
+      its ack; any other covering terminal (parent/legacy/foreign worker)
+      retires it as ``retired_covered_by_other_terminal`` with
+      ``closed_by='covered_by_<class>'`` (unattributed rows never cover);
     * otherwise the orphan is retired without advancing either cursor, so the
       parent session still sees the addressed trigger as pending.
 
@@ -1340,12 +1687,28 @@ def recover_stale_worker_claims(
         if worker_session_id in live:
             skipped_live.append(worker_session_id)
             continue
-        ack = _terminal_reply_for_trigger(
+        # Reply ownership (C2): a worker acknowledgement is ONLY the worker's
+        # own terminal (author == this worker, class 'worker').  Any other
+        # terminal on the trigger (parent, legacy, unattributed) covers the
+        # trigger but never becomes this worker's ack.
+        ack = _own_worker_terminal(
             conn,
             topic_id=topic_id,
             role=row["role"],
+            worker_session_id=worker_session_id,
             trigger_msg_id=row["trigger_msg_id"],
         )
+        covering_class = (
+            None
+            if ack is not None
+            else _covering_terminal_class(
+                conn,
+                topic_id=topic_id,
+                role=row["role"],
+                trigger_msg_id=row["trigger_msg_id"],
+            )
+        )
+        other_terminal = covering_class is not None
         details = _claim_details_dict(row)
         recovery = {
             "recovered_at": now,
@@ -1364,6 +1727,17 @@ def recover_stale_worker_claims(
                     "worker_session_id": worker_session_id,
                     "trigger_msg_id": row["trigger_msg_id"],
                     "ack_msg_id": ack_msg_id,
+                }
+            )
+        elif other_terminal:
+            result = "retired_covered_by_other_terminal"
+            new_state = "retired"
+            ack_msg_id = None
+            details["closed_by"] = f"covered_by_{covering_class}"
+            retired.append(
+                {
+                    "worker_session_id": worker_session_id,
+                    "trigger_msg_id": row["trigger_msg_id"],
                 }
             )
         else:
@@ -1430,49 +1804,6 @@ def recover_stale_worker_claims(
         "retired_count": len(retired),
         "skipped_live_count": len(skipped_live),
     }
-
-
-def _complete_worker_claim_if_terminal(
-    conn: sqlite3.Connection,
-    *,
-    topic_id: str,
-    role: str,
-    worker_session_id: str,
-    now: str,
-    claim: sqlite3.Row | None = None,
-) -> dict[str, Any] | None:
-    if not is_worker_session_id(worker_session_id):
-        return None
-    if claim is None:
-        claim = _validate_worker_claim_for_signal(
-            conn,
-            topic_id=topic_id,
-            role=role,
-            worker_session_id=worker_session_id,
-        )
-    if claim["state"] != "active":
-        return _claim_row_dict(claim)
-    ack = _terminal_reply_for_trigger(
-        conn,
-        topic_id=topic_id,
-        role=role,
-        trigger_msg_id=claim["trigger_msg_id"],
-    )
-    if ack is None:
-        return _claim_row_dict(claim)
-    conn.execute(
-        "UPDATE debate_worker_claims SET state = 'completed', "
-        "completed_at = ?, heartbeat_at = ?, ack_msg_id = ? "
-        "WHERE topic_id = ? AND role = ? AND worker_session_id = ?",
-        (now, now, ack["msg_id"], topic_id, role, worker_session_id),
-    )
-    row = _worker_claim_for_session(
-        conn,
-        topic_id=topic_id,
-        role=role,
-        worker_session_id=worker_session_id,
-    )
-    return _claim_row_dict(row)
 
 
 def reap_worker_claims(
@@ -1691,6 +2022,7 @@ def post_message(
     payload_json: Any = None,
     author_session_id: str | None = None,
     recipients: list[str] | None = None,
+    internal_unattributed: bool = False,
 ) -> dict[str, Any]:
     """Append a message to a debate. Validates topic state, role membership,
     enums, and all kind-specific semantics BEFORE the INSERT (atomicity
@@ -1840,20 +2172,57 @@ def post_message(
 
     standing_db = _standing_to_db(standing)
 
+    # ── Reply ownership: authorize + classify the author BEFORE any
+    # duplicate/protocol classification (auth-first, D2). ─────────────────
+    author_db, provenance_class = _resolve_author_provenance(
+        conn,
+        topic_id=topic_id,
+        role=role,
+        author_session_id=author_session_id,
+        reply_to=reply_to,
+        internal_unattributed=internal_unattributed,
+        kind=kind,
+    )
+
     if kind == "DECISION" and reply_to is not None and parent_kind != "Q":
         raise DebateError(f"decision_reply_to_must_be_Q: parent kind={parent_kind!r}")
 
     if kind in ("A", "STATUS") and reply_to is not None:
-        one_shot_parent = (
-            parent_kind == "DECISION" and parent_standing == 0
-        ) or _worker_claim_exists(
+        decision_one_shot = parent_kind == "DECISION" and parent_standing == 0
+        if decision_one_shot:
+            # Non-standing DECISION: role-level one-shot, UNCHANGED, even when a
+            # worker claim exists on the DECISION (C5/D7 — claims carry no kind
+            # filter, so per-class slots must not apply here).
+            if (
+                _terminal_reply_for_trigger(
+                    conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
+                )
+                is not None
+            ):
+                raise DebateError(
+                    f"terminal_reply_duplicate: {reply_to}",
+                    error_type="terminal_reply_duplicate",
+                )
+        elif _trigger_is_worker_scoped(
             conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
-        )
-        if one_shot_parent:
-            existing_terminal = _terminal_reply_for_trigger(
+        ):
+            # Per-class slots: one worker terminal + one parent terminal,
+            # parent-final.  A pre-migration ('legacy') terminal consumes both
+            # slots; 'unattributed' rows never count.  (A worker whose claim is
+            # already completed/retired never reaches here: authorization
+            # above rejects it with ROLE_UNAVAILABLE.)
+            owned = _ownership_classes(
                 conn, topic_id=topic_id, role=role, trigger_msg_id=reply_to
             )
-            if existing_terminal is not None:
+            duplicate = (
+                "legacy" in owned
+                or (
+                    provenance_class == "worker"
+                    and ("worker" in owned or "parent" in owned)
+                )
+                or (provenance_class == "parent" and "parent" in owned)
+            )
+            if duplicate:
                 raise DebateError(
                     f"terminal_reply_duplicate: {reply_to}",
                     error_type="terminal_reply_duplicate",
@@ -1897,8 +2266,8 @@ def post_message(
     conn.execute(
         "INSERT INTO debate_messages (msg_id, topic_id, role, ts, priority, "
         "kind, standing, vehicle, reply_to, body, protocol_version, round_no, "
-        "body_mode, payload_json, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "body_mode, payload_json, author_session_id, provenance_class, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             msg_id,
             topic_id,
@@ -1914,9 +2283,36 @@ def post_message(
             semantic["round_no"] if semantic else None,
             semantic["body_mode"] if semantic else None,
             semantic["payload_json"] if semantic else None,
+            author_db,
+            provenance_class,
             ts,
         ),
     )
+    # ── Atomic claim lifecycle (C2), same transaction as the row ──────────
+    # worker terminal → its exact claim completed with THIS msg_id as ack;
+    # parent terminal → every active claim for the trigger retired
+    # (closed_by='parent_final'), never acked by a parent message.
+    worker_claim_result: dict[str, Any] | None = None
+    if kind in TERMINAL_KINDS and reply_to is not None:
+        if provenance_class == "worker" and author_db is not None:
+            worker_claim_result = _complete_worker_claim_with_own_terminal(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                worker_session_id=author_db,
+                trigger_msg_id=reply_to,
+                ack_msg_id=msg_id,
+                now=ts,
+            )
+        elif provenance_class == "parent":
+            _retire_worker_claims_for_trigger(
+                conn,
+                topic_id=topic_id,
+                role=role,
+                trigger_msg_id=reply_to,
+                now=ts,
+                closed_by="parent_final",
+            )
     try:
         protocol_state = _protocol_v1_record_post(
             conn,
@@ -2007,14 +2403,12 @@ def post_message(
                 "protocol_state": protocol_state,
             }
         )
-        if author_session_id and is_worker_session_id(author_session_id):
-            result["worker_claim"] = _complete_worker_claim_if_terminal(
-                conn,
-                topic_id=topic_id,
-                role=role,
-                worker_session_id=author_session_id,
-                now=ts,
-            )
+    # Reply ownership: the worker claim is completed at the INSERT above
+    # (worker-own ack), on the legacy and the debate/v1 paths alike.
+    if worker_claim_result is not None:
+        result["worker_claim"] = worker_claim_result
+    result["author_session_id"] = author_db
+    result["provenance_class"] = provenance_class
     if signal_cursor_reconciliation is not None:
         result["signal_cursor_reconciliation"] = signal_cursor_reconciliation
     return result
@@ -2212,6 +2606,7 @@ def advance_watermark(
     topic_id: str,
     role: str,
     processed_up_to_msg_id: str,
+    author_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Convenience helper: write a canonical WATERMARK message that
     advances the (topic_id, role) cursor to a specific msg_id.
@@ -2240,6 +2635,7 @@ def advance_watermark(
         priority="INFO",
         kind="WATERMARK",
         body=processed_up_to_msg_id,
+        author_session_id=author_session_id,
     )
 
 
@@ -2807,6 +3203,7 @@ def transition_state(
     role: str,
     new_state: str,
     reason: str = "",
+    author_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Transition a debate to a new state, writing a synthetic STATE message.
 
@@ -2852,6 +3249,7 @@ def transition_state(
         priority="H",
         kind="STATE",
         body=state_body,
+        author_session_id=author_session_id,
     )
     retired_bindings, retired_worker_claims = _retire_bindings_for_transition(
         conn, topic_id=topic_id, new_state=new_state, reason=reason
@@ -3232,6 +3630,7 @@ def escalate(
     role: str,
     reason: str,
     target_role: str = "HUMAN",
+    author_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Force-write an H-priority PING message tagged for target_role."""
     validate_topic_id(topic_id)
@@ -3247,6 +3646,7 @@ def escalate(
         priority="H",
         kind="PING",
         body=body,
+        author_session_id=author_session_id,
     )
     return msg
 
@@ -3259,6 +3659,7 @@ def compact(
     body: str,
     since_ts: str | None = None,
     until_ts: str | None = None,
+    author_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Convenience wrapper writing a COMPACTION snapshot message."""
     if since_ts is not None:
@@ -3279,6 +3680,7 @@ def compact(
         priority="INFO",
         kind="COMPACTION",
         body=full_body,
+        author_session_id=author_session_id,
     )
 
 
@@ -3599,6 +4001,8 @@ def debate_post_with_recipients(
         "protocol_state",
         "worker_claim",
         "signal_cursor_reconciliation",
+        "author_session_id",
+        "provenance_class",
     ):
         if key in post_result:
             result[key] = post_result[key]
@@ -4242,6 +4646,18 @@ def debate_signal_advance(
         session_id=session_id,
         worker_claim=worker_claim,
     )
+    if (
+        not signal_recipients
+        and worker_claim is not None
+        and worker_claim["state"] in ("completed", "retired")
+        and last_processed_msg_id == worker_claim["trigger_msg_id"]
+    ):
+        # D3 (reply ownership, 2026-08-23): the terminal INSERT already
+        # completed/retired this worker's claim; the cursor advance that the
+        # legacy wake prompt issues AFTERWARDS must stay an idempotent cursor
+        # operation — same worker session, same role/topic, own trigger only.
+        # It neither revives nor changes the claim.
+        signal_recipients = [role, str(worker_claim["parent_session_id"])]
     if signal_recipients:
         recipient_placeholders = ",".join("?" for _ in signal_recipients)
         addressed = conn.execute(
@@ -4315,14 +4731,10 @@ def debate_signal_advance(
         "last_check_at = excluded.last_check_at",
         (session_id, role, topic_id, ref["msg_id"], ref["ts"], now),
     )
-    completed_worker_claim = _complete_worker_claim_if_terminal(
-        conn,
-        topic_id=topic_id,
-        role=role,
-        worker_session_id=session_id,
-        now=now,
-        claim=worker_claim,
-    )
+    # Reply ownership (2026-08-23): signal_advance is cursor-only.  The
+    # terminal INSERT completes/retires the worker claim atomically, so no
+    # lifecycle write happens here — the claim row is only echoed back.
+    completed_worker_claim = worker_claim
 
     out = {
         "session_id": session_id,
