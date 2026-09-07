@@ -92,32 +92,96 @@ def _json_maybe(value: Any) -> Any:
     return value
 
 
-def _unwrap_tool_response(value: Any) -> dict[str, Any] | None:
-    """Accept Claude hook shapes and MCP result wrappers.
+# Wrapper keys under which MCP clients and Claude hook versions have been seen
+# to nest the debate post result. Order is irrelevant: the first branch that
+# yields a post result wins, and a wrapper never masquerades as a post result
+# because acceptance requires ``msg_id`` / ``schema_version`` on the dict.
+_RESPONSE_WRAPPER_KEYS = (
+    "result",
+    "structuredContent",
+    "structured_content",
+    "content",
+    "text",
+    "tool_response",
+    "toolResponse",
+    "tool_result",
+    "toolResult",
+    "tool_output",
+    "output",
+)
+_HOOK_RESPONSE_KEYS = (
+    "tool_response",
+    "toolResponse",
+    "tool_result",
+    "toolResult",
+    "tool_output",
+    "response",
+    "result",
+)
+_NORMALIZE_MAX_DEPTH = 12
 
-    Observed MCP output often arrives as {"result": "{\"msg_id\": ...}"},
-    but hook schemas differ across Claude versions. Keep this recursive and
-    conservative so schema drift fails closed in the DAO layer.
+
+def _normalize_tool_response(value: Any, depth: int = 0) -> dict[str, Any] | None:
+    """Conservative normalizer for the debate post tool result.
+
+    The tool returns one JSON object. Depending on the MCP client and hook
+    version it reaches the hook as that object, as ``{"result": "<json>"}``,
+    as an MCP content list ``[{"type": "text", "text": "<json>"}]``, as a
+    result envelope ``{"content": [...], "structuredContent": {...}}``, or as
+    a plain JSON string — sometimes wrapped more than once. Every branch is
+    unwrapped recursively (depth-bounded); a dict is accepted only when it
+    carries ``msg_id`` or ``schema_version`` so schema drift still fails
+    closed in the DAO layer. ``None`` means no post result is present.
     """
+    if depth > _NORMALIZE_MAX_DEPTH:
+        return None
     value = _json_maybe(value)
     if isinstance(value, dict):
         if "msg_id" in value or "schema_version" in value:
             return value
-        for key in ("result", "tool_response", "tool_output", "output"):
+        for key in _RESPONSE_WRAPPER_KEYS:
             if key in value:
-                unwrapped = _unwrap_tool_response(value[key])
+                unwrapped = _normalize_tool_response(value[key], depth + 1)
                 if unwrapped is not None:
                     return unwrapped
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            unwrapped = _normalize_tool_response(item, depth + 1)
+            if unwrapped is not None:
+                return unwrapped
     return None
 
 
+def _unwrap_tool_response(value: Any) -> dict[str, Any] | None:
+    """Accept Claude hook shapes and MCP result wrappers (see normalizer)."""
+    return _normalize_tool_response(value)
+
+
 def _extract_tool_response(hook_payload: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("tool_response", "tool_output", "response", "result"):
+    for key in _HOOK_RESPONSE_KEYS:
         if key in hook_payload:
             out = _unwrap_tool_response(hook_payload[key])
             if out is not None:
                 return out
     return _unwrap_tool_response(hook_payload)
+
+
+def _describe_shape(value: Any, depth: int = 0) -> Any:
+    """Structure-only sketch of a value for the log (never its content)."""
+    if depth > 3:
+        return "..."
+    if isinstance(value, dict):
+        return {
+            str(k): _describe_shape(v, depth + 1) for k, v in list(value.items())[:12]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_describe_shape(v, depth + 1) for v in value[:4]] + (
+            ["..."] if len(value) > 4 else []
+        )
+    if isinstance(value, str):
+        return f"str[{len(value)}]"
+    return type(value).__name__
 
 
 def _notify(target: dict[str, Any], trigger_msg_id: str) -> None:
@@ -1058,7 +1122,16 @@ def _run_hook() -> int:
 
     tool_response = _extract_tool_response(payload)
     if tool_response is None:
-        _log("missing_tool_response", tool_name=tool_name, keys=sorted(payload.keys()))
+        _log(
+            "missing_tool_response",
+            tool_name=tool_name,
+            keys=sorted(payload.keys()),
+            response_shape={
+                key: _describe_shape(payload[key])
+                for key in _HOOK_RESPONSE_KEYS
+                if key in payload
+            },
+        )
         return 0
 
     if _agent_resolution_disabled(tool_response):
