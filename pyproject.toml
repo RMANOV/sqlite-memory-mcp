@@ -61,6 +61,7 @@ py-modules = [
     "debate_prompt_context",
     "debate_read_dao",
     "debate_retrieval",
+    "debate_roles",
     "debate_worker_server",
     "debate_wake_signal",
     "enrichment_constants",

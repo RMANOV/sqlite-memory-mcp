@@ -47,7 +47,9 @@ jobs:
         run: ruff check .
 
       - name: Pytest
-        run: pytest -q
+        run: |
+          pytest -q tests/test_debate_governance_authority.py
+          pytest -q
 
   registry-smoke:
     # Independent guard for MCP registry builders (Glama): a fresh

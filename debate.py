@@ -24,6 +24,7 @@ import sqlite3
 from typing import Any
 
 from db_utils import json_dumps, json_loads, now_iso
+from debate_roles import RETIRED_ROLES
 from debate_protocol_v1 import (
     PROTOCOL_VERSION as DEBATE_PROTOCOL_V1,
     SEMANTIC_KINDS,
@@ -241,6 +242,8 @@ def _validate_unique_roster(roles: list[dict[str, Any]]) -> None:
     seen_sessions: set[str] = set()
     for entry in roles:
         role = str(entry["role"])
+        if role in RETIRED_ROLES:
+            raise DebateError(f"role_retired: {role}", error_type="role_retired")
         session_id = str(entry["session_id"])
         if role in seen_roles:
             raise DebateError(
@@ -2046,6 +2049,10 @@ def post_message(
     """
     validate_topic_id(topic_id)
     validate_role(role)
+    if role in RETIRED_ROLES:
+        raise DebateError(
+            f"author_role_retired: {role}", error_type="author_role_retired"
+        )
     validate_priority(priority)
     validate_kind(kind)
     # v3.12: reject an explicit bad vehicle pre-INSERT (typed error). NULL/
@@ -2700,6 +2707,8 @@ def bind_role_session(
             error_type="topic_not_found",
         )
     _validate_role_for_debate(debate, topic_id, role)
+    if state in ("active", "diagnostic") and role in RETIRED_ROLES:
+        raise DebateError(f"role_retired: {role}", error_type="role_retired")
 
     now = now_iso()
     runtime = runtime.strip() if isinstance(runtime, str) else ""
@@ -2961,6 +2970,8 @@ def add_role_to_debate(
     """
     validate_topic_id(topic_id)
     validate_role(role)
+    if role in RETIRED_ROLES:
+        raise DebateError(f"role_retired: {role}", error_type="role_retired")
     validate_session_id(session_id)
     if not isinstance(reason, str) or not reason.strip():
         raise DebateError("invalid_reason: must be non-empty string")
@@ -3745,6 +3756,10 @@ def _validate_recipient(
     declared_roles = {
         r["role"] for r in roles_iter if isinstance(r, dict) and "role" in r
     }
+    if recipient in RETIRED_ROLES:
+        raise DebateError(
+            f"recipient_role_retired: {safe_repr}", error_type="recipient_role_retired"
+        )
     if recipient in declared_roles:
         return
     if SESSION_ID_RE.fullmatch(recipient):
@@ -3784,13 +3799,19 @@ def _validate_diagnostic_recipient(
             f"diagnostic_recipient {safe_repr} must be a valid session_id",
             error_type="recipient_invalid_session_id",
         )
-    binding = conn.execute(
-        "SELECT 1 FROM debate_role_bindings "
-        "WHERE topic_id = ? AND session_id = ? AND state = 'diagnostic' "
-        "LIMIT 1",
+    bindings = conn.execute(
+        "SELECT role, state FROM debate_role_bindings "
+        "WHERE topic_id = ? AND session_id = ? "
+        "AND state IN ('active', 'diagnostic')",
         (topic_id, recipient),
-    ).fetchone()
-    if binding is not None:
+    ).fetchall()
+    # A session may have several diagnostic roles. Never let a permitted row
+    # hide a current retired role; already-retired historical rows are not targets.
+    if any(binding["role"] in RETIRED_ROLES for binding in bindings):
+        raise DebateError(
+            f"recipient_role_retired: {safe_repr}", error_type="recipient_role_retired"
+        )
+    if any(binding["state"] == "diagnostic" for binding in bindings):
         return
     if conductor_override_msg_id:
         _validate_conductor_override(

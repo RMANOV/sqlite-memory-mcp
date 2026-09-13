@@ -533,3 +533,85 @@ def test_ordinary_added_role_and_diagnostic_delivery_remain_available(governance
         ).fetchone() == ("active",)
     finally:
         conn.close()
+
+
+def test_roles_module_constants_and_import_are_dependency_free():
+    import subprocess
+
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+before = set(sys.modules)
+import debate_roles as roles
+assert roles.GOVERNANCE_ROLES == frozenset({"ADVOCATE_CODEX", "ADVOCATE"})
+assert roles.RETIRED_ROLES == frozenset({"CONDUCTOR"})
+assert roles.HUMAN_ROLES == frozenset({"HUMAN", "OPERATOR"})
+assert all(isinstance(value, frozenset) for value in (
+    roles.GOVERNANCE_ROLES, roles.RETIRED_ROLES, roles.HUMAN_ROLES,
+))
+assert set(sys.modules) - before == {"debate_roles"}
+print("roles-stdlib-only PASS")
+"""
+    result = subprocess.run(
+        [
+            sys.executable, "-I", "-S", "-c", script,
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ],
+        capture_output=True, text=True, check=True, timeout=15,
+    )
+    assert result.stdout.strip() == "roles-stdlib-only PASS", result.stdout
+
+
+def _shared_diagnostic_topic(db_path, conductor_state):
+    topic = _seed_legacy_topic(db_path, conductor_state)
+    bound = json.loads(
+        intel_server.debate_bind_role(
+            topic_id=topic, role="EXECUTOR_2", session_id=LEGACY_SESSION,
+            state="diagnostic", reason="synthetic shared-session diagnostic role",
+        )
+    )
+    assert bound.get("state") == "diagnostic", bound
+    return topic
+
+
+@pytest.mark.parametrize("conductor_state", ["active", "diagnostic"])
+def test_current_retired_role_cannot_hide_behind_allowed_diagnostic_binding(
+    governance_db, conductor_state,
+):
+    topic = _shared_diagnostic_topic(governance_db, conductor_state)
+    before = _matrix_snapshot(governance_db)
+    out = json.loads(
+        intel_server.debate_post_with_recipients(
+            topic_id=topic, role="EXECUTOR_1", author_session_id=EXECUTOR_SESSION,
+            priority="M", kind="STATUS", body="synthetic ambiguous current target",
+            addressed_to_csv="", diagnostic_to_csv=LEGACY_SESSION,
+        )
+    )
+    _assert_matrix_refusal(governance_db, before, out, "recipient_role_retired")
+
+
+def test_past_retired_binding_does_not_taint_current_allowed_diagnostic(governance_db):
+    topic = _shared_diagnostic_topic(governance_db, "retired")
+    before_bindings = _snapshot(governance_db)["debate_role_bindings"]
+    out = json.loads(
+        intel_server.debate_post_with_recipients(
+            topic_id=topic, role="EXECUTOR_1", author_session_id=EXECUTOR_SESSION,
+            priority="M", kind="STATUS", body="synthetic current allowed target",
+            addressed_to_csv="", diagnostic_to_csv=LEGACY_SESSION,
+        )
+    )
+    assert "msg_id" in out, out
+    assert out["diagnostic_recipient_count"] == out["recipient_count"] == 1, out
+    assert _snapshot(governance_db)["debate_role_bindings"] == before_bindings
+    conn = sqlite3.connect(f"file:{governance_db}?mode=ro", uri=True)
+    try:
+        assert conn.execute(
+            "SELECT recipient, recipient_mode FROM debate_message_recipients "
+            "WHERE msg_id = ?", (out["msg_id"],),
+        ).fetchall() == [(LEGACY_SESSION, "diagnostic")]
+        assert conn.execute(
+            "SELECT recipient FROM debate_delivery_queue WHERE msg_id = ?",
+            (out["msg_id"],),
+        ).fetchall() == [(LEGACY_SESSION,)]
+    finally:
+        conn.close()
