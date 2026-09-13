@@ -748,7 +748,10 @@ def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
         parent_session_id="codex-exec1",
         trigger_msg_id=trigger["msg_id"],
     )
-    post_message(
+    # Reply ownership (2026-08-23, dispatch 10f4c51b4997): the worker posts
+    # under ITS OWN session id; the terminal INSERT completes the claim with
+    # the worker's message as the acknowledgement, atomically.
+    worker_msg = post_message(
         conn,
         topic_id=t,
         role="EXECUTOR",
@@ -756,7 +759,12 @@ def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
         kind="A",
         body="done",
         reply_to=trigger["msg_id"],
+        author_session_id=claim["worker_session_id"],
     )
+    assert worker_msg["worker_claim"]["state"] == "completed"
+    assert worker_msg["worker_claim"]["ack_msg_id"] == worker_msg["msg_id"]
+    # The cursor advance the legacy wake prompt issues afterwards stays an
+    # idempotent cursor operation (D3) — it does not change the claim.
     advanced = debate_signal_advance(
         conn,
         session_id=claim["worker_session_id"],
@@ -764,17 +772,23 @@ def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
         topic_id=t,
         last_processed_msg_id=trigger["msg_id"],
     )
-    duplicate = claim_worker_session(
+    assert advanced["worker_claim"]["state"] == "completed"
+    assert advanced["worker_claim"]["ack_msg_id"] == worker_msg["msg_id"]
+
+    # The worker's terminal does NOT consume the bound parent's right to
+    # answer: the parent's own terminal lands, attributed as the parent.
+    parent_final = post_message(
         conn,
         topic_id=t,
         role="EXECUTOR",
-        parent_session_id="codex-exec1",
-        trigger_msg_id=trigger["msg_id"],
+        priority="H",
+        kind="STATUS",
+        body="parent final",
+        reply_to=trigger["msg_id"],
+        author_session_id="codex-exec1",
     )
-
-    assert advanced["worker_claim"]["state"] == "completed"
-    assert duplicate["worker_session_id"] == claim["worker_session_id"]
-    assert duplicate["no_action"] is True
+    assert parent_final["provenance_class"] == "parent"
+    # One parent terminal per trigger.
     with pytest.raises(DebateError) as exc_info:
         post_message(
             conn,
@@ -784,8 +798,32 @@ def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
             kind="STATUS",
             body="duplicate done",
             reply_to=trigger["msg_id"],
+            author_session_id="codex-exec1",
         )
     assert exc_info.value.error_type == "terminal_reply_duplicate"
+    # A late worker terminal is unauthorized (its claim is completed).
+    with pytest.raises(DebateError) as exc_info:
+        post_message(
+            conn,
+            topic_id=t,
+            role="EXECUTOR",
+            priority="H",
+            kind="STATUS",
+            body="late worker",
+            reply_to=trigger["msg_id"],
+            author_session_id=claim["worker_session_id"],
+        )
+    assert exc_info.value.error_type == "ROLE_UNAVAILABLE"
+    # And the trigger accepts no new worker claim: its worker slot is used.
+    with pytest.raises(DebateError) as exc_info:
+        claim_worker_session(
+            conn,
+            topic_id=t,
+            role="EXECUTOR",
+            parent_session_id="codex-exec1",
+            trigger_msg_id=trigger["msg_id"],
+        )
+    assert exc_info.value.error_type == "trigger_closed_by_parent"
 
 
 def test_worker_no_action_completes_claim_and_advances_worker_cursor(topic):

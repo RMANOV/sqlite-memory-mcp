@@ -811,6 +811,23 @@ CREATE TABLE IF NOT EXISTS debate_messages (
     body_mode  TEXT DEFAULT NULL
         CHECK (body_mode IS NULL OR body_mode IN ('structured', 'live_text')),
     payload_json TEXT DEFAULT NULL,
+    -- Reply ownership / author provenance (2026-08-23, debate
+    -- 10f4c51b4997 → a784b6952429 → fd84d67e00af).  Written only by the DAO
+    -- at the INSERT choke point and immutable afterwards (trigger below).
+    -- (No semicolons in these comments: the DDL splitter cuts on them.)
+    -- author_session_id = the AUTHORIZED session that posted the row,
+    -- provenance_class  = how that author owned the role for this row:
+    --   parent       active primary binding of the role
+    --   worker       derived worker claim for (topic, role, reply_to)
+    --   unattributed trusted DAO-internal system row (explicit opt-in)
+    --   legacy       pre-migration / old explicit-column writers (DEFAULT)
+    author_session_id TEXT DEFAULT NULL,
+    provenance_class TEXT NOT NULL DEFAULT 'legacy'
+        CHECK (provenance_class IN ('parent', 'worker', 'legacy', 'unattributed')
+               AND ((author_session_id IS NULL
+                     AND provenance_class IN ('legacy', 'unattributed'))
+                    OR (author_session_id IS NOT NULL
+                        AND provenance_class IN ('parent', 'worker')))),
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_debmsg_topic_ts
@@ -855,6 +872,14 @@ AFTER UPDATE OF topic_id, role, kind, body ON debate_messages BEGIN
     DELETE FROM debate_messages_fts WHERE msg_id = old.msg_id;
     INSERT INTO debate_messages_fts(msg_id, topic_id, role, kind, body)
     VALUES (new.msg_id, new.topic_id, new.role, new.kind, new.body);
+END;
+
+-- Provenance is append-only evidence: once a row is attributed it can never
+-- be re-attributed (recreated by _create_debate_message_indexes_and_triggers
+-- after the debate/v1 rebuild, which drops triggers with the old table).
+CREATE TRIGGER IF NOT EXISTS debate_messages_provenance_immutable
+BEFORE UPDATE OF author_session_id, provenance_class ON debate_messages BEGIN
+    SELECT RAISE(ABORT, 'debate_messages provenance is immutable');
 END;
 
 CREATE TABLE IF NOT EXISTS debate_watermarks (
@@ -1074,6 +1099,9 @@ CREATE TABLE IF NOT EXISTS debate_worker_reap_log (
 );
 CREATE INDEX IF NOT EXISTS idx_dwrl_topic_created
     ON debate_worker_reap_log(topic_id, created_at);
+-- Reply-ownership classification reads reaped claims by their trigger.
+CREATE INDEX IF NOT EXISTS idx_dwrl_owner
+    ON debate_worker_reap_log(topic_id, role, trigger_msg_id);
 
 -- ── debate/v1 §7 deterministic server invariants (2026-07-22) ───────
 -- This is protocol micro-state, intentionally separate from the durable
@@ -2265,6 +2293,8 @@ _MIGRATIONS = [
         );
         CREATE INDEX idx_dwrl_topic_created
             ON debate_worker_reap_log(topic_id, created_at);
+        CREATE INDEX idx_dwrl_owner
+            ON debate_worker_reap_log(topic_id, role, trigger_msg_id);
         """,
         "debate_worker_reap_log table and indexes (v3.11)",
     ),
@@ -2400,6 +2430,38 @@ _MIGRATIONS = [
         "SELECT 1 FROM pragma_table_info('tasks') WHERE name='tombstone_pushed_at'",
         "ALTER TABLE tasks ADD COLUMN tombstone_pushed_at TEXT DEFAULT NULL",
         "tasks.tombstone_pushed_at column (push-aware tombstone retention)",
+    ),
+    # ── Reply ownership / author provenance (2026-08-23) ──────────────────
+    # ORDER IS LOAD-BEARING: the provenance_class CHECK references
+    # author_session_id, so that column must exist first.  Existing rows keep
+    # the DEFAULT 'legacy' (author NULL), which satisfies the pairing CHECK.
+    (
+        "SELECT 1 FROM pragma_table_info('debate_messages') "
+        "WHERE name='author_session_id'",
+        "ALTER TABLE debate_messages ADD COLUMN author_session_id TEXT DEFAULT NULL",
+        "debate_messages.author_session_id column (reply ownership)",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('debate_messages') "
+        "WHERE name='provenance_class'",
+        "ALTER TABLE debate_messages ADD COLUMN provenance_class TEXT NOT NULL "
+        "DEFAULT 'legacy' "
+        "CHECK (provenance_class IN ('parent', 'worker', 'legacy', 'unattributed') "
+        "AND ((author_session_id IS NULL "
+        "AND provenance_class IN ('legacy', 'unattributed')) "
+        "OR (author_session_id IS NOT NULL "
+        "AND provenance_class IN ('parent', 'worker'))))",
+        "debate_messages.provenance_class column + pairing CHECK (reply ownership)",
+    ),
+    # The immutability trigger is NOT a _MIGRATIONS entry: the runner splits
+    # statements on ';' (trigger bodies contain one), and
+    # _create_debate_message_indexes_and_triggers() — executed on every
+    # init_db after this loop, rebuild or not — creates it IF NOT EXISTS.
+    (
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_dwrl_owner'",
+        "CREATE INDEX IF NOT EXISTS idx_dwrl_owner "
+        "ON debate_worker_reap_log(topic_id, role, trigger_msg_id)",
+        "debate_worker_reap_log ownership index (reply ownership)",
     ),
 ]
 
@@ -2559,6 +2621,14 @@ def _create_debate_message_indexes_and_triggers(conn: sqlite3.Connection) -> Non
             VALUES (new.msg_id, new.topic_id, new.role, new.kind, new.body);
         END
         """,
+        # Reply-ownership provenance immutability (dropped with the old table
+        # on rebuild; this is its single recreation site besides the base DDL).
+        """
+        CREATE TRIGGER IF NOT EXISTS debate_messages_provenance_immutable
+        BEFORE UPDATE OF author_session_id, provenance_class ON debate_messages BEGIN
+            SELECT RAISE(ABORT, 'debate_messages provenance is immutable');
+        END
+        """,
     )
     for statement in statements:
         conn.execute(statement)
@@ -2617,6 +2687,13 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
             body_mode  TEXT DEFAULT NULL
                 CHECK (body_mode IS NULL OR body_mode IN ('structured', 'live_text')),
             payload_json TEXT DEFAULT NULL,
+            author_session_id TEXT DEFAULT NULL,
+            provenance_class TEXT NOT NULL DEFAULT 'legacy'
+                CHECK (provenance_class IN ('parent', 'worker', 'legacy', 'unattributed')
+                       AND ((author_session_id IS NULL
+                             AND provenance_class IN ('legacy', 'unattributed'))
+                            OR (author_session_id IS NOT NULL
+                                AND provenance_class IN ('parent', 'worker')))),
             created_at TEXT NOT NULL
         )
         """
@@ -2628,11 +2705,14 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO debate_messages_v1_new "
         "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,"
-        " protocol_version,round_no,body_mode,payload_json,created_at) "
+        " protocol_version,round_no,body_mode,payload_json,"
+        " author_session_id,provenance_class,created_at) "
         "SELECT msg_id,topic_id,role,ts,priority,kind,"
         f"{source('standing')},{source('vehicle')},reply_to,body,"
         f"{source('protocol_version')},{source('round_no')},"
-        f"{source('body_mode')},{source('payload_json')},created_at "
+        f"{source('body_mode')},{source('payload_json')},"
+        f"{source('author_session_id')},COALESCE({source('provenance_class')},'legacy'),"
+        "created_at "
         "FROM debate_messages ORDER BY ts,msg_id"
     )
     new_count = int(
@@ -2656,6 +2736,7 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
         "debate_messages_fts_ai",
         "debate_messages_fts_ad",
         "debate_messages_fts_au",
+        "debate_messages_provenance_immutable",
     ):
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     conn.execute("DROP TABLE debate_messages")

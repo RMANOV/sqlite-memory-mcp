@@ -71,6 +71,10 @@ def wrapper_db(tmp_path, monkeypatch):
     return db_path
 
 
+# Reply ownership (2026-08-23): public writers require the caller's session.
+_SESSIONS = {"CONDUCTOR": "codex-cond20260531", "EXECUTOR_1": "codex-exec20260531"}
+
+
 def _post(
     topic_id: str,
     body: str,
@@ -86,6 +90,7 @@ def _post(
             priority=priority,
             kind=kind,
             body=body,
+            author_session_id=_SESSIONS[role],
         )
     )
     assert "error_type" not in out, out

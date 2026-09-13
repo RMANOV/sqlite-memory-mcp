@@ -1155,6 +1155,27 @@ def import_from_gbrain(
 # COMPACTION, lifecycle state machine INIT→ACTIVE→RESOLVED→ARCHIVED.
 
 
+def _require_author(author_session_id: str, tool: str) -> str:
+    """Public author gate (reply ownership, 2026-08-23, contract a784b6952429
+    C1): every public writer tool requires the caller's own session id — a
+    bound primary session (cc-/codex-/...) or a derived worker id — so each
+    ledger row is attributed and the per-class ownership guard can work.  The
+    DAO keeps a bare-ledger compat path for in-process callers; it is not
+    reachable through MCP because this gate runs first.
+
+    Residual (cooperative bearer model, contract item 1): the id is a bearer
+    credential, not a proof of identity — a caller that knows a valid bound
+    or worker id can post as it.  The gate proves attribution, not
+    authentication."""
+    if not isinstance(author_session_id, str) or not author_session_id.strip():
+        raise _DebateError(
+            f"author_session_required: {tool} requires author_session_id "
+            "(your bound or worker session id)",
+            error_type="author_session_required",
+        )
+    return author_session_id.strip()
+
+
 def _debate_error_response(exc: Exception) -> str:
     """Map a DAO exception to a stable MCP error JSON string.
 
@@ -1353,6 +1374,7 @@ def debate_post(
             of dispatching a no-edit wake-worker (routed to a
             conductor-approved impl vehicle out-of-band).
     """
+    author = _require_author(author_session_id, "debate_post")
     return _debate_post_dao(
         conn,
         topic_id=topic_id,
@@ -1366,7 +1388,7 @@ def debate_post(
         protocol_version=protocol_version or None,
         body_mode=body_mode or None,
         payload_json=payload_json or None,
-        author_session_id=author_session_id or None,
+        author_session_id=author,
     )
 
 
@@ -1606,43 +1628,51 @@ def debate_state(
     role: str,
     new_state: str,
     reason: str = "",
+    author_session_id: str = "",
 ) -> str:
     """Transition debate to a new state. Validates VALID_TRANSITIONS.
     RESOLVED requires all open Qs to have a matching A reply (or A body
     starting `[DEFERRED:` to count as resolution-equivalent).
+    author_session_id: the caller's bound session id (required).
     """
+    author = _require_author(author_session_id, "debate_state")
     return _debate_transition_dao(
         conn,
         topic_id=topic_id,
         role=role,
         new_state=new_state,
         reason=reason or "",
+        author_session_id=author,
     )
 
 
 # Tool 29: debate_escalate
 @mcp.tool()
-@_db_tool(error_mapper=_debate_error_response)
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_escalate(
     conn,
     topic_id: str,
     role: str,
     reason: str,
     target_role: str = "HUMAN",
+    author_session_id: str = "",
 ) -> str:
-    """Force-write an H-priority PING tagged for target_role (default HUMAN)."""
+    """Force-write an H-priority PING tagged for target_role (default HUMAN).
+    author_session_id: the caller's bound session id (required)."""
+    author = _require_author(author_session_id, "debate_escalate")
     return _debate_escalate_dao(
         conn,
         topic_id=topic_id,
         role=role,
         reason=reason,
         target_role=target_role,
+        author_session_id=author,
     )
 
 
 # Tool 30: debate_compact
 @mcp.tool()
-@_db_tool(error_mapper=_debate_error_response)
+@_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_compact(
     conn,
     topic_id: str,
@@ -1650,11 +1680,13 @@ def debate_compact(
     body: str,
     since_ts: str = "",
     until_ts: str = "",
+    author_session_id: str = "",
 ) -> str:
     """Write a COMPACTION snapshot. Body must contain OBSERVE / ORIENT /
     DECIDE / ACT sections (regex-validated pre-INSERT). since_ts and
     until_ts are optional ISO 8601 UTC bounds for the snapshotted range.
     """
+    author = _require_author(author_session_id, "debate_compact")
     return _debate_compact(
         conn,
         topic_id=topic_id,
@@ -1662,6 +1694,7 @@ def debate_compact(
         body=body,
         since_ts=since_ts or None,
         until_ts=until_ts or None,
+        author_session_id=author,
     )
 
 
@@ -1673,8 +1706,10 @@ def debate_advance_watermark(
     topic_id: str,
     role: str,
     processed_up_to_msg_id: str,
+    author_session_id: str = "",
 ) -> str:
     """Advance (topic_id, role) cursor to a specific msg_id.
+    author_session_id: the caller's bound session id (required).
 
     Convenience wrapper that looks up the msg_id's ts and writes a
     canonical WATERMARK message of the form:
@@ -1685,11 +1720,13 @@ def debate_advance_watermark(
     and derived worker cursors remain independent. Reduces caller error surface
     vs constructing the WATERMARK body by hand.
     """
+    author = _require_author(author_session_id, "debate_advance_watermark")
     return _debate_advance_watermark_dao(
         conn,
         topic_id=topic_id,
         role=role,
         processed_up_to_msg_id=processed_up_to_msg_id,
+        author_session_id=author,
     )
 
 
@@ -1741,6 +1778,7 @@ def debate_post_with_recipients(
     diagnostic_to = [
         item.strip() for item in diagnostic_to_csv.split(",") if item.strip()
     ]
+    author = _require_author(author_session_id, "debate_post_with_recipients")
     return _debate_post_with_recipients_dao(
         conn,
         topic_id=topic_id,
@@ -1757,7 +1795,7 @@ def debate_post_with_recipients(
         protocol_version=protocol_version or None,
         body_mode=body_mode or None,
         payload_json=payload_json or None,
-        author_session_id=author_session_id or None,
+        author_session_id=author,
     )
 
 
@@ -1960,18 +1998,26 @@ def debate_rotate_binding(
 @mcp.tool()
 @_db_tool(write=True, error_mapper=_debate_error_response)
 def debate_close_topic(
-    conn, topic_id: str, role: str, new_state: str, reason: str = ""
+    conn,
+    topic_id: str,
+    role: str,
+    new_state: str,
+    reason: str = "",
+    author_session_id: str = "",
 ) -> str:
     """Close a topic through the authoritative debate_state transition path.
 
     Binding retirement happens in the same transaction as RESOLVED/ARCHIVED.
+    author_session_id: the caller's bound session id (required).
     """
+    author = _require_author(author_session_id, "debate_close_topic")
     return _debate_transition_dao(
         conn,
         topic_id=topic_id,
         role=role,
         new_state=new_state,
         reason=reason or "",
+        author_session_id=author,
     )
 
 

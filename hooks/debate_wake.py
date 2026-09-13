@@ -222,14 +222,17 @@ Task:
    topic_id, role, worker_session_id (the session_id shown above),
    trigger_msg_id, and a short reason. Then reply NO_ACTION and do not post.
 4. If there is work, post at most one focused debate response with
-   debate_post_with_recipients. Do not use bare debate_post: unaddressed
-   messages are invisible to the pump.
+   debate_post_with_recipients using author_session_id="{session_id}" (your
+   worker session id — REQUIRED, it attributes the reply) and
+   reply_to="{trigger_msg_id}" for the terminal answer. Do not use bare
+   debate_post: unaddressed messages are invisible to the pump.
 5. Address the response to the role(s) named by the trigger, normally
    CONDUCTOR and any review role that must see it.
 6. Quote the trigger msg_id or the specific msg_id(s) you read.
 7. After a successful post, advance this role/session/topic cursor to the latest
-   message you substantively handled, normally the trigger msg_id. After
-   debate_worker_no_action, do not call debate_signal_advance separately.
+   message you substantively handled, normally the trigger msg_id (your
+   terminal post already completed your claim; the advance is cursor-only).
+   After debate_worker_no_action, do not call debate_signal_advance separately.
 8. Do not edit files, run unrelated commands, or broaden scope.
 9. Stop after that one response and cursor advance.
 """
@@ -696,6 +699,18 @@ def _launch_agent(
     if target.get("result") == "worker_claim_completed":
         return {"launched": False, "reason": "worker_claim_completed", "target": target}
     if target.get("claim_error"):
+        # Reply ownership (2026-08-23): an answered trigger is terminal, not a
+        # failure — the claim DAO fails closed with trigger_closed_by_parent /
+        # worker_slot_consumed and the wake_log must not stay at 'dry_run'.
+        if any(
+            marker in str(target["claim_error"])
+            for marker in ("trigger_closed_by_parent", "worker_slot_consumed")
+        ):
+            return {
+                "launched": False,
+                "reason": "worker_claim_completed",
+                "target": target,
+            }
         return {"launched": False, "reason": "worker_claim_failed", "target": target}
 
     AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
