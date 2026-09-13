@@ -10,7 +10,7 @@ readme = "README.md"
 
 [project.optional-dependencies]
 gui = ["PyQt6>=6.5"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "httpx"]
 speed = ["orjson>=3.9.0"]
 vector = ["sqlite-vec>=0.1.6", "sentence-transformers>=3.0.0"]
 community = ["igraph>=0.11", "leidenalg>=0.10"]
