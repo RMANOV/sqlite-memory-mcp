@@ -180,4 +180,13 @@ def test_numbered_executor_legacy_topic_stays_available(governance_db):
     ]
     assert len(messages) == 1, readback
     assert messages[0]["body"] == body
-    assert messages[0]["author_session_id"] == EXECUTOR_SESSION
+    assert posted["author_session_id"] == EXECUTOR_SESSION
+    # Legacy read projects identity/body; stored provenance is a writer contract.
+    conn = sqlite3.connect(f"file:{governance_db}?mode=ro", uri=True)
+    try:
+        assert conn.execute(
+            "SELECT author_session_id FROM debate_messages WHERE msg_id = ?",
+            (posted["msg_id"],),
+        ).fetchone() == (EXECUTOR_SESSION,)
+    finally:
+        conn.close()
