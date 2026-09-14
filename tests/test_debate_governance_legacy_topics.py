@@ -164,16 +164,17 @@ def test_decision_with_non_governance_payload_is_refused_typed(api, writer):
 def test_authority_looking_metadata_grants_nothing_in_f0(api, writer, metadata_json):
     """Review item M2: an authority-looking record seeded by hand is never a pin.
 
-    F0 has no positive path even when metadata says mode=authority, so a
-    well-formed authorize on such a topic is refused typed with
-    governance_action_not_implemented and zero writes; the error name flips
-    in F1 when the real pin/consume path exists.
+    Phase A (packet v1.3 D-A1): a governance record is evidence only when the
+    newest ``action='pin'`` spend backs it.  A record planted by raw SQL has no
+    such spend, so a well-formed authorize on that topic is refused typed with
+    ``governance_pin_unbacked`` and zero writes — before any actor or issuer
+    check, so the planted record grants nothing to anyone.
     """
     call, path = api
     _seed_legacy_topic(path, metadata_json)
     before = _snapshot(path)
     out = _post(call, writer, json.dumps(_authorize_input()))
-    assert out.get("error_type") == "governance_action_not_implemented", out
+    assert out.get("error_type") == "governance_pin_unbacked", out
     assert _snapshot(path) == before
 
 

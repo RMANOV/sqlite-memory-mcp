@@ -272,7 +272,8 @@ def _read(api, msg_id, topic=TOPIC):
 def _signal(api, msg_id, *, session=AUTHOR, role="EXECUTOR_1", topic=TOPIC):
     call, _, _ = api
     out = call("debate_signal_check", session_id=session, role=role, topic_id=topic, limit=500)
-    return next(m for m in out["messages"] if m["msg_id"] == msg_id)
+    # debate_signal_check returns the addressed rows under "pending"
+    return next(m for m in out["pending"] if m["msg_id"] == msg_id)
 
 
 def _stored(path, msg_id):
@@ -833,6 +834,21 @@ def test_f13_grant_mismatches_apply_nothing(api, monkeypatch, case):
     before = _snapshot(path)
     out = _bind(api, grant=grant, **kwargs)
     assert out.get("error_type") == expected, out
+    assert _snapshot(path) == before
+
+
+def test_f13_authorize_payload_naming_another_topic_is_refused_by_the_validator(api):
+    """DA W47 (2): the validator-level refusal (payload topic_id ≠ posting
+    topic) keeps its own node; it needs no pinned authority because the
+    check precedes the authority lookup (F0 order)."""
+    _, path, _ = api
+    _init_active(api)
+    before = _snapshot(path)
+    payload = _grant_payload(api, fingerprint="a" * 64)
+    payload["topic_id"] = "C3F1B"
+    out = _authorize(api, payload)
+    assert out.get("error_type") == "governance_payload_invalid", out
+    assert "topic_id must equal the posting topic" in out.get("error", ""), out
     assert _snapshot(path) == before
 
 
