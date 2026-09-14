@@ -21,18 +21,35 @@ import os
 import re
 import secrets
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
+import debate_governance as governance
 from db_utils import json_dumps, json_loads, now_iso
 from debate_governance import (
+    APPROVE_MANIFEST_SCHEMA,
+    BOOTSTRAP_MANIFEST_SCHEMA,
+    GOVERNANCE_NEXT_TOOLS,
+    GOVERNANCE_SCHEMA,
+    SPEND_TARGET_SINGLE,
     GovernanceError,
+    binding_fingerprint,
+    binding_version_from_row,
     candidate_governance_metadata,
+    canonical_json,
+    enforce_validity_bound,
     is_legacy_governance_candidate,
+    issuer_for_binding,
+    load_private_manifest,
+    parse_iso_utc,
+    pin_record_backed,
     reject_caller_governance,
+    require_pin_record_backed,
     serialize_debate_message,
+    spend_target_key,
+    topic_fingerprint,
     validate_legacy_governance_post,
 )
-from debate_roles import GOVERNANCE_ROLES, RETIRED_ROLES
+from debate_roles import GOVERNANCE_ROLES, HUMAN_ROLES, RETIRED_ROLES
 from debate_protocol_v1 import (
     PROTOCOL_VERSION as DEBATE_PROTOCOL_V1,
     SEMANTIC_KINDS,
@@ -2051,6 +2068,7 @@ def post_message(
     author_session_id: str | None = None,
     recipients: list[str] | None = None,
     internal_unattributed: bool = False,
+    internal_governance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Append a message to a debate. Validates topic state, role membership,
     enums, and all kind-specific semantics BEFORE the INSERT (atomicity
@@ -2271,11 +2289,18 @@ def post_message(
     # v1 preflight. Every rejection is typed and leaves zero rows; there is
     # no silent fallback to a plain post with the payload dropped. Configured
     # debate/v1 topics keep their own preflight rules untouched.
-    if _protocol_v1_get_protocol_state(
+    # Phase A: a positive path returns the server-stamped row fields (payload,
+    # body_mode, governance_schema).  ``internal_governance`` is the trusted
+    # DAO-internal route used by the bootstrap/approve manifest tools; no
+    # public wrapper exposes it (same class as internal_unattributed).
+    governance_row: dict[str, Any] | None = None
+    if internal_governance is not None:
+        governance_row = dict(internal_governance)
+    elif _protocol_v1_get_protocol_state(
         conn, topic_id
     ) is None and is_legacy_governance_candidate(kind, payload_json):
         try:
-            validate_legacy_governance_post(
+            governance_row = validate_legacy_governance_post(
                 conn,
                 topic_id=topic_id,
                 role=role,
@@ -2318,11 +2343,20 @@ def post_message(
     if not ISO_UTC_RE.fullmatch(ts):
         ts = ts.replace("+00:00", "Z")
 
+    if governance_row is not None:
+        body_mode_db = governance_row["body_mode"]
+        payload_db = governance_row["payload_json"]
+        governance_schema_db = governance_row["governance_schema"]
+    else:
+        body_mode_db = semantic["body_mode"] if semantic else None
+        payload_db = semantic["payload_json"] if semantic else None
+        governance_schema_db = None
     conn.execute(
         "INSERT INTO debate_messages (msg_id, topic_id, role, ts, priority, "
         "kind, standing, vehicle, reply_to, body, protocol_version, round_no, "
-        "body_mode, payload_json, author_session_id, provenance_class, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "body_mode, payload_json, author_session_id, provenance_class, "
+        "governance_schema, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             msg_id,
             topic_id,
@@ -2336,10 +2370,11 @@ def post_message(
             body,
             semantic["protocol_version"] if semantic else None,
             semantic["round_no"] if semantic else None,
-            semantic["body_mode"] if semantic else None,
-            semantic["payload_json"] if semantic else None,
+            body_mode_db,
+            payload_db,
             author_db,
             provenance_class,
+            governance_schema_db,
             ts,
         ),
     )
@@ -2622,7 +2657,7 @@ def read_messages(
     rows = conn.execute(
         f"SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
         f"m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
-        f"m.body_mode, m.payload_json, m.created_at "
+        f"m.body_mode, m.payload_json, m.governance_schema, m.created_at "
         f"FROM debate_messages m {where_sql} "
         f"ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",
         [*params, fetch_limit],
@@ -2721,6 +2756,792 @@ def list_role_bindings(conn: sqlite3.Connection, *, topic_id: str) -> dict[str, 
     }
 
 
+# ── C3 phase A (packet v1.3): governance chain DAO ────────────────────────
+# inventory → bootstrap HUMAN (private manifest) → approve_pin (manifest tool)
+# → pin (same manifest re-presented, epoch +1) → authorize DECISION by the
+# pinned authority (public path, server-stamped) → consume in
+# bind_role_session through authorize_and_apply with exactly one spend.
+
+_BINDING_COLUMNS = (
+    "topic_id, role, session_id, runtime, state, generation, created_at, "
+    "updated_at, retired_at, reason, bound_by_role, bound_by_msg_id"
+)
+
+
+def _governance_record(debate: dict[str, Any]) -> dict[str, Any]:
+    metadata = _metadata_dict(debate.get("metadata"))
+    record = metadata.get("governance")
+    if not isinstance(record, dict):
+        record = candidate_governance_metadata(
+            list(debate.get("roles") or []), GOVERNANCE_ROLES
+        )
+    return dict(record)
+
+
+def _write_governance_record(
+    conn: sqlite3.Connection, topic_id: str, record: dict[str, Any]
+) -> None:
+    row = conn.execute(
+        "SELECT metadata_json FROM debates WHERE topic_id = ?", (topic_id,)
+    ).fetchone()
+    metadata = _metadata_dict(
+        json_loads(row["metadata_json"]) if row and row["metadata_json"] else {}
+    )
+    metadata["governance"] = dict(record)
+    conn.execute(
+        "UPDATE debates SET metadata_json = ? WHERE topic_id = ?",
+        (json_dumps(metadata), topic_id),
+    )
+
+
+def _binding_row(
+    conn: sqlite3.Connection, topic_id: str, role: str, session_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        f"SELECT {_BINDING_COLUMNS} FROM debate_role_bindings "
+        "WHERE topic_id = ? AND role = ? AND session_id = ?",
+        (topic_id, role, session_id),
+    ).fetchone()
+
+
+def _binding_image(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    image = {key: row[key] for key in row.keys()}
+    image["fingerprint"] = binding_fingerprint(binding_version_from_row(row))
+    return image
+
+
+def _active_claims(
+    conn: sqlite3.Connection, topic_id: str, role: str, session_id: str
+) -> int:
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM debate_worker_claims WHERE topic_id = ? AND role = ? "
+            "AND parent_session_id = ? AND state = 'active'",
+            (topic_id, role, session_id),
+        ).fetchone()[0]
+    )
+
+
+def _spend_row(
+    conn: sqlite3.Connection, authorization_msg_id: str, target_key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM debate_authorization_spends "
+        "WHERE authorization_msg_id = ? AND target_key = ?",
+        (authorization_msg_id, target_key),
+    ).fetchone()
+
+
+def _manifest_spends(conn: sqlite3.Connection, manifest_sha256: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM debate_authorization_spends WHERE manifest_sha256 = ? "
+        "ORDER BY spent_at",
+        (manifest_sha256,),
+    ).fetchall()
+
+
+def _record_authorization_spend(
+    conn: sqlite3.Connection,
+    *,
+    authorization_msg_id: str,
+    target_key: str,
+    manifest_sha256: str | None,
+    action: str,
+    control_topic_id: str,
+    target_topic_id: str,
+    target_role: str,
+    target_session_id: str,
+    target_fingerprint: str,
+    issuer: dict[str, Any],
+    before: Any,
+    after: Any,
+    receipt: dict[str, Any],
+    spent_at: str,
+) -> dict[str, Any]:
+    """Append ONE spend row; the PK doubles as the replay guard."""
+    try:
+        conn.execute(
+            "INSERT INTO debate_authorization_spends (authorization_msg_id, target_key, "
+            "manifest_sha256, action, control_topic_id, target_topic_id, target_role, "
+            "target_session_id, target_fingerprint, issuer_json, before_json, after_json, "
+            "receipt_json, spent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                authorization_msg_id,
+                target_key,
+                manifest_sha256,
+                action,
+                control_topic_id,
+                target_topic_id,
+                target_role,
+                target_session_id,
+                target_fingerprint,
+                canonical_json(issuer),
+                canonical_json(before),
+                canonical_json(after),
+                canonical_json(receipt),
+                spent_at,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise DebateError(
+            f"authorization_consumed: {authorization_msg_id}/{target_key}",
+            error_type="authorization_consumed",
+        ) from exc
+    return {
+        "authorization_msg_id": authorization_msg_id,
+        "target_key": target_key,
+        "manifest_sha256": manifest_sha256,
+        "action": action,
+        "spent_at": spent_at,
+    }
+
+
+def governance_inventory(conn: sqlite3.Connection, *, topic_id: str) -> dict[str, Any]:
+    """Read-only projection: mode, epoch, bindings with fingerprints, HUMAN owners."""
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    record = _governance_record(debate)
+    roles = list(debate.get("roles") or [])
+    rows = conn.execute(
+        f"SELECT {_BINDING_COLUMNS} FROM debate_role_bindings WHERE topic_id = ? "
+        "ORDER BY role, generation, session_id",
+        (topic_id,),
+    ).fetchall()
+    bindings = []
+    for row in rows:
+        image = _binding_image(row)
+        image["active_claims"] = _active_claims(conn, topic_id, row["role"], row["session_id"])
+        bindings.append(image)
+    humans = sorted(
+        b["session_id"] for b in bindings if b["role"] in HUMAN_ROLES and b["state"] == "active"
+    )
+    authority = None
+    if record.get("mode") == "authority":
+        authority = {
+            "role": record.get("authority_role"),
+            "session_id": record.get("authority_session_id"),
+            "generation": record.get("authority_generation"),
+        }
+    open_deliveries = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM debate_delivery_queue q "
+            "JOIN debate_messages m ON m.msg_id = q.msg_id "
+            "WHERE m.topic_id = ? AND q.completed_at IS NULL",
+            (topic_id,),
+        ).fetchone()[0]
+    )
+    return {
+        "topic_id": topic_id,
+        "topic_state": debate["state"],
+        "mode": record.get("mode", "legacy"),
+        "authority_epoch": int(record.get("authority_epoch") or 0),
+        "candidate_role": record.get("candidate_role", ""),
+        "authority": authority,
+        "topic_fingerprint": topic_fingerprint(topic_id, debate["state"], roles, record),
+        "active_human_owners": humans,
+        "bindings": bindings,
+        "open_deliveries": open_deliveries,
+        "pin_record_backed": bool(pin_record_backed(conn, topic_id, record)),
+        "governance": record,
+    }
+
+
+def governance_bootstrap_human(
+    conn: sqlite3.Connection, *, manifest_path: str, expected_manifest_sha256: str
+) -> dict[str, Any]:
+    """Bind the operator's HUMAN session from a private manifest, once per digest."""
+    try:
+        manifest = load_private_manifest(
+            manifest_path, expected_manifest_sha256, BOOTSTRAP_MANIFEST_SCHEMA
+        )
+    except GovernanceError as exc:
+        _raise_governance_error(exc)
+    digest = expected_manifest_sha256
+    topic_id = manifest["topic_id"]
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    human = manifest["human_session_id"]
+    # Exact replay of an applied manifest: compare the stored after-image with
+    # the current row and answer from the receipt with zero writes.
+    for spend in _manifest_spends(conn, digest):
+        if spend["action"] != "bootstrap_human":
+            continue
+        current = _binding_image(
+            _binding_row(conn, topic_id, spend["target_role"], spend["target_session_id"])
+        )
+        stored = json_loads(spend["after_json"])
+        if current == stored:
+            return {
+                "status": "already_bootstrapped",
+                "binding": stored,
+                "receipt_msg_id": spend["authorization_msg_id"],
+                "manifest_sha256": digest,
+            }
+        raise DebateError(
+            "bootstrap_after_image_changed: the HUMAN binding no longer matches the receipt",
+            error_type="bootstrap_after_image_changed",
+            details={"receipt_msg_id": spend["authorization_msg_id"]},
+        )
+    if debate["state"] not in ("INIT", "ACTIVE"):
+        raise DebateError(
+            f"bootstrap_topic_state: {debate['state']}", error_type="bootstrap_topic_state"
+        )
+    placeholders = ",".join("?" * len(HUMAN_ROLES))
+    existing = conn.execute(
+        "SELECT session_id FROM debate_role_bindings WHERE topic_id = ? "
+        f"AND state = 'active' AND role IN ({placeholders})",
+        (topic_id, *sorted(HUMAN_ROLES)),
+    ).fetchall()
+    if existing:
+        raise DebateError(
+            "bootstrap_human_exists: an ACTIVE HUMAN/OPERATOR binding already exists",
+            error_type="bootstrap_human_exists",
+        )
+    record = _governance_record(debate)
+    roles = list(debate.get("roles") or [])
+    expected_fp = topic_fingerprint(topic_id, debate["state"], roles, record)
+    if manifest["expected_topic_fingerprint"] != expected_fp:
+        raise DebateError(
+            "bootstrap_topic_changed: topic fingerprint differs from the manifest",
+            error_type="bootstrap_topic_changed",
+            details={"expected": manifest["expected_topic_fingerprint"], "actual": expected_fp},
+        )
+    validate_session_id(human)
+    if not human.startswith("human-") or is_worker_session_id(human):
+        raise DebateError(
+            "bootstrap_session_conflict: human_session_id must be a human- parent id",
+            error_type="bootstrap_session_conflict",
+        )
+    owns_other = conn.execute(
+        "SELECT role FROM debate_role_bindings WHERE topic_id = ? AND session_id = ? "
+        "AND state IN ('active', 'diagnostic') LIMIT 1",
+        (topic_id, human),
+    ).fetchone()
+    if owns_other is not None:
+        raise DebateError(
+            f"bootstrap_session_conflict: {human} already owns {owns_other['role']}",
+            error_type="bootstrap_session_conflict",
+        )
+    if not any(isinstance(r, dict) and r.get("role") == "HUMAN" for r in roles):
+        roles.append({"role": "HUMAN", "session_id": human})
+        conn.execute(
+            "UPDATE debates SET roles_json = ? WHERE topic_id = ?",
+            (json_dumps(roles), topic_id),
+        )
+    bind_role_session(
+        conn,
+        topic_id=topic_id,
+        role="HUMAN",
+        session_id=human,
+        state="active",
+        reason=f"governance_bootstrap_human:{digest}",
+        bound_by_role="HUMAN",
+    )
+    row = _binding_row(conn, topic_id, "HUMAN", human)
+    image = _binding_image(row)
+    issuer = issuer_for_binding(row, None)
+    before_image = {"active_human_owners": []}
+    payload = {
+        "schema": GOVERNANCE_SCHEMA,
+        "type": "bootstrap_human",
+        "topic_id": topic_id,
+        "human_session_id": human,
+        "manifest_sha256": digest,
+        "approval_source": "operator_manifest_cooperative",
+        "expires_at": manifest["expires_at"],
+        "nonce": manifest["nonce"],
+        "before": before_image,
+        "after": image,
+        "issuer": issuer,
+    }
+    receipt = post_message(
+        conn,
+        topic_id=topic_id,
+        role="HUMAN",
+        priority="H",
+        kind="DECISION",
+        body=f"governance bootstrap_human {digest[:12]}",
+        author_session_id=human,
+        internal_governance={
+            "payload_json": canonical_json(payload),
+            "body_mode": "structured",
+            "governance_schema": GOVERNANCE_SCHEMA,
+        },
+    )
+    spend = _record_authorization_spend(
+        conn,
+        authorization_msg_id=receipt["msg_id"],
+        target_key=spend_target_key(digest, image["fingerprint"]),
+        manifest_sha256=digest,
+        action="bootstrap_human",
+        control_topic_id=topic_id,
+        target_topic_id=topic_id,
+        target_role="HUMAN",
+        target_session_id=human,
+        target_fingerprint=image["fingerprint"],
+        issuer=issuer,
+        before=before_image,
+        after=image,
+        receipt={"manifest_sha256": digest, "topic_fingerprint": expected_fp},
+        spent_at=now_iso(),
+    )
+    return {
+        "status": "applied",
+        "binding": image,
+        "receipt_msg_id": receipt["msg_id"],
+        "manifest_sha256": digest,
+        "spend": spend,
+    }
+
+
+def _resolve_active_human(
+    conn: sqlite3.Connection, topic_id: str, session_id: str
+) -> sqlite3.Row:
+    placeholders = ",".join("?" * len(HUMAN_ROLES))
+    row = conn.execute(
+        f"SELECT {_BINDING_COLUMNS} FROM debate_role_bindings WHERE topic_id = ? "
+        f"AND session_id = ? AND state = 'active' AND role IN ({placeholders})",
+        (topic_id, session_id, *sorted(HUMAN_ROLES)),
+    ).fetchone()
+    if row is None:
+        raise DebateError(
+            "governance_actor_forbidden: caller is not an ACTIVE HUMAN/OPERATOR binding",
+            error_type="governance_actor_forbidden",
+        )
+    return row
+
+
+def _check_approval_target(
+    conn: sqlite3.Connection, topic_id: str, manifest: dict[str, Any], record: dict[str, Any]
+) -> sqlite3.Row:
+    if manifest["authority_role"] not in GOVERNANCE_ROLES:
+        raise DebateError(
+            "governance_payload_invalid: authority_role must be a governance role",
+            error_type="governance_payload_invalid",
+        )
+    row = _binding_row(conn, topic_id, manifest["authority_role"], manifest["authority_session_id"])
+    if (
+        row is None
+        or row["state"] != "active"
+        or int(row["generation"]) != int(manifest["authority_generation"])
+        or binding_fingerprint(binding_version_from_row(row))
+        != manifest["expected_authority_fingerprint"]
+    ):
+        raise DebateError(
+            "authorization_target_changed: the authority binding no longer matches the manifest",
+            error_type="authorization_target_changed",
+        )
+    if int(record.get("authority_epoch") or 0) != int(manifest["expected_authority_epoch"]):
+        raise DebateError(
+            "authorization_target_changed: authority_epoch differs from the manifest",
+            error_type="authorization_target_changed",
+        )
+    return row
+
+
+def governance_approve_pin(
+    conn: sqlite3.Connection,
+    *,
+    manifest_path: str,
+    expected_manifest_sha256: str,
+    author_session_id: str,
+) -> dict[str, Any]:
+    """HUMAN approval of a pin from a private manifest; the digest is single-use."""
+    try:
+        manifest = load_private_manifest(
+            manifest_path, expected_manifest_sha256, APPROVE_MANIFEST_SCHEMA
+        )
+    except GovernanceError as exc:
+        _raise_governance_error(exc)
+    digest = expected_manifest_sha256
+    topic_id = manifest["topic_id"]
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    if not author_session_id or author_session_id != manifest["human_session_id"]:
+        raise DebateError(
+            "governance_actor_forbidden: caller must be the manifest's human_session_id",
+            error_type="governance_actor_forbidden",
+        )
+    human_row = _resolve_active_human(conn, topic_id, author_session_id)
+    if _manifest_spends(conn, digest):
+        raise DebateError(
+            f"governance_manifest_spent: {digest}", error_type="governance_manifest_spent"
+        )
+    record = _governance_record(debate)
+    authority_row = _check_approval_target(conn, topic_id, manifest, record)
+    authority_fp = binding_fingerprint(binding_version_from_row(authority_row))
+    issuer = issuer_for_binding(human_row, None)
+    payload = {
+        "schema": GOVERNANCE_SCHEMA,
+        "type": "approve_pin",
+        "topic_id": topic_id,
+        "authority_role": manifest["authority_role"],
+        "authority_session_id": manifest["authority_session_id"],
+        "authority_generation": manifest["authority_generation"],
+        "expected_authority_fingerprint": manifest["expected_authority_fingerprint"],
+        "expected_authority_epoch": manifest["expected_authority_epoch"],
+        "human_session_id": manifest["human_session_id"],
+        "manifest_sha256": digest,
+        "expires_at": manifest["expires_at"],
+        "nonce": manifest["nonce"],
+        "issuer": issuer,
+    }
+    approval = debate_post_with_recipients(
+        conn,
+        topic_id=topic_id,
+        role=str(human_row["role"]),
+        priority="H",
+        kind="DECISION",
+        body=f"governance approve_pin {digest[:12]}",
+        addressed_to=[manifest["authority_role"]],
+        author_session_id=author_session_id,
+        internal_governance={
+            "payload_json": canonical_json(payload),
+            "body_mode": "structured",
+            "governance_schema": GOVERNANCE_SCHEMA,
+        },
+    )
+    spend = _record_authorization_spend(
+        conn,
+        authorization_msg_id=approval["msg_id"],
+        target_key=spend_target_key(digest, authority_fp),
+        manifest_sha256=digest,
+        action="approve_pin",
+        control_topic_id=topic_id,
+        target_topic_id=topic_id,
+        target_role=manifest["authority_role"],
+        target_session_id=manifest["authority_session_id"],
+        target_fingerprint=authority_fp,
+        issuer=issuer,
+        before={"authority_epoch": int(record.get("authority_epoch") or 0)},
+        after={
+            "approved": {
+                key: manifest[key]
+                for key in (
+                    "authority_role",
+                    "authority_session_id",
+                    "authority_generation",
+                    "expected_authority_fingerprint",
+                    "expected_authority_epoch",
+                )
+            }
+        },
+        receipt={"manifest_sha256": digest},
+        spent_at=now_iso(),
+    )
+    return {
+        "msg_id": approval["msg_id"],
+        "manifest_sha256": digest,
+        "topic_id": topic_id,
+        "authority": {
+            "role": manifest["authority_role"],
+            "session_id": manifest["authority_session_id"],
+            "generation": manifest["authority_generation"],
+        },
+        "spend": spend,
+    }
+
+
+def _load_governance_row(
+    conn: sqlite3.Connection, msg_id: str, topic_id: str, expected_type: str
+) -> tuple[sqlite3.Row, dict[str, Any]]:
+    validate_msg_id(msg_id)
+    row = conn.execute(
+        "SELECT msg_id, topic_id, role, ts, kind, payload_json, governance_schema, "
+        "author_session_id FROM debate_messages WHERE msg_id = ?",
+        (msg_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["topic_id"] != topic_id
+        or row["kind"] != "DECISION"
+        or row["governance_schema"] != GOVERNANCE_SCHEMA
+        or not row["payload_json"]
+    ):
+        raise DebateError(
+            f"authorization_not_found: {msg_id}", error_type="authorization_not_found"
+        )
+    payload = json_loads(row["payload_json"])
+    if payload.get("type") != expected_type or not isinstance(payload.get("issuer"), dict):
+        raise DebateError(
+            f"authorization_not_found: {msg_id} is not a {expected_type} record",
+            error_type="authorization_not_found",
+        )
+    return row, payload
+
+
+def governance_pin(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    approval_msg_id: str,
+    author_session_id: str,
+    manifest_path: str,
+    expected_manifest_sha256: str,
+) -> dict[str, Any]:
+    """Consume the approval (same manifest re-presented) and pin: epoch + 1 and one spend."""
+    validate_topic_id(topic_id)
+    try:
+        manifest = load_private_manifest(
+            manifest_path, expected_manifest_sha256, APPROVE_MANIFEST_SCHEMA
+        )
+    except GovernanceError as exc:
+        _raise_governance_error(exc)
+    digest = expected_manifest_sha256
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    _, payload = _load_governance_row(conn, approval_msg_id, topic_id, "approve_pin")
+    if payload.get("manifest_sha256") != digest or manifest["topic_id"] != topic_id:
+        raise DebateError(
+            "manifest_digest_mismatch: the presented manifest is not the approved one",
+            error_type="manifest_digest_mismatch",
+        )
+    issuer = payload["issuer"]
+    if not author_session_id or author_session_id != issuer.get("session_id"):
+        raise DebateError(
+            "governance_actor_forbidden: only the approving HUMAN may pin",
+            error_type="governance_actor_forbidden",
+        )
+    human_row = _binding_row(conn, topic_id, issuer["role"], issuer["session_id"])
+    if (
+        human_row is None
+        or human_row["state"] != "active"
+        or int(human_row["generation"]) != int(issuer["binding_generation"])
+        or binding_fingerprint(binding_version_from_row(human_row))
+        != issuer["binding_fingerprint"]
+    ):
+        raise DebateError(
+            "authorization_issuer_stale: the approving HUMAN binding changed since approval",
+            error_type="authorization_issuer_stale",
+        )
+    if parse_iso_utc(payload["expires_at"], "expires_at") <= governance.utc_now():
+        raise DebateError("authorization_expired", error_type="authorization_expired")
+    if _spend_row(conn, approval_msg_id, SPEND_TARGET_SINGLE) is not None:
+        raise DebateError(
+            f"authorization_consumed: {approval_msg_id}", error_type="authorization_consumed"
+        )
+    record = _governance_record(debate)
+    authority_row = _check_approval_target(conn, topic_id, manifest, record)
+    authority_fp = binding_fingerprint(binding_version_from_row(authority_row))
+    before = dict(record)
+    new = dict(record)
+    new.update(
+        {
+            "mode": "authority",
+            "authority_role": manifest["authority_role"],
+            "authority_session_id": manifest["authority_session_id"],
+            "authority_generation": int(manifest["authority_generation"]),
+            "authority_epoch": int(record.get("authority_epoch") or 0) + 1,
+            "pinned_at": now_iso(),
+            "pinned_by": author_session_id,
+            "approval_msg_id": approval_msg_id,
+        }
+    )
+    _write_governance_record(conn, topic_id, new)
+    spend = _record_authorization_spend(
+        conn,
+        authorization_msg_id=approval_msg_id,
+        target_key=SPEND_TARGET_SINGLE,
+        manifest_sha256=None,
+        action="pin",
+        control_topic_id=topic_id,
+        target_topic_id=topic_id,
+        target_role=manifest["authority_role"],
+        target_session_id=manifest["authority_session_id"],
+        target_fingerprint=authority_fp,
+        issuer=issuer,
+        before=before,
+        after=new,
+        receipt={"manifest_sha256": digest},
+        spent_at=now_iso(),
+    )
+    return {
+        "topic_id": topic_id,
+        "governance": new,
+        "approval_msg_id": approval_msg_id,
+        "spend": spend,
+    }
+
+
+def authorize_and_apply(
+    conn: sqlite3.Connection,
+    *,
+    topic_id: str,
+    authorization_msg_id: str,
+    requested_action: str,
+    target_role: str,
+    target_session_id: str,
+    actor_session_id: str | None,
+    apply_effect: Callable[[], dict[str, Any]],
+    now_text: str,
+) -> dict[str, Any]:
+    """Consume ONE grant inside the caller's transaction (r4 §1.3 order):
+    not_found → pin backed → actor → issuer_stale → validity bound → expired →
+    action → scope → consumed → target_changed → claims → effect → spend."""
+    _, payload = _load_governance_row(conn, authorization_msg_id, topic_id, "authorize")
+    debate = get_debate(conn, topic_id)
+    record = _governance_record(debate)
+    if record.get("mode") != "authority":
+        raise DebateError(
+            "authority_unconfigured",
+            error_type="authority_unconfigured",
+            details={"next": list(GOVERNANCE_NEXT_TOOLS)},
+        )
+    try:
+        require_pin_record_backed(conn, topic_id, record)
+    except GovernanceError as exc:
+        _raise_governance_error(exc)
+    issuer = payload["issuer"]
+    if (
+        not actor_session_id
+        or actor_session_id != issuer.get("session_id")
+        or actor_session_id != record.get("authority_session_id")
+    ):
+        raise DebateError(
+            "governance_actor_forbidden: only the pinned authority may consume its grant",
+            error_type="governance_actor_forbidden",
+        )
+    authority_row = _binding_row(
+        conn, topic_id, record["authority_role"], record["authority_session_id"]
+    )
+    if authority_row is None or authority_row["state"] != "active":
+        raise DebateError(
+            "governance_actor_forbidden: the pinned authority binding is not ACTIVE",
+            error_type="governance_actor_forbidden",
+        )
+    issuer_epoch = issuer.get("authority_epoch")
+    if (
+        int(issuer.get("binding_generation") or -1) != int(authority_row["generation"])
+        or issuer.get("binding_fingerprint")
+        != binding_fingerprint(binding_version_from_row(authority_row))
+        or int(issuer_epoch if issuer_epoch is not None else -1)
+        != int(record.get("authority_epoch") or 0)
+    ):
+        raise DebateError(
+            "authorization_issuer_stale: the grant was issued under a different authority state",
+            error_type="authorization_issuer_stale",
+        )
+    row_ts = str(
+        conn.execute(
+            "SELECT ts FROM debate_messages WHERE msg_id = ?", (authorization_msg_id,)
+        ).fetchone()["ts"]
+    )
+    # Row timestamps carry fractional seconds (now_iso); the grant's own
+    # expires_at is the strict manifest form.
+    issued_at = datetime.fromisoformat(row_ts.replace("Z", "+00:00"))
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=timezone.utc)
+    try:
+        expires = parse_iso_utc(payload["expires_at"], "expires_at")
+        enforce_validity_bound(issued_at, expires, what="authorize grant")
+    except GovernanceError as exc:
+        _raise_governance_error(exc)
+    if expires <= governance.utc_now():
+        raise DebateError("authorization_expired", error_type="authorization_expired")
+    if payload.get("action") != requested_action:
+        raise DebateError(
+            f"authorization_action_mismatch: grant={payload.get('action')} "
+            f"requested={requested_action}",
+            error_type="authorization_action_mismatch",
+        )
+    if (
+        payload.get("target_role") != target_role
+        or payload.get("target_session_id") != target_session_id
+    ):
+        raise DebateError(
+            "authorization_scope_mismatch: grant target differs from the requested binding",
+            error_type="authorization_scope_mismatch",
+        )
+    if _spend_row(conn, authorization_msg_id, SPEND_TARGET_SINGLE) is not None:
+        raise DebateError(
+            f"authorization_consumed: {authorization_msg_id}",
+            error_type="authorization_consumed",
+        )
+    target_row = _binding_row(conn, topic_id, target_role, target_session_id)
+    if (
+        target_row is None
+        or binding_fingerprint(binding_version_from_row(target_row))
+        != payload.get("target_fingerprint")
+    ):
+        raise DebateError(
+            "authorization_target_changed: the target binding differs from the grant's fingerprint",
+            error_type="authorization_target_changed",
+        )
+    claims_policy = (payload.get("effect") or {}).get("claims")
+    active = _active_claims(conn, topic_id, target_role, target_session_id)
+    retired_claims = 0
+    if claims_policy == "hold" and active:
+        raise DebateError(
+            f"active_claims_present: {active} active worker claim(s) on the target",
+            error_type="active_claims_present",
+        )
+    if claims_policy == "retire" and active:
+        retired_claims = _retire_worker_claims_for_parent_sessions(
+            conn,
+            topic_id=topic_id,
+            role=target_role,
+            parent_session_ids=[target_session_id],
+            now=now_text,
+        )
+    before = _binding_image(target_row)
+    effect = apply_effect()
+    after = _binding_image(_binding_row(conn, topic_id, target_role, target_session_id))
+    spend = _record_authorization_spend(
+        conn,
+        authorization_msg_id=authorization_msg_id,
+        target_key=SPEND_TARGET_SINGLE,
+        manifest_sha256=None,
+        action=requested_action,
+        control_topic_id=topic_id,
+        target_topic_id=topic_id,
+        target_role=target_role,
+        target_session_id=target_session_id,
+        target_fingerprint=payload["target_fingerprint"],
+        issuer=issuer,
+        before=before,
+        after=after,
+        receipt={
+            "claims": claims_policy,
+            "retired_worker_claims": retired_claims,
+            "actor_session_id": actor_session_id,
+            "effect": effect,
+        },
+        spent_at=now_text,
+    )
+    return {
+        "spend": spend,
+        "retired_worker_claims": retired_claims,
+        "before": before,
+        "after": after,
+    }
+
+
+def governance_receipt(
+    conn: sqlite3.Connection, *, authorization_msg_id: str, target_key: str
+) -> dict[str, Any]:
+    """Read-only spend lookup."""
+    validate_msg_id(authorization_msg_id)
+    row = _spend_row(conn, authorization_msg_id, target_key)
+    if row is None:
+        raise DebateError(
+            f"authorization_not_found: no spend for {authorization_msg_id}/{target_key}",
+            error_type="authorization_not_found",
+        )
+    out = {key: row[key] for key in row.keys()}
+    for key in ("issuer_json", "before_json", "after_json", "receipt_json"):
+        out[key[:-5]] = json_loads(out.pop(key))
+    return out
+
+
 def bind_role_session(
     conn: sqlite3.Connection,
     *,
@@ -2734,7 +3555,22 @@ def bind_role_session(
     bound_by_msg_id: str | None = None,
     replace_active: bool = False,
     conductor_override_msg_id: str | None = None,
+    author_session_id: str | None = None,
+    authorization_msg_id: str | None = None,
 ) -> dict[str, Any]:
+    """Bind, demote or retire a role/session binding.
+
+    Phase A (packet v1.3): uncovering an ACTIVE owner (retire without a
+    replacement, or demote to diagnostic) requires a consumed authorization
+    grant from the pinned authority (``authorization_msg_id`` with
+    ``author_session_id`` = the authority session); without one the call is
+    refused typed ``authorization_required``.  ``conductor_override_msg_id``
+    is a deprecated alias of ``authorization_msg_id`` for one release and the
+    result carries ``deprecated_argument`` when it is used.
+    ``ownership_gap_override`` in the result is a compatibility alias (True
+    when a grant was consumed); ``authorization_msg_id`` is the authoritative
+    field.  Both aliases are scheduled for removal together.
+    """
     validate_topic_id(topic_id)
     validate_session_id(session_id)
     validate_binding_state(state)
@@ -2753,6 +3589,23 @@ def bind_role_session(
     _validate_role_for_debate(debate, topic_id, role)
     if state in ("active", "diagnostic") and role in RETIRED_ROLES:
         raise DebateError(f"role_retired: {role}", error_type="role_retired")
+
+    deprecated_argument: str | None = None
+    if (
+        conductor_override_msg_id
+        and authorization_msg_id
+        and conductor_override_msg_id != authorization_msg_id
+    ):
+        raise DebateError(
+            "override_argument_conflict: conductor_override_msg_id and "
+            "authorization_msg_id name different messages",
+            error_type="override_argument_conflict",
+        )
+    if conductor_override_msg_id and not authorization_msg_id:
+        authorization_msg_id = conductor_override_msg_id
+        deprecated_argument = "conductor_override_msg_id"
+    if authorization_msg_id:
+        validate_msg_id(authorization_msg_id)
 
     now = now_iso()
     runtime = runtime.strip() if isinstance(runtime, str) else ""
@@ -2843,44 +3696,61 @@ def bind_role_session(
     if state == "diagnostic":
         target = _binding_for_session(conn, topic_id, role, session_id)
         would_uncover = bool(target and target["state"] == "active")
-        if would_uncover:
-            _validate_conductor_override(
-                conn, topic_id=topic_id, override_msg_id=conductor_override_msg_id
+        receipt: dict[str, Any] | None = None
+
+        def _apply_diagnostic() -> dict[str, Any]:
+            generation = _next_binding_generation(conn, topic_id, role)
+            conn.execute(
+                "INSERT INTO debate_role_bindings "
+                "(topic_id, role, session_id, runtime, state, generation, "
+                " created_at, updated_at, retired_at, reason, bound_by_role, "
+                " bound_by_msg_id) "
+                "VALUES (?, ?, ?, ?, 'diagnostic', ?, ?, ?, NULL, ?, ?, ?) "
+                "ON CONFLICT(topic_id, role, session_id) DO UPDATE SET "
+                "runtime = excluded.runtime, state = 'diagnostic', "
+                "generation = excluded.generation, updated_at = excluded.updated_at, "
+                "retired_at = NULL, reason = excluded.reason, "
+                "bound_by_role = excluded.bound_by_role, "
+                "bound_by_msg_id = excluded.bound_by_msg_id",
+                (
+                    topic_id,
+                    role,
+                    session_id,
+                    runtime,
+                    generation,
+                    now,
+                    now,
+                    reason.strip(),
+                    bound_by_role,
+                    bound_by_msg_id,
+                ),
             )
-            retired_worker_claims += _retire_worker_claims_for_parent_sessions(
+            return {"state": "diagnostic", "generation": generation}
+
+        if authorization_msg_id:
+            receipt = authorize_and_apply(
                 conn,
                 topic_id=topic_id,
-                role=role,
-                parent_session_ids=[session_id],
-                now=now,
+                authorization_msg_id=authorization_msg_id,
+                requested_action="diagnostic_uncover",
+                target_role=role,
+                target_session_id=session_id,
+                actor_session_id=author_session_id,
+                apply_effect=_apply_diagnostic,
+                now_text=now,
             )
-        generation = _next_binding_generation(conn, topic_id, role)
-        conn.execute(
-            "INSERT INTO debate_role_bindings "
-            "(topic_id, role, session_id, runtime, state, generation, "
-            " created_at, updated_at, retired_at, reason, bound_by_role, "
-            " bound_by_msg_id) "
-            "VALUES (?, ?, ?, ?, 'diagnostic', ?, ?, ?, NULL, ?, ?, ?) "
-            "ON CONFLICT(topic_id, role, session_id) DO UPDATE SET "
-            "runtime = excluded.runtime, state = 'diagnostic', "
-            "generation = excluded.generation, updated_at = excluded.updated_at, "
-            "retired_at = NULL, reason = excluded.reason, "
-            "bound_by_role = excluded.bound_by_role, "
-            "bound_by_msg_id = excluded.bound_by_msg_id",
-            (
-                topic_id,
-                role,
-                session_id,
-                runtime,
-                generation,
-                now,
-                now,
-                reason.strip(),
-                bound_by_role,
-                bound_by_msg_id,
-            ),
-        )
-        return {
+            retired_worker_claims += receipt["retired_worker_claims"]
+            generation = int(receipt["after"]["generation"])
+        elif would_uncover:
+            raise DebateError(
+                "authorization_required: demoting the ACTIVE owner needs a consumed "
+                "diagnostic_uncover grant from the pinned authority",
+                error_type="authorization_required",
+                details={"action": "diagnostic_uncover", "next": list(GOVERNANCE_NEXT_TOOLS)},
+            )
+        else:
+            generation = _apply_diagnostic()["generation"]
+        result = {
             "topic_id": topic_id,
             "role": role,
             "session_id": session_id,
@@ -2889,9 +3759,15 @@ def bind_role_session(
             "generation": generation,
             "ownership_gap_override": would_uncover,
             "retired_worker_claims": retired_worker_claims,
+            "authorization_msg_id": authorization_msg_id,
+            "spend": receipt["spend"] if receipt else None,
         }
+        if deprecated_argument:
+            result["deprecated_argument"] = deprecated_argument
+        return result
 
-    # Retiring a role owner without replacement is an explicit override path.
+    # Retiring a role owner without replacement uncovers the role: it needs a
+    # consumed retire_binding grant from the pinned authority (phase A).
     target = _binding_for_session(conn, topic_id, role, session_id)
     if target is None:
         raise DebateError(
@@ -2899,31 +3775,52 @@ def bind_role_session(
             error_type="binding_not_found",
         )
     would_uncover = target["state"] == "active"
-    if would_uncover:
-        _validate_conductor_override(
-            conn, topic_id=topic_id, override_msg_id=conductor_override_msg_id
+    receipt = None
+
+    def _apply_retire() -> dict[str, Any]:
+        conn.execute(
+            "UPDATE debate_role_bindings SET state = 'retired', retired_at = ?, "
+            "updated_at = ?, reason = ? "
+            "WHERE topic_id = ? AND role = ? AND session_id = ?",
+            (now, now, reason.strip(), topic_id, role, session_id),
         )
-        retired_worker_claims += _retire_worker_claims_for_parent_sessions(
+        return {"state": "retired"}
+
+    if authorization_msg_id:
+        receipt = authorize_and_apply(
             conn,
             topic_id=topic_id,
-            role=role,
-            parent_session_ids=[session_id],
-            now=now,
+            authorization_msg_id=authorization_msg_id,
+            requested_action="retire_binding",
+            target_role=role,
+            target_session_id=session_id,
+            actor_session_id=author_session_id,
+            apply_effect=_apply_retire,
+            now_text=now,
         )
-    conn.execute(
-        "UPDATE debate_role_bindings SET state = 'retired', retired_at = ?, "
-        "updated_at = ?, reason = ? "
-        "WHERE topic_id = ? AND role = ? AND session_id = ?",
-        (now, now, reason.strip(), topic_id, role, session_id),
-    )
-    return {
+        retired_worker_claims += receipt["retired_worker_claims"]
+    elif would_uncover:
+        raise DebateError(
+            "authorization_required: retiring the ACTIVE owner without a replacement "
+            "needs a consumed retire_binding grant from the pinned authority",
+            error_type="authorization_required",
+            details={"action": "retire_binding", "next": list(GOVERNANCE_NEXT_TOOLS)},
+        )
+    else:
+        _apply_retire()
+    result = {
         "topic_id": topic_id,
         "role": role,
         "session_id": session_id,
         "state": "retired",
         "ownership_gap_override": would_uncover,
         "retired_worker_claims": retired_worker_claims,
+        "authorization_msg_id": authorization_msg_id,
+        "spend": receipt["spend"] if receipt else None,
     }
+    if deprecated_argument:
+        result["deprecated_argument"] = deprecated_argument
+    return result
 
 
 def seed_initial_role_bindings(
@@ -3922,6 +4819,7 @@ def debate_post_with_recipients(
     body_mode: str | None = None,
     payload_json: Any = None,
     author_session_id: str | None = None,
+    internal_governance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomic insert: debate_messages row + per-recipient
     debate_message_recipients rows.
@@ -4033,6 +4931,7 @@ def debate_post_with_recipients(
         payload_json=payload_json,
         author_session_id=author_session_id,
         recipients=[*deduped, *diagnostic_deduped],
+        internal_governance=internal_governance,
     )
     msg_id = post_result["msg_id"]
     for recipient in deduped:
@@ -4544,7 +5443,7 @@ def debate_signal_check(
     rows = conn.execute(
         "SELECT m.msg_id, m.topic_id, m.role, m.ts, m.priority, m.kind, "
         "m.reply_to, m.standing, m.body, m.protocol_version, m.round_no, "
-        "m.body_mode, m.payload_json, m.created_at "
+        "m.body_mode, m.payload_json, m.governance_schema, m.created_at "
         "FROM debate_messages m "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY m.ts ASC, m.msg_id ASC LIMIT ?",

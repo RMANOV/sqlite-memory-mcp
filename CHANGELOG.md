@@ -6,6 +6,31 @@ project uses semantic-ish versioning on the `3.x` line.
 
 ## Unreleased
 
+### Added
+
+- **C3 phase A — F1 minimal authority chain.** `debate_governance_inventory`,
+  `debate_governance_bootstrap_human` (operator-private `governance-bootstrap/v1`
+  manifest), `debate_governance_approve_pin` and `debate_governance_pin` (one
+  `governance-approve/v1` manifest per pin cycle, presented twice, single-use
+  per action), `debate_governance_receipt`; `authorize` DECISION grants are
+  server-stamped and consumed by `debate_bind_role(author_session_id=…,
+  authorization_msg_id=…)` in one immediate transaction with exactly one
+  finalized spend (`debate_authorization_spends`). Governance rows carry the
+  server-only `debate_messages.governance_schema` column and are immutable by
+  trigger; grants and manifests are bounded to 24 h of validity.
+
+### Changed
+
+- **`bind_role_session` / `debate_bind_role`:** retiring or demoting an ACTIVE
+  owner without a replacement now requires a consumed authorization grant
+  (`authorization_required`); the retired CONDUCTOR override DECISION path is
+  gone. `conductor_override_msg_id` is accepted as a deprecated alias of
+  `authorization_msg_id` for one release (`deprecated_argument` marker;
+  `override_argument_conflict` when both differ). `ownership_gap_override` is
+  a compatibility alias (True ⇔ an authorization grant was consumed;
+  `authorization_msg_id` is the authoritative field) scheduled for removal
+  together with the alias.
+
 ### Removed
 
 - **`shared.js` is no longer generated, staged, or published.** The file was a

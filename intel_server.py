@@ -85,6 +85,11 @@ from debate import (
     get_debate as _debate_get_debate,
     init_debate as _debate_init_dao,
     list_open_debate_work as _debate_list_open_work_dao,
+    governance_approve_pin as _debate_governance_approve_pin_dao,
+    governance_bootstrap_human as _debate_governance_bootstrap_human_dao,
+    governance_inventory as _debate_governance_inventory_dao,
+    governance_pin as _debate_governance_pin_dao,
+    governance_receipt as _debate_governance_receipt_dao,
     list_role_bindings as _debate_list_role_bindings_dao,
     post_message as _debate_post_dao,
     prepare_wake_dry_run as _debate_prepare_wake_dry_run_dao,
@@ -1871,6 +1876,92 @@ def debate_binding_list(conn, topic_id: str) -> str:
     return _debate_list_role_bindings_dao(conn, topic_id=topic_id)
 
 
+# Tools 35b–35f: C3 phase A governance chain (packet v1.3)
+@mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
+def debate_governance_inventory(conn, topic_id: str) -> str:
+    """Read-only governance projection of a topic: mode, authority epoch,
+    candidate role, bindings with fingerprints and active claims, HUMAN owners,
+    topic fingerprint, and whether the pin record is backed by a pin spend."""
+    return _debate_governance_inventory_dao(conn, topic_id=topic_id)
+
+
+@mcp.tool()
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
+def debate_governance_bootstrap_human(
+    conn, manifest_path: str, expected_manifest_sha256: str
+) -> str:
+    """Bind the operator's HUMAN session from a private governance-bootstrap/v1
+    manifest (owner-only 0600 file in an owner-only directory, digest and
+    expiry checked). Applies once per manifest digest; an exact retry answers
+    already_bootstrapped with zero writes."""
+    return _debate_governance_bootstrap_human_dao(
+        conn,
+        manifest_path=manifest_path,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+
+
+@mcp.tool()
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
+def debate_governance_approve_pin(
+    conn, manifest_path: str, expected_manifest_sha256: str, author_session_id: str
+) -> str:
+    """HUMAN approval of a pin from a private governance-approve/v1 manifest;
+    the approval DECISION is server-stamped and the manifest digest is
+    single-use (governance_manifest_spent on reuse)."""
+    return _debate_governance_approve_pin_dao(
+        conn,
+        manifest_path=manifest_path,
+        expected_manifest_sha256=expected_manifest_sha256,
+        author_session_id=author_session_id,
+    )
+
+
+@mcp.tool()
+@_db_tool(
+    write=True,
+    error_mapper=_debate_error_response,
+    after_commit=_signal_wake_after_commit,
+)
+def debate_governance_pin(
+    conn,
+    topic_id: str,
+    approval_msg_id: str,
+    author_session_id: str,
+    manifest_path: str,
+    expected_manifest_sha256: str,
+) -> str:
+    """Pin the approved authority: the approving HUMAN re-presents the SAME
+    manifest; the approval is consumed (one spend) and the authority epoch
+    increments in the same transaction."""
+    return _debate_governance_pin_dao(
+        conn,
+        topic_id=topic_id,
+        approval_msg_id=approval_msg_id,
+        author_session_id=author_session_id,
+        manifest_path=manifest_path,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+
+
+@mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
+def debate_governance_receipt(conn, authorization_msg_id: str, target_key: str) -> str:
+    """Read one spend row (issuer, before/after images, receipt) by grant id and target key."""
+    return _debate_governance_receipt_dao(
+        conn, authorization_msg_id=authorization_msg_id, target_key=target_key
+    )
+
+
 # Tool 36: debate_bind_role (v3.10 role/session lifecycle)
 @mcp.tool()
 @_db_tool(
@@ -1890,12 +1981,17 @@ def debate_bind_role(
     bound_by_msg_id: str = "",
     replace_active: bool = False,
     conductor_override_msg_id: str = "",
+    author_session_id: str = "",
+    authorization_msg_id: str = "",
 ) -> str:
     """Bind, diagnose, or retire a role/session binding.
 
-    Direct retirement of an active owner requires a CONDUCTOR override
-    DECISION msg_id. Duplicate active primary owners are rejected unless
-    replace_active is explicitly set for an atomic swap.
+    Retiring or demoting an active owner without a replacement requires a
+    consumed authorization grant from the pinned authority
+    (author_session_id = the authority session, authorization_msg_id = its
+    authorize DECISION). conductor_override_msg_id is a deprecated alias of
+    authorization_msg_id for one release. Duplicate active primary owners are
+    rejected unless replace_active is explicitly set for an atomic swap.
     """
     return _debate_bind_role_session_dao(
         conn,
@@ -1909,6 +2005,8 @@ def debate_bind_role(
         bound_by_msg_id=bound_by_msg_id or None,
         replace_active=replace_active,
         conductor_override_msg_id=conductor_override_msg_id or None,
+        author_session_id=author_session_id or None,
+        authorization_msg_id=authorization_msg_id or None,
     )
 
 
