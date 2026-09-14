@@ -146,3 +146,123 @@ def test_decision_with_non_governance_payload_is_refused_typed(api, writer):
     out = _post(call, writer, '{"ordinary": "opaque"}')
     assert out.get("error_type") == "governance_schema_unsupported", out
     assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+@pytest.mark.parametrize(
+    "metadata_json",
+    [
+        '{"governance": {"mode": "authority"}}',
+        json.dumps({"governance": {
+            "mode": "authority", "candidate_role": "ADVOCATE_CODEX",
+            "authority_role": "ADVOCATE_CODEX", "authority_session_id": "codex-f0adv01",
+            "authority_generation": 1, "authority_epoch": 1,
+        }}),
+    ],
+    ids=["authority_mode_only", "complete_looking_record"],
+)
+def test_authority_looking_metadata_grants_nothing_in_f0(api, writer, metadata_json):
+    """Review item M2: an authority-looking record seeded by hand is never a pin.
+
+    F0 has no positive path even when metadata says mode=authority, so a
+    well-formed authorize on such a topic is refused typed with
+    governance_action_not_implemented and zero writes; the error name flips
+    in F1 when the real pin/consume path exists.
+    """
+    call, path = api
+    _seed_legacy_topic(path, metadata_json)
+    before = _snapshot(path)
+    out = _post(call, writer, json.dumps(_authorize_input()))
+    assert out.get("error_type") == "governance_action_not_implemented", out
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_oversize_non_decision_governance_payload_is_refused_by_size(api, writer):
+    """Review item M1: classification never parses beyond the byte bound.
+
+    A STATUS payload that carries the governance marker but exceeds 65536
+    UTF-8 bytes is a candidate by size alone and is refused as too large,
+    with zero writes, instead of being parsed in full before classification.
+    """
+    call, path = api
+    _seed_legacy_topic(path, None)
+    before = _snapshot(path)
+    raw = '{"schema": "governance/v1", "pad": "' + "я" * 40000 + '"}'
+    assert len(raw.encode("utf-8")) > 65536
+    kwargs = {"addressed_to_csv": "EXECUTOR_2"} if writer == "debate_post_with_recipients" else {}
+    out = call(
+        writer, topic_id=TOPIC, role="EXECUTOR_1", priority="M", kind="STATUS",
+        body="synthetic oversize governance-marker probe", payload_json=raw,
+        body_mode="structured", author_session_id=AUTHOR, **kwargs,
+    )
+    assert out.get("error_type") == "governance_payload_too_large", out
+    assert _snapshot(path) == before
+
+
+def test_caller_supplied_governance_object_is_refused_at_init(api):
+    """Review item M3: the whole governance record is server-derived.
+
+    Even a governance object with only non-authority keys is refused at
+    debate_init (no silent overwrite), with zero rows.
+    """
+    call, path = api
+    before = _snapshot(path)
+    out = call(
+        "debate_init", topic_id="C3F0_M3", title="caller governance object",
+        roles_json=json.dumps([
+            {"role": "EXECUTOR_1", "session_id": AUTHOR},
+            {"role": "EXECUTOR_2", "session_id": RECIPIENT},
+        ]),
+        created_by_role="EXECUTOR_1",
+        metadata_json=json.dumps({
+            "priority_lane": "P2", "priority_reason": "synthetic",
+            "governance": {"candidate_role": "ADVOCATE_CODEX"},
+        }),
+    )
+    assert out.get("error_type") == "governance_server_field_supplied", out
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_v1_topic_refuses_stamped_looking_decision_before_storage(api, writer):
+    """Review item M4 characterization (ROOT Q5 evidence): configured debate/v1.
+
+    A DECISION carrying a complete, issuer-stamped-looking governance payload
+    on a debate/v1 topic never reaches the legacy governance validator; the
+    existing v1 preflight refuses the legacy kind (SEMANTIC_KIND_REQUIRED)
+    and nothing is stored, so no v1 row can be mistaken for a server-stamped
+    grant by shape alone.
+    """
+    call, path = api
+    topic = "C3F0_V1STAMP"
+    roles = [
+        {"role": "EXECUTOR_1", "session_id": AUTHOR},
+        {"role": "EXECUTOR_2", "session_id": RECIPIENT},
+    ]
+    created = call(
+        "debate_init", topic_id=topic, title="v1 stamped-looking probe",
+        roles_json=json.dumps(roles), created_by_role="EXECUTOR_1",
+        metadata_json=json.dumps({"priority_lane": "P2", "priority_reason": "synthetic"}),
+        protocol_version="debate/v1", blind_roles_csv="EXECUTOR_1,EXECUTOR_2",
+    )
+    assert "error_type" not in created, created
+    state = call(
+        "debate_state", topic_id=topic, role="EXECUTOR_1", new_state="ACTIVE",
+        reason="synthetic", author_session_id=AUTHOR,
+    )
+    assert state.get("new_state") == "ACTIVE", state
+    payload = dict(_authorize_input(), topic_id=topic)
+    payload["issuer"] = {
+        "topic_id": topic, "role": "ADVOCATE_CODEX", "session_id": "codex-f0adv01",
+        "binding_generation": 1, "binding_fingerprint": "b" * 64, "authority_epoch": 1,
+    }
+    before = _snapshot(path)
+    kwargs = {"addressed_to_csv": "EXECUTOR_2"} if writer == "debate_post_with_recipients" else {}
+    out = call(
+        writer, topic_id=topic, role="EXECUTOR_1", priority="M", kind="DECISION",
+        body="synthetic stamped-looking probe", payload_json=json.dumps(payload),
+        body_mode="structured", author_session_id=AUTHOR, **kwargs,
+    )
+    assert out.get("error_type") == "SEMANTIC_KIND_REQUIRED", out
+    assert _snapshot(path) == before

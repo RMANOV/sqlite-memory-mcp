@@ -392,13 +392,21 @@ def serialize_debate_message(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def is_legacy_governance_candidate(kind: str, payload_json: Any) -> bool:
-    """Every non-empty DECISION payload, or any payload with a governance/* schema."""
+    """Every non-empty DECISION payload, or any payload with a governance/* schema.
+
+    Classification never parses more than the strict decoder would accept: a
+    payload over the byte bound that carries the governance marker is a
+    candidate by size alone, so the bounded decoder rejects it as too large
+    instead of this function parsing it in full.
+    """
     if not isinstance(payload_json, str) or not payload_json.strip():
         return False
     if kind == "DECISION":
         return True
     if '"governance/' not in payload_json:
         return False
+    if len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return True
     try:
         value = json.loads(payload_json)
     except (json.JSONDecodeError, RecursionError):
@@ -431,8 +439,11 @@ def _require_nonce_and_expiry(payload: Mapping[str, Any], form: str) -> None:
         )
     expires_at = payload.get("expires_at")
     if not isinstance(expires_at, str) or not expires_at:
+        # Shape check only in this phase; the timestamp is parsed and compared
+        # against utc_now() where a grant is actually consumed (F1).
         raise GovernanceError(
-            "governance_payload_invalid", f"{form} expires_at must be a UTC timestamp"
+            "governance_payload_invalid",
+            f"{form} expires_at must be a non-empty string (UTC timestamp)",
         )
 
 
@@ -609,20 +620,20 @@ def candidate_governance_metadata(
 
 
 def reject_caller_governance(metadata: Mapping[str, Any] | None) -> None:
-    """Refuse any caller-supplied governance server field (never a raw pin)."""
-    if not isinstance(metadata, Mapping):
+    """Refuse ANY caller-supplied ``governance`` key (never a raw pin).
+
+    The whole record is server-derived; accepting a partial object and then
+    overwriting it would be a silent fallback, so the key itself is refused
+    whatever it contains.
+    """
+    if not isinstance(metadata, Mapping) or "governance" not in metadata:
         return
     governance = metadata.get("governance")
-    if governance is None:
-        return
-    if not isinstance(governance, Mapping):
-        raise GovernanceError(
-            "governance_server_field_supplied", "governance metadata must be an object"
-        )
-    supplied = sorted(str(key) for key in governance if key in GOVERNANCE_SERVER_FIELDS)
-    if supplied:
-        raise GovernanceError(
-            "governance_server_field_supplied",
-            "governance authority fields are server-derived and may not be supplied",
-            {"fields": supplied},
-        )
+    supplied = (
+        sorted(str(key) for key in governance) if isinstance(governance, Mapping) else []
+    )
+    raise GovernanceError(
+        "governance_server_field_supplied",
+        "the governance record is server-derived and may not be supplied by the caller",
+        {"fields": supplied or ["governance"]},
+    )
