@@ -62,7 +62,6 @@ def _manifest():
 
 
 def test_f00_module_import_is_stdlib_only_and_side_effect_free():
-    _gov()  # Absence is a scoped ModuleNotFoundError, not collection failure.
     script = (
         "import builtins, importlib, pathlib, socket, sqlite3, sys\n"
         "def forbidden(*a, **kw):\n"
