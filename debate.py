@@ -2898,6 +2898,28 @@ def _record_authorization_spend(
     }
 
 
+def _governance_topic(conn: sqlite3.Connection, topic_id: str) -> dict[str, Any]:
+    """Shared topic loader for the three manifest WRITE tools (M3, DA W49).
+
+    Configured debate/v1 topics keep their own preflight: their DECISION rows
+    would carry protocol_version and an authorize on them never reaches the
+    legacy validator, so receipts/spends there would have no usable grant.
+    The phase-A chain is therefore refused typed on protocol topics.
+    """
+    validate_topic_id(topic_id)
+    debate = get_debate(conn, topic_id)
+    if debate is None:
+        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    if _protocol_v1_get_protocol_state(conn, topic_id) is not None:
+        raise DebateError(
+            "governance_action_not_implemented: the governance chain is not available "
+            "on configured debate/v1 topics in this phase",
+            error_type="governance_action_not_implemented",
+            details={"reason": "protocol_topic", "topic_id": topic_id},
+        )
+    return debate
+
+
 def governance_inventory(conn: sqlite3.Connection, *, topic_id: str) -> dict[str, Any]:
     """Read-only projection: mode, epoch, bindings with fingerprints, HUMAN owners."""
     validate_topic_id(topic_id)
@@ -2962,10 +2984,7 @@ def governance_bootstrap_human(
         _raise_governance_error(exc)
     digest = expected_manifest_sha256
     topic_id = manifest["topic_id"]
-    validate_topic_id(topic_id)
-    debate = get_debate(conn, topic_id)
-    if debate is None:
-        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    debate = _governance_topic(conn, topic_id)
     human = manifest["human_session_id"]
     # Exact replay of an applied manifest: compare the stored after-image with
     # the current row and answer from the receipt with zero writes.
@@ -3161,10 +3180,7 @@ def governance_approve_pin(
         _raise_governance_error(exc)
     digest = expected_manifest_sha256
     topic_id = manifest["topic_id"]
-    validate_topic_id(topic_id)
-    debate = get_debate(conn, topic_id)
-    if debate is None:
-        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    debate = _governance_topic(conn, topic_id)
     if not author_session_id or author_session_id != manifest["human_session_id"]:
         raise DebateError(
             "governance_actor_forbidden: caller must be the manifest's human_session_id",
@@ -3296,9 +3312,7 @@ def governance_pin(
     except GovernanceError as exc:
         _raise_governance_error(exc)
     digest = expected_manifest_sha256
-    debate = get_debate(conn, topic_id)
-    if debate is None:
-        raise DebateError(f"unknown_topic: {topic_id}", error_type="topic_not_found")
+    debate = _governance_topic(conn, topic_id)
     _, payload = _load_governance_row(conn, approval_msg_id, topic_id, "approve_pin")
     if payload.get("manifest_sha256") != digest or manifest["topic_id"] != topic_id:
         raise DebateError(
@@ -3727,7 +3741,11 @@ def bind_role_session(
             )
             return {"state": "diagnostic", "generation": generation}
 
-        if authorization_msg_id:
+        # M1 (DA W49): a grant is consumed ONLY when the call uncovers the
+        # ACTIVE owner; with nothing to uncover a supplied grant stays unspent
+        # and the result reports no authorization.  Contract line:
+        # ownership_gap_override True ⇔ a grant was consumed.
+        if would_uncover and authorization_msg_id:
             receipt = authorize_and_apply(
                 conn,
                 topic_id=topic_id,
@@ -3757,9 +3775,9 @@ def bind_role_session(
             "runtime": runtime,
             "state": "diagnostic",
             "generation": generation,
-            "ownership_gap_override": would_uncover,
+            "ownership_gap_override": receipt is not None,
             "retired_worker_claims": retired_worker_claims,
-            "authorization_msg_id": authorization_msg_id,
+            "authorization_msg_id": authorization_msg_id if receipt else None,
             "spend": receipt["spend"] if receipt else None,
         }
         if deprecated_argument:
@@ -3786,7 +3804,9 @@ def bind_role_session(
         )
         return {"state": "retired"}
 
-    if authorization_msg_id:
+    # M1 (DA W49): consume only when the retire uncovers the ACTIVE owner;
+    # otherwise a supplied grant stays unspent and no authorization is reported.
+    if would_uncover and authorization_msg_id:
         receipt = authorize_and_apply(
             conn,
             topic_id=topic_id,
@@ -3813,9 +3833,9 @@ def bind_role_session(
         "role": role,
         "session_id": session_id,
         "state": "retired",
-        "ownership_gap_override": would_uncover,
+        "ownership_gap_override": receipt is not None,
         "retired_worker_claims": retired_worker_claims,
-        "authorization_msg_id": authorization_msg_id,
+        "authorization_msg_id": authorization_msg_id if receipt else None,
         "spend": receipt["spend"] if receipt else None,
     }
     if deprecated_argument:

@@ -23,13 +23,16 @@ project uses semantic-ish versioning on the `3.x` line.
 
 - **`bind_role_session` / `debate_bind_role`:** retiring or demoting an ACTIVE
   owner without a replacement now requires a consumed authorization grant
-  (`authorization_required`); the retired CONDUCTOR override DECISION path is
-  gone. `conductor_override_msg_id` is accepted as a deprecated alias of
-  `authorization_msg_id` for one release (`deprecated_argument` marker;
-  `override_argument_conflict` when both differ). `ownership_gap_override` is
-  a compatibility alias (True ⇔ an authorization grant was consumed;
-  `authorization_msg_id` is the authoritative field) scheduled for removal
-  together with the alias.
+  (`authorization_required`); in `bind_role_session` the CONDUCTOR override
+  DECISION path is replaced by that grant (the diagnostic-recipient override
+  in `debate_post_with_recipients` is unchanged in this phase). A grant is
+  consumed only when the call uncovers the ACTIVE owner; otherwise it stays
+  unspent and the result reports no authorization. `conductor_override_msg_id`
+  is accepted as a deprecated alias of `authorization_msg_id` for one release
+  (`deprecated_argument` marker; `override_argument_conflict` when both
+  differ). `ownership_gap_override` is a compatibility alias (True ⇔ an
+  authorization grant was consumed; `authorization_msg_id` is the
+  authoritative field) scheduled for removal together with the alias.
 
 ### Removed
 
