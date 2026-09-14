@@ -43,13 +43,13 @@ def test_paranoid_socket_blocked_v3_9_2_dao_paths(tmp_path):
     init_debate(
         c, topic_id="PARANOID", title="no network",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
             {"role": "EXECUTOR", "session_id": "cc-exec1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     transition_state(
-        c, topic_id="PARANOID", role="CONDUCTOR", new_state="ACTIVE"
+        c, topic_id="PARANOID", role="ADVOCATE_CODEX", new_state="ACTIVE"
     )
 
     orig = socket.socket
@@ -62,12 +62,12 @@ def test_paranoid_socket_blocked_v3_9_2_dao_paths(tmp_path):
     socket.socket = tripwire
     try:
         m1 = debate_post_with_recipients(
-            c, topic_id="PARANOID", role="CONDUCTOR",
+            c, topic_id="PARANOID", role="ADVOCATE_CODEX",
             priority="H", kind="STATUS", body="m1",
             addressed_to=["EXECUTOR"],
         )
         m2 = debate_post_with_recipients(
-            c, topic_id="PARANOID", role="CONDUCTOR",
+            c, topic_id="PARANOID", role="ADVOCATE_CODEX",
             priority="L", kind="STATUS", body="m2",
             addressed_to=["EXECUTOR"],
         )
@@ -108,15 +108,15 @@ def test_concurrent_post_with_recipients_4_threads_x_50_messages(tmp_path):
     init_debate(
         setup, topic_id="X1", title="concurrency-v3.9.2",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
             {"role": "EXECUTOR", "session_id": "cc-exec1"},
             {"role": "ADVOCATE", "session_id": "codex-adv1"},
             {"role": "HUMAN", "session_id": "human-rmanov"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     transition_state(
-        setup, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE"
+        setup, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE"
     )
     setup.close()
 
@@ -147,8 +147,8 @@ def test_concurrent_post_with_recipients_4_threads_x_50_messages(tmp_path):
                 errors.append(f"{role}: {exc!r}")
 
     threads = [
-        threading.Thread(target=worker, args=("CONDUCTOR", "EXECUTOR")),
-        threading.Thread(target=worker, args=("EXECUTOR", "CONDUCTOR")),
+        threading.Thread(target=worker, args=("ADVOCATE_CODEX", "EXECUTOR")),
+        threading.Thread(target=worker, args=("EXECUTOR", "ADVOCATE_CODEX")),
         threading.Thread(target=worker, args=("ADVOCATE", "EXECUTOR")),
         threading.Thread(target=worker, args=("HUMAN", "ADVOCATE")),
     ]
@@ -194,18 +194,18 @@ def test_concurrent_signal_advance_no_lost_updates(tmp_path):
     init_debate(
         setup, topic_id="X1", title="advance-race",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
             {"role": "EXECUTOR", "session_id": "cc-exec1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     transition_state(
-        setup, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE"
+        setup, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE"
     )
     msg_ids: list[str] = []
     for i in range(2):
         out = debate_post_with_recipients(
-            setup, topic_id="X1", role="CONDUCTOR",
+            setup, topic_id="X1", role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body=f"m{i}",
             addressed_to=["EXECUTOR"],
         )
