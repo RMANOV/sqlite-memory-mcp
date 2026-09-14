@@ -54,6 +54,7 @@ py-modules = [
     "daily_digest",
     "db_utils",
     "debate",
+    "debate_governance",
     "debate_list_widget",
     "debate_ops",
     "debate_ops_windows",
