@@ -133,7 +133,12 @@ def _init_active(api, topic=TOPIC):
     out = call(
         "debate_init", topic_id=topic, title="C3 F1 synthetic chain",
         roles_json=json.dumps(_roles()), created_by_role="EXECUTOR_1",
-        metadata_json=json.dumps({"priority_lane": "P2", "unrelated": {"keep": [1, "two"]}}),
+        metadata_json=json.dumps({
+            # priority_lane requires priority_reason (topic_priority_reason_required);
+            # the A1 run proved every node fails at init without it.
+            "priority_lane": "P2", "priority_reason": "synthetic F1 chain test",
+            "unrelated": {"keep": [1, "two"]},
+        }),
     )
     assert "error_type" not in out, out
     state = call(
@@ -380,10 +385,10 @@ def test_p1_generic_public_bootstrap_form_is_refused(api, writer):
         "expires_at": _iso(3600), "nonce": "0011223344556677",
     }
     out = _authorize(api, payload, author=AUTHOR, writer=writer, role="EXECUTOR_1")
-    assert out.get("error_type") in {
-        "governance_payload_invalid", "governance_action_not_implemented",
-        "authority_unconfigured", "governance_tool_required",
-    }, out
+    # Contract (packet v1.3 C2 + F0): bootstrap_human is a reserved, tool-only
+    # DECISION type; the public validator refuses it as an invalid payload
+    # before any authority lookup.  Green at A1 because F0 raises exactly this.
+    assert out.get("error_type") == "governance_payload_invalid", out
     assert _snapshot(path) == before
 
 
@@ -539,13 +544,22 @@ def test_p2_reader_of_the_decision_row_cannot_replay_approve_pin(api):
     # (a) same manifest again, presented as the HUMAN → spent
     replay = _approve(api, chain["approve_path"], chain["approve_digest"])
     assert replay.get("error_type") == "governance_manifest_spent", replay
-    # (b) hand-built approve_pin DECISION as HUMAN through the public writer → refused
-    payload = json.loads(_stored(path, chain["approval"])["payload_json"])
-    payload.pop("issuer")
+    # (b) hand-built approve_pin DECISION as HUMAN through the public writer, in
+    #     the exact F0 input shape with the REAL digest → refused: on a pinned
+    #     topic the public approve_pin form is never minted (v1.3 C2), the F0
+    #     tail names it governance_action_not_implemented.
+    stored = json.loads(_stored(path, chain["approval"])["payload_json"])
+    payload = {
+        "schema": "governance/v1", "type": "approve_pin", "topic_id": TOPIC,
+        "authority_role": stored["authority_role"],
+        "authority_session_id": stored["authority_session_id"],
+        "authority_generation": stored["authority_generation"],
+        "expected_authority_epoch": stored["expected_authority_epoch"],
+        "manifest_sha256": chain["approve_digest"],
+        "expires_at": _iso(3600), "nonce": "0a0a0a0a0a0a0a0a",
+    }
     forged = _authorize(api, payload, author=HUMAN, role="HUMAN")
-    assert forged.get("error_type") in {
-        "governance_action_not_implemented", "governance_tool_required",
-    }, forged
+    assert forged.get("error_type") == "governance_action_not_implemented", forged
     # (c) pin again after the legitimate pin → consumed
     again = _pin(api, chain["approval"], chain["approve_path"], chain["approve_digest"])
     assert again.get("error_type") == "authorization_consumed", again
@@ -608,6 +622,56 @@ def test_p2_pin_requires_the_approved_manifest_digest(api):
     out = _pin(api, approval, other, odigest)
     assert out.get("error_type") == "manifest_digest_mismatch", out
     assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("case", [
+    "authority_retired", "authority_rotated", "human_retired", "human_rotated",
+])
+def test_p2_approve_to_pin_window_is_cas_guarded(api, case):
+    """EXECUTOR M3 / DA C3: the authority or the approving HUMAN changes
+    between approve_pin and pin.  Authority changes → the approval's CAS
+    target no longer exists (authorization_target_changed); HUMAN changes →
+    the approval's issuer binding is no longer the ACTIVE row at the stamped
+    generation/fingerprint (authorization_issuer_stale).  Zero spends, epoch 0."""
+    call, path, _ = api
+    _init_active(api)
+    mpath, digest = _bootstrap_manifest(api)
+    assert _bootstrap(api, mpath, digest)["status"] == "applied"
+    apath, adigest = _approve_manifest(api)
+    approval = _approve(api, apath, adigest)["msg_id"]
+    now = _iso(0)
+    if case == "authority_retired":
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "UPDATE debate_role_bindings SET state = 'retired', retired_at = ?, "
+                "updated_at = ? WHERE topic_id = ? AND role = 'ADVOCATE_CODEX' "
+                "AND session_id = ?", (now, now, TOPIC, AUTHORITY))
+        expected = "authorization_target_changed"
+    elif case == "authority_rotated":
+        swap = call("debate_bind_role", topic_id=TOPIC, role="ADVOCATE_CODEX",
+                    session_id="codex-f1adv02", reason="rotate authority",
+                    replace_active=True)
+        assert swap.get("state") == "active", swap
+        expected = "authorization_target_changed"
+    elif case == "human_retired":
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "UPDATE debate_role_bindings SET state = 'retired', retired_at = ?, "
+                "updated_at = ? WHERE topic_id = ? AND role = 'HUMAN' AND session_id = ?",
+                (now, now, TOPIC, HUMAN))
+        expected = "authorization_issuer_stale"
+    else:
+        swap = call("debate_bind_role", topic_id=TOPIC, role="HUMAN",
+                    session_id="human-f1op02", reason="rotate human",
+                    replace_active=True)
+        assert swap.get("state") == "active", swap
+        expected = "authorization_issuer_stale"
+    before = _snapshot(path)
+    out = _pin(api, approval, apath, adigest)
+    assert out.get("error_type") == expected, out
+    assert _snapshot(path) == before
+    assert _governance_record(path)["authority_epoch"] == 0
+    assert [s["action"] for s in _spends(path)] == ["bootstrap_human", "approve_pin"]
 
 
 def test_p2_pin_fault_between_record_and_spend_rolls_back(api, monkeypatch):
@@ -924,10 +988,9 @@ def test_f18_public_status_with_a_complete_governance_payload_is_refused_not_sto
     before = _snapshot(path)
     out = _authorize(api, payload, author=AUTHOR, writer=writer, role="EXECUTOR_1",
                      kind="STATUS")
-    assert out.get("error_type") in {
-        "governance_server_field_supplied", "governance_kind_invalid",
-        "governance_action_not_implemented",
-    }, out
+    # The complete stored form carries "issuer", which only the server may
+    # stamp: the validator refuses it first, whatever the kind (F0 order).
+    assert out.get("error_type") == "governance_server_field_supplied", out
     assert _snapshot(path) == before
     assert _rows(path, "SELECT COUNT(*) AS c FROM debate_messages WHERE governance_schema "
                        "IS NOT NULL AND kind != 'DECISION'")[0]["c"] == 0
