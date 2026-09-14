@@ -224,6 +224,64 @@ def test_caller_supplied_governance_object_is_refused_at_init(api):
     assert _snapshot(path) == before
 
 
+def test_caller_governance_null_is_refused_with_named_key(api):
+    """A caller passing "governance": null is refused too; details name the key
+    and flag the null value so the caller can tell it from a field supply."""
+    call, path = api
+    before = _snapshot(path)
+    out = call(
+        "debate_init", topic_id="C3F0_M3NULL", title="caller governance null",
+        roles_json=json.dumps([
+            {"role": "EXECUTOR_1", "session_id": AUTHOR},
+            {"role": "EXECUTOR_2", "session_id": RECIPIENT},
+        ]),
+        created_by_role="EXECUTOR_1",
+        metadata_json=json.dumps({
+            "priority_lane": "P2", "priority_reason": "synthetic", "governance": None,
+        }),
+    )
+    assert out.get("error_type") == "governance_server_field_supplied", out
+    assert out.get("details", {}).get("fields") == ["governance"], out
+    assert out.get("details", {}).get("value_is_null") is True, out
+    assert _snapshot(path) == before
+
+
+def _init_pair(call, topic, metadata):
+    roles = [
+        {"role": "EXECUTOR_1", "session_id": AUTHOR},
+        {"role": "EXECUTOR_2", "session_id": RECIPIENT},
+    ]
+    return call(
+        "debate_init", topic_id=topic, title="re-init characterization",
+        roles_json=json.dumps(roles), created_by_role="EXECUTOR_1",
+        metadata_json=json.dumps(metadata),
+    )
+
+
+def test_reinit_echoing_stored_metadata_is_refused_before_idempotent_return(api):
+    """Review item M6(ii): the governance refusal runs BEFORE the existing-topic
+    short-circuit. A same-roster re-init that echoes the STORED metadata (which
+    now carries the server governance record) is refused typed with zero
+    writes; a same-roster re-init with the caller's original metadata (no
+    governance key) still returns the existing row idempotently."""
+    call, path = api
+    original = {"priority_lane": "P2", "priority_reason": "synthetic"}
+    created = _init_pair(call, "C3F0_REINIT", original)
+    assert "error_type" not in created, created
+    assert created["metadata"]["governance"]["mode"] == "legacy"
+    before = _snapshot(path)
+
+    echoed = _init_pair(call, "C3F0_REINIT", created["metadata"])
+    assert echoed.get("error_type") == "governance_server_field_supplied", echoed
+    assert _snapshot(path) == before
+
+    again = _init_pair(call, "C3F0_REINIT", original)
+    assert "error_type" not in again, again
+    assert again["topic_id"] == "C3F0_REINIT" and again["state"] == "INIT"
+    assert again["metadata"]["governance"] == created["metadata"]["governance"]
+    assert _snapshot(path) == before
+
+
 @pytest.mark.parametrize("writer", WRITERS)
 def test_v1_topic_refuses_stamped_looking_decision_before_storage(api, writer):
     """Review item M4 characterization (ROOT Q5 evidence): configured debate/v1.

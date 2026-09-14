@@ -635,5 +635,5 @@ def reject_caller_governance(metadata: Mapping[str, Any] | None) -> None:
     raise GovernanceError(
         "governance_server_field_supplied",
         "the governance record is server-derived and may not be supplied by the caller",
-        {"fields": supplied or ["governance"]},
+        {"fields": supplied or ["governance"], "value_is_null": governance is None},
     )
