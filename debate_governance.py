@@ -435,7 +435,34 @@ def _require_nonce_and_expiry(payload: Mapping[str, Any], form: str) -> None:
         )
 
 
+def _pinned_authority(conn: sqlite3.Connection, topic_id: str) -> dict[str, Any] | None:
+    """Return the topic's pinned authority record, or None while in legacy mode.
+
+    F0 has no pin operation, so this always resolves to None; F1's pin writes
+    the record this reads.  A missing topic or unreadable metadata counts as
+    unpinned (fail closed).  This is the only DB read in this module and it
+    runs inside the caller's transaction.
+    """
+    row = conn.execute(
+        "SELECT metadata_json FROM debates WHERE topic_id = ?", (topic_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row[0]
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        metadata = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    governance = metadata.get("governance") if isinstance(metadata, dict) else None
+    if not isinstance(governance, dict) or governance.get("mode") != "authority":
+        return None
+    return governance
+
+
 def validate_legacy_governance_post(
+    conn: sqlite3.Connection,
     *,
     topic_id: str,
     role: str,
@@ -445,15 +472,17 @@ def validate_legacy_governance_post(
     body_mode: str | None,
     author_session_id: str | None,
     recipients: tuple[str, ...] | list[str] = (),
-    authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate a governance candidate on an unconfigured (legacy) topic.
 
-    Rejection order is the F0 contract: strict decode, body mode, exact
-    schema, caller-supplied server fields, form/key shape.  A structurally
-    valid form then requires a pinned authority; F0 has none, so the result
-    is a typed ``authority_unconfigured`` naming the bootstrap/pin path.  No
-    positive path exists in F0 (F1 adds issuer stamping and persistence).
+    ``conn`` is the caller's open write transaction (approved signature); in
+    F0 it is read only to resolve the topic's governance mode.  Rejection
+    order is the F0 contract: strict decode, body mode, exact schema,
+    caller-supplied server fields, form/key shape.  A structurally valid form
+    then requires a pinned authority; no topic can be pinned yet, so the
+    result is a typed ``authority_unconfigured`` naming the bootstrap/pin
+    path.  No positive path exists in F0 (F1 adds issuer stamping and
+    persistence).
     """
     payload = decode_governance_payload(payload_json)
     mode = body_mode if body_mode not in (None, "") else "structured"

@@ -2276,6 +2276,7 @@ def post_message(
     ) is None and is_legacy_governance_candidate(kind, payload_json):
         try:
             validate_legacy_governance_post(
+                conn,
                 topic_id=topic_id,
                 role=role,
                 kind=kind,
