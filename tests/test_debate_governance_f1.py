@@ -207,15 +207,15 @@ def _pin(api, approval_msg_id, path, digest, author=HUMAN, topic=TOPIC):
                 author_session_id=author, manifest_path=path, expected_manifest_sha256=digest)
 
 
-def _chain(api):
+def _chain(api, topic=TOPIC):
     """bootstrap → approve_pin → pin; returns the ids and the approve manifest."""
-    path, digest = _bootstrap_manifest(api)
+    path, digest = _bootstrap_manifest(api, topic=topic, name=f"bootstrap-{topic}.json")
     boot = _bootstrap(api, path, digest)
     assert boot.get("status") == "applied", boot
-    apath, adigest = _approve_manifest(api)
+    apath, adigest = _approve_manifest(api, topic=topic)
     approval = _approve(api, apath, adigest)
     assert approval.get("msg_id"), approval
-    pinned = _pin(api, approval["msg_id"], apath, adigest)
+    pinned = _pin(api, approval["msg_id"], apath, adigest, topic=topic)
     assert "error_type" not in pinned, pinned
     return {"bootstrap": boot, "approval": approval["msg_id"], "pin": pinned,
             "approve_path": apath, "approve_digest": adigest}
@@ -248,7 +248,8 @@ def _authorize(api, payload, *, author=AUTHORITY, writer="debate_post_with_recip
 
 
 def _grant(api, **kw):
-    out = _authorize(api, _grant_payload(api, **kw))
+    # the grant is posted ON the topic it names (a pinned authority exists there)
+    out = _authorize(api, _grant_payload(api, **kw), topic=kw.get("topic", TOPIC))
     assert out.get("msg_id"), out
     return out["msg_id"]
 
@@ -812,7 +813,9 @@ def test_f13_grant_mismatches_apply_nothing(api, monkeypatch, case):
     elif case == "target_session":
         grant = _grant(api, target_role="EXECUTOR_1", target_session=AUTHOR)
     elif case == "foreign_topic":
+        # a REAL grant issued by C3F1B's own pinned authority, consumed on TOPIC
         _init_active(api, topic="C3F1B")
+        _chain(api, topic="C3F1B")
         grant = _grant(api, topic="C3F1B")
     elif case == "expired":
         grant = _grant(api)
