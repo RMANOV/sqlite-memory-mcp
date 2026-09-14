@@ -54,6 +54,83 @@ def topic(tmp_path):
     c.close()
 
 
+def _authority_grant(conn, tmp_path, topic_id, *, authority_session, target_role,
+                     target_session, action, claims="hold"):
+    """Real phase-A chain (never a seeded CONDUCTOR/authority row): bootstrap the
+    HUMAN from a private 0600 manifest under tmp_path, approve_pin, pin, then an
+    ``authorize`` DECISION by the pinned authority.  Imports are local so a
+    missing surface fails this node only (A1 RED shape), never collection."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    import debate_governance as gov
+    from debate import (
+        governance_approve_pin,
+        governance_bootstrap_human,
+        governance_inventory,
+        governance_pin,
+    )
+
+    gov_dir = tmp_path / "gov"
+    gov_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(gov_dir, 0o700)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def write(name, manifest):
+        path = gov_dir / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return str(path), gov.content_digest("c3-manifest/v1", manifest)
+
+    human = "human-f1op01"
+    inv = governance_inventory(conn, topic_id=topic_id)
+    if not any(b["role"] == "ADVOCATE_CODEX" and b["session_id"] == authority_session
+               and b["state"] == "active" for b in inv["bindings"]):
+        bind_role_session(conn, topic_id=topic_id, role="ADVOCATE_CODEX",
+                          session_id=authority_session, reason="seed authority")
+        inv = governance_inventory(conn, topic_id=topic_id)
+    if human not in inv["active_human_owners"]:
+        path, digest = write("bootstrap.json", {
+            "schema": "governance-bootstrap/v1", "topic_id": topic_id,
+            "expected_topic_fingerprint": inv["topic_fingerprint"],
+            "human_session_id": human, "expires_at": expires, "nonce": "0011223344556677",
+        })
+        governance_bootstrap_human(conn, manifest_path=path, expected_manifest_sha256=digest)
+        inv = governance_inventory(conn, topic_id=topic_id)
+    authority = next(b for b in inv["bindings"] if b["role"] == "ADVOCATE_CODEX"
+                     and b["session_id"] == authority_session and b["state"] == "active")
+    path, digest = write(f"approve-{inv['authority_epoch']}.json", {
+        "schema": "governance-approve/v1", "topic_id": topic_id,
+        "authority_role": "ADVOCATE_CODEX", "authority_session_id": authority_session,
+        "authority_generation": authority["generation"],
+        "expected_authority_fingerprint": authority["fingerprint"],
+        "expected_authority_epoch": inv["authority_epoch"],
+        "human_session_id": human, "expires_at": expires, "nonce": "1122334455667788",
+    })
+    approval = governance_approve_pin(conn, manifest_path=path, expected_manifest_sha256=digest,
+                                      author_session_id=human)
+    governance_pin(conn, topic_id=topic_id, approval_msg_id=approval["msg_id"],
+                   author_session_id=human, manifest_path=path, expected_manifest_sha256=digest)
+    inv = governance_inventory(conn, topic_id=topic_id)
+    target = next(b for b in inv["bindings"] if b["role"] == target_role
+                  and b["session_id"] == target_session)
+    payload = {
+        "schema": "governance/v1", "type": "authorize", "action": action,
+        "topic_id": topic_id, "target_role": target_role, "target_session_id": target_session,
+        "target_fingerprint": target["fingerprint"],
+        "effect": {"state": "retired" if action == "retire_binding" else "diagnostic",
+                   "claims": claims},
+        "expires_at": expires, "nonce": "8877665544332211",
+    }
+    grant = post_message(
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", priority="H", kind="DECISION",
+        body=f"authorize {action}", payload_json=gov.canonical_json(payload),
+        body_mode="structured", author_session_id=authority_session,
+    )
+    return grant["msg_id"]
+
+
 def _binding_state(conn, topic_id, role, session_id):
     row = conn.execute(
         "SELECT state FROM debate_role_bindings "
@@ -172,7 +249,10 @@ def test_debate_state_archived_retires_diagnostic_bindings_atomically(topic):
     assert _binding_state(conn, t, "EXECUTOR", "codex-diag1") == "retired"
 
 
-def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
+def test_bind_role_rejects_ownership_gap_without_conductor_override(topic, tmp_path):
+    """Phase A contract (packet v1.3 M-A4 row 1): retiring the ACTIVE owner
+    without a replacement needs a consumed authorization grant from the pinned
+    authority; the retired CONDUCTOR DECISION override no longer exists."""
     conn, t = topic
     bind_role_session(
         conn,
@@ -190,15 +270,12 @@ def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
             state="retired",
             reason="retire without replacement",
         )
-    assert exc_info.value.error_type == "conductor_override_required"
+    assert exc_info.value.error_type == "authorization_required"
+    assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
-    override = post_message(
-        conn,
-        topic_id=t,
-        role="ADVOCATE_CODEX",
-        priority="H",
-        kind="DECISION",
-        body="allow temporary ownership gap",
+    grant = _authority_grant(
+        conn, tmp_path, t, authority_session="codex-cond1",
+        target_role="EXECUTOR", target_session="codex-exec1", action="retire_binding",
     )
     out = bind_role_session(
         conn,
@@ -206,16 +283,27 @@ def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
         role="EXECUTOR",
         session_id="codex-exec1",
         state="retired",
-        reason="override retire",
-        conductor_override_msg_id=override["msg_id"],
+        reason="authorized retire",
+        author_session_id="codex-cond1",
+        authorization_msg_id=grant,
     )
     assert out["ownership_gap_override"] is True
+    assert out["authorization_msg_id"] == grant
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "retired"
+    spends = conn.execute(
+        "SELECT authorization_msg_id, target_key FROM debate_authorization_spends "
+        "WHERE authorization_msg_id = ?",
+        (grant,),
+    ).fetchall()
+    assert [tuple(r) for r in spends] == [(grant, "single")]
 
 
 def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_workers(
-    topic,
+    topic, tmp_path,
 ):
+    """Phase A contract (packet v1.3 M-A4 row 2): demoting the ACTIVE owner to
+    diagnostic needs a consumed ``diagnostic_uncover`` grant whose effect
+    retires the worker claims; no authorization → typed refusal, state active."""
     conn, t = topic
     bind_role_session(
         conn,
@@ -250,16 +338,13 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
             state="diagnostic",
             reason="demote without replacement",
         )
-    assert exc_info.value.error_type == "conductor_override_required"
+    assert exc_info.value.error_type == "authorization_required"
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
-    override = post_message(
-        conn,
-        topic_id=t,
-        role="ADVOCATE_CODEX",
-        priority="H",
-        kind="DECISION",
-        body="allow temporary diagnostic demotion",
+    grant = _authority_grant(
+        conn, tmp_path, t, authority_session="codex-cond1",
+        target_role="EXECUTOR", target_session="codex-exec1",
+        action="diagnostic_uncover", claims="retire",
     )
     out = bind_role_session(
         conn,
@@ -268,7 +353,8 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
         session_id="codex-exec1",
         state="diagnostic",
         reason="diagnostic investigation",
-        conductor_override_msg_id=override["msg_id"],
+        author_session_id="codex-cond1",
+        authorization_msg_id=grant,
     )
     worker = conn.execute(
         "SELECT state FROM debate_worker_claims WHERE worker_session_id = ?",
@@ -276,9 +362,16 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
     ).fetchone()
 
     assert out["ownership_gap_override"] is True
+    assert out["authorization_msg_id"] == grant
     assert out["retired_worker_claims"] == 1
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "diagnostic"
     assert worker["state"] == "retired"
+    spends = conn.execute(
+        "SELECT action, target_key FROM debate_authorization_spends "
+        "WHERE authorization_msg_id = ?",
+        (grant,),
+    ).fetchall()
+    assert [tuple(r) for r in spends] == [("diagnostic_uncover", "single")]
 
 
 def test_rotate_requires_cursor_mode_and_copy_missing_cursor_warns(topic):

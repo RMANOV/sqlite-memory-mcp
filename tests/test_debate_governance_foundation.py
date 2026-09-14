@@ -321,6 +321,9 @@ def _stored_format_row():
         "round_no": None, "body_mode": "structured",
         "payload_json": json.dumps(payload, ensure_ascii=False, sort_keys=True,
                                    separators=(",", ":")),
+        # Phase A (packet v1.3 C1): classification is the server-only column,
+        # never the payload shape.
+        "governance_schema": "governance/v1",
     }
 
 
@@ -340,11 +343,12 @@ def test_f09_complete_stored_format_keeps_canonical_string_not_authority_proof()
     None, "{broken", '{"authorizes":{"action":"retire_binding"}}',
     '{"schema":"governance/v2","type":"authorize"}',
     '{"schema":"governance/v1","type":"authorize"}',
+    _stored_format_row()["payload_json"],
 ], ids=["ordinary", "malformed", "authority_looking_text", "unknown_schema",
-        "incomplete_stored_form"])
+        "incomplete_stored_form", "shape_without_column"])
 def test_f09_legacy_or_malformed_rows_are_not_promoted(payload):
     gov = _gov()
-    row = dict(_stored_format_row(), payload_json=payload)
+    row = dict(_stored_format_row(), payload_json=payload, governance_schema=None)
     out = gov.serialize_debate_message(row)
     assert not {"protocol_version", "round_no", "body_mode", "payload_json"} & out.keys()
     assert out["msg_id"] == row["msg_id"]
