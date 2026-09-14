@@ -19,6 +19,7 @@ import dataclasses
 import hashlib
 import json
 import re
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -563,7 +564,7 @@ def validate_legacy_governance_post(
             f"kind {kind} cannot carry a governance payload",
             {"kind": kind},
         )
-    if authority is None:
+    if _pinned_authority(conn, topic_id) is None:
         raise GovernanceError(
             "authority_unconfigured",
             "no pinned governance authority on this topic; bootstrap a HUMAN "
