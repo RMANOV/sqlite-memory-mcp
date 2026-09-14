@@ -984,6 +984,43 @@ CREATE INDEX IF NOT EXISTS idx_drb_session
 CREATE INDEX IF NOT EXISTS idx_drb_topic_state
     ON debate_role_bindings(topic_id, state);
 
+-- ── C3 governance: append-only authorization spend ledger ────────────────
+-- One row per consumed capability. A single-target grant always spends
+-- target_key 'single'; a manifest grant spends one c3-target/v1 digest per
+-- target under the approved canonical manifest digest. Rows are immutable
+-- (triggers below); the before/after/receipt images are the audit evidence.
+-- Base DDL only: IF NOT EXISTS runs on every init_db, so no migration entry.
+CREATE TABLE IF NOT EXISTS debate_authorization_spends (
+    authorization_msg_id TEXT NOT NULL REFERENCES debate_messages(msg_id),
+    target_key          TEXT NOT NULL,
+    manifest_sha256     TEXT,
+    action              TEXT NOT NULL,
+    control_topic_id    TEXT NOT NULL,
+    target_topic_id     TEXT NOT NULL,
+    target_role         TEXT NOT NULL,
+    target_session_id   TEXT NOT NULL,
+    target_fingerprint  TEXT NOT NULL,
+    issuer_json         TEXT NOT NULL,
+    before_json         TEXT NOT NULL,
+    after_json          TEXT NOT NULL,
+    receipt_json        TEXT NOT NULL,
+    spent_at            TEXT NOT NULL,
+    PRIMARY KEY (authorization_msg_id, target_key),
+    CHECK ((manifest_sha256 IS NULL AND target_key='single')
+        OR (manifest_sha256 IS NOT NULL AND length(manifest_sha256)=64
+            AND length(target_key)=64))
+);
+
+CREATE TRIGGER IF NOT EXISTS debate_authorization_spends_no_update
+BEFORE UPDATE ON debate_authorization_spends BEGIN
+    SELECT RAISE(ABORT, 'debate_authorization_spends is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS debate_authorization_spends_no_delete
+BEFORE DELETE ON debate_authorization_spends BEGIN
+    SELECT RAISE(ABORT, 'debate_authorization_spends is append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS debate_wake_log (
     wake_id             TEXT PRIMARY KEY,
     trigger_msg_id      TEXT NOT NULL,

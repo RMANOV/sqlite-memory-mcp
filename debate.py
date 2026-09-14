@@ -24,13 +24,22 @@ import sqlite3
 from typing import Any
 
 from db_utils import json_dumps, json_loads, now_iso
-from debate_roles import RETIRED_ROLES
+from debate_governance import (
+    GovernanceError,
+    candidate_governance_metadata,
+    is_legacy_governance_candidate,
+    reject_caller_governance,
+    serialize_debate_message,
+    validate_legacy_governance_post,
+)
+from debate_roles import GOVERNANCE_ROLES, RETIRED_ROLES
 from debate_protocol_v1 import (
     PROTOCOL_VERSION as DEBATE_PROTOCOL_V1,
     SEMANTIC_KINDS,
     ProtocolV1Error,
     _resolve_author_session as _protocol_v1_resolve_author_session,
     configure_topic as _protocol_v1_configure_topic,
+    get_protocol_state as _protocol_v1_get_protocol_state,
     preflight_post as _protocol_v1_preflight_post,
     record_post as _protocol_v1_record_post,
     visibility_sql as _protocol_v1_visibility_sql,
@@ -214,6 +223,10 @@ def _raise_protocol_error(exc: ProtocolV1Error) -> None:
     raise DebateError(str(exc), error_type=exc.error_type, details=exc.details) from exc
 
 
+def _raise_governance_error(exc: GovernanceError) -> None:
+    raise DebateError(str(exc), error_type=exc.error_type, details=exc.details) from exc
+
+
 def validate_topic_id(topic_id: str) -> None:
     if not isinstance(topic_id, str) or not TOPIC_RE.fullmatch(topic_id):
         raise DebateError(
@@ -386,6 +399,13 @@ def init_debate(
         if not isinstance(session_id, str) or not session_id:
             raise DebateError(f"invalid_roles_entry: role {role} missing session_id")
     _validate_unique_roster(roles)
+    # C3 F06: the governance record is server-derived. A caller-supplied
+    # authority field is refused before the idempotency lookup, so neither a
+    # fresh nor a same-roster retry can smuggle a pin through metadata.
+    try:
+        reject_caller_governance(metadata)
+    except GovernanceError as exc:
+        _raise_governance_error(exc)
     if resolve_by is not None:
         validate_iso_utc(resolve_by)
     if protocol_version not in (None, "", DEBATE_PROTOCOL_V1):
@@ -435,6 +455,11 @@ def init_debate(
         now=now,
         require_priority=require_priority,
     )
+    # C3 F06: every new topic starts in legacy mode with at most one named
+    # governance candidate; nothing here pins an authority (that needs the
+    # explicit HUMAN approval path). Caller keys are preserved next to it.
+    metadata = dict(metadata or {})
+    metadata["governance"] = candidate_governance_metadata(roles, GOVERNANCE_ROLES)
     conn.execute(
         "INSERT INTO debates (topic_id, title, state, created_at, "
         "created_by_role, resolve_by, archived_at, roles_json, metadata_json) "
@@ -2241,6 +2266,28 @@ def post_message(
             "OBSERVE / ORIENT / DECIDE / ACT in that order"
         )
 
+    # C3 F07: governance candidates on an unconfigured (legacy) topic are
+    # validated here — after author provenance (auth-first) and before the
+    # v1 preflight. Every rejection is typed and leaves zero rows; there is
+    # no silent fallback to a plain post with the payload dropped. Configured
+    # debate/v1 topics keep their own preflight rules untouched.
+    if _protocol_v1_get_protocol_state(
+        conn, topic_id
+    ) is None and is_legacy_governance_candidate(kind, payload_json):
+        try:
+            validate_legacy_governance_post(
+                topic_id=topic_id,
+                role=role,
+                kind=kind,
+                reply_to=reply_to,
+                payload_json=payload_json,
+                body_mode=body_mode,
+                author_session_id=author_session_id,
+                recipients=tuple(recipients or ()),
+            )
+        except GovernanceError as exc:
+            _raise_governance_error(exc)
+
     # debate/v1 is enforced here, at the only message INSERT choke point.
     # The preflight is read-only: any rejection therefore produces exactly
     # zero message, recipient, protocol-state or audit rows.
@@ -2583,13 +2630,9 @@ def read_messages(
     truncated = len(rows) > effective_limit
     if truncated:
         rows = rows[:effective_limit]
-    messages = []
-    for row in rows:
-        item = dict(row)
-        if item.get("protocol_version") is None:
-            for key in ("protocol_version", "round_no", "body_mode", "payload_json"):
-                item.pop(key, None)
-        messages.append(item)
+    # One shared legacy/v1/governance read shape (C3 F08/F09); the same
+    # serializer is used by debate_signal_check so both readers agree.
+    messages = [serialize_debate_message(dict(row)) for row in rows]
     last_msg_id = messages[-1]["msg_id"] if messages else None
     last_ts = messages[-1]["ts"] if messages else None
 
@@ -4516,11 +4559,7 @@ def debate_signal_check(
             conn, msg=row, role=role, session_id=session_id
         ):
             continue
-        item = dict(row)
-        if item.get("protocol_version") is None:
-            for key in ("protocol_version", "round_no", "body_mode", "payload_json"):
-                item.pop(key, None)
-        pending.append(item)
+        pending.append(serialize_debate_message(dict(row)))
 
     next_cursor: dict[str, str] | None = None
     if truncated and pending:
