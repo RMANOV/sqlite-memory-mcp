@@ -389,6 +389,9 @@ def test_p1_generic_public_bootstrap_form_is_refused(api, writer):
     # DECISION type; the public validator refuses it as an invalid payload
     # before any authority lookup.  Green at A1 because F0 raises exactly this.
     assert out.get("error_type") == "governance_payload_invalid", out
+    # DA W42 §3(b): the refusal must name the reserved type, not merely be
+    # "some invalid payload" (F0 raises the same type for unrelated defects).
+    assert out["details"]["type"] == "bootstrap_human", out
     assert _snapshot(path) == before
 
 
@@ -1076,6 +1079,10 @@ def test_m_a2_internal_parameters_are_not_reachable_from_public_inputs(api):
                 body="probe", author_session_id=AUTHOR, **kwargs,
             ))
             assert out.get("error_type") == "internal_error", out
+            # DA W42 §3(a): green for the RIGHT reason — the boundary mapped the
+            # unknown-keyword TypeError, not some other crash.
+            assert "unexpected keyword argument" in out.get("error", ""), out
+            assert key in out.get("error", ""), out
     assert _snapshot(path) == before
     parser = debate_ops.build_parser()
     flags = set()
