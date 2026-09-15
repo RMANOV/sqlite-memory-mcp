@@ -3584,6 +3584,12 @@ def bind_role_session(
     ``ownership_gap_override`` in the result is a compatibility alias (True
     when a grant was consumed); ``authorization_msg_id`` is the authoritative
     field.  Both aliases are scheduled for removal together.
+
+    Lenient no-uncover path (DA W51): when the call uncovers nothing, a
+    supplied grant is IGNORED, not validated -- only replay is detected
+    (an already-spent grant raises ``authorization_consumed``); a
+    nonexistent, foreign, expired, wrong-actor or stale-issuer grant yields
+    the same success as no grant at all, because a no-op needs no credential.
     """
     validate_topic_id(topic_id)
     validate_session_id(session_id)
@@ -3744,7 +3750,15 @@ def bind_role_session(
         # M1 (DA W49): a grant is consumed ONLY when the call uncovers the
         # ACTIVE owner; with nothing to uncover a supplied grant stays unspent
         # and the result reports no authorization.  Contract line:
-        # ownership_gap_override True ⇔ a grant was consumed.
+        # ownership_gap_override True ⇔ a grant was consumed.  A grant that
+        # was ALREADY spent is refused whatever the target state (F14/F17):
+        # replay detection does not depend on there being something to uncover.
+        if authorization_msg_id and not would_uncover:
+            if _spend_row(conn, authorization_msg_id, SPEND_TARGET_SINGLE) is not None:
+                raise DebateError(
+                    f"authorization_consumed: {authorization_msg_id}",
+                    error_type="authorization_consumed",
+                )
         if would_uncover and authorization_msg_id:
             receipt = authorize_and_apply(
                 conn,
@@ -3806,6 +3820,13 @@ def bind_role_session(
 
     # M1 (DA W49): consume only when the retire uncovers the ACTIVE owner;
     # otherwise a supplied grant stays unspent and no authorization is reported.
+    # An already-spent grant is refused regardless (F14/F17 replay contract).
+    if authorization_msg_id and not would_uncover:
+        if _spend_row(conn, authorization_msg_id, SPEND_TARGET_SINGLE) is not None:
+            raise DebateError(
+                f"authorization_consumed: {authorization_msg_id}",
+                error_type="authorization_consumed",
+            )
     if would_uncover and authorization_msg_id:
         receipt = authorize_and_apply(
             conn,
