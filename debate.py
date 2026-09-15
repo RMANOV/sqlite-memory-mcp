@@ -3585,11 +3585,12 @@ def bind_role_session(
     when a grant was consumed); ``authorization_msg_id`` is the authoritative
     field.  Both aliases are scheduled for removal together.
 
-    Lenient no-uncover path (DA W51): when the call uncovers nothing, a
-    supplied grant is IGNORED, not validated -- only replay is detected
-    (an already-spent grant raises ``authorization_consumed``); a
-    nonexistent, foreign, expired, wrong-actor or stale-issuer grant yields
-    the same success as no grant at all, because a no-op needs no credential.
+    No-uncover path (DA W51/W54): replay of a spent single-target grant
+    (a ``debate_authorization_spends`` row for ``authorization_msg_id`` with
+    ``target_key = 'single'``) is refused with ``authorization_consumed``
+    even when no uncover occurs; no other property of the grant is checked on
+    the no-op path -- a nonexistent, foreign, expired, wrong-actor or
+    stale-issuer grant yields the same success as no grant at all.
     """
     validate_topic_id(topic_id)
     validate_session_id(session_id)
