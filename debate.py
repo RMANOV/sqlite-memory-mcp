@@ -3591,6 +3591,15 @@ def bind_role_session(
     even when no uncover occurs; no other property of the grant is checked on
     the no-op path -- a nonexistent, foreign, expired, wrong-actor or
     stale-issuer grant yields the same success as no grant at all.
+
+    Retry (DA W57): idempotency belongs to the client read, not to this
+    call.  After any ambiguous outcome read ``debate_binding_list`` before
+    retrying -- a grant-attached retry is refused with
+    ``authorization_consumed`` once the first attempt landed, and a
+    grant-less retry cannot uncover.  Disclosure direction: whether a grant
+    id is spent is observable to any caller holding the id (the no-op path
+    consults the spend table), whether it exists is not; the error carries
+    only the error name and the id, never the spend row or its receipt.
     """
     validate_topic_id(topic_id)
     validate_session_id(session_id)
