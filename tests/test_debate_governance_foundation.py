@@ -358,4 +358,5 @@ def test_f09_v1_read_shape_is_unchanged():
     gov = _gov()
     row = dict(_stored_format_row(), protocol_version="debate/v1", round_no=1,
                kind="CLAIM", payload_json='{"summary":"existing v1"}')
+    row.pop("governance_schema")  # a debate/v1 row is never classified (phase A)
     assert gov.serialize_debate_message(row) == row
