@@ -49,7 +49,7 @@ def debate_db(tmp_path, monkeypatch):
 def _roles_json() -> str:
     return json.dumps(
         [
-            {"role": "CONDUCTOR", "session_id": "codex-cond20260531"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond20260531"},
             {"role": "ADVOCATE", "session_id": "codex-adv20260531"},
             {"role": "EXECUTOR_1", "session_id": "codex-exec20260531"},
         ]
@@ -71,7 +71,7 @@ def _debate_init(topic_id: str) -> dict[str, object]:
             topic_id=topic_id,
             title="Premium gate test",
             roles_json=_roles_json(),
-            created_by_role="CONDUCTOR",
+            created_by_role="ADVOCATE_CODEX",
             metadata_json=_priority_metadata_json(),
         )
     )
@@ -175,7 +175,7 @@ def test_debate_existing_topic_post_and_signal_stay_ungated(debate_db, monkeypat
     q = json.loads(
         intel_server.debate_post_with_recipients(
             topic_id="PREMIUM_GATE_ROUTING",
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="M",
             kind="Q",
             body="CONDUCTOR -> ADVOCATE question",
@@ -251,7 +251,7 @@ def test_debate_bind_role_existing_topic_never_gated(debate_db, monkeypatch):
             role="ADVOCATE",
             session_id="codex-advrebind20260531",
             reason="rebind under enabled gate",
-            bound_by_role="CONDUCTOR",
+            bound_by_role="ADVOCATE_CODEX",
             replace_active=True,
         )
     )

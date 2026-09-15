@@ -62,12 +62,12 @@ from debate import (  # noqa: E402
 from schema import init_db  # noqa: E402
 
 PARENT = "codex-exec1"
-CONDUCTOR = "codex-cond1"
+SENDER_SESSION = "codex-cond1"
 OTHER_ROLE_SESSION = "cc-adv1"
 TERMINAL_KINDS = ("A", "STATUS")
 PROVENANCE_COLUMNS = {"author_session_id", "provenance_class"}
 ROLES = (
-    ("CONDUCTOR", CONDUCTOR),
+    ("ADVOCATE_CODEX", SENDER_SESSION),
     ("EXECUTOR", PARENT),
     ("ADVOCATE", OTHER_ROLE_SESSION),
 )
@@ -87,9 +87,9 @@ def _seed(conn, t):
         title="reply ownership",
         roles=[{"role": r, "session_id": s} for r, s in ROLES]
         + [{"role": "EXECUTOR2", "session_id": "codex-exec2"}],  # unbound roster role
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE")
     for role, session_id in ROLES:
         bind_role_session(
             conn, topic_id=t, role=role, session_id=session_id, reason="primary"
@@ -110,12 +110,12 @@ def _trigger(conn, t, *, kind="Q", body="one-shot work", addressed="EXECUTOR", *
     return debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind=kind,
         body=body,
         addressed_to=[addressed],
-        author_session_id=CONDUCTOR,
+        author_session_id=SENDER_SESSION,
         **kw,
     )["msg_id"]
 
@@ -894,7 +894,7 @@ def _post_addressed(conn, t, *, author, body, reply_to):
         priority="H",
         kind="A",
         body=body,
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=reply_to,
         author_session_id=author,
     )
@@ -1121,7 +1121,7 @@ def test_post_with_recipients_result_carries_provenance(topic):
         kind="A",
         body="x",
         reply_to=trigger,
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         author_session_id=PARENT,
     )
     assert (out["author_session_id"], out["provenance_class"]) == (PARENT, "parent")

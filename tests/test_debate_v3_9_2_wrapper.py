@@ -54,14 +54,14 @@ def wrapped_topic(tmp_path):
         init_debate(
             conn, topic_id="X1", title="wrapper-shaped",
             roles=[
-                {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+                {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
                 {"role": "EXECUTOR", "session_id": "cc-exec1"},
                 {"role": "ADVOCATE", "session_id": "codex-adv1"},
             ],
-            created_by_role="CONDUCTOR",
+            created_by_role="ADVOCATE_CODEX",
         )
         transition_state(
-            conn, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE"
+            conn, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE"
         )
     yield db_path
 
@@ -80,7 +80,7 @@ def test_post_with_recipients_runs_inside_get_conn_wrapper(wrapped_topic):
     db = wrapped_topic
     with get_conn(db_path=db) as conn:
         out = debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="H", kind="STATUS", body="wrapper-shaped",
             addressed_to=["EXECUTOR"],
         )
@@ -99,7 +99,7 @@ def test_signal_check_runs_inside_get_conn_wrapper(wrapped_topic):
     db = wrapped_topic
     with get_conn(db_path=db) as conn:
         debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="H", kind="STATUS", body="for-EXECUTOR",
             addressed_to=["EXECUTOR"],
         )
@@ -115,7 +115,7 @@ def test_signal_advance_runs_inside_get_conn_wrapper(wrapped_topic):
     db = wrapped_topic
     with get_conn(db_path=db) as conn:
         m1 = debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body="m1",
             addressed_to=["EXECUTOR"],
         )
@@ -187,7 +187,7 @@ def test_post_with_recipients_atomic_through_wrapper(wrapped_topic):
     with pytest.raises(_BoomError):
         with get_conn(db_path=db) as conn:
             debate_post_with_recipients(
-                conn, topic_id="X1", role="CONDUCTOR",
+                conn, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="M", kind="STATUS", body="atomic",
                 addressed_to=["EXECUTOR"],
             )
@@ -217,7 +217,7 @@ def test_signal_advance_monotonic_forward_succeeds(wrapped_topic):
     with get_conn(db_path=db) as conn:
         for i in range(3):
             out = debate_post_with_recipients(
-                conn, topic_id="X1", role="CONDUCTOR",
+                conn, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="L", kind="STATUS", body=f"m{i}",
                 addressed_to=["EXECUTOR"],
             )
@@ -245,12 +245,12 @@ def test_signal_advance_regression_raises_watermark_regression(wrapped_topic):
     db = wrapped_topic
     with get_conn(db_path=db) as conn:
         m0 = debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body="m0",
             addressed_to=["EXECUTOR"],
         )
         m1 = debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body="m1",
             addressed_to=["EXECUTOR"],
         )
@@ -286,7 +286,7 @@ def test_signal_advance_idempotent_at_equal_cursor(wrapped_topic):
     db = wrapped_topic
     with get_conn(db_path=db) as conn:
         m1 = debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body="m1",
             addressed_to=["EXECUTOR"],
         )
@@ -324,7 +324,7 @@ def test_signal_advance_interleaved_racers_converge_to_newer_cursor(
     with get_conn(db_path=db) as conn:
         for i in range(2):
             out = debate_post_with_recipients(
-                conn, topic_id="X1", role="CONDUCTOR",
+                conn, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="M", kind="STATUS", body=f"m{i}",
                 addressed_to=["EXECUTOR"],
             )
@@ -407,7 +407,7 @@ def test_signal_advance_initial_no_state_row_no_regression_check(
     db = wrapped_topic
     with get_conn(db_path=db) as conn:
         m1 = debate_post_with_recipients(
-            conn, topic_id="X1", role="CONDUCTOR",
+            conn, topic_id="X1", role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body="m1",
             addressed_to=["EXECUTOR"],
         )
@@ -432,7 +432,7 @@ def test_post_with_recipients_high_volume_sequential_via_wrapper(wrapped_topic):
     for i in range(50):
         with get_conn(db_path=db) as conn:
             out = debate_post_with_recipients(
-                conn, topic_id="X1", role="CONDUCTOR",
+                conn, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="INFO", kind="STATUS", body=f"vol{i}",
                 addressed_to=["EXECUTOR"],
             )
@@ -459,7 +459,7 @@ def test_signal_check_post_advance_via_wrapper_returns_remainder(
     for i in range(5):
         with get_conn(db_path=db) as conn:
             out = debate_post_with_recipients(
-                conn, topic_id="X1", role="CONDUCTOR",
+                conn, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="M", kind="STATUS", body=f"e2e{i}",
                 addressed_to=["EXECUTOR"],
             )

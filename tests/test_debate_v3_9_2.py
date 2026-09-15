@@ -49,13 +49,13 @@ def topic(tmp_path):
     init_debate(
         c, topic_id="X1", title="v3.9.2 test topic",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
             {"role": "EXECUTOR", "session_id": "cc-exec1"},
             {"role": "ADVOCATE", "session_id": "codex-adv1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(c, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     yield c, "X1"
     c.close()
 
@@ -124,7 +124,7 @@ def test_schema_indexes_present(topic):
 def test_post_with_recipients_happy_path_inserts_atomic_rows(topic):
     conn, t = topic
     out = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="H", kind="STATUS", body="hello",
         addressed_to=["EXECUTOR"],
     )
@@ -150,7 +150,7 @@ def test_post_with_recipients_dedupes_role_silently(topic):
     """addressed_to=['EXECUTOR', 'EXECUTOR'] inserts 1 row, not 2."""
     conn, t = topic
     out = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="x",
         addressed_to=["EXECUTOR", "EXECUTOR"],
     )
@@ -167,7 +167,7 @@ def test_post_with_recipients_rejects_direct_session_in_normal_path(topic):
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         debate_post_with_recipients(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="M", kind="STATUS", body="x",
             addressed_to=["EXECUTOR", "cc-exec1"],
         )
@@ -233,11 +233,11 @@ def test_post_with_recipients_atomic_rollback_on_invalid_recipient(topic):
 def test_post_with_recipients_archived_blocks_state_kind(topic):
     """Per amendment a08c61b3: ARCHIVED is terminal — even kind=STATE blocked."""
     conn, t = topic
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ARCHIVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ARCHIVED")
     with pytest.raises(DebateError) as exc_info:
         debate_post_with_recipients(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="H", kind="STATE", body="ANYTHING",
             addressed_to=["EXECUTOR"],
         )
@@ -246,12 +246,12 @@ def test_post_with_recipients_archived_blocks_state_kind(topic):
 
 def test_post_with_recipients_resolved_blocks_non_state(topic):
     conn, t = topic
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     with pytest.raises(DebateError) as exc_info:
         debate_post_with_recipients(
             conn, topic_id=t, role="EXECUTOR",
             priority="M", kind="STATUS", body="late",
-            addressed_to=["CONDUCTOR"],
+            addressed_to=["ADVOCATE_CODEX"],
         )
     assert exc_info.value.error_type == "lifecycle_resolved_non_state"
 
@@ -275,14 +275,14 @@ def test_post_with_recipients_unknown_topic_raises(topic):
 def test_signal_check_returns_only_addressed_messages(topic):
     conn, t = topic
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="for-EXECUTOR",
         addressed_to=["EXECUTOR"],
     )
     debate_post_with_recipients(
         conn, topic_id=t, role="EXECUTOR",
         priority="M", kind="STATUS", body="for-CONDUCTOR",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
     )
     out = debate_signal_check(
         conn, session_id="cc-exec1", role="EXECUTOR", topic_id=t
@@ -299,7 +299,7 @@ def test_signal_check_dedupes_role_and_session_id_match(topic):
         state="diagnostic", reason="diagnostic",
     )
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="dual",
         addressed_to=["EXECUTOR"], diagnostic_to=["cc-exec1"],
     )
@@ -316,7 +316,7 @@ def test_ping_explicit_and_derived_recipient_is_idempotent(topic):
     result = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="PING",
         body="wake now target=EXECUTOR",
@@ -344,7 +344,7 @@ def test_signal_check_truncation_and_next_cursor(topic):
     conn, t = topic
     for i in range(5):
         debate_post_with_recipients(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="L", kind="STATUS", body=f"m{i}",
             addressed_to=["EXECUTOR"],
         )
@@ -362,7 +362,7 @@ def test_signal_check_pagination_walk_returns_remainder(topic):
     conn, t = topic
     for i in range(5):
         debate_post_with_recipients(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="L", kind="STATUS", body=f"m{i}",
             addressed_to=["EXECUTOR"],
         )
@@ -382,15 +382,15 @@ def test_signal_check_pagination_walk_returns_remainder(topic):
 def test_signal_check_max_priority_uses_correct_order(topic):
     conn, t = topic
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR", priority="L",
+        conn, topic_id=t, role="ADVOCATE_CODEX", priority="L",
         kind="STATUS", body="low", addressed_to=["EXECUTOR"],
     )
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR", priority="H",
+        conn, topic_id=t, role="ADVOCATE_CODEX", priority="H",
         kind="STATUS", body="high", addressed_to=["EXECUTOR"],
     )
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR", priority="M",
+        conn, topic_id=t, role="ADVOCATE_CODEX", priority="M",
         kind="STATUS", body="mid", addressed_to=["EXECUTOR"],
     )
     out = debate_signal_check(
@@ -412,12 +412,12 @@ def test_signal_check_empty_returns_none_max_priority(topic):
 def test_signal_check_resurfaces_standing_decision_after_cursor(topic):
     conn, t = topic
     standing = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="H", kind="DECISION", body="standing mandate",
         addressed_to=["EXECUTOR"],
     )
     transient = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="one-shot status",
         addressed_to=["EXECUTOR"],
     )
@@ -437,12 +437,12 @@ def test_signal_check_resurfaces_standing_decision_after_cursor(topic):
 def test_signal_check_explicit_pagination_does_not_resurface_decision(topic):
     conn, t = topic
     standing = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="H", kind="DECISION", body="standing mandate",
         addressed_to=["EXECUTOR"],
     )
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="after decision",
         addressed_to=["EXECUTOR"],
     )
@@ -539,12 +539,12 @@ def test_signal_check_uses_signal_state_cursor_when_no_explicit_args(topic):
     """After signal_advance, signal_check uses the persisted cursor."""
     conn, t = topic
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="m1",
         addressed_to=["EXECUTOR"],
     )
     debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="m2",
         addressed_to=["EXECUTOR"],
     )
@@ -567,7 +567,7 @@ def test_signal_check_uses_signal_state_cursor_when_no_explicit_args(topic):
 def test_signal_advance_to_role_addressed_msg_succeeds(topic):
     conn, t = topic
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="m1",
         addressed_to=["EXECUTOR"],
     )
@@ -586,7 +586,7 @@ def test_signal_advance_to_session_id_addressed_msg_succeeds(topic):
         state="diagnostic", reason="diagnostic",
     )
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="m1",
         addressed_to=[], diagnostic_to=["cc-exec1"],
     )
@@ -604,7 +604,7 @@ def test_signal_advance_to_msg_addressed_to_BOTH_succeeds_once(topic):
         state="diagnostic", reason="diagnostic",
     )
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="m1",
         addressed_to=["EXECUTOR"], diagnostic_to=["cc-exec1"],
     )
@@ -626,7 +626,7 @@ def test_signal_advance_to_unaddressed_msg_raises(topic):
     m1 = debate_post_with_recipients(
         conn, topic_id=t, role="EXECUTOR",
         priority="M", kind="STATUS", body="for-CONDUCTOR-only",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
     )
     with pytest.raises(DebateError) as exc_info:
         debate_signal_advance(
@@ -649,7 +649,7 @@ def test_signal_advance_unknown_msg_id_raises(topic):
 def test_signal_advance_invalid_session_id_raises(topic):
     conn, t = topic
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="x",
         addressed_to=["EXECUTOR"],
     )
@@ -664,7 +664,7 @@ def test_signal_advance_invalid_session_id_raises(topic):
 def test_signal_advance_idempotent(topic):
     conn, t = topic
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="x",
         addressed_to=["EXECUTOR"],
     )
@@ -683,7 +683,7 @@ def test_signal_advance_writes_both_cursor_columns(topic):
     """Compound (ts, msg_id) cursor — both columns must be set."""
     conn, t = topic
     m1 = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="x",
         addressed_to=["EXECUTOR"],
     )

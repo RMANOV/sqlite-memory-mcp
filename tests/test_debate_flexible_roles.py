@@ -43,21 +43,21 @@ def topic(tmp_path):
     c = sqlite3.connect(db_path, isolation_level=None)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON")
-    # Minimal frozen roster: only CONDUCTOR + EXECUTOR at init.
+    # Minimal frozen roster: only ADVOCATE_CODEX + EXECUTOR at init.
     init_debate(
         c,
         topic_id="FLEX1",
         title="flexible roster",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
             {"role": "EXECUTOR", "session_id": "codex-exec1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     bind_role_session(
         c,
         topic_id="FLEX1",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         session_id="codex-cond1",
         reason="seed conductor",
     )
@@ -68,7 +68,7 @@ def topic(tmp_path):
         session_id="codex-exec1",
         reason="seed executor",
     )
-    transition_state(c, topic_id="FLEX1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="FLEX1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     yield c, "FLEX1"
     c.close()
 
@@ -80,6 +80,77 @@ def _binding_state(conn, topic_id, role, session_id):
         (topic_id, role, session_id),
     ).fetchone()
     return row["state"] if row else None
+
+
+def _authority_grant(conn, tmp_path, topic_id, *, authority_session, target_role,
+                     target_session, action, claims="hold"):
+    """Real phase-A chain (never a seeded CONDUCTOR/authority row): bootstrap the
+    HUMAN from a private 0600 manifest under tmp_path, approve_pin, pin, then an
+    ``authorize`` DECISION by the pinned authority.  Imports are local so a
+    missing surface fails this node only (A1 RED shape), never collection."""
+    from datetime import datetime, timedelta, timezone
+
+    import debate_governance as gov
+    from debate import (
+        governance_approve_pin,
+        governance_bootstrap_human,
+        governance_inventory,
+        governance_pin,
+    )
+
+    gov_dir = tmp_path / "gov"
+    gov_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(gov_dir, 0o700)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def write(name, manifest):
+        path = gov_dir / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return str(path), gov.content_digest("c3-manifest/v1", manifest)
+
+    human = "human-f1op01"
+    inv = governance_inventory(conn, topic_id=topic_id)
+    if human not in inv["active_human_owners"]:
+        path, digest = write("bootstrap.json", {
+            "schema": "governance-bootstrap/v1", "topic_id": topic_id,
+            "expected_topic_fingerprint": inv["topic_fingerprint"],
+            "human_session_id": human, "expires_at": expires, "nonce": "0011223344556677",
+        })
+        governance_bootstrap_human(conn, manifest_path=path, expected_manifest_sha256=digest)
+        inv = governance_inventory(conn, topic_id=topic_id)
+    authority = next(b for b in inv["bindings"] if b["role"] == "ADVOCATE_CODEX"
+                     and b["session_id"] == authority_session and b["state"] == "active")
+    path, digest = write(f"approve-{inv['authority_epoch']}.json", {
+        "schema": "governance-approve/v1", "topic_id": topic_id,
+        "authority_role": "ADVOCATE_CODEX", "authority_session_id": authority_session,
+        "authority_generation": authority["generation"],
+        "expected_authority_fingerprint": authority["fingerprint"],
+        "expected_authority_epoch": inv["authority_epoch"],
+        "human_session_id": human, "expires_at": expires, "nonce": "1122334455667788",
+    })
+    approval = governance_approve_pin(conn, manifest_path=path, expected_manifest_sha256=digest,
+                                      author_session_id=human)
+    governance_pin(conn, topic_id=topic_id, approval_msg_id=approval["msg_id"],
+                   author_session_id=human, manifest_path=path, expected_manifest_sha256=digest)
+    inv = governance_inventory(conn, topic_id=topic_id)
+    target = next(b for b in inv["bindings"] if b["role"] == target_role
+                  and b["session_id"] == target_session)
+    payload = {
+        "schema": "governance/v1", "type": "authorize", "action": action,
+        "topic_id": topic_id, "target_role": target_role, "target_session_id": target_session,
+        "target_fingerprint": target["fingerprint"],
+        "effect": {"state": "retired" if action == "retire_binding" else "diagnostic",
+                   "claims": claims},
+        "expires_at": expires, "nonce": "8877665544332211",
+    }
+    grant = post_message(
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", priority="H", kind="DECISION",
+        body=f"authorize {action}", payload_json=gov.canonical_json(payload),
+        body_mode="structured", author_session_id=authority_session,
+    )
+    return grant["msg_id"]
 
 
 def _declared_roles(conn, topic_id):
@@ -123,11 +194,11 @@ def test_pre_change_reinit_with_added_role_was_rejected(topic):
             topic_id=t,
             title="flexible roster",
             roles=[
-                {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+                {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
                 {"role": "EXECUTOR", "session_id": "codex-exec1"},
                 {"role": "ADVOCATE", "session_id": "cc-adv1"},
             ],
-            created_by_role="CONDUCTOR",
+            created_by_role="ADVOCATE_CODEX",
         )
     assert "topic_exists_with_different_roles" in str(exc_info.value)
 
@@ -141,7 +212,7 @@ def test_add_role_then_post_addressed_to_it_is_delivered(topic):
         role="ADVOCATE",
         session_id="cc-adv1",
         reason="enable advocate mid-debate",
-        bound_by_role="CONDUCTOR",
+        bound_by_role="ADVOCATE_CODEX",
     )
     assert out["added_role"] is True
     assert out["state"] == "active"
@@ -156,7 +227,7 @@ def test_add_role_then_post_addressed_to_it_is_delivered(topic):
     msg = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="advocate, weigh in",
@@ -176,7 +247,7 @@ def test_add_role_writes_audit_fields_on_binding_row(topic):
         role="EXECUTOR_2",
         session_id="codex-exec2",
         reason="add backup executor lane",
-        bound_by_role="CONDUCTOR",
+        bound_by_role="ADVOCATE_CODEX",
     )
     row = conn.execute(
         "SELECT reason, bound_by_role, generation, created_at, state "
@@ -186,7 +257,7 @@ def test_add_role_writes_audit_fields_on_binding_row(topic):
     ).fetchone()
     # The binding row IS the audit artifact (no separate audit table).
     assert row["reason"] == "add backup executor lane"
-    assert row["bound_by_role"] == "CONDUCTOR"
+    assert row["bound_by_role"] == "ADVOCATE_CODEX"
     assert row["generation"] == 1
     assert row["created_at"]
     assert row["state"] == "active"
@@ -218,7 +289,7 @@ def test_addressed_post_enqueues_durable_targeted_delivery(topic):
     posted = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="wake the executor now",
@@ -255,7 +326,7 @@ def test_add_role_idempotent_when_same_session_already_owns(topic):
     # No second declaration, no duplicate active.
     assert _active_count(conn, t, "ADVOCATE") == 1
     assert sorted(_declared_roles(conn, t)) == sorted(
-        {"CONDUCTOR", "EXECUTOR", "ADVOCATE"}
+        {"ADVOCATE_CODEX", "EXECUTOR", "ADVOCATE"}
     )
 
 
@@ -334,7 +405,7 @@ def test_rotate_binding_swaps_owner_and_carries_cursor(topic):
     msg = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="STATUS",
         body="cursor anchor",
@@ -399,7 +470,7 @@ def test_disable_non_active_backup_then_reactivate(topic):
     assert _binding_state(conn, t, "ADVOCATE", "cc-adv1") == "active"
 
 
-def test_disable_active_owner_then_reactivate_keeps_history(topic):
+def test_disable_active_owner_then_reactivate_keeps_history(topic, tmp_path):
     conn, t = topic
     add_role_to_debate(
         conn,
@@ -414,8 +485,8 @@ def test_disable_active_owner_then_reactivate_keeps_history(topic):
         (t, "ADVOCATE", "cc-adv1"),
     ).fetchone()["generation"]
 
-    # Retiring the ACTIVE owner is an ownership gap -> requires CONDUCTOR
-    # override DECISION.
+    # Retiring the ACTIVE owner is an ownership gap -> requires a consumed
+    # authorization grant from the pinned authority (phase A, packet v1.3 M-A4 row 4).
     with pytest.raises(DebateError) as exc_info:
         bind_role_session(
             conn,
@@ -423,27 +494,25 @@ def test_disable_active_owner_then_reactivate_keeps_history(topic):
             role="ADVOCATE",
             session_id="cc-adv1",
             state="retired",
-            reason="disable active without override",
+            reason="disable active without authorization",
         )
-    assert exc_info.value.error_type == "conductor_override_required"
+    assert exc_info.value.error_type == "authorization_required"
 
-    override = post_message(
-        conn,
-        topic_id=t,
-        role="CONDUCTOR",
-        priority="H",
-        kind="DECISION",
-        body="allow advocate to go offline",
+    grant = _authority_grant(
+        conn, tmp_path, t, authority_session="codex-cond1",
+        target_role="ADVOCATE", target_session="cc-adv1", action="retire_binding",
     )
-    bind_role_session(
+    out = bind_role_session(
         conn,
         topic_id=t,
         role="ADVOCATE",
         session_id="cc-adv1",
         state="retired",
         reason="advocate offline",
-        conductor_override_msg_id=override["msg_id"],
+        author_session_id="codex-cond1",
+        authorization_msg_id=grant,
     )
+    assert out["authorization_msg_id"] == grant
     assert _binding_state(conn, t, "ADVOCATE", "cc-adv1") == "retired"
 
     # Reactivate the same session: no other active owner -> no override needed,
@@ -462,18 +531,17 @@ def test_disable_active_owner_then_reactivate_keeps_history(topic):
     assert _active_count(conn, t, "ADVOCATE") == 1
 
 
-def test_add_role_reattaches_new_session_when_declared_role_has_no_active_owner(topic):
+def test_add_role_reattaches_new_session_when_declared_role_has_no_active_owner(
+    topic, tmp_path,
+):
     """Declared role whose owner was retired -> add_role reattaches a fresh
     session as active (not a re-declaration, no roles_json duplication)."""
     conn, t = topic
-    # Retire EXECUTOR's active owner via CONDUCTOR override.
-    override = post_message(
-        conn,
-        topic_id=t,
-        role="CONDUCTOR",
-        priority="H",
-        kind="DECISION",
-        body="executor offline",
+    # Retire EXECUTOR's active owner through a consumed authorization grant
+    # (phase A, packet v1.3 M-A4 row 3); the add_role assertions are unchanged.
+    grant = _authority_grant(
+        conn, tmp_path, t, authority_session="codex-cond1",
+        target_role="EXECUTOR", target_session="codex-exec1", action="retire_binding",
     )
     bind_role_session(
         conn,
@@ -482,7 +550,8 @@ def test_add_role_reattaches_new_session_when_declared_role_has_no_active_owner(
         session_id="codex-exec1",
         state="retired",
         reason="exec offline",
-        conductor_override_msg_id=override["msg_id"],
+        author_session_id="codex-cond1",
+        authorization_msg_id=grant,
     )
     assert _active_count(conn, t, "EXECUTOR") == 0
 
@@ -531,6 +600,8 @@ def test_invariant_no_two_active_owners_for_a_role(topic):
 
 
 def test_invariant_retiring_active_owner_requires_conductor_override(topic):
+    """Phase A: the uncover guard now names the authorization path
+    (``authorization_required``); the CONDUCTOR override is gone."""
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         bind_role_session(
@@ -541,7 +612,7 @@ def test_invariant_retiring_active_owner_requires_conductor_override(topic):
             state="retired",
             reason="retire active executor",
         )
-    assert exc_info.value.error_type == "conductor_override_required"
+    assert exc_info.value.error_type == "authorization_required"
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
 
@@ -598,12 +669,12 @@ def test_backcompat_original_roles_and_bindings_intact_after_add(topic):
     assert before_active <= after_active
     assert ("ADVOCATE", "cc-adv1") in after_active
     # Original declared roles still present.
-    assert {"CONDUCTOR", "EXECUTOR"} <= _declared_roles(conn, t)
+    assert {"ADVOCATE_CODEX", "EXECUTOR"} <= _declared_roles(conn, t)
     # Existing-role posting still works (no regression to declared roles).
     msg = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="STATUS",
         body="executor still addressable",
@@ -640,11 +711,11 @@ def wrapper_db(tmp_path, monkeypatch):
         title="wrapper roster",
         roles_json=json.dumps(
             [
-                {"role": "CONDUCTOR", "session_id": "codex-cond20260531"},
+                {"role": "ADVOCATE_CODEX", "session_id": "codex-cond20260531"},
                 {"role": "EXECUTOR_1", "session_id": "codex-exec20260531"},
             ]
         ),
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         metadata_json=json.dumps(
             {"priority_lane": "P2", "priority_reason": "wrapper add-role test"}
         ),
@@ -659,7 +730,7 @@ def test_wrapper_add_role_then_addressed_post_delivers(wrapper_db):
             role="ADVOCATE",
             session_id="cc-adv20260531",
             reason="enable advocate via MCP",
-            bound_by_role="CONDUCTOR",
+            bound_by_role="ADVOCATE_CODEX",
         )
     )
     assert "error_type" not in out
@@ -669,7 +740,7 @@ def test_wrapper_add_role_then_addressed_post_delivers(wrapper_db):
     posted = json.loads(
         intel_server.debate_post_with_recipients(
             topic_id="WRAP1",
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="H",
             kind="STATUS",
             body="advocate online?",
@@ -705,7 +776,7 @@ def test_wrapper_add_role_existing_topic_never_gated(wrapper_db, monkeypatch):
             role="ADVOCATE",
             session_id="cc-adv20260531",
             reason="add under enabled gate",
-            bound_by_role="CONDUCTOR",
+            bound_by_role="ADVOCATE_CODEX",
         )
     )
     assert "error_type" not in out

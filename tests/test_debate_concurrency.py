@@ -28,12 +28,12 @@ def db_path(tmp_path):
     init_debate(
         c, topic_id="X1", title="concurrency-tests",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR", "session_id": "s-exec"},
             {"role": "ADVOCATE", "session_id": "s-adv"},
             {"role": "HUMAN", "session_id": "s-h"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     c.close()
     yield p
@@ -66,7 +66,7 @@ def test_concurrent_post_isolation_level_none_no_lock_errors(db_path):
 
     threads = [
         threading.Thread(target=worker, args=(r,))
-        for r in ("CONDUCTOR", "EXECUTOR", "ADVOCATE", "HUMAN")
+        for r in ("ADVOCATE_CODEX", "EXECUTOR", "ADVOCATE", "HUMAN")
     ]
     for t in threads:
         t.start()
@@ -89,7 +89,7 @@ def test_post_atomicity_state_invalid_no_persisted_row(db_path):
         ).fetchone()[0]
         try:
             post_message(
-                c, topic_id="X1", role="CONDUCTOR",
+                c, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="H", kind="STATE", body="ARCHIVED",
             )
         except Exception:
