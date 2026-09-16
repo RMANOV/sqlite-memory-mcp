@@ -5852,9 +5852,47 @@ def export_task_files(
             continue
         task_ids.append(tid)
         task_map[tid] = dict(row)
+
+    # Attachment retention is independent from the task tombstone export
+    # window.  A task may age out of ``task_ids`` while its attachment
+    # metadata is still active; such a blob must not be classified as stale by
+    # the full-export cleanup pass.  Build the keep-set before the empty-task
+    # early return so the same invariant holds when no task JSON is exported.
+    active_attachment_paths: set[str] = set()
+
+    def _register_active_attachment(
+        stored_relpath: str, *, copy_to_bridge: bool
+    ) -> None:
+        try:
+            src_path = _local_attachment_path(stored_relpath, attachment_root)
+            dst_path = _bridge_attachment_path(stored_relpath, bridge_dir)
+            attachment_relpath = dst_path.relative_to(
+                attachments_dir.resolve()
+            ).as_posix()
+        except (TypeError, ValueError):
+            return
+
+        active_attachment_paths.add(attachment_relpath)
+        if not copy_to_bridge:
+            return
+        if src_path.exists():
+            _copy_attachment_file(src_path, dst_path)
+        elif not dst_path.exists():
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if _sqlite_table_exists(conn, "task_attachments"):
+        active_attachment_rows = conn.execute(
+            "SELECT stored_relpath FROM task_attachments "
+            "WHERE status = 'active' AND stored_relpath IS NOT NULL"
+        ).fetchall()
+        for ar in active_attachment_rows:
+            _register_active_attachment(
+                ar["stored_relpath"], copy_to_bridge=not changed_since
+            )
+
     if not task_ids:
         if not changed_since:
-            _cleanup_stale_generated_files(set(), set())
+            _cleanup_stale_generated_files(set(), active_attachment_paths)
         return exported
 
     # Batch fetch all field versions in one query
@@ -5942,7 +5980,6 @@ def export_task_files(
                 records[existing_index] = candidate
 
     attachment_map: dict[str, list[dict]] = {}
-    active_attachment_paths: set[str] = set()
     if _sqlite_table_exists(conn, "task_attachments"):
         attachment_rows = conn.execute(
             "SELECT attachment_id, task_id, file_name, stored_relpath, media_type, file_size, "
@@ -5963,18 +6000,9 @@ def export_task_files(
             }
             attachment_map.setdefault(ar["task_id"], []).append(meta)
             if ar["status"] == "active" and ar["stored_relpath"]:
-                active_attachment_paths.add(ar["stored_relpath"])
-                try:
-                    src_path = _local_attachment_path(
-                        ar["stored_relpath"], attachment_root
-                    )
-                    dst_path = _bridge_attachment_path(ar["stored_relpath"], bridge_dir)
-                except ValueError:
-                    continue
-                if src_path.exists():
-                    _copy_attachment_file(src_path, dst_path)
-                elif not dst_path.exists():
-                    dst_path.parent.mkdir(parents=True, exist_ok=True)
+                _register_active_attachment(
+                    ar["stored_relpath"], copy_to_bridge=bool(changed_since)
+                )
 
     tasks_for_export: list[dict[str, Any]] = []
     for tid in task_ids:

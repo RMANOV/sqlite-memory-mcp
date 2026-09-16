@@ -19,6 +19,7 @@ from db_utils import (
     load_remote_tasks_for_merge,
     load_task_content,
     now_iso,
+    remove_task_attachment,
     upsert_field_versions,
 )
 
@@ -255,6 +256,111 @@ class TestExportTaskFiles:
         assert task["_attachments"][0]["file_name"] == "sample.txt"
         assert os.path.isfile(bridge_copy)
         assert open(bridge_copy, encoding="utf-8").read() == "attachment body"
+
+    def test_full_export_keeps_active_attachment_for_aged_out_parent(
+        self, setup, tmp_path
+    ):
+        """An active attachment survives when its archived parent ages out."""
+        conn, bridge_dir = setup
+        _insert_task(conn, "task-live", "Live task")
+        task_id = "task-aged-attachment"
+        _insert_task(conn, task_id, "Aged archived task", status="archived")
+        conn.execute(
+            "UPDATE tasks SET updated_at = ?, tombstone_pushed_at = ? WHERE id = ?",
+            ("2020-01-01T00:00:00+00:00", "2020-01-02T00:00:00+00:00", task_id),
+        )
+
+        source_file = tmp_path / "aged.txt"
+        source_file.write_text("retained attachment", encoding="utf-8")
+        local_root = str(tmp_path / "local_attachments")
+        attachment = add_task_attachment(
+            conn, task_id, str(source_file), local_root=local_root
+        )
+        bridge_copy = os.path.join(
+            bridge_dir,
+            "attachments",
+            attachment["stored_relpath"].replace("/", os.sep),
+        )
+
+        exported = export_task_files(conn, bridge_dir, attachment_root=local_root)
+
+        assert exported == ["task-live"]
+        assert os.path.isfile(bridge_copy)
+        assert open(bridge_copy, encoding="utf-8").read() == "retained attachment"
+
+    def test_full_export_keeps_active_attachment_with_no_exportable_tasks(
+        self, setup, tmp_path
+    ):
+        """The empty task export path must still retain active attachment blobs."""
+        conn, bridge_dir = setup
+        task_id = "task-only-aged-attachment"
+        _insert_task(conn, task_id, "Only aged archived task", status="archived")
+        conn.execute(
+            "UPDATE tasks SET updated_at = ?, tombstone_pushed_at = ? WHERE id = ?",
+            ("2020-01-01T00:00:00+00:00", "2020-01-02T00:00:00+00:00", task_id),
+        )
+
+        source_file = tmp_path / "only-aged.txt"
+        source_file.write_text("retained without task json", encoding="utf-8")
+        local_root = str(tmp_path / "local_attachments")
+        attachment = add_task_attachment(
+            conn, task_id, str(source_file), local_root=local_root
+        )
+        bridge_copy = os.path.join(
+            bridge_dir,
+            "attachments",
+            attachment["stored_relpath"].replace("/", os.sep),
+        )
+
+        assert export_task_files(conn, bridge_dir, attachment_root=local_root) == []
+        assert os.path.isfile(bridge_copy)
+
+        os.remove(
+            os.path.join(local_root, attachment["stored_relpath"].replace("/", os.sep))
+        )
+        export_task_files(conn, bridge_dir, attachment_root=local_root)
+
+        assert os.path.isfile(bridge_copy)
+        assert (
+            open(bridge_copy, encoding="utf-8").read() == "retained without task json"
+        )
+
+    def test_full_export_removes_removed_attachment_but_keeps_active(
+        self, setup, tmp_path
+    ):
+        """Removed metadata is stale; active metadata is not."""
+        conn, bridge_dir = setup
+        task_id = "task-attachment-status"
+        _insert_task(conn, task_id, "Attachment status task")
+        local_root = str(tmp_path / "local_attachments")
+
+        active_source = tmp_path / "active.txt"
+        active_source.write_text("active", encoding="utf-8")
+        removed_source = tmp_path / "removed.txt"
+        removed_source.write_text("removed", encoding="utf-8")
+        active = add_task_attachment(
+            conn, task_id, str(active_source), local_root=local_root
+        )
+        removed = add_task_attachment(
+            conn, task_id, str(removed_source), local_root=local_root
+        )
+        assert remove_task_attachment(
+            conn, removed["attachment_id"], local_root=local_root
+        )
+
+        active_path = os.path.join(
+            bridge_dir, "attachments", active["stored_relpath"].replace("/", os.sep)
+        )
+        removed_path = os.path.join(
+            bridge_dir, "attachments", removed["stored_relpath"].replace("/", os.sep)
+        )
+        os.makedirs(os.path.dirname(removed_path), exist_ok=True)
+        open(removed_path, "wb").write(b"stale bridge copy")
+
+        export_task_files(conn, bridge_dir, attachment_root=local_root)
+
+        assert os.path.isfile(active_path)
+        assert not os.path.exists(removed_path)
 
     def test_content_aware_preserves_bridge_description(self, setup):
         """NULL local description is filled from existing bridge file, not overwritten."""
