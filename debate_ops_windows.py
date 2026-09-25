@@ -29,6 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TASK_NAME = os.environ.get("DEBATE_PUMP_TASK_NAME", "SqliteMemoryDebatePump")
 PUMP_SCRIPT = ROOT / "hooks" / "debate_pump.py"
+SUPERVISOR_SCRIPT = ROOT / "hooks" / "debate_pump_supervisor.py"
 HEARTBEAT_PATH = Path(
     os.environ.get(
         "DEBATE_PUMP_HEARTBEAT",
@@ -105,6 +106,14 @@ def _pump_command_line() -> str:
     return " ".join([f'"{_pythonw()}"', f'"{PUMP_SCRIPT}"', *PUMP_ARGS])
 
 
+def _autostart_command_line() -> str:
+    """Prefer the user-level restart supervisor when the Task Scheduler
+    fallback is the active autostart mechanism."""
+    if SUPERVISOR_SCRIPT.is_file():
+        return " ".join([f'"{_pythonw()}"', f'"{SUPERVISOR_SCRIPT}"'])
+    return _pump_command_line()
+
+
 def _run_key_installed() -> bool:
     import winreg
 
@@ -120,18 +129,20 @@ def _install_run_key() -> dict[str, object]:
     """IT policy on managed machines can deny schtasks even for user tasks;
     the HKCU Run key is user-writable and gives the same at-logon start.
     MultipleInstances=IgnoreNew is enforced by the pump's own singleton
-    guard; restart-on-failure is NOT available on this path (documented
-    limitation — logon or ``debate_ops start`` restarts it)."""
+    guard. The user-level supervisor supplies restart-on-failure when the
+    managed machine denies a Scheduled Task registration."""
     import winreg
 
     with winreg.OpenKey(
         winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE
     ) as key:
-        winreg.SetValueEx(key, RUN_KEY_VALUE, 0, winreg.REG_SZ, _pump_command_line())
+        winreg.SetValueEx(
+            key, RUN_KEY_VALUE, 0, winreg.REG_SZ, _autostart_command_line()
+        )
     return {
         "mechanism": "run_key",
         "value": RUN_KEY_VALUE,
-        "command": _pump_command_line(),
+        "command": _autostart_command_line(),
     }
 
 
