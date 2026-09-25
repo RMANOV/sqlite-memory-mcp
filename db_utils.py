@@ -1604,6 +1604,7 @@ BRIDGE_GENERATED_TEMP_FILES = frozenset(
         "shared.js.tmp",  # legacy leftover from the removed shared.js writer
         "index.json.tmp",
         "entities_index.json.tmp",
+        "kanban_payload.json.tmp",  # write_kanban_payload tmp; stale copy must never block
     }
 )
 BRIDGE_GENERATED_DIRS = frozenset(
@@ -2083,6 +2084,7 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
         "shared.js.tmp",
         "index.json.tmp",
         "entities_index.json.tmp",
+        "kanban_payload.json.tmp",
         "tasks",
         "entities",
         "attachments",
