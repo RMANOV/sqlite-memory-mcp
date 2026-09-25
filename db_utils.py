@@ -1716,12 +1716,35 @@ def ensure_bridge_git_identity(
     }
 
 
+def _unquote_git_path(path: str) -> str:
+    """Undo git's C-style quoting of porcelain paths (spaces, non-ASCII)."""
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    escapes = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
+    body, out, i = path[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 == len(body):
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = body[i + 1]
+        octal = body[i + 1 : i + 4]
+        if len(octal) == 3 and all(c in "01234567" for c in octal):
+            out.append(int(octal, 8))
+            i += 4
+        else:
+            out.append(escapes.get(nxt, ord(nxt)))
+            i += 2
+    return out.decode("utf-8", "surrogateescape")
+
+
 def _bridge_status_path(line: str) -> str:
     """Extract the repo-relative path from a git status --porcelain line."""
     path = line[3:].strip()
     if " -> " in path:
         path = path.split(" -> ", 1)[1]
-    return path.replace("\\", "/").strip("/")
+    return _unquote_git_path(path).replace("\\", "/").strip("/")
 
 
 def is_generated_bridge_path(path: str) -> bool:
