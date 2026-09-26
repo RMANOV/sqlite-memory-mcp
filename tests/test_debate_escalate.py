@@ -27,13 +27,13 @@ def topic(tmp_path):
     init_debate(
         c, topic_id="X1", title="escalate-tests",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR", "session_id": "s-exec"},
             {"role": "HUMAN", "session_id": "s-human"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(c, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     yield c, "X1"
     c.close()
 

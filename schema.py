@@ -828,6 +828,13 @@ CREATE TABLE IF NOT EXISTS debate_messages (
                      AND provenance_class IN ('legacy', 'unattributed'))
                     OR (author_session_id IS NOT NULL
                         AND provenance_class IN ('parent', 'worker')))),
+    -- C3 phase A (packet v1.3 C1): server-only classification of governance
+    -- rows. Written by the DAO governance insert path only, never from caller
+    -- input, and the immutability triggers key on it (created in
+    -- _create_debate_message_indexes_and_triggers, after the ALTER migration
+    -- so an existing v1 DB gains the column first).
+    governance_schema TEXT DEFAULT NULL
+        CHECK (governance_schema IS NULL OR governance_schema = 'governance/v1'),
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_debmsg_topic_ts
@@ -983,6 +990,43 @@ CREATE INDEX IF NOT EXISTS idx_drb_session
     ON debate_role_bindings(session_id);
 CREATE INDEX IF NOT EXISTS idx_drb_topic_state
     ON debate_role_bindings(topic_id, state);
+
+-- ── C3 governance: append-only authorization spend ledger ────────────────
+-- One row per consumed capability. A single-target grant always spends
+-- target_key 'single'; a manifest grant spends one c3-target/v1 digest per
+-- target under the approved canonical manifest digest. Rows are immutable
+-- (triggers below); the before/after/receipt images are the audit evidence.
+-- Base DDL only: IF NOT EXISTS runs on every init_db, so no migration entry.
+CREATE TABLE IF NOT EXISTS debate_authorization_spends (
+    authorization_msg_id TEXT NOT NULL REFERENCES debate_messages(msg_id),
+    target_key          TEXT NOT NULL,
+    manifest_sha256     TEXT,
+    action              TEXT NOT NULL,
+    control_topic_id    TEXT NOT NULL,
+    target_topic_id     TEXT NOT NULL,
+    target_role         TEXT NOT NULL,
+    target_session_id   TEXT NOT NULL,
+    target_fingerprint  TEXT NOT NULL,
+    issuer_json         TEXT NOT NULL,
+    before_json         TEXT NOT NULL,
+    after_json          TEXT NOT NULL,
+    receipt_json        TEXT NOT NULL,
+    spent_at            TEXT NOT NULL,
+    PRIMARY KEY (authorization_msg_id, target_key),
+    CHECK ((manifest_sha256 IS NULL AND target_key='single')
+        OR (manifest_sha256 IS NOT NULL AND length(manifest_sha256)=64
+            AND length(target_key)=64))
+);
+
+CREATE TRIGGER IF NOT EXISTS debate_authorization_spends_no_update
+BEFORE UPDATE ON debate_authorization_spends BEGIN
+    SELECT RAISE(ABORT, 'debate_authorization_spends is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS debate_authorization_spends_no_delete
+BEFORE DELETE ON debate_authorization_spends BEGIN
+    SELECT RAISE(ABORT, 'debate_authorization_spends is append-only');
+END;
 
 CREATE TABLE IF NOT EXISTS debate_wake_log (
     wake_id             TEXT PRIMARY KEY,
@@ -2453,6 +2497,19 @@ _MIGRATIONS = [
         "AND provenance_class IN ('parent', 'worker'))))",
         "debate_messages.provenance_class column + pairing CHECK (reply ownership)",
     ),
+    # ── C3 phase A (2026-09-14): governance row classification column ──────
+    # Server-only; the governance immutability triggers reference it, so they
+    # are created only in _create_debate_message_indexes_and_triggers(), which
+    # runs after this loop (rebuild or not).  Known cost: the CHECK pins the
+    # literal 'governance/v1' and SQLite cannot alter a CHECK, so a future
+    # governance/v2 needs a debate_messages rebuild.
+    (
+        "SELECT 1 FROM pragma_table_info('debate_messages') "
+        "WHERE name='governance_schema'",
+        "ALTER TABLE debate_messages ADD COLUMN governance_schema TEXT DEFAULT NULL "
+        "CHECK (governance_schema IS NULL OR governance_schema = 'governance/v1')",
+        "debate_messages.governance_schema column (C3 governance rows)",
+    ),
     # The immutability trigger is NOT a _MIGRATIONS entry: the runner splits
     # statements on ';' (trigger bodies contain one), and
     # _create_debate_message_indexes_and_triggers() — executed on every
@@ -2629,6 +2686,24 @@ def _create_debate_message_indexes_and_triggers(conn: sqlite3.Connection) -> Non
             SELECT RAISE(ABORT, 'debate_messages provenance is immutable');
         END
         """,
+        # C3 phase A (packet v1.3 C1): governance rows are immutable by the
+        # server-only column — no column list on the UPDATE trigger, so a
+        # future column cannot reopen the hole, and a DELETE twin.  Created
+        # ONLY here (after the ALTER migration), never in the base DDL.
+        """
+        CREATE TRIGGER IF NOT EXISTS debate_messages_governance_immutable_update
+        BEFORE UPDATE ON debate_messages
+        WHEN old.governance_schema IS NOT NULL BEGIN
+            SELECT RAISE(ABORT, 'governance rows are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS debate_messages_governance_immutable_delete
+        BEFORE DELETE ON debate_messages
+        WHEN old.governance_schema IS NOT NULL BEGIN
+            SELECT RAISE(ABORT, 'governance rows are immutable');
+        END
+        """,
     )
     for statement in statements:
         conn.execute(statement)
@@ -2694,6 +2769,8 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
                              AND provenance_class IN ('legacy', 'unattributed'))
                             OR (author_session_id IS NOT NULL
                                 AND provenance_class IN ('parent', 'worker')))),
+            governance_schema TEXT DEFAULT NULL
+                CHECK (governance_schema IS NULL OR governance_schema = 'governance/v1'),
             created_at TEXT NOT NULL
         )
         """
@@ -2706,12 +2783,13 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
         "INSERT INTO debate_messages_v1_new "
         "(msg_id,topic_id,role,ts,priority,kind,standing,vehicle,reply_to,body,"
         " protocol_version,round_no,body_mode,payload_json,"
-        " author_session_id,provenance_class,created_at) "
+        " author_session_id,provenance_class,governance_schema,created_at) "
         "SELECT msg_id,topic_id,role,ts,priority,kind,"
         f"{source('standing')},{source('vehicle')},reply_to,body,"
         f"{source('protocol_version')},{source('round_no')},"
         f"{source('body_mode')},{source('payload_json')},"
         f"{source('author_session_id')},COALESCE({source('provenance_class')},'legacy'),"
+        f"{source('governance_schema')},"
         "created_at "
         "FROM debate_messages ORDER BY ts,msg_id"
     )
@@ -2737,6 +2815,8 @@ def _migrate_debate_messages_v1(conn: sqlite3.Connection) -> None:
         "debate_messages_fts_ad",
         "debate_messages_fts_au",
         "debate_messages_provenance_immutable",
+        "debate_messages_governance_immutable_update",
+        "debate_messages_governance_immutable_delete",
     ):
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     conn.execute("DROP TABLE debate_messages")

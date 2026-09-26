@@ -58,12 +58,12 @@ def topic(tmp_path):
         topic_id="X1",
         title="vehicle tagging",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
             {"role": "EXECUTOR", "session_id": "codex-exec1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(c, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     bind_role_session(
         c,
         topic_id="X1",
@@ -92,7 +92,7 @@ def _post(conn, topic_id, **kw):
     return debate_post_with_recipients(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body=kw.pop("body", "wake executor"),
@@ -219,7 +219,7 @@ def test_dry_run_refuses_implementation_for_session_diagnostic_target(topic):
     ana = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="analyze (diagnostic)",
@@ -239,7 +239,7 @@ def test_dry_run_refuses_implementation_for_session_diagnostic_target(topic):
     impl = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="apply the patch (diagnostic)",

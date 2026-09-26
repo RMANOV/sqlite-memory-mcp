@@ -59,12 +59,12 @@ def topic(tmp_path):
     init_debate(
         c, topic_id="WR1", title="wake-regression-tests",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR3", "session_id": "s-exec3"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(c, topic_id="WR1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="WR1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     bind_role_session(
         c, topic_id="WR1", role="EXECUTOR3", session_id=IMPL_SESSION,
         runtime="cc", reason="regression fixture",
@@ -76,7 +76,7 @@ def topic(tmp_path):
 def test_impl_trigger_notify_only_and_rescan_dedupe(topic):
     conn, t = topic
     out = debate_post_with_recipients(
-        conn, topic_id=t, role="CONDUCTOR", priority="H", kind="Q",
+        conn, topic_id=t, role="ADVOCATE_CODEX", priority="H", kind="Q",
         body="impl hand-off: fix the widget on your branch",
         addressed_to=["EXECUTOR3"], vehicle="implementation",
     )
@@ -116,7 +116,7 @@ def test_impl_trigger_notify_only_and_rescan_dedupe(topic):
 def test_ping_recipient_derivation_is_roster_only(topic):
     conn, t = topic
     out = post_message(
-        conn, topic_id=t, role="CONDUCTOR", priority="H", kind="PING",
+        conn, topic_id=t, role="ADVOCATE_CODEX", priority="H", kind="PING",
         body=(
             "[ESCALATE:WAKE] wake needed target=EXECUTOR3 target=executor3 "
             "target=BOGUSROLE target=cc-fakesession1234"

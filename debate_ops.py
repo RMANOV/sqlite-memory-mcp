@@ -193,6 +193,63 @@ def cmd_set_priority(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── C3 phase A governance chain (thin wrappers over the DAO) ────────────────
+
+
+def cmd_governance_inventory(args: argparse.Namespace) -> int:
+    from db_utils import get_conn
+    from debate import governance_inventory
+
+    with get_conn() as conn:
+        payload = governance_inventory(conn, topic_id=args.topic_id)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_governance_bootstrap_human(args: argparse.Namespace) -> int:
+    from db_utils import get_conn_immediate
+    from debate import governance_bootstrap_human
+
+    with get_conn_immediate() as conn:
+        payload = governance_bootstrap_human(
+            conn, manifest_path=args.manifest, expected_manifest_sha256=args.sha256
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_governance_approve_pin(args: argparse.Namespace) -> int:
+    from db_utils import get_conn_immediate
+    from debate import governance_approve_pin
+
+    with get_conn_immediate() as conn:
+        payload = governance_approve_pin(
+            conn,
+            manifest_path=args.manifest,
+            expected_manifest_sha256=args.sha256,
+            author_session_id=args.author_session_id,
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_governance_pin(args: argparse.Namespace) -> int:
+    from db_utils import get_conn_immediate
+    from debate import governance_pin
+
+    with get_conn_immediate() as conn:
+        payload = governance_pin(
+            conn,
+            topic_id=args.topic_id,
+            approval_msg_id=args.approval_msg_id,
+            author_session_id=args.author_session_id,
+            manifest_path=args.manifest,
+            expected_manifest_sha256=args.sha256,
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local debate wake pump and runtime hardening helpers."
@@ -261,6 +318,41 @@ def build_parser() -> argparse.ArgumentParser:
     priority.add_argument("--next-action", default="")
     priority.add_argument("--blocked-by", default="")
     priority.set_defaults(func=cmd_set_priority)
+
+    inventory = sub.add_parser(
+        "governance-inventory",
+        help="Print the C3 governance projection of a topic (read-only).",
+    )
+    inventory.add_argument("topic_id")
+    inventory.set_defaults(func=cmd_governance_inventory)
+
+    bootstrap = sub.add_parser(
+        "governance-bootstrap-human",
+        help="Bind the operator HUMAN session from a private bootstrap manifest.",
+    )
+    bootstrap.add_argument("--manifest", required=True)
+    bootstrap.add_argument("--sha256", required=True)
+    bootstrap.set_defaults(func=cmd_governance_bootstrap_human)
+
+    approve = sub.add_parser(
+        "governance-approve-pin",
+        help="HUMAN approval of a pin from a private approve manifest.",
+    )
+    approve.add_argument("--manifest", required=True)
+    approve.add_argument("--sha256", required=True)
+    approve.add_argument("--author-session-id", required=True)
+    approve.set_defaults(func=cmd_governance_approve_pin)
+
+    pin = sub.add_parser(
+        "governance-pin",
+        help="Pin the approved authority (same manifest re-presented).",
+    )
+    pin.add_argument("topic_id")
+    pin.add_argument("approval_msg_id")
+    pin.add_argument("--author-session-id", required=True)
+    pin.add_argument("--manifest", required=True)
+    pin.add_argument("--sha256", required=True)
+    pin.set_defaults(func=cmd_governance_pin)
 
     return parser
 

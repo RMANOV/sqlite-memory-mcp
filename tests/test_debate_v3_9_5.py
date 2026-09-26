@@ -54,10 +54,10 @@ def topic(tmp_path):
     init_debate(
         c, topic_id="X1", title="v3.9.5 lifecycle test",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
             {"role": "EXECUTOR", "session_id": "cc-exec1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     yield c, "X1"
     c.close()
@@ -74,7 +74,7 @@ def test_state_transition_with_reason_persists_in_state_body(topic):
     dropped; the STATE row stored only ``ACTIVE``."""
     conn, t = topic
     result = transition_state(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         new_state="ACTIVE", reason="kickoff",
     )
     assert result["new_state"] == "ACTIVE"
@@ -103,10 +103,10 @@ def test_resolved_transition_with_reason_succeeds(topic):
     gate. Post-fix: single STATE row, no follow-up write, succeeds."""
     conn, t = topic
     transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE",
+        conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE",
     )
     result = transition_state(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         new_state="RESOLVED", reason="all_questions_answered",
     )
     assert result["new_state"] == "RESOLVED"
@@ -123,13 +123,13 @@ def test_archived_transition_with_reason_succeeds(topic):
     terminal state, so the deprecated dual-record path hit it too."""
     conn, t = topic
     transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE",
+        conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE",
     )
     transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED",
+        conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED",
     )
     result = transition_state(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         new_state="ARCHIVED", reason="retention_complete",
     )
     assert result["new_state"] == "ARCHIVED"
@@ -147,7 +147,7 @@ def test_no_reason_transitions_unchanged(topic):
     body shape, not a breaking change for callers that omit reason."""
     conn, t = topic
     r1 = transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE",
+        conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE",
     )
     assert r1["body"] == "ACTIVE"
     row1 = conn.execute(
@@ -157,7 +157,7 @@ def test_no_reason_transitions_unchanged(topic):
     assert row1["body"] == "ACTIVE"
 
     r2 = transition_state(
-        conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED",
+        conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED",
     )
     assert r2["body"] == "RESOLVED"
     row2 = conn.execute(
@@ -180,7 +180,7 @@ def test_state_body_rejects_prefix_junk(topic):
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         post_message(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="H", kind="STATE",
             body="ACTIVE trailing-junk",
         )
@@ -193,7 +193,7 @@ def test_state_body_rejects_empty_reason(topic):
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         post_message(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="H", kind="STATE",
             body="ACTIVE [reason:]",
         )
@@ -207,7 +207,7 @@ def test_state_body_rejects_wrong_bracket_key(topic):
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         post_message(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="H", kind="STATE",
             body="ACTIVE [transition_id: x]",
         )
@@ -221,7 +221,7 @@ def test_state_body_rejects_typo_state_name(topic):
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         post_message(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="H", kind="STATE",
             body="AKTIVE [reason: kickoff]",
         )
@@ -235,7 +235,7 @@ def test_state_body_rejects_multi_line_reason(topic):
     conn, t = topic
     with pytest.raises(DebateError) as exc_info:
         post_message(
-            conn, topic_id=t, role="CONDUCTOR",
+            conn, topic_id=t, role="ADVOCATE_CODEX",
             priority="H", kind="STATE",
             body="ACTIVE [reason: line1\nline2]",
         )
