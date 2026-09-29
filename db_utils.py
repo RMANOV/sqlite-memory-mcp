@@ -4997,6 +4997,7 @@ def apply_task_mutation(
     provenance_map: dict[str, dict[str, Any]] | None = None,
     record_events: bool = True,
     touch_updated_at: bool = True,
+    explicit_clear_fields: tuple[str, ...] = (),
     expected_status: str | None = None,
     expected_status_order: int | None = None,
     expected_status_event_id: str | None = None,
@@ -5006,6 +5007,11 @@ def apply_task_mutation(
     This is the preferred write path for any task update outside low-level merge code.
     """
     raw_changes = {k: v for k, v in changes.items() if k != "updated_at"}
+    if explicit_clear_fields:
+        if set(explicit_clear_fields) != {"parent_id"} or raw_changes.get("parent_id", "missing") is not None:
+            raise ValueError("explicit clear requires parent_id=None")
+        if not record_events or not touch_updated_at:
+            raise ValueError("explicit clear requires events and updated_at")
     status_cas = expected_status is not None
     if status_cas and set(raw_changes) != {"status"}:
         raise ValueError("status CAS accepts exactly one field: status")
@@ -5044,7 +5050,8 @@ def apply_task_mutation(
 
     old_values = {field: row[field] for field in changed_fields}
     effective_changes = {
-        field: value for field, value in raw_changes.items() if row[field] != value
+        field: value for field, value in raw_changes.items()
+        if row[field] != value or field in explicit_clear_fields
     }
     effective_fields = tuple(
         field for field in changed_fields if field in effective_changes
@@ -5159,6 +5166,7 @@ def apply_task_mutation(
             source_ref=source_ref or task_id,
             provenance_map=provenance_map,
             record_events=record_events,
+            explicit_clear_fields=explicit_clear_fields,
         )
     return {
         "updated": cur.rowcount,
@@ -5217,6 +5225,7 @@ def upsert_field_versions(
     source_ref: str | None = None,
     provenance_map: dict[str, dict[str, Any]] | None = None,
     record_events: bool = True,
+    explicit_clear_fields: tuple[str, ...] = (),
 ) -> None:
     """Upsert field versions for the given fields.
 
@@ -5228,6 +5237,14 @@ def upsert_field_versions(
     mid = machine_id or MACHINE_ID
     _old = old_values or {}
     _new = new_values or {}
+    if explicit_clear_fields and (
+        set(explicit_clear_fields) != {"parent_id"}
+        or "parent_id" not in fields
+        or "parent_id" not in _new
+        or _new["parent_id"] is not None
+        or not record_events
+    ):
+        raise ValueError("explicit parent clear needs a recorded parent_id=None event")
     _prov = provenance_map or {}
     column_flags = _task_field_version_column_flags(conn)
     has_old, has_new, has_order, has_event = column_flags
@@ -5258,6 +5275,7 @@ def upsert_field_versions(
                     "field_name": field,
                     "old_value": ov,
                     "new_value": nv,
+                    **({"mutation_intent": "explicit_clear"} if field in explicit_clear_fields else {}),
                 },
                 source_kind=prov.get("source_kind", source_kind),
                 source_ref=prov.get("source_ref", source_ref or task_id),
@@ -5799,14 +5817,177 @@ def canonicalize_exported_task_statuses(
             )
 
 
+class TaskExportConflict(ValueError):
+    """Existing transport authority cannot safely be reconciled with this DB."""
+
+
+def _strict_transport_version(entry: Any) -> tuple[str, str, int, str | None]:
+    """Read an actual wire clock, never synthesize authority from row timestamps."""
+    if isinstance(entry, dict):
+        ts, writer = entry.get("updated_at"), entry.get("updated_by")
+        order, event = entry.get("updated_order", 0), entry.get("source_event_id")
+    elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+        ts, writer = entry[:2]
+        order = entry[2] if len(entry) >= 3 else 0
+        event = entry[3] if len(entry) >= 4 else None
+    else:
+        raise TaskExportConflict("missing or malformed parent field version")
+    if not isinstance(ts, str) or not isinstance(writer, str) or not writer.strip():
+        raise TaskExportConflict("invalid field timestamp/writer")
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise TaskExportConflict("invalid field timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if not isinstance(order, int) or isinstance(order, bool) or order < 0:
+        raise TaskExportConflict("invalid field logical clock")
+    if event is not None and (not isinstance(event, str) or not event.strip()):
+        raise TaskExportConflict("invalid field event id")
+    return parsed.astimezone(timezone.utc).isoformat(), writer, order, event
+
+
+def resolve_export_parent(
+    task_id: str,
+    local_parent: str | None,
+    local_version: Any,
+    existing: dict[str, Any],
+    matching_event: dict[str, Any] | None = None,
+) -> str | None:
+    """Preserve opaque unresolved parents, but never resurrect an explicit clear."""
+    if local_parent is not None or not existing.get("parent_id"):
+        return local_parent
+    if existing.get("id") != task_id:
+        raise TaskExportConflict(f"{task_id}: transport task id mismatch")
+    if not isinstance(existing["parent_id"], str):
+        raise TaskExportConflict(f"{task_id}: invalid transport parent id")
+    remote_fts = existing.get("_field_ts")
+    if not isinstance(remote_fts, dict):
+        raise TaskExportConflict(f"{task_id}: missing transport field versions")
+    local = _strict_transport_version(local_version)
+    remote = _strict_transport_version(remote_fts.get("parent_id"))
+    local_key, remote_key = _field_version_sort_key(*local[:3]), _field_version_sort_key(*remote[:3])
+    if local_key > remote_key:
+        return None
+    if local_key < remote_key or local != remote:
+        raise TaskExportConflict(f"{task_id}: unresolved parent field authority")
+    if matching_event is not None:
+        event_version = _strict_transport_version([
+            matching_event.get("event_ts"), matching_event.get("machine_id"),
+            matching_event.get("logical_clock"), matching_event.get("event_id"),
+        ])
+        if (event_version != local or matching_event.get("aggregate_kind") != "task"
+                or matching_event.get("aggregate_id") != task_id
+                or matching_event.get("field_name") != "parent_id"):
+            raise TaskExportConflict(f"{task_id}: parent event does not match its field version")
+        if matching_event.get("new_value") is None:
+            try:
+                payload = json_loads(matching_event.get("payload_json") or "null")
+            except (TypeError, ValueError) as exc:
+                raise TaskExportConflict(f"{task_id}: invalid parent clear event payload") from exc
+            if (matching_event.get("event_type") == "task_field_set"
+                    and isinstance(payload, dict)
+                    and payload.get("mutation_intent") == "explicit_clear"
+                    and payload.get("task_id") == task_id
+                    and payload.get("field_name") == "parent_id"
+                    and "new_value" in payload and payload["new_value"] is None):
+                return None
+            # Imported/seeded NULL→NULL events also exist. Their matching clock
+            # proves event identity, not an explicit request to erase this edge.
+            raise TaskExportConflict(f"{task_id}: equal-clock NULL event lacks explicit-clear intent")
+    return existing["parent_id"]
+
+
+def prepare_task_export_overrides(
+    conn: sqlite3.Connection, bridge_dir: str,
+) -> dict[str, dict[str, Any]]:
+    """Read all preservation decisions before any generated-file writes.
+
+    Callers in canonical sync reuse this map in the same SQLite read transaction.
+    Standalone exports run the same preflight. No semantic DB writes are made.
+    Non-mergeable timestamp clocks imported by older peers remain opaque transport
+    history; they are not promoted into local value authority.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
+    rows = conn.execute(
+        "SELECT id, parent_id FROM tasks WHERE status NOT IN ('archived','cancelled') "
+        "OR tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?", (cutoff,),
+    ).fetchall()
+    fv_select, has_order, has_event = _task_field_version_select(conn)
+    versions: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(f"SELECT {fv_select} FROM task_field_versions"):
+        versions.setdefault(row["task_id"], {})[row["field_name"]] = _field_version_entry(
+            row, has_order=has_order, has_event=has_event,
+        )
+    overrides = {}
+    for row in rows:
+        tid = row["id"]
+        path = _task_storage_path(tid, bridge_dir)
+        if not path.exists():
+            continue
+        try:
+            existing = json_loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            raise TaskExportConflict(f"{tid}: unreadable transport task") from exc
+        if not isinstance(existing, dict):
+            raise TaskExportConflict(f"{tid}: invalid transport task identity")
+        if existing.get("id") != tid:
+            if existing.get("parent_id"):
+                raise TaskExportConflict(f"{tid}: invalid transport task identity")
+            # Preserve the established non-parent export behavior: an unrelated
+            # sidecar without a parent cannot supply any preservation metadata.
+            continue
+        local_fts = versions.get(tid, {})
+        parent_version = local_fts.get("parent_id")
+        event = None
+        if row["parent_id"] is None and existing.get("parent_id"):
+            event_id = _strict_transport_version(parent_version)[3]
+            if event_id and _sqlite_table_exists(conn, "memory_events"):
+                event_row = conn.execute(
+                    "SELECT * FROM memory_events WHERE event_id=?", (event_id,),
+                ).fetchone()
+                event = dict(event_row) if event_row else None
+        parent = resolve_export_parent(tid, row["parent_id"], parent_version, existing, event)
+        extra = {"parent_id": parent_version} if parent_version is not None else {}
+        existing_fts = existing.get("_field_ts", {})
+        if isinstance(existing_fts, dict):
+            for field in ("created_at", "updated_at"):
+                if field in existing_fts and field not in local_fts:
+                    extra[field] = existing_fts[field]
+        overrides[tid] = {"parent_id": parent, "field_versions": extra}
+    return overrides
+
+
+def apply_task_export_overrides(
+    tasks: list[dict[str, Any]], overrides: dict[str, dict[str, Any]],
+) -> None:
+    for task in tasks:
+        override = overrides.get(task["id"])
+        if override is not None:
+            task["parent_id"] = override["parent_id"]
+            if override["field_versions"]:
+                task["_field_ts"] = {**override["field_versions"], **task.get("_field_ts", {})}
+
+
 def export_task_files(
     conn: sqlite3.Connection,
     bridge_dir: str,
     changed_since: str | None = None,
     *,
     attachment_root: str | None = None,
+    export_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Export active tasks plus recent tombstones to per-task bridge files."""
+    """Export active tasks plus recent tombstones to per-task bridge files.
+
+    BRIDGE_PRESERVE_ORPHAN_ATTACHMENTS retains existing bridge attachment bytes
+    when this machine may not have imported their metadata yet. Task cleanup
+    and attachment metadata remain unchanged; default attachment cleanup is on.
+    Existing named links to entities absent from this local database remain
+    in transport. Known local entity links and explicit link tombstones remain
+    authoritative, so exporting a partial entity snapshot cannot erase edges.
+    """
+    if export_overrides is None:
+        export_overrides = prepare_task_export_overrides(conn, bridge_dir)
     tasks_dir = Path(bridge_dir) / "tasks"
     tasks_dir.mkdir(exist_ok=True)
     attachments_dir = Path(bridge_dir) / "attachments"
@@ -5819,6 +6000,8 @@ def export_task_files(
         for stale in tasks_dir.iterdir():
             if stale.suffix == ".json" and stale.stem not in active_stems:
                 stale.unlink()
+        if _env_flag("BRIDGE_PRESERVE_ORPHAN_ATTACHMENTS"):
+            return
         for stale in attachments_dir.rglob("*"):
             if not stale.is_file():
                 continue
@@ -6044,6 +6227,11 @@ def export_task_files(
         tasks_for_export.append(task)
 
     canonicalize_exported_task_statuses(conn, tasks_for_export)
+    apply_task_export_overrides(tasks_for_export, export_overrides)
+
+    known_entity_names = {
+        row["name"] for row in conn.execute("SELECT name FROM entities")
+    }
 
     for tid in task_ids:
         task = task_map[tid]
@@ -6053,6 +6241,31 @@ def export_task_files(
         if task_path.exists():
             try:
                 existing = json_loads(task_path.read_text(encoding="utf-8"))
+                if existing.get("id") == tid:
+                    # An import cannot materialize a foreign-key link when its
+                    # named entity was not included in this peer's snapshot.
+                    # Carry that unresolved transport edge forward, without
+                    # resurrecting a known local deletion or a link tombstone.
+                    authoritative_names = {
+                        link.get("name")
+                        for link in task["_links"] + task.get("_link_tombstones", [])
+                    }
+                    existing_links = existing.get("_links", [])
+                    if not isinstance(existing_links, list):
+                        existing_links = []
+                    for link in existing_links:
+                        if not isinstance(link, dict):
+                            continue
+                        name = link.get("name")
+                        if (
+                            isinstance(name, str)
+                            and name
+                            and name not in known_entity_names
+                            and name not in authoritative_names
+                            and not link.get("deleted_at")
+                        ):
+                            task["_links"].append(link)
+                            authoritative_names.add(name)
                 if not is_archived_duplicate_redirect_task(task):
                     for content_field in CONTENT_FIELDS:
                         local_content = task.get(content_field)
@@ -6121,11 +6334,16 @@ def mark_tombstones_pushed(
     return stamped
 
 
-def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
+def export_index_json(
+    conn: sqlite3.Connection, bridge_dir: str, *,
+    export_overrides: dict[str, dict[str, Any]] | None = None,
+) -> int:
     """Build index.json: metadata + field versions for all active tasks + tombstones.
 
     Returns count of tasks in index.
     """
+    if export_overrides is None:
+        export_overrides = prepare_task_export_overrides(conn, bridge_dir)
     # Active tasks (no description/notes — metadata only)
     meta_cols = ", ".join(METADATA_FIELDS)
     rows = conn.execute(
@@ -6186,6 +6404,7 @@ def export_index_json(conn: sqlite3.Connection, bridge_dir: str) -> int:
         tasks.append(entry)
 
     canonicalize_exported_task_statuses(conn, tasks)
+    apply_task_export_overrides(tasks, export_overrides)
 
     index = {
         "version": 4,
@@ -6954,8 +7173,19 @@ def merge_import_tasks(
                         source_event_id=remote_event_id,
                         column_flags=field_version_column_flags,
                     )
-                    if local_val != remote_val:
-                        fields_to_update[field] = remote_val
+                    materialized_value = remote_val
+                    if field == "parent_id" and remote_val is not None:
+                        parent_exists = conn.execute(
+                            "SELECT 1 FROM tasks WHERE id=?", (remote_val,),
+                        ).fetchone()
+                        if parent_exists is None:
+                            # A partial peer cannot materialize an unresolved
+                            # foreign key. Keep the remote field clock/value
+                            # above; transport retains the edge until its parent
+                            # arrives. This projection is not a semantic clear.
+                            materialized_value = None
+                    if local_val != materialized_value:
+                        fields_to_update[field] = materialized_value
                         semantic_update_timestamps.append(remote_ts or fallback_ts)
                         updated_fields += 1
                         record_memory_conflict(
@@ -7415,6 +7645,7 @@ def export_entity_files(
             "name": r["name"],
             "entityType": r["entity_type"],
             "project": r["project"],
+            "visibility": r["visibility"],
             "observations": obs_by_eid.get(eid, []),
             "createdAt": r["created_at"],
             "updatedAt": r["updated_at"],
@@ -7520,6 +7751,11 @@ def load_entities_from_files(bridge_dir: str) -> list[dict]:
         if eid is None:
             continue
         content = load_entity_content(eid, bridge_dir)
+        if content and content.get("name") == meta.get("name"):
+            # Older per-entity files omitted visibility even though the index
+            # carried it. Keep an explicit per-file value authoritative.
+            if "visibility" not in content and "visibility" in meta:
+                content = {**content, "visibility": meta["visibility"]}
         entities.append(content if content else meta)
     return entities
 
@@ -7545,20 +7781,47 @@ def load_remote_entities_for_import(
     payload: dict[str, Any],
     logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """Load remote bridge entities, falling back to shared.json on manifest errors."""
+    """Load shared and public entities without losing their visibility."""
     index_path = Path(bridge_dir) / "entities_index.json"
-    if not index_path.exists():
-        return list(payload.get("entities", []))
-    try:
-        json_loads(index_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError, TypeError) as exc:
-        if logger is not None:
-            logger.warning(
-                "entities_index.json read failed: %s; falling back to shared.json entities",
-                exc,
-            )
-        return list(payload.get("entities", []))
-    return load_entities_from_files(bridge_dir)
+    entities = list(payload.get("entities", []))
+    if index_path.exists():
+        try:
+            json_loads(index_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError, TypeError) as exc:
+            if logger is not None:
+                logger.warning(
+                    "entities_index.json read failed: %s; falling back to shared.json entities",
+                    exc,
+                )
+        else:
+            entities = load_entities_from_files(bridge_dir)
+
+    public_payload = payload.get("public_knowledge")
+    public_entities = (
+        public_payload.get("entities", []) if isinstance(public_payload, dict) else []
+    )
+    by_name = {ent.get("name"): ent for ent in entities if isinstance(ent, dict)}
+    for public_ent in public_entities:
+        if not isinstance(public_ent, dict) or not public_ent.get("name"):
+            continue
+        existing = by_name.get(public_ent["name"])
+        if existing is None:
+            ent = {**public_ent, "visibility": public_ent.get("visibility", "public")}
+            entities.append(ent)
+            by_name[ent["name"]] = ent
+        else:
+            # An explicit shared/index privacy setting wins over a possibly
+            # stale public projection. Legacy entities have no such setting.
+            if "visibility" not in existing and not _timestamp_is_newer(
+                existing.get("updatedAt"), public_ent.get("updatedAt")
+            ):
+                existing["visibility"] = public_ent.get("visibility", "public")
+            observations = list(existing.get("observations", []))
+            for obs in public_ent.get("observations", []):
+                if obs not in observations:
+                    observations.append(obs)
+            existing["observations"] = observations
+    return entities
 
 
 def load_remote_tasks_for_merge(
@@ -7643,14 +7906,18 @@ def import_bridge_entities_and_relations(
     new_relations = 0
 
     for ent in entities:
+        visibility = ent.get("visibility", "private")
+        if visibility not in {"private", "pending_public", "public"}:
+            visibility = "private"
         cur = conn.execute(
             "INSERT OR IGNORE INTO entities "
-            "(name, entity_type, project, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(name, entity_type, project, visibility, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 ent["name"],
                 ent["entityType"],
                 ent.get("project"),
+                visibility,
                 ent.get("createdAt", now),
                 ent.get("updatedAt", now),
             ),
@@ -7660,6 +7927,16 @@ def import_bridge_entities_and_relations(
         eid = get_entity_id(conn, ent["name"])
         if not eid:
             continue
+        if not cur.rowcount and "visibility" in ent:
+            local = conn.execute(
+                "SELECT updated_at FROM entities WHERE id = ?", (eid,)
+            ).fetchone()
+            # A stale or tied snapshot must never undo a local privacy choice.
+            if local and _timestamp_is_newer(ent.get("updatedAt"), local["updated_at"]):
+                conn.execute(
+                    "UPDATE entities SET visibility = ?, updated_at = ? WHERE id = ?",
+                    (visibility, ent["updatedAt"], eid),
+                )
         for obs in ent.get("observations", []):
             content = obs["content"] if isinstance(obs, dict) else obs
             created = obs.get("createdAt", now) if isinstance(obs, dict) else now

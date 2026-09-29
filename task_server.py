@@ -506,6 +506,7 @@ def update_task(
             {k: v for k, v in updates.items() if k != "updated_at"},
             timestamp=updates["updated_at"],
             tool_name="sqlite-tasks.update_task",
+            explicit_clear_fields=("parent_id",) if parent_id == "CLEAR" else (),
         )
         if result.get("updated", 0) == 0 and result.get("missing"):
             return json.dumps(

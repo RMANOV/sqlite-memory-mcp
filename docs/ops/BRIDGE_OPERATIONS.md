@@ -50,6 +50,11 @@ Task export eligibility and attachment retention are separate contracts:
 - Incremental export is task-scoped and must not run global stale-file cleanup;
   otherwise an unchanged task or attachment can be deleted by a partial
   keep-set.
+- For a fresh-machine import with incomplete attachment metadata, set
+  `BRIDGE_PRESERVE_ORPHAN_ATTACHMENTS=1` in every sync/MCP process to retain all
+  existing bridge attachment blobs during full export. This opt-in also retains
+  blobs whose metadata says removed; it does not restore them as active
+  attachments or change task-file cleanup. Unset or `0` keeps normal cleanup.
 - Marking an attachment inactive/removed permits cleanup on a later full
   export; it must not make unrelated active attachments removable.
 
@@ -83,6 +88,50 @@ When exact attachment bytes matter on Windows, do not rely on an ordinary Git
 checkout/restore without checking attributes and line-ending behavior. Use a
 byte-preserving restore from a verified object/source and compare SHA-256
 against a manifest before and after the canonical worker run.
+
+## Partial-import preservation
+
+A partial peer can hold a task's parent field clock while its SQLite foreign key
+is temporarily NULL because that parent has not arrived. That projection must
+not clear the original parent on the next export. Before writing generated files,
+the worker resolves parent authority once in its read transaction and reuses the
+result in task files, index, shared payload and Kanban. Matching transport clocks
+retain unresolved parents; contradictory or malformed authority blocks export.
+Imports carrying the parent event also retain the wire value and clock while
+materializing only parents present in the local task table.
+
+An explicit `update_task(parent_id="CLEAR")` creates a new field event even if
+the local projection is already NULL. A matching equal-clock clear requires the
+event's explicit-clear intent; a legacy synthetic NULL event is not enough.
+Older peers' opaque creation/update clocks and named links to entities absent
+locally remain transport history. Existing local link removals and tombstones
+still win. Entity import/export preserves explicit visibility, and stale public
+snapshots cannot override a local private setting.
+
+These rules address a partial-import incident where an export could remove
+unresolved parent edges and field clocks, while bootstrap attachment cleanup
+could drop bytes whose metadata had not arrived. Synthetic regressions also
+cover repeat imports with a causal ledger, parent arrival and explicit clears.
+
+For a synchronization limited to the configured private Git bridge, set
+`BRIDGE_PRIVATE_ONLY=1` in the worker process. This skips pending-public promotion,
+peer delivery, public releases and Cloudflare deployment even when external
+targets are configured. It does not choose or validate the repository, redact
+existing bridge data or change other-machine configuration. The default remains
+off. Set `MACHINE_ID` to the intended provenance identity; otherwise the worker
+uses the hostname. Attachment preservation is a separate opt-in described above.
+
+Run the preservation regression gate with the normal bridge smoke checks:
+
+```bash
+python -m pytest -q tests/test_bridge_parent_preservation.py tests/test_bridge_bootstrap_preservation.py tests/test_bridge_unresolved_links.py tests/test_entity_public_bridge.py
+python bin/bridge_ops.py smoke
+```
+
+A running MCP process must be reconnected after updating its code to load the
+new `CLEAR` callable. A fresh bridge worker loads the updated code on launch.
+Unit tests and a private Git push do not prove that another machine has imported
+the data; that still needs a separate endpoint receipt.
 
 ## Still manual
 

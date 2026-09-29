@@ -36,6 +36,7 @@ from db_utils import (
     git_run,
     git_retry,
     _NOWIN,
+    _env_flag,
     record_memory_conflict,
     serialize_entity,
     export_relations,
@@ -47,6 +48,9 @@ from db_utils import (
     json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
     export_task_files,
     export_index_json,
+    prepare_task_export_overrides,
+    apply_task_export_overrides,
+    TaskExportConflict,
     mark_tombstones_pushed,
     load_remote_tasks_for_merge,
     task_source_event_ids,
@@ -679,7 +683,10 @@ def _export_relations(conn: sqlite3.Connection, entity_ids: set) -> list:
     return export_relations(conn, entity_ids, include_timestamps=True)
 
 
-def _export_tasks(conn: sqlite3.Connection) -> list[dict]:
+def _export_tasks(
+    conn: sqlite3.Connection, bridge_dir: str | None = None, *,
+    export_overrides: dict | None = None,
+) -> list[dict]:
     """Export all non-archived tasks."""
     rows = conn.execute(
         f"SELECT {TASK_EXPORT_COLS} "
@@ -687,6 +694,10 @@ def _export_tasks(conn: sqlite3.Connection) -> list[dict]:
     ).fetchall()
     tasks = [dict(r) for r in rows]
     canonicalize_exported_task_statuses(conn, tasks)
+    if export_overrides is None and bridge_dir is not None:
+        export_overrides = prepare_task_export_overrides(conn, bridge_dir)
+    if export_overrides is not None:
+        apply_task_export_overrides(tasks, export_overrides)
     return tasks
 
 
@@ -851,7 +862,7 @@ def main(
     """
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
-    machine_id = socket.gethostname()
+    machine_id = os.environ.get("MACHINE_ID") or socket.gethostname()
     repo_lock = _RepoSyncLock(bridge_dir)
 
     # Respect push-failure backoff (skip push attempts while in cooldown)
@@ -918,6 +929,7 @@ def _main_locked(
 ) -> dict:
     """Run sync with process/thread locks already held."""
     _db_path = db_path
+    private_only = _env_flag("BRIDGE_PRIVATE_ONLY")
     export_started_at = now_iso()
     promoted_entities = 0
     promoted_tasks = 0
@@ -946,7 +958,7 @@ def _main_locked(
         }
 
     # Phase 1: Promote pending_public (short transaction)
-    if not pull_only:
+    if not pull_only and not private_only:
         with get_conn(_db_path) as conn:
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(minutes=PUBLISH_STANDBY_MINUTES)
@@ -1267,14 +1279,25 @@ def _main_locked(
         _progress(progress_callback, 30, "Exporting relations...")
         relations_out = _export_relations(conn, entity_ids)
         _progress(progress_callback, 40, "Exporting tasks...")
-        tasks_out = _export_tasks(conn)
+        try:
+            export_overrides = prepare_task_export_overrides(conn, bridge_dir)
+        except TaskExportConflict as exc:
+            message = f"task transport preservation blocked export: {exc}"
+            log.error(message)
+            _progress(progress_callback, -1, f"BLOCKED: {message}")
+            return {
+                "entities": 0, "tasks": 0, "pushed": False,
+                "imported_new": new_t, "imported_updated": upd_t,
+                "blocked_by_task_export_conflict": True, "message": message,
+            }
+        tasks_out = _export_tasks(conn, export_overrides=export_overrides)
 
         _progress(progress_callback, 45, "Exporting per-task files...")
         # Full export here (no changed_since): the returned id list contains every
         # task written to the payload, including tombstones. We stamp the pushed
         # tombstones from this exact list AFTER a successful push (see below).
-        exported_task_ids = export_task_files(conn, bridge_dir)
-        export_index_json(conn, bridge_dir)
+        exported_task_ids = export_task_files(conn, bridge_dir, export_overrides=export_overrides)
+        export_index_json(conn, bridge_dir, export_overrides=export_overrides)
 
         _progress(progress_callback, 25, "Exporting per-entity files...")
         _, entity_rows = export_entity_files(conn, bridge_dir)
@@ -1511,7 +1534,7 @@ def _main_locked(
 
     peer_result: dict = {}
     github_release: str | None = None
-    if pushed:
+    if pushed and not private_only:
         try:
             peer_result = publish_peer_payloads(_db_path, tasks_out)
         except Exception as exc:  # noqa: BLE001 - optional peer delivery
@@ -1524,7 +1547,7 @@ def _main_locked(
     # Deploy to Cloudflare Pages (auto-update after push)
     deployed = False
     deployment_result: dict = {}
-    if pushed and os.environ.get("CLOUDFLARE_API_TOKEN"):
+    if pushed and not private_only and os.environ.get("CLOUDFLARE_API_TOKEN"):
         _progress(progress_callback, 97, "CF Pages deploy...")
         deployment_result = _deploy_pages_privacy_shell(bridge_dir)
         deployed = bool(deployment_result["deployed"])
@@ -1535,6 +1558,7 @@ def _main_locked(
 
     _progress(progress_callback, 100, "Done")
     response = {
+        "private_only": private_only,
         "entities": n_ent,
         "observations": n_obs,
         "relations": len(relations_out),
