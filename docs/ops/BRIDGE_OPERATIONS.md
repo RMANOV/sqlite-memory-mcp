@@ -105,8 +105,15 @@ the local projection is already NULL. A matching equal-clock clear requires the
 event's explicit-clear intent; a legacy synthetic NULL event is not enough.
 Older peers' opaque creation/update clocks and named links to entities absent
 locally remain transport history. Existing local link removals and tombstones
-still win. Entity import/export preserves explicit visibility, and stale public
-snapshots cannot override a local private setting.
+still win. Shared entity import/export preserves explicit visibility, and stale
+snapshots cannot override a local private setting. The `public_knowledge`
+projection alone is not an authoritative import source: non-shared public
+entities have no revocation transport, so importing them as publishable local
+entities could leave a peer republishing after the source revokes visibility.
+Only the shared entity transport and its manifest provide that import authority.
+This prevents new public-only imports; it does not migrate, demote or delete
+entities imported by older code. Auditing those existing rows is a separate
+operation. Full replication of the public projection is not provided here.
 
 These rules address a partial-import incident where an export could remove
 unresolved parent edges and field clocks, while bootstrap attachment cleanup

@@ -7781,7 +7781,11 @@ def load_remote_entities_for_import(
     payload: dict[str, Any],
     logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """Load shared and public entities without losing their visibility."""
+    """Load authoritative shared transport without widening publication scope.
+
+    Public-only projections have no revocation transport. Do not promote them
+    into locally publishable entities; their absence later is not a tombstone.
+    """
     index_path = Path(bridge_dir) / "entities_index.json"
     entities = list(payload.get("entities", []))
     if index_path.exists():
@@ -7796,31 +7800,6 @@ def load_remote_entities_for_import(
         else:
             entities = load_entities_from_files(bridge_dir)
 
-    public_payload = payload.get("public_knowledge")
-    public_entities = (
-        public_payload.get("entities", []) if isinstance(public_payload, dict) else []
-    )
-    by_name = {ent.get("name"): ent for ent in entities if isinstance(ent, dict)}
-    for public_ent in public_entities:
-        if not isinstance(public_ent, dict) or not public_ent.get("name"):
-            continue
-        existing = by_name.get(public_ent["name"])
-        if existing is None:
-            ent = {**public_ent, "visibility": public_ent.get("visibility", "public")}
-            entities.append(ent)
-            by_name[ent["name"]] = ent
-        else:
-            # An explicit shared/index privacy setting wins over a possibly
-            # stale public projection. Legacy entities have no such setting.
-            if "visibility" not in existing and not _timestamp_is_newer(
-                existing.get("updatedAt"), public_ent.get("updatedAt")
-            ):
-                existing["visibility"] = public_ent.get("visibility", "public")
-            observations = list(existing.get("observations", []))
-            for obs in public_ent.get("observations", []):
-                if obs not in observations:
-                    observations.append(obs)
-            existing["observations"] = observations
     return entities
 
 

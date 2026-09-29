@@ -1,10 +1,11 @@
-"""Public entity transport must survive a fresh machine without widening access."""
+"""Shared entity visibility survives transport without widening publication."""
 
 import json
 import sqlite3
 
 import pytest
 
+import bridge_sync_worker
 from db_utils import (
     export_entities_index,
     export_entity_files,
@@ -40,7 +41,7 @@ def entity(name, *, project="shared:bridge", visibility=None, updated="2026-08-0
     return result
 
 
-def test_fresh_import_preserves_index_visibility_and_public_only_entity(db, tmp_path):
+def test_fresh_import_preserves_index_visibility_without_public_only_import(db, tmp_path):
     bridge = tmp_path / "bridge"
     (bridge / "entities").mkdir(parents=True)
     shared = entity("Shared published fact")
@@ -54,23 +55,20 @@ def test_fresh_import_preserves_index_visibility_and_public_only_entity(db, tmp_
         {"id": 155, **private, "visibility": "private"},
     ]}), encoding="utf-8")
     public_only = entity("Public-only fact", project="research")
-    relation = {"from": shared["name"], "to": public_only["name"],
+    relation = {"from": shared["name"], "to": private["name"],
                 "relationType": "supports", "createdAt": "2026-07-02T00:00:00Z"}
     payload = {"public_knowledge": {"entities": [shared, public_only]}, "relations": [relation]}
 
     result = import_remote_bridge_data(db, str(bridge), payload)
-    assert result["entities"] == 3
+    assert result["entities"] == 2
     assert result["relations"] == 1
     rows = {row["name"]: dict(row) for row in db.execute("SELECT * FROM entities")}
     assert rows[shared["name"]]["visibility"] == "public"
     assert rows[private["name"]]["visibility"] == "private"
-    assert rows[public_only["name"]]["visibility"] == "public"
-    assert rows[public_only["name"]]["project"] == "research"
-    assert rows[public_only["name"]]["created_at"] == public_only["createdAt"]
-    assert rows[public_only["name"]]["updated_at"] == public_only["updatedAt"]
-    assert db.execute("SELECT count(*) FROM observations").fetchone()[0] == 3
+    assert public_only["name"] not in rows
+    assert db.execute("SELECT count(*) FROM observations").fetchone()[0] == 2
     assert import_remote_bridge_data(db, str(bridge), payload)["entities"] == 0
-    assert db.execute("SELECT count(*) FROM observations").fetchone()[0] == 3
+    assert db.execute("SELECT count(*) FROM observations").fetchone()[0] == 2
 
     _, exported = export_entity_files(db, str(bridge))
     export_entities_index(db, str(bridge), rows=exported)
@@ -110,8 +108,42 @@ def test_explicit_private_shared_entity_wins_over_stale_public_projection(db, tm
     assert db.execute("SELECT visibility FROM entities").fetchone()[0] == "private"
 
 
-def test_public_only_legacy_payload_is_imported_without_entity_manifest(db, tmp_path):
+def test_public_only_legacy_payload_is_not_imported_without_entity_manifest(db, tmp_path):
     public = entity("Legacy published fact", project="research")
     result = import_remote_bridge_data(db, str(tmp_path), {"public_knowledge": {"entities": [public]}})
-    assert result["entities"] == 1
-    assert tuple(db.execute("SELECT name, visibility FROM entities").fetchone()) == (public["name"], "public")
+    assert result["entities"] == 0
+    assert db.execute("SELECT count(*) FROM entities").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("project", ["research", "shared:bridge"])
+def test_export_import_revocation_cannot_leave_peer_republishing(db, tmp_path, project):
+    source_path = tmp_path / "source.db"
+    init_db(str(source_path))
+    source = sqlite3.connect(source_path, isolation_level=None)
+    source.row_factory = sqlite3.Row
+    bridge = tmp_path / "transport"
+    bridge.mkdir()
+    try:
+        item = entity("Publication fixture", project=project, visibility="public")
+        import_bridge_entities_and_relations(source, [item], [])
+
+        def export_and_import():
+            _, rows = export_entity_files(source, str(bridge))
+            export_entities_index(source, str(bridge), rows=rows)
+            public, relations = bridge_sync_worker._export_public_knowledge(source)
+            payload = {"public_knowledge": {"entities": public, "relations": relations}}
+            return import_remote_bridge_data(db, str(bridge), payload)
+
+        first = export_and_import()
+        assert first["entities"] == int(project == "shared:bridge")
+        source.execute("UPDATE entities SET visibility='private', updated_at=? WHERE name=?",
+                       ("2026-08-02T00:00:00Z", item["name"]))
+        export_and_import()
+        republished, _ = bridge_sync_worker._export_public_knowledge(db)
+        assert republished == []
+        rows = db.execute("SELECT visibility FROM entities").fetchall()
+        assert [row["visibility"] for row in rows] == (
+            ["private"] if project == "shared:bridge" else []
+        )
+    finally:
+        source.close()
