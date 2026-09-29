@@ -1241,7 +1241,9 @@ def debate_init(
         topic_id: matches ^[A-Z][A-Z0-9_]+$.
         title: non-empty.
         roles_json: JSON array of unique {role, session_id} dicts. New executor
-            addresses must be numbered: EXECUTOR_1, EXECUTOR_2, ...
+            addresses must be numbered: EXECUTOR_1, EXECUTOR_2, ... or bare
+            EXECUTOR for the next free number. EXECUTOR_N is never inherited
+            by a different session.
         created_by_role: role posting the init.
         resolve_by: optional ISO 8601 UTC deadline.
         metadata_json: JSON object. New official topics must include either
@@ -1939,6 +1941,11 @@ def debate_add_role(
     role is already declared and this session already owns it, returns the
     existing binding with ``added_role=False``.
 
+    role=EXECUTOR (or EXECUTOR_NEXT) allocates the next free EXECUTOR_N; the
+    response carries the allocated role plus display_label/pane_identity.
+    An EXECUTOR_N owned by another session is rejected
+    (executor_number_not_inheritable).
+
     To swap a different active owner for this session, set ``replace_active``
     (atomic). To preserve the new owner's read cursor on an exhausted-session
     handoff, prefer ``debate_rotate_binding`` instead.
@@ -1979,6 +1986,8 @@ def debate_rotate_binding(
     """Atomically rotate a role owner with explicit cursor mode.
 
     cursor_mode must be head, copy, or replay. Missing/invalid mode fails.
+    EXECUTOR_N never rotates to a new session (executor_number_not_inheritable);
+    the new session registers as EXECUTOR for the next free number.
     """
     return _debate_rotate_role_binding_dao(
         conn,

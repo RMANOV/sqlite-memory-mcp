@@ -236,13 +236,83 @@ def validate_numbered_executor_role(role: str) -> None:
         )
 
 
+# A new executor asks for the next free number instead of naming one.
+EXECUTOR_NEXT_ROLES = frozenset({"EXECUTOR", "EXECUTOR_NEXT"})
+
+
+def _executor_owner(conn: sqlite3.Connection, role: str) -> str | None:
+    """Latest session ever bound to ``role`` across all topics (any state)."""
+    row = conn.execute(
+        "SELECT session_id FROM debate_role_bindings WHERE role = ? "
+        "ORDER BY created_at DESC, updated_at DESC LIMIT 1",
+        (role,),
+    ).fetchone()
+    return row["session_id"] if row else None
+
+
+def validate_executor_not_inherited(
+    conn: sqlite3.Connection, role: str, session_id: str
+) -> None:
+    """An EXECUTOR_N number belongs to its session forever; never re-issued."""
+    if not NUMBERED_EXECUTOR_ROLE_RE.fullmatch(role):
+        return
+    owner = _executor_owner(conn, role)
+    if owner is not None and owner != session_id:
+        raise DebateError(
+            f"executor_number_not_inheritable: {role} belongs to session "
+            f"{owner}; request role EXECUTOR to get the next free number",
+            error_type="executor_number_not_inheritable",
+            details={"role": role, "owner_session_id": owner},
+        )
+
+
+def allocate_executor_role(
+    conn: sqlite3.Connection, session_id: str, *, reserved: set[str] | None = None
+) -> str:
+    """Return this session's own EXECUTOR_N, else EXECUTOR_{max_ever+1}.
+
+    Callers run inside the write transaction (BEGIN IMMEDIATE), so the max
+    read and the binding insert are serialized across registrations.
+    """
+    reserved = reserved or set()
+    rows = conn.execute(
+        "SELECT role FROM debate_role_bindings WHERE role GLOB 'EXECUTOR_[1-9]*' "
+        "GROUP BY role"
+    ).fetchall()
+    numbers = [0] + [int(r["role"][9:]) for r in rows if r["role"][9:].isdigit()]
+    for n in sorted(numbers, reverse=True):
+        role = f"EXECUTOR_{n}"
+        if n and role not in reserved and _executor_owner(conn, role) == session_id:
+            return role
+    numbers += [int(r[9:]) for r in reserved]
+    return f"EXECUTOR_{max(numbers) + 1}"
+
+
+def _pane_identity(role: str, session_id: str) -> dict[str, str]:
+    label = role.replace("EXECUTOR_", "E").replace("ADVOCATE", "ADV")
+    # statusline.py matches only a '_<8+ hex>' session_id tail that prefixes
+    # the Claude session UUID (cc-<name>_<uuid8>).
+    if re.search(r"_[0-9a-f]{8,}$", session_id.lower()):
+        hint = (
+            f"Claude pane shows {label} via ~/.claude/statusline.py if the "
+            f"session_id tail is its session UUID prefix; Codex pane: "
+            f"operator runs /rename {label} once"
+        )
+    else:
+        hint = (
+            f"session_id has no _<uuid8> tail, so statusline.py shows no "
+            f"badge: operator runs /rename {label} once in this pane"
+        )
+    return {"display_label": label, "pane_identity": hint}
+
+
 def _validate_unique_roster(roles: list[dict[str, Any]]) -> None:
     seen_roles: set[str] = set()
     seen_sessions: set[str] = set()
     for entry in roles:
         role = str(entry["role"])
         session_id = str(entry["session_id"])
-        if role in seen_roles:
+        if role in seen_roles and role not in EXECUTOR_NEXT_ROLES:
             raise DebateError(
                 f"duplicate_role_in_roster: {role}",
                 error_type="roster_duplicate_role",
@@ -402,6 +472,31 @@ def init_debate(
         "FROM debates WHERE topic_id = ?",
         (topic_id,),
     ).fetchone()
+    if require_numbered_executors:
+        # Resolve bare EXECUTOR before the idempotency check, so a retry of
+        # the same payload gets the number it was given the first time.
+        stored = {
+            str(e.get("session_id")): str(e.get("role"))
+            for e in (json_loads(existing["roles_json"]) if existing else [])
+            if isinstance(e, dict)
+            and NUMBERED_EXECUTOR_ROLE_RE.fullmatch(str(e.get("role")))
+        }
+        allocated: list[str] = []
+        for entry in roles:
+            if entry["role"] in EXECUTOR_NEXT_ROLES:
+                # In place: the caller seeds bindings from the same entries.
+                entry["role"] = stored.get(
+                    str(entry["session_id"])
+                ) or allocate_executor_role(
+                    conn, str(entry["session_id"]), reserved=set(allocated)
+                )
+                allocated.append(entry["role"])
+        _validate_unique_roster(roles)
+        if blind_roles and allocated and EXECUTOR_NEXT_ROLES & set(blind_roles):
+            blind_roles = [
+                r for r in blind_roles if r not in EXECUTOR_NEXT_ROLES
+            ] + allocated
+
     if existing is not None:
         same_roles = json_loads(existing["roles_json"]) == roles
         if same_roles:
@@ -424,6 +519,9 @@ def init_debate(
     if require_numbered_executors:
         for entry in roles:
             validate_numbered_executor_role(str(entry["role"]))
+            validate_executor_not_inherited(
+                conn, str(entry["role"]), str(entry["session_id"])
+            )
 
     now = now_iso()
     metadata = _normalize_initial_topic_priority_metadata(
@@ -2700,6 +2798,8 @@ def bind_role_session(
             error_type="topic_not_found",
         )
     _validate_role_for_debate(debate, topic_id, role)
+    if state != "retired":
+        validate_executor_not_inherited(conn, role, session_id)
 
     now = now_iso()
     runtime = runtime.strip() if isinstance(runtime, str) else ""
@@ -2779,6 +2879,7 @@ def bind_role_session(
         return {
             "topic_id": topic_id,
             "role": role,
+            **_pane_identity(role, session_id),
             "session_id": session_id,
             "runtime": runtime,
             "state": "active",
@@ -2830,6 +2931,7 @@ def bind_role_session(
         return {
             "topic_id": topic_id,
             "role": role,
+            **_pane_identity(role, session_id),
             "session_id": session_id,
             "runtime": runtime,
             "state": "diagnostic",
@@ -2866,6 +2968,7 @@ def bind_role_session(
     return {
         "topic_id": topic_id,
         "role": role,
+        **_pane_identity(role, session_id),
         "session_id": session_id,
         "state": "retired",
         "ownership_gap_override": would_uncover,
@@ -2972,6 +3075,10 @@ def add_role_to_debate(
             error_type="topic_not_found",
         )
 
+    # Legacy topics that declared the bare generic EXECUTOR keep it as-is.
+    if role in EXECUTOR_NEXT_ROLES and not role_in_debate(debate["roles"], role):
+        role = allocate_executor_role(conn, session_id)
+    validate_executor_not_inherited(conn, role, session_id)
     already_declared = role_in_debate(debate["roles"], role)
     if not already_declared:
         validate_numbered_executor_role(role)
@@ -2986,6 +3093,7 @@ def add_role_to_debate(
             return {
                 "topic_id": topic_id,
                 "role": role,
+                **_pane_identity(role, session_id),
                 "session_id": session_id,
                 "runtime": existing_active["runtime"],
                 "state": "active",

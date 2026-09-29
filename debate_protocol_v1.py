@@ -1173,6 +1173,10 @@ def sweep_missing_roles(
         for role in roles:
             if role.upper() in {"HUMAN", "OPERATOR"}:
                 continue
+            if re.fullmatch(r"EXECUTOR_[1-9][0-9]*", role):
+                # Never re-issued to a synthetic session: the number belongs
+                # to its owner (debate.validate_executor_not_inherited).
+                continue
             active = conn.execute(
                 "SELECT 1 FROM debate_role_bindings "
                 "WHERE topic_id=? AND role=? AND state='active' LIMIT 1",

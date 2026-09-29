@@ -211,6 +211,26 @@ their primary wake mechanism.
 - A role with genuinely nothing to add completes its wake with
   `debate_worker_no_action` rather than posting noise.
 
+### Executor numbers are never inherited (operator requirement, 2026-09-29)
+
+- **R1.** An `EXECUTOR_n` number belongs to the session it was first bound to
+  (latest owner in `debate_role_bindings`, any topic, any state). Only that
+  same session may bind it again — e.g. the day-roll carry of a live session
+  into a new day topic.
+- **R2.** A new session registers with role `EXECUTOR` (or `EXECUTOR_NEXT`) in
+  `debate_add_role` / `debate_init` roster; the server allocates
+  `EXECUTOR_{max_ever+1}` inside the write transaction. A session that already
+  owns a number gets its own number back.
+- **R3.** Adding, binding (active/diagnostic), init-rostering or rotating an
+  `EXECUTOR_n` to any other session fails with
+  `executor_number_not_inheritable`. Retiring stays allowed. Non-executor
+  roles (`ADVOCATE`, `CONDUCTOR`, ...) rotate as before.
+- **R4.** Add/bind responses carry `display_label` (`ADV`, `E31`, ...) and a
+  `pane_identity` hint: a Claude pane shows it via `~/.claude/statusline.py`
+  only when the session_id is `cc-<name>_<uuid8>` (tail = its session UUID
+  prefix); otherwise, and in a Codex pane, the operator runs `/rename <label>`
+  once. The protocol-v1 missing-role sweep never re-issues an `EXECUTOR_n`.
+
 ### CONDUCTOR + ADVOCATE — receive, answer, control, and log everything
 
 `CONDUCTOR` and `ADVOCATE` are the supervisory loop. Beyond the all-roles duty
