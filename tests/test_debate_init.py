@@ -285,7 +285,9 @@ def test_debate_init_strict_path_requires_numbered_executor(conn):
             title="strict executor address",
             roles=[
                 {"role": "CONDUCTOR", "session_id": "codex-conductor"},
-                {"role": "EXECUTOR", "session_id": "codex-executor"},
+                # Bare EXECUTOR now means "next free number"; other
+                # unnumbered EXECUTOR* names are still rejected.
+                {"role": "EXECUTOR_LEAD", "session_id": "codex-executor"},
             ],
             created_by_role="CONDUCTOR",
             require_numbered_executors=True,
