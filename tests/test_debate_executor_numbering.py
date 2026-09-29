@@ -25,8 +25,10 @@ from debate import (
     bind_role_session,
     init_debate,
     rotate_role_binding,
+    seed_initial_role_bindings,
     transition_state,
 )
+from debate_protocol_v1 import sweep_missing_roles
 from schema import init_db
 
 
@@ -315,3 +317,89 @@ def test_wrapper_add_role_executor_returns_allocated_label(db, monkeypatch):
         )
     )
     assert denied["error_type"] == "executor_number_not_inheritable"
+
+
+def _roster(*pairs):
+    return [{"role": r, "session_id": s} for r, s in pairs]
+
+
+def test_init_retry_with_bare_executor_is_idempotent(db):
+    conn, _ = db
+    payload = (("CONDUCTOR", "codex-cond1"), ("EXECUTOR", "cc-new"))
+    _init(conn, "RETRY", _roster(*payload))
+    # Client retry after an MCP timeout: same JSON, no bindings seeded yet.
+    again = init_debate(
+        conn,
+        topic_id="RETRY",
+        title="RETRY",
+        roles=_roster(*payload),
+        created_by_role="CONDUCTOR",
+        require_numbered_executors=True,
+    )
+    assert [r["role"] for r in again["roles"]] == ["CONDUCTOR", "EXECUTOR_31"]
+
+
+def test_v1_blind_bare_executor_resolves_to_allocated_number(db):
+    conn, _ = db
+    out = init_debate(
+        conn,
+        topic_id="V1BLIND",
+        title="V1BLIND",
+        roles=_roster(("CONDUCTOR", "codex-cond1"), ("EXECUTOR", "cc-execx1")),
+        created_by_role="CONDUCTOR",
+        require_numbered_executors=True,
+        protocol_version="debate/v1",
+        blind_roles=["CONDUCTOR", "EXECUTOR"],
+    )
+    assert out["roles"][1]["role"] == "EXECUTOR_31"
+    assert "EXECUTOR_31" in json.dumps(out["protocol_state"])
+
+
+def test_v1_sweep_never_reissues_executor_number(db):
+    conn, _ = db
+    roles = _roster(("CONDUCTOR", "codex-cond1"), ("EXECUTOR_7", "cc-exec7"))
+    init_debate(
+        conn,
+        topic_id="V1SWEEP",
+        title="V1SWEEP",
+        roles=roles,
+        created_by_role="CONDUCTOR",
+        require_numbered_executors=True,
+        protocol_version="debate/v1",
+        blind_roles=["CONDUCTOR", "EXECUTOR_7"],
+    )
+    seed_initial_role_bindings(
+        conn, topic_id="V1SWEEP", roles=roles, bound_by_role="CONDUCTOR", reason="t"
+    )
+    transition_state(conn, topic_id="V1SWEEP", role="CONDUCTOR", new_state="ACTIVE")
+    conn.execute(
+        "UPDATE debate_role_bindings SET state='retired' "
+        "WHERE topic_id='V1SWEEP' AND role='EXECUTOR_7'"
+    )
+    actions = sweep_missing_roles(conn, topic_ids=["V1SWEEP"])
+    assert all(a["role"] != "EXECUTOR_7" for a in actions)
+    back = bind_role_session(
+        conn,
+        topic_id="V1SWEEP",
+        role="EXECUTOR_7",
+        session_id="cc-exec7",
+        reason="owner rebinds",
+        replace_active=True,
+    )
+    assert back["state"] == "active"
+
+
+def test_pane_identity_hint_depends_on_uuid_tail(db):
+    conn, _ = db
+    plain = add_role_to_debate(
+        conn, topic_id="DAY1", role="EXECUTOR", session_id="cc-exec_newpane", reason="x"
+    )
+    assert "no _<uuid8> tail" in plain["pane_identity"]
+    tagged = add_role_to_debate(
+        conn,
+        topic_id="DAY1",
+        role="EXECUTOR",
+        session_id="cc-exec_1a2b3c4d",
+        reason="x",
+    )
+    assert "statusline.py if" in tagged["pane_identity"]

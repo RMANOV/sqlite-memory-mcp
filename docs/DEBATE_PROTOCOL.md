@@ -226,8 +226,10 @@ their primary wake mechanism.
   `executor_number_not_inheritable`. Retiring stays allowed. Non-executor
   roles (`ADVOCATE`, `CONDUCTOR`, ...) rotate as before.
 - **R4.** Add/bind responses carry `display_label` (`ADV`, `E31`, ...) and a
-  `pane_identity` hint: Claude panes show it via `~/.claude/statusline.py`;
-  in a Codex pane the operator runs `/rename <label>` once.
+  `pane_identity` hint: a Claude pane shows it via `~/.claude/statusline.py`
+  only when the session_id is `cc-<name>_<uuid8>` (tail = its session UUID
+  prefix); otherwise, and in a Codex pane, the operator runs `/rename <label>`
+  once. The protocol-v1 missing-role sweep never re-issues an `EXECUTOR_n`.
 
 ### CONDUCTOR + ADVOCATE — receive, answer, control, and log everything
 
