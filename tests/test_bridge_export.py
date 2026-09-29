@@ -466,6 +466,37 @@ class TestExportTaskFiles:
         assert not os.path.exists(stale_task)
         assert not os.path.exists(stale_attachment)
 
+    @pytest.mark.parametrize("preserve", [None, "0", "1"])
+    @pytest.mark.parametrize("has_tasks", [False, True])
+    def test_bootstrap_attachment_preservation(
+        self, setup, tmp_path, monkeypatch, preserve, has_tasks
+    ):
+        """A fresh peer can retain blobs whose metadata was not imported."""
+        conn, bridge_dir = setup
+        if preserve is None:
+            monkeypatch.delenv("BRIDGE_PRESERVE_ORPHAN_ATTACHMENTS", raising=False)
+        else:
+            monkeypatch.setenv("BRIDGE_PRESERVE_ORPHAN_ATTACHMENTS", preserve)
+        if has_tasks:
+            _insert_task(conn, "task-live", "Imported task")
+
+        orphan = tmp_path / "bridge" / "attachments" / "legacy" / "source.bin"
+        orphan.parent.mkdir(parents=True)
+        original_bytes = b"original\x00attachment\r\nbytes\n\xff"
+        orphan.write_bytes(original_bytes)
+        stale_task = tmp_path / "bridge" / "tasks" / "task-ghost.json"
+        stale_task.parent.mkdir()
+        stale_task.write_text("{}", encoding="utf-8")
+
+        exported = export_task_files(conn, bridge_dir)
+
+        assert exported == (["task-live"] if has_tasks else [])
+        assert not stale_task.exists()  # The opt-in does not change task cleanup.
+        if preserve == "1":
+            assert orphan.read_bytes() == original_bytes
+        else:
+            assert not orphan.exists()
+
     def test_incremental_export_no_stale_cleanup(self, setup):
         """Incremental export (changed_since set) does NOT delete other task files."""
         conn, bridge_dir = setup
