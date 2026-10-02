@@ -119,6 +119,16 @@ TASK_STATUSES = ("not_started", "in_progress", "done", "archived", "cancelled")
 TASK_TYPES = ("task", "note")
 TASK_HIDDEN_STATUSES = ("archived", "cancelled")
 TASK_ACTIVE_EXCLUSIONS = ("done", "archived", "cancelled")
+TASK_REOPEN_FIELDS = frozenset(
+    {
+        "status",
+        "section",
+        "priority",
+        "due_date",
+        "reminder_at",
+        "recurring",
+    }
+)
 
 DASHBOARD_KINDS = (
     "result",
@@ -5008,7 +5018,10 @@ def apply_task_mutation(
     """
     raw_changes = {k: v for k, v in changes.items() if k != "updated_at"}
     if explicit_clear_fields:
-        if set(explicit_clear_fields) != {"parent_id"} or raw_changes.get("parent_id", "missing") is not None:
+        if (
+            set(explicit_clear_fields) != {"parent_id"}
+            or raw_changes.get("parent_id", "missing") is not None
+        ):
             raise ValueError("explicit clear requires parent_id=None")
         if not record_events or not touch_updated_at:
             raise ValueError("explicit clear requires events and updated_at")
@@ -5050,9 +5063,29 @@ def apply_task_mutation(
 
     old_values = {field: row[field] for field in changed_fields}
     effective_changes = {
-        field: value for field, value in raw_changes.items()
+        field: value
+        for field, value in raw_changes.items()
         if row[field] != value or field in explicit_clear_fields
     }
+    # An explicit confirmation is a real caller command, even when a legacy
+    # writer already changed the row without authoring its hidden status.
+    # Ordinary same-value writes and unrelated edits remain no-ops.
+    if (
+        raw_changes.get("status") in TASK_HIDDEN_STATUSES
+        and row["status"] == raw_changes["status"]
+        and record_events
+        and touch_updated_at
+        and not status_cas
+    ):
+        state = _compute_authoritative_task_statuses(
+            conn,
+            [{"id": task_id, "status": row["status"]}],
+        )[task_id]
+        if _normalize_task_status_value(state.get("value")) not in (
+            *TASK_HIDDEN_STATUSES,
+            None,
+        ):
+            effective_changes["status"] = raw_changes["status"]
     effective_fields = tuple(
         field for field in changed_fields if field in effective_changes
     )
@@ -5275,7 +5308,11 @@ def upsert_field_versions(
                     "field_name": field,
                     "old_value": ov,
                     "new_value": nv,
-                    **({"mutation_intent": "explicit_clear"} if field in explicit_clear_fields else {}),
+                    **(
+                        {"mutation_intent": "explicit_clear"}
+                        if field in explicit_clear_fields
+                        else {}
+                    ),
                 },
                 source_kind=prov.get("source_kind", source_kind),
                 source_ref=prov.get("source_ref", source_ref or task_id),
@@ -5558,6 +5595,7 @@ def _build_task_field_event_heads(
     field_name: str,
 ) -> dict[str, dict[str, Any]]:
     heads: dict[str, dict[str, Any]] = {}
+    histories: dict[str, list[dict[str, Any]]] = {}
     if not events:
         return heads
     for event in events:
@@ -5574,6 +5612,8 @@ def _build_task_field_event_heads(
         if not aggregate_id:
             continue
         candidate = dict(event)
+        if field_name == "status":
+            histories.setdefault(aggregate_id, []).append(candidate)
         current = heads.get(aggregate_id)
         if current is None or _event_sort_key(
             candidate.get("event_ts"),
@@ -5585,6 +5625,10 @@ def _build_task_field_event_heads(
             int(current.get("logical_clock") or 0),
         ):
             heads[aggregate_id] = candidate
+    for aggregate_id, history in histories.items():
+        # Keep genuine intermediate reopen commands: the latest visible event
+        # can be a later in_progress/done edit rather than the initial reopen.
+        heads[aggregate_id]["_status_history"] = [dict(event) for event in history]
     return heads
 
 
@@ -5595,9 +5639,14 @@ def _load_memory_events_by_id(
     if not event_ids or not _sqlite_table_exists(conn, "memory_events"):
         return {}
     placeholders = ",".join("?" * len(event_ids))
+    old_value = (
+        "old_value"
+        if _sqlite_has_column(conn, "memory_events", "old_value")
+        else "NULL AS old_value"
+    )
     rows = conn.execute(
-        "SELECT event_id, event_type, aggregate_id, field_name, machine_id, "
-        "logical_clock, event_ts, new_value FROM memory_events WHERE event_id IN ("
+        "SELECT event_id, event_type, aggregate_kind, aggregate_id, field_name, machine_id, "
+        f"logical_clock, event_ts, {old_value}, new_value FROM memory_events WHERE event_id IN ("
         + placeholders
         + ")",
         tuple(event_ids),
@@ -5613,38 +5662,96 @@ def _load_task_field_event_heads(
     if not task_ids or not _sqlite_table_exists(conn, "memory_events"):
         return {}
     placeholders = ",".join("?" * len(task_ids))
+    old_value = (
+        "old_value"
+        if _sqlite_has_column(conn, "memory_events", "old_value")
+        else "NULL AS old_value"
+    )
     rows = conn.execute(
-        "SELECT event_id, event_type, aggregate_id, field_name, machine_id, "
-        "logical_clock, event_ts, new_value FROM memory_events "
+        "SELECT event_id, event_type, aggregate_kind, aggregate_id, field_name, machine_id, "
+        f"logical_clock, event_ts, {old_value}, new_value FROM memory_events "
         "WHERE aggregate_kind = 'task' "
         "AND field_name = ? AND aggregate_id IN (" + placeholders + ")",
         (field_name, *task_ids),
     ).fetchall()
-    heads: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        aggregate_id = row["aggregate_id"]
-        candidate = dict(row)
-        # See _build_task_field_event_heads: excluded during head selection so
-        # a bookkeeping event cannot shadow the authoring event beneath it.
-        if _is_bookkeeping_event(candidate):
-            continue
-        current = heads.get(aggregate_id)
-        if current is None or _event_sort_key(
-            candidate.get("event_ts"),
-            candidate.get("machine_id"),
-            int(candidate.get("logical_clock") or 0),
-        ) > _event_sort_key(
-            current.get("event_ts"),
-            current.get("machine_id"),
-            int(current.get("logical_clock") or 0),
+    return _build_task_field_event_heads([dict(row) for row in rows], field_name)
+
+
+def _hidden_status_transition_blocked(
+    current_status: Any, state: dict[str, Any]
+) -> bool:
+    """An ambiguous hidden row needs confirmation, not a synthetic reopening."""
+    target = _normalize_task_status_value(state.get("value"))
+    return (
+        _normalize_task_status_value(current_status) in TASK_HIDDEN_STATUSES
+        and target is not None
+        and target not in TASK_HIDDEN_STATUSES
+        and not state.get("hidden_reopen_authorized", False)
+    )
+
+
+def _status_author_event_matches(
+    event: dict[str, Any] | None,
+    task_id: str | None,
+    value: Any,
+    version: tuple[str, str, int, str | None],
+) -> bool:
+    return bool(
+        event
+        and task_id
+        and event.get("event_type") == "task_field_set"
+        and event.get("aggregate_kind") == "task"
+        and event.get("aggregate_id") == task_id
+        and event.get("field_name") == "status"
+        and _normalize_task_status_value(event.get("new_value")) == value
+        and (
+            str(event.get("event_ts") or ""),
+            str(event.get("machine_id") or ""),
+            int(event.get("logical_clock") or 0),
+            event.get("event_id"),
+        )
+        == version
+    )
+
+
+def _status_history_has_reopening(
+    task_id: str | None,
+    closure: dict[str, Any],
+    reopening: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> bool:
+    def key(event):
+        return _event_sort_key(
+            event.get("event_ts"),
+            event.get("machine_id"),
+            int(event.get("logical_clock") or 0),
+        )
+
+    lower, upper = key(closure), key(reopening)
+    hidden = _normalize_task_status_value(closure.get("new_value"))
+    opened = False
+    for event in sorted([*history, reopening], key=key):
+        value = _normalize_task_status_value(event.get("new_value"))
+        if not (
+            lower < key(event) <= upper
+            and event.get("event_type") == "task_field_set"
+            and event.get("aggregate_kind") == "task"
+            and event.get("aggregate_id") == task_id
+            and event.get("field_name") == "status"
+            and value is not None
         ):
-            heads[aggregate_id] = candidate
-    return heads
+            continue
+        if value in TASK_HIDDEN_STATUSES:
+            hidden, opened = value, False
+        elif _normalize_task_status_value(event.get("old_value")) == hidden:
+            opened = True
+    return opened
 
 
 def _resolve_task_status_authority(
     current_status: Any,
     *,
+    task_id: str | None = None,
     field_updated_at: str | None = None,
     field_updated_by: str | None = None,
     field_updated_order: int = 0,
@@ -5693,6 +5800,12 @@ def _resolve_task_status_authority(
     ):
         if not event or _is_bookkeeping_event(event):
             continue
+        if task_id and (
+            event.get("aggregate_kind") != "task"
+            or event.get("aggregate_id") != task_id
+            or event.get("field_name") != "status"
+        ):
+            continue
         event_id = str(event.get("event_id") or "")
         if event_id and event_id in seen_events:
             continue
@@ -5720,12 +5833,48 @@ def _resolve_task_status_authority(
         return best
 
     chosen = max(candidates, key=lambda item: item["_sort_key"])
+    field_version = (
+        str(field_updated_at or ""),
+        str(field_updated_by or ""),
+        int(field_updated_order or 0),
+        source_event_id,
+    )
+    closure = (event_by_id or {}).get(source_event_id) if source_event_id else None
+    reopening = (event_by_id or {}).get(chosen["source_event_id"])
+    if event_head and event_head.get("event_id") == chosen["source_event_id"]:
+        reopening = event_head
+    chosen_version = (
+        chosen["updated_at"],
+        chosen["updated_by"],
+        chosen["updated_order"],
+        chosen["source_event_id"],
+    )
+    # Preserve distributed API reopening of a *versioned* hidden closure.
+    # A row timestamp, a newer value-only clock, or a bookkeeping event cannot
+    # supply the missing causal token of an unversioned closure.
+    hidden_reopen_authorized = (
+        raw_status in TASK_HIDDEN_STATUSES
+        and chosen["value"] not in TASK_HIDDEN_STATUSES
+        and field_value in (None, raw_status)
+        and _status_author_event_matches(closure, task_id, raw_status, field_version)
+        and _status_author_event_matches(
+            reopening, task_id, chosen["value"], chosen_version
+        )
+        and chosen["_sort_key"] > _field_version_sort_key(*field_version[:3])
+        and _status_history_has_reopening(
+            task_id,
+            closure,
+            reopening,
+            (event_head or {}).get("_status_history", []),
+        )
+    )
     return {
         "value": chosen["value"],
         "updated_at": chosen["updated_at"],
         "updated_by": chosen["updated_by"],
         "updated_order": chosen["updated_order"],
         "source_event_id": chosen["source_event_id"],
+        "hidden_reopen_authorized": bool(hidden_reopen_authorized),
     }
 
 
@@ -5777,6 +5926,7 @@ def _compute_authoritative_task_statuses(
         row = status_rows.get(tid)
         state = _resolve_task_status_authority(
             task.get("status"),
+            task_id=tid,
             field_updated_at=row["updated_at"] if row else None,
             field_updated_by=row["updated_by"] if row else None,
             field_updated_order=int(row["updated_order"] or 0)
@@ -5796,6 +5946,14 @@ def canonicalize_exported_task_statuses(
     tasks: list[dict[str, Any]],
 ) -> None:
     status_map = _compute_authoritative_task_statuses(conn, tasks)
+    # Validate the entire batch before changing even an in-memory wire payload.
+    for task in tasks:
+        state = status_map.get(str(task.get("id") or ""), {})
+        if _hidden_status_transition_blocked(task.get("status"), state):
+            raise TaskExportConflict(
+                f"{task['id']}: hidden status {task['status']} conflicts with "
+                f"{state['value']} authority; confirm the intended status with update_task"
+            )
     for task in tasks:
         tid = str(task.get("id") or "")
         if not tid:
@@ -5807,6 +5965,8 @@ def canonicalize_exported_task_statuses(
         if resolved_status is None:
             continue
         task["status"] = resolved_status
+        if resolved_status not in TASK_HIDDEN_STATUSES:
+            task.pop("_tombstone", None)
         if "_field_ts" in task and state.get("updated_at"):
             task["_field_ts"]["status"] = _field_ts_entry_from_status(
                 state.get("updated_at", ""),
@@ -5866,40 +6026,88 @@ def resolve_export_parent(
         raise TaskExportConflict(f"{task_id}: missing transport field versions")
     local = _strict_transport_version(local_version)
     remote = _strict_transport_version(remote_fts.get("parent_id"))
-    local_key, remote_key = _field_version_sort_key(*local[:3]), _field_version_sort_key(*remote[:3])
+    local_key, remote_key = (
+        _field_version_sort_key(*local[:3]),
+        _field_version_sort_key(*remote[:3]),
+    )
     if local_key > remote_key:
         return None
     if local_key < remote_key or local != remote:
         raise TaskExportConflict(f"{task_id}: unresolved parent field authority")
     if matching_event is not None:
-        event_version = _strict_transport_version([
-            matching_event.get("event_ts"), matching_event.get("machine_id"),
-            matching_event.get("logical_clock"), matching_event.get("event_id"),
-        ])
-        if (event_version != local or matching_event.get("aggregate_kind") != "task"
-                or matching_event.get("aggregate_id") != task_id
-                or matching_event.get("field_name") != "parent_id"):
-            raise TaskExportConflict(f"{task_id}: parent event does not match its field version")
+        event_version = _strict_transport_version(
+            [
+                matching_event.get("event_ts"),
+                matching_event.get("machine_id"),
+                matching_event.get("logical_clock"),
+                matching_event.get("event_id"),
+            ]
+        )
+        if (
+            event_version != local
+            or matching_event.get("aggregate_kind") != "task"
+            or matching_event.get("aggregate_id") != task_id
+            or matching_event.get("field_name") != "parent_id"
+        ):
+            raise TaskExportConflict(
+                f"{task_id}: parent event does not match its field version"
+            )
         if matching_event.get("new_value") is None:
             try:
                 payload = json_loads(matching_event.get("payload_json") or "null")
             except (TypeError, ValueError) as exc:
-                raise TaskExportConflict(f"{task_id}: invalid parent clear event payload") from exc
-            if (matching_event.get("event_type") == "task_field_set"
-                    and isinstance(payload, dict)
-                    and payload.get("mutation_intent") == "explicit_clear"
-                    and payload.get("task_id") == task_id
-                    and payload.get("field_name") == "parent_id"
-                    and "new_value" in payload and payload["new_value"] is None):
+                raise TaskExportConflict(
+                    f"{task_id}: invalid parent clear event payload"
+                ) from exc
+            if (
+                matching_event.get("event_type") == "task_field_set"
+                and isinstance(payload, dict)
+                and payload.get("mutation_intent") == "explicit_clear"
+                and payload.get("task_id") == task_id
+                and payload.get("field_name") == "parent_id"
+                and "new_value" in payload
+                and payload["new_value"] is None
+            ):
                 return None
             # Imported/seeded NULL→NULL events also exist. Their matching clock
             # proves event identity, not an explicit request to erase this edge.
-            raise TaskExportConflict(f"{task_id}: equal-clock NULL event lacks explicit-clear intent")
+            raise TaskExportConflict(
+                f"{task_id}: equal-clock NULL event lacks explicit-clear intent"
+            )
     return existing["parent_id"]
 
 
+def _pending_task_status_reopen_clause(
+    conn: sqlite3.Connection,
+) -> tuple[str, tuple[str, ...]]:
+    """Include safely reopened projections even before the hidden row is repaired."""
+    rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE status IN ('archived','cancelled')"
+    ).fetchall()
+    states = _compute_authoritative_task_statuses(conn, [dict(row) for row in rows])
+    ids = tuple(
+        tid for tid, state in states.items() if state.get("hidden_reopen_authorized")
+    )
+    return (f" OR id IN ({','.join('?' for _ in ids)})", ids) if ids else ("", ())
+
+
+def _validate_task_export_statuses(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
+    reopen_clause, reopened_ids = _pending_task_status_reopen_clause(conn)
+    rows = conn.execute(
+        "SELECT id, parent_id, status, visibility FROM tasks WHERE status NOT IN ('archived','cancelled') "
+        f"OR tombstone_pushed_at IS NULL OR tombstone_pushed_at > ? OR visibility='public'{reopen_clause}",
+        (cutoff, *reopened_ids),
+    ).fetchall()
+    # Public export includes aged-out hidden rows too. Validate the union before
+    # any task, entity or attachment export changes generated bridge bytes.
+    canonicalize_exported_task_statuses(conn, [dict(row) for row in rows])
+    return rows
+
+
 def prepare_task_export_overrides(
-    conn: sqlite3.Connection, bridge_dir: str,
+    conn: sqlite3.Connection,
+    bridge_dir: str,
 ) -> dict[str, dict[str, Any]]:
     """Read all preservation decisions before any generated-file writes.
 
@@ -5908,16 +6116,16 @@ def prepare_task_export_overrides(
     Non-mergeable timestamp clocks imported by older peers remain opaque transport
     history; they are not promoted into local value authority.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=_TOMBSTONE_DAYS)).isoformat()
-    rows = conn.execute(
-        "SELECT id, parent_id FROM tasks WHERE status NOT IN ('archived','cancelled') "
-        "OR tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?", (cutoff,),
-    ).fetchall()
+    rows = _validate_task_export_statuses(conn)
     fv_select, has_order, has_event = _task_field_version_select(conn)
     versions: dict[str, dict[str, Any]] = {}
     for row in conn.execute(f"SELECT {fv_select} FROM task_field_versions"):
-        versions.setdefault(row["task_id"], {})[row["field_name"]] = _field_version_entry(
-            row, has_order=has_order, has_event=has_event,
+        versions.setdefault(row["task_id"], {})[row["field_name"]] = (
+            _field_version_entry(
+                row,
+                has_order=has_order,
+                has_event=has_event,
+            )
         )
     overrides = {}
     for row in rows:
@@ -5944,10 +6152,13 @@ def prepare_task_export_overrides(
             event_id = _strict_transport_version(parent_version)[3]
             if event_id and _sqlite_table_exists(conn, "memory_events"):
                 event_row = conn.execute(
-                    "SELECT * FROM memory_events WHERE event_id=?", (event_id,),
+                    "SELECT * FROM memory_events WHERE event_id=?",
+                    (event_id,),
                 ).fetchone()
                 event = dict(event_row) if event_row else None
-        parent = resolve_export_parent(tid, row["parent_id"], parent_version, existing, event)
+        parent = resolve_export_parent(
+            tid, row["parent_id"], parent_version, existing, event
+        )
         extra = {"parent_id": parent_version} if parent_version is not None else {}
         existing_fts = existing.get("_field_ts", {})
         if isinstance(existing_fts, dict):
@@ -5959,14 +6170,18 @@ def prepare_task_export_overrides(
 
 
 def apply_task_export_overrides(
-    tasks: list[dict[str, Any]], overrides: dict[str, dict[str, Any]],
+    tasks: list[dict[str, Any]],
+    overrides: dict[str, dict[str, Any]],
 ) -> None:
     for task in tasks:
         override = overrides.get(task["id"])
         if override is not None:
             task["parent_id"] = override["parent_id"]
             if override["field_versions"]:
-                task["_field_ts"] = {**override["field_versions"], **task.get("_field_ts", {})}
+                task["_field_ts"] = {
+                    **override["field_versions"],
+                    **task.get("_field_ts", {}),
+                }
 
 
 def export_task_files(
@@ -5988,6 +6203,9 @@ def export_task_files(
     """
     if export_overrides is None:
         export_overrides = prepare_task_export_overrides(conn, bridge_dir)
+    else:
+        # Supplying parent overrides must not bypass status preflight.
+        _validate_task_export_statuses(conn)
     tasks_dir = Path(bridge_dir) / "tasks"
     tasks_dir.mkdir(exist_ok=True)
     attachments_dir = Path(bridge_dir) / "attachments"
@@ -6024,10 +6242,11 @@ def export_task_files(
     # This keeps export-eligibility the exact complement of Tier-2 hard-delete
     # eligibility (see TaskDAO.purge_done), so no tombstone can age out of export
     # before it has propagated.
+    reopen_clause, reopened_ids = _pending_task_status_reopen_clause(conn)
     export_filter = (
         "WHERE (status NOT IN ('archived', 'cancelled') "
         "OR (status IN ('archived', 'cancelled') "
-        "AND (tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?)))"
+        f"AND (tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?)){reopen_clause})"
     )
     if changed_since:
         # Incremental export: normally only rows touched since the last push are
@@ -6041,14 +6260,14 @@ def export_task_files(
             f"SELECT {TASK_EXPORT_COLS} FROM tasks "
             f"{export_filter} AND (updated_at >= ? "
             "OR (status IN ('archived', 'cancelled') "
-            "AND tombstone_pushed_at IS NULL)) "
+            f"AND tombstone_pushed_at IS NULL){reopen_clause}) "
             "ORDER BY created_at",
-            (cutoff, changed_since),
+            (cutoff, *reopened_ids, changed_since, *reopened_ids),
         ).fetchall()
     else:
         rows = conn.execute(
             f"SELECT {TASK_EXPORT_COLS} FROM tasks {export_filter} ORDER BY created_at",
-            (cutoff,),
+            (cutoff, *reopened_ids),
         ).fetchall()
 
     exported: list[str] = []
@@ -6318,6 +6537,11 @@ def mark_tombstones_pushed(
     ids = [tid for tid in exported_ids if isinstance(tid, str) and tid]
     if not ids:
         return 0
+    # A pending genuine reopen can export a visible projection while its raw
+    # row is still hidden. That payload did not push a tombstone.
+    _, reopened_ids = _pending_task_status_reopen_clause(conn)
+    reopened = set(reopened_ids)
+    ids = [tid for tid in ids if tid not in reopened]
     stamped = 0
     # Chunk to stay under SQLite's variable limit on very large payloads.
     for start in range(0, len(ids), 500):
@@ -6335,7 +6559,9 @@ def mark_tombstones_pushed(
 
 
 def export_index_json(
-    conn: sqlite3.Connection, bridge_dir: str, *,
+    conn: sqlite3.Connection,
+    bridge_dir: str,
+    *,
     export_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> int:
     """Build index.json: metadata + field versions for all active tasks + tombstones.
@@ -6346,9 +6572,11 @@ def export_index_json(
         export_overrides = prepare_task_export_overrides(conn, bridge_dir)
     # Active tasks (no description/notes — metadata only)
     meta_cols = ", ".join(METADATA_FIELDS)
+    reopen_clause, reopened_ids = _pending_task_status_reopen_clause(conn)
     rows = conn.execute(
         f"SELECT {meta_cols} FROM tasks "
-        "WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
+        f"WHERE status NOT IN ('archived', 'cancelled'){reopen_clause} ORDER BY created_at",
+        reopened_ids,
     ).fetchall()
 
     # Tombstones: archived/cancelled rows still inside the push-aware retention
@@ -6360,8 +6588,13 @@ def export_index_json(
         f"SELECT {meta_cols} FROM tasks "
         "WHERE status IN ('archived', 'cancelled') "
         "AND (tombstone_pushed_at IS NULL OR tombstone_pushed_at > ?) "
-        "ORDER BY updated_at",
-        (cutoff,),
+        + (
+            f"AND id NOT IN ({','.join('?' for _ in reopened_ids)}) "
+            if reopened_ids
+            else ""
+        )
+        + "ORDER BY updated_at",
+        (cutoff, *reopened_ids),
     ).fetchall()
 
     # Batch-fetch field versions for all tasks + tombstones (avoid N+1)
@@ -6579,6 +6812,51 @@ def merge_import_tasks(
     remote_id_set = {rid for rid in remote_ids if isinstance(rid, str) and rid}
     remote_event_by_id = _build_event_lookup_by_id(remote_events)
     remote_status_heads = _build_task_field_event_heads(remote_events, "status")
+    # Reject contradictory transport before *any* batch write. The worker may
+    # catch ValueError inside its transaction, so a late validation error would
+    # otherwise commit an earlier subset and hide the incomplete import.
+    seen_payloads: dict[str, dict[str, Any]] = {}
+    for remote in tasks_sorted:
+        tid = remote.get("id")
+        if not isinstance(tid, str) or not tid:
+            continue
+        if tid in seen_payloads and seen_payloads[tid] != remote:
+            raise ValueError(f"{tid}: contradictory duplicate task UUID")
+        seen_payloads[tid] = remote
+        fts = remote.get("_field_ts", {})
+        ts, writer, order, event_id = _parse_field_ts(
+            fts, "status", remote.get("updated_at", "")
+        )
+        value = _field_ts_explicit_value(fts, "status")
+        if value is _FIELD_VALUE_MISSING and _legacy_payload_value_is_authoritative(
+            field="status",
+            updated_by=writer,
+            source_machine_id=(
+                remote.get("_source_machine_id")
+                or remote.get("source_machine")
+                or remote.get("machine_id")
+            ),
+        ):
+            value = remote.get("status")
+        state = _resolve_task_status_authority(
+            remote.get("status"),
+            task_id=tid,
+            field_updated_at=ts,
+            field_updated_by=writer,
+            field_updated_order=order,
+            source_event_id=event_id,
+            source_new_value=value,
+            event_by_id=remote_event_by_id,
+            event_head=remote_status_heads.get(tid),
+        )
+        if _hidden_status_transition_blocked(remote.get("status"), state):
+            raise ValueError(
+                f"{tid}: hidden transport status conflicts with visible authority"
+            )
+        if remote.get("_tombstone") and state.get("value") not in TASK_HIDDEN_STATUSES:
+            raise ValueError(
+                f"{tid}: tombstone status must resolve to archived or cancelled"
+            )
     if remote_ids:
         placeholders = ",".join("?" * len(remote_ids))
         existing_rows = conn.execute(
@@ -6719,6 +6997,7 @@ def merge_import_tasks(
             remote_status_source_value = remote.get("status")
         remote_status_state = _resolve_task_status_authority(
             remote.get("status"),
+            task_id=tid,
             field_updated_at=remote_status_ts,
             field_updated_by=remote_status_by,
             field_updated_order=remote_status_order,
@@ -6942,10 +7221,37 @@ def merge_import_tasks(
             local_status_value = _normalize_task_status_value(
                 (local_status_state or {}).get("value")
             )
+            original_local_status = task_content_map.get(local_id, {}).get("status")
+            blocked_status_repair = _hidden_status_transition_blocked(
+                original_local_status,
+                local_status_state or {},
+            )
+            if blocked_status_repair:
+                version = local_fvs.get("status", ("", "", 0, None))
+                record_memory_conflict(
+                    conn,
+                    aggregate_kind="task",
+                    aggregate_id=local_id,
+                    field_name="status",
+                    local_value=original_local_status,
+                    remote_value=local_status_value,
+                    local_updated_at=version[0],
+                    remote_updated_at=(local_status_state or {}).get("updated_at"),
+                    local_updated_order=version[2],
+                    remote_updated_order=(local_status_state or {}).get(
+                        "updated_order", 0
+                    ),
+                    local_source_event_id=version[3],
+                    remote_source_event_id=(local_status_state or {}).get(
+                        "source_event_id"
+                    ),
+                    winner="guard_local",
+                    rationale="hidden status requires explicit confirmation before visible authority repair",
+                )
             if (
                 local_status_value is not None
-                and local_status_value
-                != task_content_map.get(local_id, {}).get("status")
+                and local_status_value != original_local_status
+                and not blocked_status_repair
             ):
                 fields_to_update["status"] = local_status_value
                 materialization_repairs.add("status")
@@ -7029,14 +7335,7 @@ def merge_import_tasks(
                         local_task_status in TASK_HIDDEN_STATUSES
                         and remote_task_status not in TASK_HIDDEN_STATUSES
                     )
-                    if hidden_local_remote_reopens and field in {
-                        "status",
-                        "section",
-                        "priority",
-                        "due_date",
-                        "reminder_at",
-                        "recurring",
-                    }:
+                    if hidden_local_remote_reopens and field in TASK_REOPEN_FIELDS:
                         if local_val != remote_val:
                             record_memory_conflict(
                                 conn,
@@ -7176,7 +7475,8 @@ def merge_import_tasks(
                     materialized_value = remote_val
                     if field == "parent_id" and remote_val is not None:
                         parent_exists = conn.execute(
-                            "SELECT 1 FROM tasks WHERE id=?", (remote_val,),
+                            "SELECT 1 FROM tasks WHERE id=?",
+                            (remote_val,),
                         ).fetchone()
                         if parent_exists is None:
                             # A partial peer cannot materialize an unresolved

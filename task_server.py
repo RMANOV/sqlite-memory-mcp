@@ -435,6 +435,10 @@ def update_task(
 
     Pass special value "CLEAR" to set a field to NULL.
 
+    Explicitly confirming an archived/cancelled status whose row conflicts with
+    visible field/event authority records that confirmation once. Repeating a
+    consistent same-status command remains a no-op.
+
     ``description`` is the primary body field for task/note text.
     ``notes`` is reserved for secondary/internal metadata.
 

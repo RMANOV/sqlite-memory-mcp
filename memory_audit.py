@@ -17,7 +17,10 @@ from typing import Any
 
 from db_utils import (
     MERGEABLE_FIELDS,
+    TASK_REOPEN_FIELDS,
+    _compute_authoritative_task_statuses,
     _event_sort_key,
+    _hidden_status_transition_blocked,
     _store_task_field_version,
     _normalize_task_status_value,
     _sqlite_has_column,
@@ -214,9 +217,18 @@ def rebuild_task_from_events(
     rebuilt: dict[str, Any] = {}
     drift: dict[str, dict[str, Any]] = {}
     max_event_ts = ""
+    status_state = _compute_authoritative_task_statuses(
+        conn,
+        [{"id": task_id, "status": row["status"]}],
+    )[task_id]
     for field in MERGEABLE_FIELDS:
         head = event_heads.get(field)
-        if head is not None:
+        if field == "status":
+            # Status replay uses the same authoring-event and hidden-closure
+            # decision as import/export, never a fresh bookkeeping repair.
+            rebuilt[field] = status_state["value"]
+            max_event_ts = max(max_event_ts, status_state["updated_at"])
+        elif head is not None:
             value = _parse_event_value(head.get("new_value"))
             rebuilt[field] = _materialize_task_field_value(field, value)
             max_event_ts = max(max_event_ts, str(head.get("event_ts") or ""))
@@ -234,8 +246,18 @@ def rebuild_task_from_events(
 
     repaired_fields: list[str] = []
     repair_skipped_reason: str | None = None
+    blocked_fields = sorted(
+        set(drift) & TASK_REOPEN_FIELDS
+        if _hidden_status_transition_blocked(row["status"], status_state)
+        else set()
+    )
+    repairable_drift = {
+        field: value for field, value in drift.items() if field not in blocked_fields
+    }
+    if repair and blocked_fields:
+        repair_skipped_reason = "hidden_status_requires_confirmation"
     row_updated = str(row["updated_at"] or "")
-    if repair and drift and max_event_ts:
+    if repair and repairable_drift and max_event_ts:
         if row_updated > max_event_ts:
             logger.warning(
                 "Task %s: updated_at (%s) is ahead of max event ts (%s) — "
@@ -246,13 +268,16 @@ def rebuild_task_from_events(
             )
             repair_skipped_reason = "materialized_newer_than_ledger"
         else:
-            set_clause = ", ".join(f"{field} = ?" for field in drift)
-            values = [rebuilt[field] for field in drift] + [max_event_ts, task_id]
+            set_clause = ", ".join(f"{field} = ?" for field in repairable_drift)
+            values = [rebuilt[field] for field in repairable_drift] + [
+                max_event_ts,
+                task_id,
+            ]
             conn.execute(
                 f"UPDATE tasks SET {set_clause}, updated_at = ? WHERE id = ?",
                 values,
             )
-            for field in drift:
+            for field in repairable_drift:
                 version_row = versions.get(field)
                 if version_row is not None:
                     _store_task_field_version(
@@ -267,9 +292,9 @@ def rebuild_task_from_events(
                         updated_order=int(version_row["updated_order"] or 0),
                         source_event_id=version_row["source_event_id"],
                     )
-            repaired_fields = sorted(drift)
+            repaired_fields = sorted(repairable_drift)
             # EB-03 fix: record repair in event ledger so future audits see it
-            for field in drift:
+            for field in repairable_drift:
                 record_memory_event(
                     conn,
                     event_type="repair",
@@ -288,6 +313,7 @@ def rebuild_task_from_events(
         "drift": drift,
         "repaired_fields": repaired_fields,
         "repair_skipped_reason": repair_skipped_reason,
+        "blocked_fields": blocked_fields,
         "max_event_ts": max_event_ts or None,
     }
 

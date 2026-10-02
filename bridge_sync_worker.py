@@ -33,6 +33,7 @@ from db_utils import (
     TASK_EXPORT_COLS,
     apply_task_mutation,
     canonicalize_exported_task_statuses,
+    _pending_task_status_reopen_clause,
     git_run,
     git_retry,
     _NOWIN,
@@ -684,13 +685,17 @@ def _export_relations(conn: sqlite3.Connection, entity_ids: set) -> list:
 
 
 def _export_tasks(
-    conn: sqlite3.Connection, bridge_dir: str | None = None, *,
+    conn: sqlite3.Connection,
+    bridge_dir: str | None = None,
+    *,
     export_overrides: dict | None = None,
 ) -> list[dict]:
     """Export all non-archived tasks."""
+    reopen_clause, reopened_ids = _pending_task_status_reopen_clause(conn)
     rows = conn.execute(
         f"SELECT {TASK_EXPORT_COLS} "
-        "FROM tasks WHERE status NOT IN ('archived', 'cancelled') ORDER BY created_at"
+        f"FROM tasks WHERE status NOT IN ('archived', 'cancelled'){reopen_clause} ORDER BY created_at",
+        reopened_ids,
     ).fetchall()
     tasks = [dict(r) for r in rows]
     canonicalize_exported_task_statuses(conn, tasks)
@@ -1286,9 +1291,13 @@ def _main_locked(
             log.error(message)
             _progress(progress_callback, -1, f"BLOCKED: {message}")
             return {
-                "entities": 0, "tasks": 0, "pushed": False,
-                "imported_new": new_t, "imported_updated": upd_t,
-                "blocked_by_task_export_conflict": True, "message": message,
+                "entities": 0,
+                "tasks": 0,
+                "pushed": False,
+                "imported_new": new_t,
+                "imported_updated": upd_t,
+                "blocked_by_task_export_conflict": True,
+                "message": message,
             }
         tasks_out = _export_tasks(conn, export_overrides=export_overrides)
 
@@ -1296,7 +1305,9 @@ def _main_locked(
         # Full export here (no changed_since): the returned id list contains every
         # task written to the payload, including tombstones. We stamp the pushed
         # tombstones from this exact list AFTER a successful push (see below).
-        exported_task_ids = export_task_files(conn, bridge_dir, export_overrides=export_overrides)
+        exported_task_ids = export_task_files(
+            conn, bridge_dir, export_overrides=export_overrides
+        )
         export_index_json(conn, bridge_dir, export_overrides=export_overrides)
 
         _progress(progress_callback, 25, "Exporting per-entity files...")

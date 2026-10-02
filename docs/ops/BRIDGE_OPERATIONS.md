@@ -140,6 +140,40 @@ new `CLEAR` callable. A fresh bridge worker loads the updated code on launch.
 Unit tests and a private Git push do not prove that another machine has imported
 the data; that still needs a separate endpoint receipt.
 
+## Hidden status conflicts
+
+An older status field/event must not make an unversioned `archived` or
+`cancelled` row visible again. Import and audit preserve that row and its
+scheduling fields. Export reports `blocked_by_task_export_conflict` before
+authoring generated files or copying attachments, including for aged-out public
+tasks. This gate applies to the export phase; Git pull and legacy migrations can
+already have changed downloaded transport files.
+
+Confirm the intended hidden status explicitly with
+`update_task(task_id=..., status="archived")` or `status="cancelled"`, then retry
+the normal bridge sync. That command records one genuine caller-authored status
+event even when the row already has the requested hidden value. Further
+consistent confirmations are no-ops. Do not edit field clocks or synthesize an
+archive event from `tasks.updated_at`.
+
+A deliberate local API reopen still works. A peer reopen also works when a
+genuine later status event follows a matching versioned hidden closure; both
+events must match the UUID, status field, value and field/event clock. A newer
+value-only clock or a bookkeeping event is insufficient. Legacy hidden rows
+without that causal closure token require explicit local confirmation.
+This uses existing event authorship and clock ordering, rather than a new
+causal-token protocol; an unversioned repeat archive that preserves an old hidden
+token remains ambiguous. Use the versioned API for every status write.
+
+The synthetic incident and adversarial regressions are:
+
+```bash
+python -m pytest -q tests/test_hidden_status_preservation.py tests/test_merge.py tests/test_memory_audit.py tests/test_task_status_cas.py tests/test_auto_archive.py
+```
+
+The OODA plan and release evidence are in
+[`HIDDEN_STATUS_OODA_20261002.md`](HIDDEN_STATUS_OODA_20261002.md).
+
 ## Still manual
 
 These remain operator checks and are not closed by unit tests:
