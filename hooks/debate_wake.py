@@ -552,6 +552,54 @@ def _agent_command(
     return None
 
 
+def _routing_binding_snapshot(target: dict[str, Any], trigger: str, topic: str) -> dict[str, Any] | None:
+    """Capture authoritative original recipient/binding before any OS launch."""
+    sys.path.insert(0, str(REPO))
+    from db_utils import get_conn_immediate
+
+    with get_conn_immediate() as conn:
+        row = conn.execute(
+            "SELECT r.recipient,r.recipient_mode,b.session_id,b.generation,b.state "
+            "FROM debate_message_recipients r JOIN debate_messages m ON m.msg_id=r.msg_id "
+            "JOIN debate_role_bindings b ON b.topic_id=m.topic_id "
+            "WHERE m.msg_id=? AND m.topic_id=? AND r.recipient=? AND b.role=? "
+            "AND b.session_id=? ORDER BY b.generation DESC LIMIT 1",
+            (trigger, topic, target.get("recipient"), target.get("target_role"), target.get("target_session_id")),
+        ).fetchone()
+        if row is None:
+            return None
+        state = "diagnostic" if row["recipient_mode"] == "diagnostic" else "active"
+        if row["state"] != state:
+            return None
+        return {"recipient":row["recipient"], "recipient_mode":row["recipient_mode"],
+                "binding_session_id":row["session_id"], "binding_generation":row["generation"]}
+
+
+def _routing_snapshot_current(conn: sqlite3.Connection, snapshot: Any, target: dict[str, Any], trigger: str, topic: str) -> bool:
+    """Audit-transaction recheck: spawn-before-rebind is not current delivery proof."""
+    if not isinstance(snapshot, dict):
+        return False
+    state = "diagnostic" if snapshot.get("recipient_mode") == "diagnostic" else "active"
+    binding = conn.execute(
+        "SELECT 1 FROM debate_role_bindings b JOIN debate_message_recipients r ON r.msg_id=? "
+        "JOIN debate_messages m ON m.msg_id=r.msg_id AND m.topic_id=b.topic_id "
+        "WHERE b.topic_id=? AND b.role=? AND b.session_id=? AND b.generation=? AND b.state=? "
+        "AND r.recipient=? AND r.recipient_mode=?",
+        (trigger, topic, target.get("target_role"), snapshot.get("binding_session_id"),
+         snapshot.get("binding_generation"), state, snapshot.get("recipient"), snapshot.get("recipient_mode")),
+    ).fetchone()
+    if binding is None:
+        return False
+    worker = target.get("target_session_id")
+    if snapshot.get("recipient_mode") == "diagnostic" and worker == snapshot.get("binding_session_id"):
+        return True
+    return conn.execute(
+        "SELECT 1 FROM debate_worker_claims WHERE topic_id=? AND role=? AND trigger_msg_id=? "
+        "AND parent_session_id=? AND worker_session_id=? AND state IN ('active','completed')",
+        (topic, target.get("target_role"), trigger, snapshot.get("binding_session_id"), worker),
+    ).fetchone() is not None
+
+
 def _record_real_spawn(
     *,
     trigger_msg_id: str,
@@ -599,6 +647,15 @@ def _record_real_spawn(
                 "parent_session_id": target.get("parent_session_id"),
                 "worker_claim": target.get("worker_claim"),
             }
+            snapshot = target.get("routing_binding_snapshot")
+            if _routing_snapshot_current(conn, snapshot, target, trigger_msg_id, topic_id):
+                details.update(snapshot)
+                details.update({"routing_receipt_version":1, "launch_confirmed":True,
+                                "worker_session_id":target_session_id})
+            else:
+                # Real OS spawn, but uncertain/stale attribution. Never fabricate
+                # confirmed delivery or silently authorize a second launch.
+                details["launch_confirmed"] = False
             # Requeue retry: the unique (trigger, session, action) receipt
             # index forbids a second row, but liveness reads pid+create_time
             # from this receipt — a re-spawned worker must refresh it or the
@@ -626,9 +683,9 @@ def _record_real_spawn(
                     }
                 ]
                 conn.execute(
-                    "UPDATE debate_wake_log SET details_json = ?, created_at = ? "
+                    "UPDATE debate_wake_log SET details_json = ?, created_at = ?, binding_generation = ? "
                     "WHERE wake_id = ?",
-                    (json_dumps(details), launched_at, wake_id),
+                    (json_dumps(details), launched_at, snapshot.get("binding_generation") if isinstance(snapshot, dict) else None, wake_id),
                 )
             else:
                 wake_id = new_msg_id()
@@ -651,7 +708,7 @@ def _record_real_spawn(
                         target_role,
                         target_session_id,
                         target_runtime,
-                        None,
+                        snapshot.get("binding_generation") if isinstance(snapshot, dict) else None,
                         action,
                         "real_spawn",
                         DEBATE_WAKE_SCHEMA_VERSION,
@@ -1071,7 +1128,9 @@ def _maybe_dispatch(
                 skipped_target=target,
             )
             break
-        launch = _launch_agent(target, str(tool_response.get("msg_id") or ""), topic_id)
+        trigger = str(tool_response.get("msg_id") or "")
+        target = {**target, "routing_binding_snapshot": _routing_binding_snapshot(target, trigger, topic_id)}
+        launch = _launch_agent(target, trigger, topic_id)
         if launch.get("launched"):
             remaining -= 1
             _mark_source_wake_result(
