@@ -92,32 +92,117 @@ def _json_maybe(value: Any) -> Any:
     return value
 
 
-def _unwrap_tool_response(value: Any) -> dict[str, Any] | None:
-    """Accept Claude hook shapes and MCP result wrappers.
+_RESPONSE_WRAPPER_KEYS = (
+    "result", "structuredContent", "structured_content", "content", "text",
+    "tool_response", "toolResponse", "tool_result", "toolResult", "tool_output", "output",
+)
+_HOOK_RESPONSE_KEYS = (
+    "tool_response", "toolResponse", "tool_result", "toolResult", "tool_output", "response", "result",
+)
+_IDENTITY_KEYS = ("msg_id", "topic_id", "schema_version")
+_NORMALIZE_MAX_DEPTH = 12
+_NORMALIZE_MAX_NODES = 256
+_NORMALIZE_MAX_LIST = 64
+_NORMALIZE_MAX_JSON_BYTES = 262144
 
-    Observed MCP output often arrives as {"result": "{\"msg_id\": ...}"},
-    but hook schemas differ across Claude versions. Keep this recursive and
-    conservative so schema drift fails closed in the DAO layer.
+
+def _normalize_tool_response(value: Any, depth: int = 0) -> dict[str, Any] | None:
+    """Collect compatible identities across known wrappers, or fail closed.
+
+    Never select a success prefix before inspecting all recognized branches.
+    Return an original candidate, not a synthetic merger. DAO schema/row
+    validation remains authoritative after normalization.
     """
-    value = _json_maybe(value)
-    if isinstance(value, dict):
-        if "msg_id" in value or "schema_version" in value:
-            return value
-        for key in ("result", "tool_response", "tool_output", "output"):
-            if key in value:
-                unwrapped = _unwrap_tool_response(value[key])
-                if unwrapped is not None:
-                    return unwrapped
-    return None
+    candidates: list[dict[str, Any]] = []
+    visited = 0
+    rejected = False
+
+    def scalar(marker: Any) -> bool:
+        return (
+            isinstance(marker, (str, int, float))
+            and not isinstance(marker, bool)
+            and bool(str(marker).strip())
+        )
+
+    def visit(node: Any, level: int) -> None:
+        nonlocal visited, rejected
+        if rejected:
+            return
+        visited += 1
+        if level > _NORMALIZE_MAX_DEPTH or visited > _NORMALIZE_MAX_NODES:
+            rejected = True
+            return
+        if isinstance(node, str):
+            # Bound before parsing, including multibyte UTF-8 wrappers.
+            try:
+                byte_count = len(node.encode("utf-8")) if len(node) <= _NORMALIZE_MAX_JSON_BYTES else _NORMALIZE_MAX_JSON_BYTES + 1
+            except UnicodeEncodeError:
+                rejected = True
+                return
+            if byte_count > _NORMALIZE_MAX_JSON_BYTES:
+                rejected = True
+                return
+            parsed = _json_maybe(node)
+            if parsed is not node and parsed != node:
+                visit(parsed, level + 1)
+            return
+        if isinstance(node, dict):
+            if node.get("isError") is True:
+                rejected = True
+                return
+            if "msg_id" in node or "schema_version" in node:
+                if "msg_id" not in node or any(not scalar(node[k]) for k in _IDENTITY_KEYS if k in node):
+                    rejected = True
+                    return
+                candidates.append(node)
+            for key in _RESPONSE_WRAPPER_KEYS:
+                if key in node:
+                    visit(node[key], level + 1)
+        elif isinstance(node, (list, tuple)):
+            if len(node) > _NORMALIZE_MAX_LIST:
+                rejected = True
+                return
+            for item in node:
+                visit(item, level + 1)
+
+    visit(value, depth)
+    if rejected or not candidates:
+        return None
+    for key in _IDENTITY_KEYS:
+        provided = [candidate[key] for candidate in candidates if key in candidate]
+        if any(item != provided[0] for item in provided[1:]):
+            return None
+    return max(candidates, key=lambda item: sum(key in item for key in _IDENTITY_KEYS))
+
+
+def _unwrap_tool_response(value: Any) -> dict[str, Any] | None:
+    return _normalize_tool_response(value)
 
 
 def _extract_tool_response(hook_payload: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("tool_response", "tool_output", "response", "result"):
-        if key in hook_payload:
-            out = _unwrap_tool_response(hook_payload[key])
-            if out is not None:
-                return out
+    if "tool_response" in hook_payload:
+        return _normalize_tool_response(hook_payload["tool_response"])
+    aliases = [hook_payload[key] for key in _HOOK_RESPONSE_KEYS[1:] if key in hook_payload]
+    if aliases:
+        return _normalize_tool_response(aliases)
     return _unwrap_tool_response(hook_payload)
+
+
+def _describe_shape(value: Any, depth: int = 0, keys: tuple[str, ...] = _RESPONSE_WRAPPER_KEYS) -> dict[str, Any]:
+    """Allowlisted type/count sketches; unknown names and values never log."""
+    if depth > 3:
+        return {"type": "bounded"}
+    if isinstance(value, dict):
+        known = [key for key in keys if key in value]
+        return {
+            "type": "dict", "unknown_key_count": len(value) - len(known),
+            "known_key_count": len(known), "omitted_known_children": max(0, len(known) - 4),
+            "children": {key: _describe_shape(value[key], depth + 1) for key in known[:4]},
+        }
+    if isinstance(value, (list, tuple)):
+        return {"type": "list", "count": len(value), "items": [_describe_shape(item, depth + 1) for item in value[:4]]}
+    # Input from json.loads has only builtin types. Do not log custom class names.
+    return {"type": "str" if isinstance(value, str) else "scalar"}
 
 
 def _notify(target: dict[str, Any], trigger_msg_id: str) -> None:
@@ -1063,8 +1148,11 @@ def _run_hook() -> int:
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
-    except Exception as exc:
-        _log("invalid_hook_payload", error=str(exc))
+    except Exception:
+        _log("invalid_hook_payload", reason="invalid_json")
+        return 0
+    if not isinstance(payload, dict):
+        _log("invalid_hook_payload", reason="non_object")
         return 0
 
     tool_name = str(payload.get("tool_name") or payload.get("toolName") or "")
@@ -1073,7 +1161,10 @@ def _run_hook() -> int:
 
     tool_response = _extract_tool_response(payload)
     if tool_response is None:
-        _log("missing_tool_response", tool_name=tool_name, keys=sorted(payload.keys()))
+        _log(
+            "missing_tool_response", tool_name="debate_post_with_recipients" if tool_name else "unknown",
+            response_shape=_describe_shape(payload, keys=_HOOK_RESPONSE_KEYS),
+        )
         return 0
 
     if _agent_resolution_disabled(tool_response):
