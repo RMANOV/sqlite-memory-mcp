@@ -372,10 +372,19 @@ def _fetch_pending_deliveries(
             con.close()
 
 
-def _complete_pending_deliveries(msg_id: str, *, enqueued_at: str | None = None) -> int:
-    """Acknowledge the durable queue only after the trigger is terminal."""
+def _complete_pending_deliveries(
+    msg_id: str, *, enqueued_at: str | None = None,
+    suppressed_roles: set[str] | None = None,
+) -> int:
+    """Complete on an owned write transaction; main always supplies ACK policy.
+
+    None preserves the queue-only helper used by legacy synthetic callers.
+    A supplied set (including empty) requires exact all-recipient proof.
+    """
     con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
     try:
+        con.execute("BEGIN IMMEDIATE")
         has_delivery_queue = (
             con.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -384,7 +393,17 @@ def _complete_pending_deliveries(msg_id: str, *, enqueued_at: str | None = None)
             is not None
         )
         if not has_delivery_queue:
+            if suppressed_roles is not None:
+                raise sqlite3.OperationalError("delivery queue unavailable for guarded completion")
+            con.rollback()
             return 0
+        if suppressed_roles is not None:
+            acknowledged, _pending = _delivery_acknowledged_on_connection(
+                con, msg_id, suppressed_roles
+            )
+            if not acknowledged:
+                con.rollback()
+                return 0
         queued_at = enqueued_at or _now()
         con.execute(
             "INSERT OR IGNORE INTO debate_delivery_queue "
@@ -401,6 +420,9 @@ def _complete_pending_deliveries(msg_id: str, *, enqueued_at: str | None = None)
         )
         con.commit()
         return int(cur.rowcount)
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 
@@ -539,6 +561,116 @@ def _recipient_has_terminal_reply(
         ).fetchone()
         is not None
     )
+
+
+def _cursor_reached(cursor: sqlite3.Row | None, trigger_ts: str, trigger_id: str) -> bool:
+    return bool(cursor and cursor["last_processed_ts"] and
+                (str(cursor["last_processed_ts"]), str(cursor["last_processed_msg_id"] or "")) >= (trigger_ts, trigger_id))
+
+
+def _confirmed_delivery_receipt(con: sqlite3.Connection, *, topic: str, trigger: str,
+                                recipient: str, mode: str, binding: sqlite3.Row) -> bool:
+    """Exact current binding/worker launch proof; historical reservations do not count."""
+    rows = con.execute(
+        "SELECT * FROM debate_wake_log WHERE topic_id=? AND trigger_msg_id=? "
+        "AND recipient=? AND result IN ('real_spawn','dispatched')",
+        (topic, trigger, recipient),
+    ).fetchall()
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(details, dict):
+            continue
+        if type(details.get("routing_receipt_version")) is not int or details["routing_receipt_version"] != 1:
+            continue
+        if details.get("launch_confirmed") is not True:
+            continue
+        expected = {"recipient": recipient, "recipient_mode": mode,
+                    "binding_session_id": binding["session_id"], "binding_generation": binding["generation"]}
+        if any(details.get(key) != value for key, value in expected.items()):
+            continue
+        if type(details.get("binding_generation")) is not int:
+            continue
+        if row["binding_generation"] != binding["generation"]:
+            continue
+        worker = details.get("worker_session_id")
+        if not isinstance(worker, str) or not worker or row["target_session_id"] != worker or row["target_role"] != binding["role"]:
+            continue
+        if mode == "diagnostic" and worker == binding["session_id"]:
+            return True  # Direct diagnostic launch has no derived worker claim.
+        claim = con.execute(
+            "SELECT 1 FROM debate_worker_claims WHERE topic_id=? AND role=? "
+            "AND trigger_msg_id=? AND parent_session_id=? AND worker_session_id=? "
+            "AND state IN ('active','completed') LIMIT 1",
+            (topic, binding["role"], trigger, binding["session_id"], worker),
+        ).fetchone()
+        if claim is not None:
+            return True
+    return False
+
+
+def _delivery_acknowledged(msg_id: str, suppressed_roles: set[str]) -> tuple[bool, list[str]]:
+    """Queue ACK is separate from cursor-terminal, and each recipient owns its proof."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        return _delivery_acknowledged_on_connection(con, msg_id, suppressed_roles)
+    finally:
+        con.close()
+
+
+def _delivery_acknowledged_on_connection(
+    con: sqlite3.Connection, msg_id: str, suppressed_roles: set[str],
+) -> tuple[bool, list[str]]:
+    """Read evidence without starting, ending or closing the caller's transaction."""
+    msg = con.execute("SELECT topic_id,ts FROM debate_messages WHERE msg_id=?", (msg_id,)).fetchone()
+    if msg is None:
+        return True, []
+    topic, ts = str(msg["topic_id"]), str(msg["ts"])
+    pending = []
+    for row in con.execute("SELECT recipient,recipient_mode FROM debate_message_recipients WHERE msg_id=? ORDER BY recipient", (msg_id,)):
+        recipient, mode = str(row["recipient"]), str(row["recipient_mode"])
+        if recipient.upper() in suppressed_roles or recipient.upper() in _HUMAN_ROLES:
+            continue
+        role_mode = mode == "normal" and bool(_ROLE_RE.fullmatch(recipient))
+        if role_mode:
+            if _recipient_has_terminal_reply(con, topic, recipient, msg_id):
+                continue
+            watermark = con.execute("SELECT last_processed_ts,last_processed_msg_id FROM debate_watermarks WHERE topic_id=? AND role=?", (topic, recipient)).fetchone()
+            if _cursor_reached(watermark, ts, msg_id):
+                continue
+            binding = con.execute("SELECT * FROM debate_role_bindings WHERE topic_id=? AND role=? AND state='active' ORDER BY generation DESC LIMIT 1", (topic, recipient)).fetchone()
+        else:
+            # Do not resolve a direct address through another same-role session.
+            state = "diagnostic" if mode == "diagnostic" else "active"
+            binding = con.execute("SELECT * FROM debate_role_bindings WHERE topic_id=? AND session_id=? AND state=? ORDER BY generation DESC LIMIT 1", (topic, recipient, state)).fetchone()
+        if binding is not None:
+            cursor = con.execute("SELECT last_processed_ts,last_processed_msg_id FROM debate_signal_state WHERE topic_id=? AND session_id=? AND role=?", (topic, binding["session_id"], binding["role"])).fetchone()
+            if _cursor_reached(cursor, ts, msg_id) or _confirmed_delivery_receipt(con, topic=topic, trigger=msg_id, recipient=recipient, mode=mode, binding=binding):
+                continue
+        pending.append(recipient)
+    return not pending, pending
+
+
+_WITHHELD_DELIVERY_LOGGED: dict[str, tuple[str, ...]] = {}
+_WITHHELD_DELIVERY_SATURATED = False
+
+
+def _log_withheld_delivery(msg_id: str, topic_id: str, pending: list[str]) -> None:
+    global _WITHHELD_DELIVERY_SATURATED
+    if len(_WITHHELD_DELIVERY_LOGGED) < 1024:
+        _WITHHELD_DELIVERY_SATURATED = False
+    signature = tuple(pending)
+    if _WITHHELD_DELIVERY_LOGGED.get(msg_id) == signature:
+        return
+    if msg_id in _WITHHELD_DELIVERY_LOGGED or len(_WITHHELD_DELIVERY_LOGGED) < 1024:
+        _WITHHELD_DELIVERY_LOGGED[msg_id] = signature
+        _log("pump_targeted_delivery_pending_no_vehicle", msg_id=msg_id, topic_id=topic_id, pending_recipients=pending)
+    elif not _WITHHELD_DELIVERY_SATURATED:
+        _WITHHELD_DELIVERY_SATURATED = True
+        _log("pump_targeted_delivery_log_saturated")
 
 
 def _estimate_worker_demand(msg_id: str, suppressed_roles: set[str]) -> int:
@@ -1624,15 +1756,17 @@ def main() -> int:
                 # Terminal → advance the cursor past it and keep scanning.
                 if _trigger_is_terminal(msg_id, suppressed_roles):
                     if row.get("_targeted_delivery"):
-                        completed = _complete_pending_deliveries(
-                            msg_id, enqueued_at=str(row.get("ts") or _now())
-                        )
-                        if completed:
-                            _log(
-                                "pump_targeted_delivery_completed",
-                                msg_id=msg_id,
-                                recipients=completed,
+                        acknowledged, pending = _delivery_acknowledged(msg_id, suppressed_roles)
+                        if acknowledged:
+                            _WITHHELD_DELIVERY_LOGGED.pop(msg_id, None)
+                            completed = _complete_pending_deliveries(
+                                msg_id, enqueued_at=str(row.get("ts") or _now()),
+                                suppressed_roles=suppressed_roles,
                             )
+                            if completed:
+                                _log("pump_targeted_delivery_completed", msg_id=msg_id, recipients=completed)
+                        else:
+                            _log_withheld_delivery(msg_id, row["topic_id"], pending)
                     if row.get("_cursor_eligible") and not row.get("_blind_replay"):
                         last_ts = row["ts"]
                         last_msg_id = msg_id
