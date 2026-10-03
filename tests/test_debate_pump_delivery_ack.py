@@ -34,6 +34,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 import sqlite3
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -612,9 +613,17 @@ def test_withheld_diagnostics_are_bounded_and_queue_remains_pending(pump_db, mon
 
 
 @pytest.mark.parametrize("spawn_ok,rebind_race", [(True,False), (False,False), (True,True)])
-def test_real_launcher_receipt_records_prelaunch_parent_and_actual_worker(pump_db, monkeypatch, tmp_path, spawn_ok, rebind_race):
+@pytest.mark.parametrize("psutil_available", [True, False], ids=["available_fake", "absent"])
+def test_real_launcher_receipt_records_prelaunch_parent_and_actual_worker(pump_db, monkeypatch, tmp_path, spawn_ok, rebind_race, psutil_available):
     import db_utils
-    import psutil
+    # This optional OS-identity boundary is test-owned in both environments;
+    # monkeypatch restores the previously installed module (or absence).
+    if psutil_available:
+        fake_psutil = ModuleType("psutil")
+        fake_psutil.Process = lambda _pid: type("FakeIdentity", (), {"create_time": lambda _self: 123.5})()
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    else:
+        monkeypatch.setitem(sys.modules, "psutil", None)
     con = pump_db
     trigger = _post_analysis_q(con)
     monkeypatch.setattr(db_utils, "DB_PATH", str(debate_pump.DB_PATH))
@@ -638,7 +647,6 @@ def test_real_launcher_receipt_records_prelaunch_parent_and_actual_worker(pump_d
                 bind_role_session(con, topic_id=TOPIC, role="EXECUTOR", session_id="cc-racedparent123", runtime="cc", reason="public Popen rebind before receipt", replace_active=True)
             self.stdin = io.BytesIO()
     monkeypatch.setattr(wake.subprocess, "Popen", FakeProcess)
-    monkeypatch.setattr(psutil, "Process", lambda _pid: type("FakeIdentity", (), {"create_time":lambda _self:123.5})())
     response = {"msg_id":trigger,"topic_id":TOPIC,"schema_version":"debate_post_with_recipients.v1"}
     resolved = wake._handle_tool_response(response)
     generation = con.execute("SELECT generation FROM debate_role_bindings WHERE topic_id=? AND role=? AND session_id=?", (TOPIC,"EXECUTOR",EXECUTOR_SESSION)).fetchone()[0]
@@ -653,6 +661,7 @@ def test_real_launcher_receipt_records_prelaunch_parent_and_actual_worker(pump_d
         return
     assert len(rows) == 1
     details = json.loads(rows[0][0])
+    assert details["create_time"] == (123.5 if psutil_available else None)
     if rebind_race:
         assert details.get("launch_confirmed") is not True
         assert debate_pump._delivery_acknowledged(trigger, SUPPRESSED)[0] is False
