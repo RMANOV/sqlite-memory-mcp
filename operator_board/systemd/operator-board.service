@@ -1,0 +1,33 @@
+[Unit]
+# Operator Board — persistent local board over ~/.claude/memory/memory.db.
+# Auto-launch with the memory-db user session. REVERSIBLE:
+#   enable : systemctl --user enable --now operator-board.service
+#   disable: systemctl --user disable --now operator-board.service
+# Install (operator, one-time):
+#   ln -s %h/sqlite-memory-mcp/operator_board/systemd/operator-board.service \
+#         ~/.config/systemd/user/operator-board.service && systemctl --user daemon-reload
+# NOTE: left NOT enabled by design — operator runs the enable command.
+Description=Operator Board (null-floor, read-only memory board)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sqlite-memory-mcp/operator_board
+Environment=SQLITE_MEMORY_DB=%h/.claude/memory/memory.db
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# --no-open: no browser spawn under the service; open http://127.0.0.1:8787 manually.
+ExecStart=/usr/bin/python3 %h/sqlite-memory-mcp/operator_board/board.py --host 127.0.0.1 --port 8787 --no-open
+Nice=10
+CPUWeight=20
+MemoryHigh=512M
+MemoryMax=1G
+TasksMax=64
+Restart=on-failure
+RestartSec=5
+KillMode=process
+TimeoutStopSec=10
+StandardOutput=append:%h/.claude/memory/operator_board.out
+StandardError=append:%h/.claude/memory/operator_board.err
+
+[Install]
+WantedBy=default.target
