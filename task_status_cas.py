@@ -60,7 +60,15 @@ def status_token(conn: sqlite3.Connection, task_id: str) -> StatusToken | None:
 
 def _allowed(source: str, target: str, *, confirmed: bool, undo: bool) -> bool:
     if undo:
-        return source == "archived" and target in _ACTIVE | {"done"}
+        # Frozen-matrix delta (DAILY_20260704 ruling 17cd147ec28d for gate
+        # 5d4cc16c54ee/A "undo exact"): a done-close must be reversible to the
+        # EXACT prior active status, so undo additionally permits done->active.
+        # The pre-existing archived->* undo edge is unchanged.
+        if source == "archived":
+            return target in _ACTIVE | {"done"}
+        if source == "done":
+            return target in _ACTIVE
+        return False
     if source in _ACTIVE and target == "done":
         return True
     if source == "done" and target == "archived":
@@ -126,7 +134,10 @@ def transition_status(
             result["status_token"] = StatusToken(
                 token.task_id, target, version[0], version[1]
             )
-            if target == "archived" and not undo:
+            if target in ("archived", "done") and not undo:
+                # done-close is reversible to the exact prior active status
+                # (frozen-matrix delta 17cd147ec28d); previous_status is the
+                # source status captured before this transition applied.
                 result["undo_token"] = UndoToken(
                     task_id=token.task_id,
                     previous_status=token.status,
