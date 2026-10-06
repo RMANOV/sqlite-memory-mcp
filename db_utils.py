@@ -5407,6 +5407,24 @@ TRANSPORT_STAMP_KEYS = ("pushed_at", "machine_id")
 _UNREAD = object()
 
 
+def _without_stamps(doc: dict, ignore_keys: tuple[str, ...]) -> dict:
+    """``doc`` without its top-level stamps and its tray profiles' ``updated_at``."""
+    stripped = {k: v for k, v in doc.items() if k not in ignore_keys}
+    profiles = stripped.get("ui_profiles")
+    if isinstance(profiles, dict):
+        # A tray sync stamps its profile with the sync time; as in
+        # bridge_sync_worker._ui_profile_changed, that stamp alone is no change.
+        stripped["ui_profiles"] = {
+            machine: (
+                {k: v for k, v in profile.items() if k != "updated_at"}
+                if isinstance(profile, dict)
+                else profile
+            )
+            for machine, profile in profiles.items()
+        }
+    return stripped
+
+
 def bridge_json_unchanged(
     path: Path,
     doc: Any,
@@ -5418,8 +5436,9 @@ def bridge_json_unchanged(
 
     The comparison is on parsed JSON: a file a peer wrote with another
     serializer or key order is not a change. ``ignore_keys`` drops top-level
-    stamps. Skipping unchanged files keeps an export without data changes out
-    of git, and keeps a one-item change to that item's files.
+    stamps, and with them each tray profile's ``updated_at``. Skipping unchanged
+    files keeps an export without data changes out of git, and keeps a one-item
+    change to that item's files.
     """
     if existing is _UNREAD:
         try:
@@ -5427,8 +5446,8 @@ def bridge_json_unchanged(
         except (OSError, ValueError):
             return False
     if ignore_keys and isinstance(existing, dict) and isinstance(doc, dict):
-        existing = {k: v for k, v in existing.items() if k not in ignore_keys}
-        doc = {k: v for k, v in doc.items() if k not in ignore_keys}
+        existing = _without_stamps(existing, ignore_keys)
+        doc = _without_stamps(doc, ignore_keys)
     return existing == doc
 
 

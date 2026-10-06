@@ -118,6 +118,13 @@ INCREMENTAL_WATERMARK_MARGIN_SECONDS = 10
 # diagnostics; only the push DECISION ignores it, and the row still travels in
 # the export payload whenever a genuine change causes a push.
 _NON_TRIGGER_COUNTERS = frozenset({"changed_memory_audit_state"})
+# Rewritten by every memory-audit run (last_detected_at re-stamps, scheduler
+# state) even when no task, note or entity changed. Staged alone they make no
+# commit; they stay staged and ride along with the next real change.
+_AUDIT_BOOKKEEPING_PATHS = (
+    "extended_memory/memory_audit_issues.json",
+    "extended_memory/memory_audit_state.json",
+)
 _SYNC_THREAD_LOCK = threading.Lock()
 _GIT_PULL_TIMEOUT = 120
 _GIT_PUSH_TIMEOUT = 300
@@ -278,6 +285,22 @@ def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
     if local_sha == remote_sha or base_sha == remote_sha:
         return True, None
     if base_sha == local_sha:
+        # Audit bookkeeping left staged makes git refuse this fast-forward when
+        # the incoming commit touches the same file. It yields: the import then
+        # writes that copy over the local audit rows anyway.
+        incoming = git_retry(
+            bridge_dir,
+            "diff",
+            "--name-only",
+            "HEAD",
+            "origin/main",
+            "--",
+            *_AUDIT_BOOKKEEPING_PATHS,
+            timeout=30,
+        )
+        touched = incoming.stdout.split() if incoming.returncode == 0 else []
+        if touched:
+            git_retry(bridge_dir, "checkout", "HEAD", "--", *touched, timeout=30)
         merge = git_retry(
             bridge_dir,
             "merge",
@@ -395,14 +418,22 @@ def _stage_generated_bridge_artifacts(bridge_dir: str) -> subprocess.CompletedPr
 
 
 def _remote_already_has_export(bridge_dir: str) -> bool:
-    """True when nothing is staged and HEAD is already on origin/main.
+    """True when HEAD is on origin/main and nothing but audit bookkeeping is staged.
 
-    Then a commit would be empty and a push would send nothing. Any git error
-    answers False, so the caller keeps the commit/push path.
+    Then a commit would carry no task, note or entity change, and a push would
+    send nothing else. Any git error answers False, so the caller keeps the
+    commit/push path.
     """
-    if git_run(bridge_dir, "diff", "--cached", "--quiet").returncode != 0:
+    excluded = [f":(exclude){path}" for path in _AUDIT_BOOKKEEPING_PATHS]
+    try:
+        staged = git_run(
+            bridge_dir, "diff", "--cached", "--quiet", "--", ".", *excluded
+        )
+        if staged.returncode != 0:
+            return False
+        ahead = git_run(bridge_dir, "rev-list", "--count", "origin/main..HEAD")
+    except subprocess.TimeoutExpired:
         return False
-    ahead = git_run(bridge_dir, "rev-list", "--count", "origin/main..HEAD")
     return ahead.returncode == 0 and ahead.stdout.strip() == "0"
 
 
@@ -1511,12 +1542,13 @@ def _main_locked(
     ).isoformat()
 
     # Unchanged files are never rewritten, so an export without data changes
-    # stages nothing. The remote already holds this snapshot: no commit, no push.
+    # stages nothing but audit bookkeeping. The remote already holds this
+    # snapshot: no commit, no push.
     if _remote_already_has_export(bridge_dir):
         _record_remote_snapshot(
             _db_path, watermark_at, exported_task_ids, payload["pushed_at"]
         )
-        log.info("Export identical to origin/main — nothing to commit or push")
+        log.info("No change beyond audit bookkeeping — nothing to commit or push")
         _progress(progress_callback, 100, "No changes — nothing to push")
         return {
             "entities": n_ent,

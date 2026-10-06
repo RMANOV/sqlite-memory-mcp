@@ -16,10 +16,15 @@ import pytest
 
 import bridge_sync_worker as worker
 import db_utils as db
+import memory_audit
 from schema import init_db
 
 ROOT = Path(__file__).resolve().parent.parent
 PARENT, CHILD, OTHER = "task-parent", "task-child", "task-other"
+AUDIT_FILES = (
+    "extended_memory/memory_audit_issues.json",
+    "extended_memory/memory_audit_state.json",
+)
 
 
 def _git(cwd, *args):
@@ -96,6 +101,64 @@ def _blocked_keys(result):
         for key, value in result.items()
         if value is True and (key.startswith("blocked_by_") or key.endswith("_failed"))
     ]
+
+
+def _open_audit_issue(env):
+    """A claim without evidence: every audit run reports it open and re-stamps it."""
+    now = db.now_iso()
+    with db.get_conn(env.db) as conn:
+        conn.execute(
+            "INSERT INTO context_chunks (chunk_id, source_type, source_ref, "
+            "source_hash, title, body, state, enrich_policy, created_at, updated_at) "
+            "VALUES ('chunk-a', 'observation', 'source-a', 'hash-a', 'Chunk', "
+            "'Service uses Redis', 'enrichable', 'manual', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO candidate_claims (claim_id, chunk_id, subject, predicate, "
+            "object_text, claim_scope, confidence, created_at, updated_at) "
+            "VALUES ('claim-a', 'chunk-a', 'Service', 'uses', 'Redis', 'memory', "
+            "0.9, ?, ?)",
+            (now, now),
+        )
+
+
+def _audit_due(monkeypatch):
+    """The next cycle finds the hourly audit due, as the top of the hour does.
+
+    The schedule cannot be rewound in the DB: each cycle imports the bridge copy
+    of memory_audit_state over it. So the next scheduler call is forced instead.
+    """
+    real = memory_audit.maybe_run_memory_audit
+
+    def due_once(conn, **kwargs):
+        monkeypatch.setattr(memory_audit, "maybe_run_memory_audit", real)
+        return real(conn, **kwargs, force=True)
+
+    monkeypatch.setattr(memory_audit, "maybe_run_memory_audit", due_once)
+
+
+def _audit_schedule(env):
+    with db.get_conn(env.db) as conn:
+        row = conn.execute(
+            "SELECT last_finished_at, next_run_after FROM memory_audit_state "
+            "WHERE runner_name = 'bridge_sync'"
+        ).fetchone()
+    return tuple(row)
+
+
+def _staged_audit_only(env):
+    return _git(env.bridge, "status", "--porcelain").splitlines() == [
+        f"M  {path}" for path in AUDIT_FILES
+    ]
+
+
+def _commit_files(env, sha):
+    return set(
+        _git(
+            env.remote, "diff-tree", "--no-commit-id", "--name-only", "-r", sha
+        ).split()
+    )
 
 
 def test_field_ts_key_order_is_canonical_whatever_the_merge_order():
@@ -313,3 +376,129 @@ def test_hook_worker_treats_the_engine_no_change_result_as_synced(
     assert Path(module.FAIL_COUNTER).read_text(encoding="utf-8") == "0"
     notice = json.loads(Path(module.NOTIFY_FILE).read_text(encoding="utf-8"))
     assert notice["level"] == "info"
+
+
+def test_idle_cycle_that_runs_the_audit_commits_nothing(env, monkeypatch):
+    """The hourly audit re-stamps its own bookkeeping; alone that is no commit."""
+    # Real preflight: what the next cycle reads back decides the audit cadence.
+    monkeypatch.setattr(worker, "ensure_bridge_repo_ready", db.ensure_bridge_repo_ready)
+    _open_audit_issue(env)
+    assert _cycle(env)["pushed"] is True
+    head = _remote_head(env)
+    before = _audit_schedule(env)
+    _audit_due(monkeypatch)
+
+    result = _cycle(env)
+
+    schedule = _audit_schedule(env)
+    assert schedule != before  # the audit ran ...
+    assert result.get("no_changes") is True  # ... the export ran, found nothing
+    assert result["pushed"] is False
+    assert _blocked_keys(result) == []
+    assert _remote_head(env) == head
+    assert _git(env.bridge, "rev-parse", "HEAD") == head
+    # Only the audit files changed; they stay staged for the next real change.
+    assert _staged_audit_only(env)
+
+    _non_item_activity(env)
+    again = _cycle(env)
+
+    # The import read back the staged copy, so the audit is not due again.
+    assert again.get("no_changes") is True
+    assert _audit_schedule(env) == schedule
+    assert _remote_head(env) == head
+
+
+def test_tray_syncs_without_item_change_commit_nothing(env):
+    """tray_sync._build_ui_profile stamps updated_at=now; that stamp is no change."""
+
+    def tray_sync(stamp):
+        profile = {"theme": "dark", "font_size": 11, "bold": False}
+        return worker.main(
+            db_path=env.db,
+            bridge_repo=str(env.bridge),
+            ui_profile={**profile, "tab_views": {}, "updated_at": stamp},
+        )
+
+    assert tray_sync("2026-10-06T08:00:00+00:00")["pushed"] is True
+    head = _remote_head(env)
+
+    for stamp in ("2026-10-06T08:30:00+00:00", "2026-10-06T09:00:00+00:00"):
+        _non_item_activity(env)
+        result = tray_sync(stamp)
+        assert result.get("no_changes") is True
+        assert result["pushed"] is False
+
+    assert _remote_head(env) == head
+    assert _git(env.bridge, "status", "--porcelain") == ""
+
+
+def test_audit_bookkeeping_rides_along_with_the_next_item_change(env, monkeypatch):
+    monkeypatch.setattr(worker, "ensure_bridge_repo_ready", db.ensure_bridge_repo_ready)
+    _open_audit_issue(env)
+    assert _cycle(env)["pushed"] is True
+    _audit_due(monkeypatch)
+    assert _cycle(env).get("no_changes") is True
+    head = _remote_head(env)
+
+    with db.get_conn(env.db) as conn:
+        db.apply_task_mutation(
+            conn, OTHER, {"title": "Other, renamed"}, tool_name="test"
+        )
+    result = _cycle(env)
+
+    assert result["pushed"] is True
+    commits = _git(env.remote, "rev-list", f"{head}..main").split()
+    assert len(commits) == 1
+    # The task's file, the aggregates that embed it, the conflict ledger the
+    # import writes for it, and the audit bookkeeping the idle cycle left staged.
+    assert _commit_files(env, commits[0]) == {
+        f"tasks/{OTHER}.json",
+        "index.json",
+        "shared.json",
+        "kanban_payload.json",
+        "extended_memory/memory_conflicts.json",
+        *AUDIT_FILES,
+    }
+    state = json.loads(_git(env.remote, "show", f"main:{AUDIT_FILES[1]}"))
+    assert [row["next_run_after"] for row in state] == [_audit_schedule(env)[1]]
+    assert _git(env.bridge, "status", "--porcelain") == ""
+
+
+def test_staged_audit_bookkeeping_yields_to_a_peer_commit_on_the_same_file(
+    env, tmp_path, monkeypatch
+):
+    """Left staged, the bookkeeping must not stop the fast-forward to a peer's audit."""
+    _open_audit_issue(env)
+    assert _cycle(env)["pushed"] is True
+    _audit_due(monkeypatch)
+    assert _cycle(env).get("no_changes") is True
+    assert _staged_audit_only(env)
+
+    peer = tmp_path / "peer"
+    _git(tmp_path, "clone", "-q", str(env.remote), str(peer))
+    issues_path = peer / AUDIT_FILES[0]
+    issues = json.loads(issues_path.read_text(encoding="utf-8"))
+    for issue in issues:
+        issue["last_detected_at"] = db.now_iso()  # the peer's own hourly audit
+    issues_path.write_text(json.dumps(issues), encoding="utf-8")
+    identity = ("-c", "user.name=peer", "-c", "user.email=peer@example.invalid")
+    _git(peer, *identity, "commit", "-q", "-am", "peer audit")
+    _git(peer, "push", "-q", "origin", "main")
+    peer_head = _git(peer, "rev-parse", "HEAD")
+
+    result = _cycle(env)
+
+    assert _blocked_keys(result) == []
+    assert result.get("no_changes") is True
+    assert _git(env.bridge, "rev-parse", "HEAD") == peer_head
+    assert _remote_head(env) == peer_head
+
+
+def test_remote_check_answers_false_when_git_times_out(tmp_path, monkeypatch):
+    def timed_out(repo_dir, *args, timeout=30):
+        raise subprocess.TimeoutExpired(["git", *args], timeout)
+
+    monkeypatch.setattr(worker, "git_run", timed_out)
+
+    assert worker._remote_already_has_export(str(tmp_path)) is False
