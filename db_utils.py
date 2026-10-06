@@ -7355,8 +7355,11 @@ def merge_import_tasks(
                     )
                     legacy_value_authority = True
                 remote_wins = remote_key > local_key
+                # A tombstone only merges strictly newer fields: its equal-key
+                # value repair would overwrite a value authored here.
                 remote_repairs_equal_key = (
-                    remote_key == local_key
+                    not tombstone
+                    and remote_key == local_key
                     and local_val != remote_val
                     and (has_explicit_authority or legacy_value_authority)
                 )

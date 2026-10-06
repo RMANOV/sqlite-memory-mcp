@@ -310,3 +310,36 @@ def test_live_record_merge_is_unchanged(case):
     assert merge_events(conn, "live-equal") == []
     assert row(conn, "live-drift")["status"] == "done"
     assert merge_events(conn, "live-drift") == []
+
+
+def test_tombstone_equal_key_keeps_local_authored_value(case):
+    """A tombstone must not run the live path's equal-key value repair.
+
+    Same clock and writer as the local authoring write but a drifted value:
+    only a strictly newer remote key may change a field of a tombstoned row.
+    """
+    conn, _ = case
+    seed_row(conn, "archived", section="inbox")
+    author_local(conn, "status", "archived", CLOSED)
+    author_local(conn, "section", "inbox", OLD)
+    section_before = version(conn, "section")
+    remote = remote_task("archived", CLOSED, fields={"section": ("today", OLD)})
+    remote["_field_ts"]["status"] = [
+        CLOSED,
+        LOCAL,
+        clock(CLOSED),
+        f"local-{TID}-status-{CLOSED}",
+        "archived",
+    ]
+    remote["_field_ts"]["section"] = [
+        OLD,
+        LOCAL,
+        clock(OLD),
+        f"local-{TID}-section-{OLD}",
+        "today",
+    ]
+
+    assert db.merge_import_tasks(conn, [remote], import_content=True) == (0, 0)
+    assert row(conn)["section"] == "inbox"
+    assert version(conn, "section") == section_before
+    assert merge_events(conn) == []
