@@ -251,15 +251,20 @@ def _parse_result(result):
 
 
 def _sync_block_message(result, default):
+    """Return the block reason when the canonical worker refused to sync.
+
+    Same rule as bridge_server.bridge_push: any ``blocked_by_*`` or ``*_failed``
+    key set to True is a block. The former enumerated list missed
+    ``blocked_by_task_export_conflict`` and ``generated_file_failed``, so a
+    blocked export fell through to fix_remote_ahead(), whose no-op push then
+    reported "synced 0 tasks OK" and deleted the dirty flag.
+    """
     if not isinstance(result, dict):
         return None
-    blocked = (
-        result.get("blocked_by_repo_state")
-        or result.get("git_pull_failed")
-        or result.get("blocked_by_merge_failure")
-        or result.get("blocked_by_safety")
-        or result.get("git_add_failed")
-        or result.get("git_commit_failed")
+    blocked = any(
+        key.startswith("blocked_by_") or key.endswith("_failed")
+        for key, value in result.items()
+        if value is True
     )
     if not blocked:
         return None

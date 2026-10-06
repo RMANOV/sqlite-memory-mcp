@@ -446,3 +446,65 @@ def test_hook_worker_drains_writes_that_arrive_during_sync(tmp_path, monkeypatch
     assert Path(module.LAST_SYNC).exists()
     assert not Path(module.DIRTY_FLAG).exists()
     assert notifications[-1] == ("info", "BRIDGE: synced 4 tasks OK")
+
+
+def test_hook_worker_treats_task_export_conflict_as_blocked(tmp_path, monkeypatch):
+    """A blocked export must not fall through to fix_remote_ahead's no-op push."""
+    module = _load_module(
+        "bridge_hook_worker_export_conflict_test",
+        ROOT / "hooks" / "bridge_sync_worker.py",
+    )
+    module.LOCK_FILE = str(tmp_path / ".lock")
+    module.LAST_SYNC = str(tmp_path / ".last_sync")
+    module.DIRTY_FLAG = str(tmp_path / ".dirty")
+    module.NOTIFY_FILE = str(tmp_path / ".notify")
+    module.FAIL_COUNTER = str(tmp_path / ".fail_count")
+    module.SERVER_DIR = str(tmp_path)
+    Path(module.DIRTY_FLAG).write_text("1", encoding="utf-8")
+    notifications = []
+    git_verbs = []
+
+    def up_to_date_git(*args, cwd=None):
+        git_verbs.append(args[0])
+        return True, "a14faf60da00a189215e1dd5f773acf25ce87bf2"
+
+    monkeypatch.setattr(module, "acquire_lock", lambda: True)
+    monkeypatch.setattr(module, "release_lock", lambda: None)
+    monkeypatch.setattr(module, "preflight_git_check", lambda: (True, None))
+    monkeypatch.setattr(module, "_read_fail_count", lambda: 0)
+    monkeypatch.setattr(module, "git_run", up_to_date_git)
+    monkeypatch.setattr(
+        module, "notify", lambda level, msg: notifications.append((level, msg))
+    )
+
+    class Tool:
+        def __init__(self, fn):
+            self.fn = fn
+
+    message = (
+        "task transport preservation blocked export: t1: hidden status archived "
+        "conflicts with done authority; confirm the intended status with update_task"
+    )
+    fake_bridge_server = types.SimpleNamespace(
+        bridge_push=Tool(
+            lambda tag="shared": json.dumps(
+                {
+                    "entities": 0,
+                    "tasks": 0,
+                    "pushed": False,
+                    "blocked_by_task_export_conflict": True,
+                    "message": message,
+                    "pushed_to_remote": False,
+                    "error": message,
+                }
+            )
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "bridge_server", fake_bridge_server)
+
+    module.main()
+
+    assert notifications == [("warning", f"BRIDGE: sync blocked — {message}")]
+    assert Path(module.DIRTY_FLAG).exists()
+    assert not Path(module.LAST_SYNC).exists()
+    assert git_verbs == []
