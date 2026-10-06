@@ -47,6 +47,8 @@ from db_utils import (
     # v2.0.0: Bridge Sync v2 — per-field LWW
     json_loads as _json_loads,
     json_dumps as _json_dumps,  # I5: canonical JSON serialiser from db_utils
+    TRANSPORT_STAMP_KEYS,
+    bridge_json_unchanged,
     export_task_files,
     export_index_json,
     prepare_task_export_overrides,
@@ -116,6 +118,13 @@ INCREMENTAL_WATERMARK_MARGIN_SECONDS = 10
 # diagnostics; only the push DECISION ignores it, and the row still travels in
 # the export payload whenever a genuine change causes a push.
 _NON_TRIGGER_COUNTERS = frozenset({"changed_memory_audit_state"})
+# Rewritten by every memory-audit run (last_detected_at re-stamps, scheduler
+# state) even when no task, note or entity changed. Staged alone they make no
+# commit; they stay staged and ride along with the next real change.
+_AUDIT_BOOKKEEPING_PATHS = (
+    "extended_memory/memory_audit_issues.json",
+    "extended_memory/memory_audit_state.json",
+)
 _SYNC_THREAD_LOCK = threading.Lock()
 _GIT_PULL_TIMEOUT = 120
 _GIT_PUSH_TIMEOUT = 300
@@ -276,6 +285,22 @@ def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
     if local_sha == remote_sha or base_sha == remote_sha:
         return True, None
     if base_sha == local_sha:
+        # Audit bookkeeping left staged makes git refuse this fast-forward when
+        # the incoming commit touches the same file. It yields: the import then
+        # writes that copy over the local audit rows anyway.
+        incoming = git_retry(
+            bridge_dir,
+            "diff",
+            "--name-only",
+            "HEAD",
+            "origin/main",
+            "--",
+            *_AUDIT_BOOKKEEPING_PATHS,
+            timeout=30,
+        )
+        touched = incoming.stdout.split() if incoming.returncode == 0 else []
+        if touched:
+            git_retry(bridge_dir, "checkout", "HEAD", "--", *touched, timeout=30)
         merge = git_retry(
             bridge_dir,
             "merge",
@@ -390,6 +415,41 @@ def _stage_generated_bridge_artifacts(bridge_dir: str) -> subprocess.CompletedPr
     if untrack_result.returncode != 0:
         return untrack_result
     return git_run(bridge_dir, "add", *BRIDGE_GIT_STAGE_PATHS)
+
+
+def _remote_already_has_export(bridge_dir: str) -> bool:
+    """True when HEAD is on origin/main and nothing but audit bookkeeping is staged.
+
+    Then a commit would carry no task, note or entity change, and a push would
+    send nothing else. Any git error answers False, so the caller keeps the
+    commit/push path.
+    """
+    excluded = [f":(exclude){path}" for path in _AUDIT_BOOKKEEPING_PATHS]
+    try:
+        staged = git_run(
+            bridge_dir, "diff", "--cached", "--quiet", "--", ".", *excluded
+        )
+        if staged.returncode != 0:
+            return False
+        ahead = git_run(bridge_dir, "rev-list", "--count", "origin/main..HEAD")
+    except subprocess.TimeoutExpired:
+        return False
+    return ahead.returncode == 0 and ahead.stdout.strip() == "0"
+
+
+def _record_remote_snapshot(
+    db_path: str,
+    watermark_at: str,
+    exported_task_ids: list[str],
+    pushed_at: str,
+) -> None:
+    """Record that the remote holds this export: the watermark and its tombstones."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bridge_meta(key, value) VALUES('last_push_at', ?)",
+            (watermark_at,),
+        )
+        mark_tombstones_pushed(conn, exported_task_ids, pushed_at)
 
 
 def _ui_profile_changed(
@@ -1395,11 +1455,13 @@ def _main_locked(
         profiles[machine_id] = ui_profile
 
     _progress(progress_callback, 70, "Writing shared.json...")
-    payload_json = _json_dumps(payload)
     try:
-        tmp_shared_path = _tmp_write_path(shared_path)
-        tmp_shared_path.write_text(payload_json, encoding="utf-8")
-        os.replace(tmp_shared_path, shared_path)
+        if not bridge_json_unchanged(
+            shared_path, payload, ignore_keys=TRANSPORT_STAMP_KEYS
+        ):
+            tmp_shared_path = _tmp_write_path(shared_path)
+            tmp_shared_path.write_text(_json_dumps(payload), encoding="utf-8")
+            os.replace(tmp_shared_path, shared_path)
     except OSError as exc:
         message = f"generated bridge file write failed: {exc}"
         log.error(message)
@@ -1464,6 +1526,41 @@ def _main_locked(
             "message": message,
         }
 
+    # Record the read-snapshot watermark that the remote will hold, rewound by
+    # a small margin. ``payload['pushed_at']`` intentionally remains the
+    # transport/merge timestamp, while tombstones retain its delivery time.
+    #
+    # The margin closes the residual race: a writer stamps ``updated_at`` a few
+    # milliseconds before the export pins its read snapshot but commits just
+    # after it. That row is invisible to THIS export and would also sort below
+    # an un-rewound watermark, so the next run would skip it — permanently.
+    # Re-examining the window costs one more export after each real push; it
+    # stages nothing unless data changed. Not re-examining it costs data.
+    watermark_at = (
+        parse_iso_datetime_for_compare(export_snapshot_at)
+        - timedelta(seconds=INCREMENTAL_WATERMARK_MARGIN_SECONDS)
+    ).isoformat()
+
+    # Unchanged files are never rewritten, so an export without data changes
+    # stages nothing but audit bookkeeping. The remote already holds this
+    # snapshot: no commit, no push.
+    if _remote_already_has_export(bridge_dir):
+        _record_remote_snapshot(
+            _db_path, watermark_at, exported_task_ids, payload["pushed_at"]
+        )
+        log.info("No change beyond audit bookkeeping — nothing to commit or push")
+        _progress(progress_callback, 100, "No changes — nothing to push")
+        return {
+            "entities": n_ent,
+            "tasks": n_tasks,
+            "pushed": False,
+            "imported_new": new_t,
+            "imported_updated": upd_t,
+            "skipped": True,
+            "no_changes": True,
+            "message": "No changes since the last push",
+        }
+
     _progress(progress_callback, 90, "git commit...")
     msg = f"bridge: push {n_ent} entities, {n_tasks} tasks from {machine_id}"
     result = git_run(bridge_dir, "commit", "-m", msg, timeout=_GIT_COMMIT_TIMEOUT)
@@ -1520,28 +1617,10 @@ def _main_locked(
                 delay,
             )
 
-    # Record the read-snapshot watermark that this push actually contains,
-    # rewound by a small margin. ``payload['pushed_at']`` intentionally remains
-    # the transport/merge timestamp, while tombstones retain its delivery time.
-    #
-    # The margin closes the residual race: a writer stamps ``updated_at`` a few
-    # milliseconds before the export pins its read snapshot but commits just
-    # after it. That row is invisible to THIS export and would also sort below
-    # an un-rewound watermark, so the next run would skip it — permanently.
-    # Re-examining the window costs one redundant push after each real one,
-    # because the merge is idempotent LWW; not re-examining it costs data.
-    watermark_at = (
-        parse_iso_datetime_for_compare(export_snapshot_at)
-        - timedelta(seconds=INCREMENTAL_WATERMARK_MARGIN_SECONDS)
-    ).isoformat()
     if pushed:
-        with get_conn(_db_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO bridge_meta(key, value) "
-                "VALUES('last_push_at', ?)",
-                (watermark_at,),
-            )
-            mark_tombstones_pushed(conn, exported_task_ids, payload["pushed_at"])
+        _record_remote_snapshot(
+            _db_path, watermark_at, exported_task_ids, payload["pushed_at"]
+        )
 
     peer_result: dict = {}
     github_release: str | None = None

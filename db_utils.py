@@ -5401,6 +5401,55 @@ ENTITY_EXPORT_COLS = (
     "id, name, entity_type, project, visibility, created_at, updated_at"
 )
 
+# Per-push stamp of the aggregate bridge files: when and on which machine the
+# file was generated. A stamp is not content, so it never makes a file "changed".
+TRANSPORT_STAMP_KEYS = ("pushed_at", "machine_id")
+_UNREAD = object()
+
+
+def _without_stamps(doc: dict, ignore_keys: tuple[str, ...]) -> dict:
+    """``doc`` without its top-level stamps and its tray profiles' ``updated_at``."""
+    stripped = {k: v for k, v in doc.items() if k not in ignore_keys}
+    profiles = stripped.get("ui_profiles")
+    if isinstance(profiles, dict):
+        # A tray sync stamps its profile with the sync time; as in
+        # bridge_sync_worker._ui_profile_changed, that stamp alone is no change.
+        stripped["ui_profiles"] = {
+            machine: (
+                {k: v for k, v in profile.items() if k != "updated_at"}
+                if isinstance(profile, dict)
+                else profile
+            )
+            for machine, profile in profiles.items()
+        }
+    return stripped
+
+
+def bridge_json_unchanged(
+    path: Path,
+    doc: Any,
+    *,
+    existing: Any = _UNREAD,
+    ignore_keys: tuple[str, ...] = (),
+) -> bool:
+    """True when ``path`` already holds ``doc``, so the export must not rewrite it.
+
+    The comparison is on parsed JSON: a file a peer wrote with another
+    serializer or key order is not a change. ``ignore_keys`` drops top-level
+    stamps, and with them each tray profile's ``updated_at``. Skipping unchanged
+    files keeps an export without data changes out of git, and keeps a one-item
+    change to that item's files.
+    """
+    if existing is _UNREAD:
+        try:
+            existing = json_loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+    if ignore_keys and isinstance(existing, dict) and isinstance(doc, dict):
+        existing = _without_stamps(existing, ignore_keys)
+        doc = _without_stamps(doc, ignore_keys)
+    return existing == doc
+
 
 def _task_field_version_select(
     conn: sqlite3.Connection,
@@ -6130,6 +6179,12 @@ def prepare_task_export_overrides(
     overrides = {}
     for row in rows:
         tid = row["id"]
+        local_fts = versions.get(tid, {})
+        parent_version = local_fts.get("parent_id")
+        extra = {"parent_id": parent_version} if parent_version is not None else {}
+        # The local parent clock travels before a transport file exists too, so
+        # a task's first export already equals every later one.
+        overrides[tid] = {"parent_id": row["parent_id"], "field_versions": extra}
         path = _task_storage_path(tid, bridge_dir)
         if not path.exists():
             continue
@@ -6145,8 +6200,6 @@ def prepare_task_export_overrides(
             # Preserve the established non-parent export behavior: an unrelated
             # sidecar without a parent cannot supply any preservation metadata.
             continue
-        local_fts = versions.get(tid, {})
-        parent_version = local_fts.get("parent_id")
         event = None
         if row["parent_id"] is None and existing.get("parent_id"):
             event_id = _strict_transport_version(parent_version)[3]
@@ -6159,7 +6212,6 @@ def prepare_task_export_overrides(
         parent = resolve_export_parent(
             tid, row["parent_id"], parent_version, existing, event
         )
-        extra = {"parent_id": parent_version} if parent_version is not None else {}
         existing_fts = existing.get("_field_ts", {})
         if isinstance(existing_fts, dict):
             for field in ("created_at", "updated_at"):
@@ -6182,6 +6234,11 @@ def apply_task_export_overrides(
                     **override["field_versions"],
                     **task.get("_field_ts", {}),
                 }
+        # Canonical key order. The merge above puts override keys first and the
+        # SQL row order is plan-dependent, so equal clocks could serialize
+        # differently from one export to the next.
+        if isinstance(task.get("_field_ts"), dict):
+            task["_field_ts"] = dict(sorted(task["_field_ts"].items()))
 
 
 def export_task_files(
@@ -6455,6 +6512,7 @@ def export_task_files(
     for tid in task_ids:
         task = task_map[tid]
         task_path = _task_storage_path(tid, bridge_dir)
+        existing: Any = _UNREAD
 
         # Content-aware export: preserve bridge descriptions/notes if local is NULL
         if task_path.exists():
@@ -6500,7 +6558,8 @@ def export_task_files(
             except (ValueError, OSError):
                 pass
 
-        task_path.write_text(json_dumps(task), encoding="utf-8")
+        if not bridge_json_unchanged(task_path, task, existing=existing):
+            task_path.write_text(json_dumps(task), encoding="utf-8")
         exported.append(tid)
 
     # Clean stale files only during full export (changed_since=None).
@@ -6648,7 +6707,8 @@ def export_index_json(
     }
 
     index_path = Path(bridge_dir) / "index.json"
-    index_path.write_text(json_dumps(index), encoding="utf-8")
+    if not bridge_json_unchanged(index_path, index, ignore_keys=TRANSPORT_STAMP_KEYS):
+        index_path.write_text(json_dumps(index), encoding="utf-8")
     return len(tasks)
 
 
@@ -7951,7 +8011,8 @@ def export_entity_files(
             "updatedAt": r["updated_at"],
         }
         fpath = entities_dir / f"{eid}.json"
-        fpath.write_text(json_dumps(entity), encoding="utf-8")
+        if not bridge_json_unchanged(fpath, entity):
+            fpath.write_text(json_dumps(entity), encoding="utf-8")
         exported.append(eid)
 
     # Clean stale files (entities no longer in DB)
@@ -8011,7 +8072,8 @@ def export_entities_index(
         "entities": entries,
     }
     index_path = Path(bridge_dir) / "entities_index.json"
-    index_path.write_text(json_dumps(index), encoding="utf-8")
+    if not bridge_json_unchanged(index_path, index, ignore_keys=TRANSPORT_STAMP_KEYS):
+        index_path.write_text(json_dumps(index), encoding="utf-8")
     return len(entries)
 
 
@@ -9238,7 +9300,8 @@ def write_extended_memory_files(
 ) -> list[str]:
     """Write each extended memory section to extended_memory/<key>.json.
 
-    Returns list of written file paths (relative to bridge_dir).
+    A section file that already holds the same data is left untouched.
+    Returns the section file paths (relative to bridge_dir).
     """
     em_dir = Path(bridge_dir) / "extended_memory"
     em_dir.mkdir(exist_ok=True)
@@ -9249,9 +9312,10 @@ def write_extended_memory_files(
             continue
         data = extended_memory.get(key, [])
         file_path = em_dir / f"{key}.json"
-        tmp_path = file_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json_dumps(data), encoding="utf-8")
-        os.replace(tmp_path, file_path)
+        if not bridge_json_unchanged(file_path, data):
+            tmp_path = file_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json_dumps(data), encoding="utf-8")
+            os.replace(tmp_path, file_path)
         written.append(f"extended_memory/{key}.json")
     return written
 
@@ -9307,6 +9371,8 @@ def write_kanban_payload(bridge_dir: str, payload: dict) -> str:
     text = json_dumps(kb)
     json_loads(text)  # guard: never publish unparseable JSON
     path = Path(bridge_dir) / "kanban_payload.json"
+    if bridge_json_unchanged(path, kb, ignore_keys=TRANSPORT_STAMP_KEYS):
+        return "kanban_payload.json"
     tmp_path = path.with_suffix(".json.tmp")
     tmp_path.write_text(text, encoding="utf-8")
     os.replace(tmp_path, path)
