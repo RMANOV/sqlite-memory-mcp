@@ -6949,6 +6949,7 @@ def merge_import_tasks(
         ).fetchall()
         fv_map: dict[str, dict[str, tuple[str, str, int, str | None]]] = {}
         raw_local_status_versions: dict[str, tuple[str, str, int, str | None]] = {}
+        local_status_values: dict[str, Any] = {}
         for r in fv_rows:
             raw_field_version = (
                 str(r["updated_at"] or ""),
@@ -6958,6 +6959,8 @@ def merge_import_tasks(
             )
             if r["field_name"] == "status":
                 raw_local_status_versions[r["task_id"]] = raw_field_version
+                if field_version_column_flags[1]:
+                    local_status_values[r["task_id"]] = r["new_value"]
             field_updated_at, field_updated_order, field_clock_skewed = (
                 _clamp_field_version_clock(
                     raw_field_version[0],
@@ -6990,6 +6993,7 @@ def merge_import_tasks(
         fv_map = {}
         task_content_map = {}
         raw_local_status_versions = {}
+        local_status_values = {}
 
     local_status_authority = _compute_authoritative_task_statuses(
         conn, list(task_content_map.values())
@@ -7133,8 +7137,10 @@ def merge_import_tasks(
             )
             _clock_skew_warned = True
 
-        # Handle tombstones — only merge status field
-        if remote.get("_tombstone"):
+        # Tombstones: status follows the tombstone rules here; the other fields
+        # of an existing row still take the per-field merge below.
+        tombstone = bool(remote.get("_tombstone"))
+        if tombstone:
             existing = existing_map.get(tid)
             if existing:
                 remote_ts, remote_by, remote_order, remote_event_id = _parse_field_ts(
@@ -7145,9 +7151,9 @@ def merge_import_tasks(
                 local_by = local_fv_data[1] if local_fv_data else ""
                 local_order = local_fv_data[2] if local_fv_data else 0
 
-                tombstone_wins = _field_version_sort_key(
-                    remote_ts, remote_by, remote_order
-                ) > _field_version_sort_key(local_ts, local_by, local_order)
+                remote_key = _field_version_sort_key(remote_ts, remote_by, remote_order)
+                local_key = _field_version_sort_key(local_ts, local_by, local_order)
+                tombstone_wins = remote_key > local_key
                 raw_local_status = raw_local_status_versions.get(tid)
                 if raw_local_status is not None:
                     tombstone_wins = tombstone_wins or _field_version_sort_key(
@@ -7159,6 +7165,20 @@ def merge_import_tasks(
                         raw_local_status[1],
                         raw_local_status[2],
                     )
+
+                # Earlier imports stored this same remote clock without its
+                # value; the event ledger never crosses machines, so an older
+                # local event then outranked it. The valued copy restores it.
+                if (
+                    not tombstone_wins
+                    and remote_key == local_key
+                    and local_fv_data is not None
+                    and field_version_column_flags[1]
+                    and local_status_values.get(tid) is None
+                    and _field_ts_explicit_value(remote_fts, "status")
+                    is not _FIELD_VALUE_MISSING
+                ):
+                    tombstone_wins = True
 
                 # Fallback: if field timestamps are equal, tombstone wins
                 # when its updated_at is newer (archival may not update field_versions)
@@ -7207,10 +7227,24 @@ def merge_import_tasks(
                         "status",
                         updated_at=remote_ts or fallback_ts,
                         updated_by=remote_by or MACHINE_ID,
+                        old_value=local_status,
+                        new_value=remote["status"],
                         updated_order=remote_order,
                         source_event_id=remote_event_id,
                         column_flags=field_version_column_flags,
                     )
+                    if local_status != remote["status"]:
+                        # Bookkeeping, as for any merged field below.
+                        record_memory_event(
+                            conn,
+                            event_type="merge",
+                            aggregate_kind="task",
+                            aggregate_id=tid,
+                            field_name="status",
+                            new_value=remote["status"],
+                        )
+                    task_content_map[tid]["status"] = remote["status"]
+                    existing["updated_at"] = row_updated_at
                     updated_fields += 1
             else:
                 desc = remote.get("description") if import_content else None
@@ -7263,7 +7297,7 @@ def merge_import_tasks(
                         column_flags=field_version_column_flags,
                     )
                 new_count += 1
-            continue
+                continue
 
         # Match by UUID only — authoritative in LWW model
         existing = existing_map.get(tid)
@@ -7277,7 +7311,10 @@ def merge_import_tasks(
             # Per-field LWW merge
             fields_to_update: dict[str, Any] = {}
             materialization_repairs: set[str] = set()
-            local_status_state = local_status_authority.get(local_id)
+            # A tombstone's status was already decided above.
+            local_status_state = (
+                None if tombstone else local_status_authority.get(local_id)
+            )
             local_status_value = _normalize_task_status_value(
                 (local_status_state or {}).get("value")
             )
@@ -7325,7 +7362,7 @@ def merge_import_tasks(
                 if field not in remote:
                     continue
                 # Skip fields already corrected by status authority (PF-01 fix)
-                if field in fields_to_update:
+                if field in fields_to_update or (tombstone and field == "status"):
                     continue
                 remote_val = remote.get(field)
                 remote_ts, remote_by, remote_order, remote_event_id = _parse_field_ts(
@@ -7378,8 +7415,11 @@ def merge_import_tasks(
                     )
                     legacy_value_authority = True
                 remote_wins = remote_key > local_key
+                # A tombstone only merges strictly newer fields: its equal-key
+                # value repair would overwrite a value authored here.
                 remote_repairs_equal_key = (
-                    remote_key == local_key
+                    not tombstone
+                    and remote_key == local_key
                     and local_val != remote_val
                     and (has_explicit_authority or legacy_value_authority)
                 )
