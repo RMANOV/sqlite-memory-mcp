@@ -19,6 +19,7 @@ import inspect
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 from datetime import datetime, timedelta, timezone
@@ -219,6 +220,32 @@ def _chain(api, topic=TOPIC):
     assert "error_type" not in pinned, pinned
     return {"bootstrap": boot, "approval": approval["msg_id"], "pin": pinned,
             "approve_path": apath, "approve_digest": adigest}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bin/task is a POSIX shell entrypoint")
+def test_bin_task_feedback_uses_backed_pinned_authority_and_existing_human(api):
+    from db_utils import dash_topic_id
+
+    _, db_path, _ = api
+    topic = dash_topic_id()
+    _init_active(api, topic=topic)
+    _chain(api, topic=topic)
+    before = _spends(db_path)
+    env = os.environ.copy()
+    env["TASK_DB"] = db_path
+    script = Path(__file__).resolve().parents[1] / "bin" / "task"
+    result = subprocess.run(
+        [str(script), "fb", "task-test", "operator feedback"],
+        env=env, text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    messages = _rows(db_path,
+        "SELECT m.role, m.author_session_id, m.provenance_class, r.recipient "
+        "FROM debate_messages m JOIN debate_message_recipients r ON r.msg_id=m.msg_id "
+        "WHERE m.kind='Q' AND m.body='Human feedback for task-test: operator feedback'")
+    assert messages == [{"role": "HUMAN", "author_session_id": HUMAN,
+                         "provenance_class": "parent", "recipient": "ADVOCATE_CODEX"}]
+    assert _spends(db_path) == before
 
 
 def _grant_payload(api, *, target_role="EXECUTOR_2", target_session=RECIPIENT,

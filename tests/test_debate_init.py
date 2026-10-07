@@ -230,7 +230,9 @@ def test_debate_init_require_priority_normalizes_initial_lane(conn):
     assert priority["lane"] == "P1"
     assert priority["rank"] > 0
     assert priority["reason"] == "operator says this blocks active risk"
-    assert priority["source"] == "conductor_assessed"
+    # A current reviewer records the caller's request; retirement does not
+    # turn the legacy metadata key into a new conductor assessment.
+    assert priority["source"] == "human_requested"
     assert out["metadata"]["initial_priority_gate"]["required"] is True
 
 

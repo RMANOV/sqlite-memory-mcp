@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -15,26 +16,41 @@ from debate import (  # noqa: E402
     list_open_debate_work,
     seed_initial_role_bindings,
     set_topic_priority,
-    transition_state,
 )
 from schema import init_db  # noqa: E402
 
 
 def _topic(conn: sqlite3.Connection, topic_id: str) -> None:
+    """Seed pre-retirement priority records, never create a new retired roster.
+
+    The priority API still owns the legacy conductor_priority metadata lane.
+    These compatibility tests do not establish priority authority on new rosters.
+    """
     roles = [
         {"role": "CONDUCTOR", "session_id": f"codex-cond_{topic_id.lower()}"},
         {"role": "EXECUTOR", "session_id": f"codex-exec_{topic_id.lower()}"},
         {"role": "ADVOCATE", "session_id": f"cc-adv_{topic_id.lower()}"},
     ]
-    init_debate(
-        conn,
-        topic_id=topic_id,
-        title=f"{topic_id} priority test",
-        roles=roles,
-        created_by_role="CONDUCTOR",
+    conn.execute(
+        "INSERT INTO debates "
+        "(topic_id, title, state, created_at, created_by_role, roles_json) "
+        "VALUES (?, ?, 'ACTIVE', '2026-01-01T00:00:00Z', 'CONDUCTOR', ?)",
+        (topic_id, f"{topic_id} historical priority test", json.dumps(roles)),
     )
-    transition_state(conn, topic_id=topic_id, role="CONDUCTOR", new_state="ACTIVE")
-    seed_initial_role_bindings(conn, topic_id=topic_id, roles=roles, bound_by_role="CONDUCTOR")
+    seed_initial_role_bindings(
+        conn, topic_id=topic_id,
+        roles=[entry for entry in roles if entry["role"] != "CONDUCTOR"],
+        bound_by_role="EXECUTOR",
+    )
+    # Pre-retirement ownership is a historical database image, not a current
+    # bind_role_session call; public reactivation is forbidden on this branch.
+    conn.execute(
+        "INSERT INTO debate_role_bindings "
+        "(topic_id, role, session_id, runtime, state, generation, created_at, "
+        "updated_at, reason) VALUES (?, 'CONDUCTOR', ?, 'codex', 'active', 1, "
+        "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'synthetic historical owner')",
+        (topic_id, roles[0]["session_id"]),
+    )
 
 
 @pytest.fixture
@@ -50,7 +66,7 @@ def conn(tmp_path):
     c.close()
 
 
-def test_conductor_topic_lane_is_cross_topic_sort_authority(conn):
+def test_legacy_conductor_topic_lane_is_cross_topic_sort_authority(conn):
     debate_post_with_recipients(
         conn,
         topic_id="PRIORITY_A",
@@ -110,6 +126,23 @@ def test_topic_priority_requires_conductor_role(conn):
         )
 
     assert exc_info.value.error_type == "topic_priority_requires_conductor"
+
+
+def test_new_priority_roster_rejects_retired_conductor(conn):
+    """Historical metadata compatibility cannot reopen public retired rosters."""
+    before = conn.execute("SELECT COUNT(*) FROM debates").fetchone()[0]
+    bindings_before = conn.execute("SELECT COUNT(*) FROM debate_role_bindings").fetchone()[0]
+    with pytest.raises(DebateError) as exc_info:
+        init_debate(
+            conn, topic_id="PRIORITY_NEW", title="new priority topic",
+            roles=[{"role": "CONDUCTOR", "session_id": "codex-retired"}],
+            created_by_role="CONDUCTOR",
+        )
+    assert exc_info.value.error_type == "role_retired"
+    assert conn.execute("SELECT COUNT(*) FROM debates").fetchone()[0] == before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM debate_role_bindings"
+    ).fetchone()[0] == bindings_before
 
 
 def test_work_queue_reports_missing_active_binding_as_p1(conn):
