@@ -525,6 +525,98 @@ def test_same_timestamp_watermark_does_not_cover_later_msg_id(pump_db, monkeypat
     assert _queue(con, higher)["EXECUTOR"] is None
 
 
+@pytest.mark.parametrize("cursor_ts,trigger_ts,expected", [
+    ("2026-10-03T00:00:00.123Z", "2026-10-03T00:00:00Z", True),
+    ("2026-10-03T00:00:00Z", "2026-10-03T00:00:00.123Z", False),
+    ("2026-10-03T01:00:00+02:00", "2026-10-03T00:00:00Z", False),
+    ("2026-10-02T23:00:00-02:00", "2026-10-03T00:00:00Z", True),
+])
+def test_cursor_reached_orders_instants_before_message_ids(cursor_ts, trigger_ts, expected):
+    cursor = {"last_processed_ts": cursor_ts, "last_processed_msg_id": "ffffffffffff"}
+    assert debate_pump._cursor_reached(cursor, trigger_ts, "000000000001") is expected
+
+
+@pytest.mark.parametrize("cursor_ts", [
+    "2026-10-03T00:00:00.000000Z",
+    "2026-10-03T00:00:00+00:00",
+    "2026-10-03T02:00:00+02:00",
+])
+@pytest.mark.parametrize("cursor_id,expected", [
+    ("000000000001", False), ("000000000002", True), ("000000000003", True),
+])
+def test_cursor_reached_equivalent_instants_use_message_id(cursor_ts, cursor_id, expected):
+    cursor = {"last_processed_ts": cursor_ts, "last_processed_msg_id": cursor_id}
+    assert debate_pump._cursor_reached(cursor, "2026-10-03T00:00:00Z", "000000000002") is expected
+
+
+@pytest.mark.parametrize("invalid", [None, "", "not-a-timestamp", "2026-10-03", "2026-10-03T00:00:00", "2026-13-03T00:00:00Z"])
+@pytest.mark.parametrize("invalid_side", ["cursor", "trigger"])
+def test_cursor_reached_invalid_or_missing_timestamp_fails_closed(invalid, invalid_side):
+    valid = "2026-10-03T00:00:00Z"
+    cursor = {"last_processed_ts": invalid if invalid_side == "cursor" else valid,
+              "last_processed_msg_id": "ffffffffffff"}
+    trigger_ts = invalid if invalid_side == "trigger" else valid
+    assert debate_pump._cursor_reached(cursor, trigger_ts, "000000000001") is False
+
+
+def test_cursor_reached_missing_cursor_fails_closed():
+    assert debate_pump._cursor_reached(None, "2026-10-03T00:00:00Z", "000000000001") is False
+
+
+@pytest.mark.parametrize("cursor_ts,trigger_ts", [
+    ("2026-10-03T00:00:00.0000001Z", "2026-10-03T00:00:00.0000009Z"),
+    ("2026-10-03T00:00:00.0000009Z", "2026-10-03T00:00:00.0000001Z"),
+    ("2026-10-03T00:00:00.1234561Z", "2026-10-03T00:00:00.1234561Z"),
+    ("2026-10-03T00:00:00.0000001Z", "2026-10-03T00:00:00Z"),
+    ("2026-10-03T00:00:00Z", "2026-10-03T00:00:00.0000001Z"),
+    ("2026-10-03T00:00:00,0000001Z", "2026-10-03T00:00:00Z"),
+    ("2026-10-03T00:00:00Z", "2026-10-03T00:00:00+00:00:00.0000001"),
+])
+def test_cursor_reached_nonzero_submicrosecond_precision_fails_closed(cursor_ts, trigger_ts):
+    cursor = {"last_processed_ts": cursor_ts, "last_processed_msg_id": "ffffffffffff"}
+    assert debate_pump._cursor_reached(cursor, trigger_ts, "000000000001") is False
+
+
+@pytest.mark.parametrize("cursor_id,expected", [
+    ("000000000001", False), ("000000000002", True), ("000000000003", True),
+])
+def test_cursor_reached_zero_extra_fraction_digits_preserve_message_id_order(cursor_id, expected):
+    cursor = {"last_processed_ts": "2026-10-03T00:00:00.1234560000Z",
+              "last_processed_msg_id": cursor_id}
+    assert debate_pump._cursor_reached(cursor, "2026-10-03T00:00:00.123456Z", "000000000002") is expected
+
+
+@pytest.mark.parametrize("ack_source", ["signal", "watermark"])
+def test_submicrosecond_cursor_cannot_complete_later_delivery(pump_db, ack_source):
+    con = pump_db
+    earlier, trigger = sorted([_post_impl_ping(con, "first"), _post_impl_ping(con, "second")], reverse=True)
+    con.execute("UPDATE debate_messages SET ts=? WHERE msg_id=?", ("2026-10-03T00:00:00.0000001Z", earlier))
+    con.execute("UPDATE debate_messages SET ts=? WHERE msg_id=?", ("2026-10-03T00:00:00.0000009Z", trigger))
+    if ack_source == "signal":
+        _executor_signal_ack(con, earlier)
+    else:
+        advance_watermark(con, topic_id=TOPIC, role="EXECUTOR", processed_up_to_msg_id=earlier)
+    assert debate_pump._delivery_acknowledged_on_connection(con, trigger, SUPPRESSED) == (False, ["EXECUTOR"])
+    assert debate_pump._complete_pending_deliveries(trigger, suppressed_roles=SUPPRESSED) == 0
+    assert _queue(con, trigger)["EXECUTOR"] is None
+
+
+@pytest.mark.parametrize("ack_source", ["signal", "watermark"])
+def test_later_fractional_ack_reaches_whole_second_delivery(pump_db, ack_source):
+    con = pump_db
+    trigger = _post_impl_ping(con, "whole-second trigger")
+    later = _post_analysis_q(con, "later fractional acknowledgement")
+    con.execute("UPDATE debate_messages SET ts=? WHERE msg_id=?", ("2026-10-03T00:00:00Z", trigger))
+    con.execute("UPDATE debate_messages SET ts=? WHERE msg_id=?", ("2026-10-03T00:00:00.123Z", later))
+    if ack_source == "signal":
+        _executor_signal_ack(con, later)
+    else:
+        advance_watermark(con, topic_id=TOPIC, role="EXECUTOR", processed_up_to_msg_id=later)
+    assert debate_pump._delivery_acknowledged_on_connection(con, trigger, SUPPRESSED) == (True, [])
+    assert debate_pump._complete_pending_deliveries(trigger, suppressed_roles=SUPPRESSED) > 0
+    assert _queue(con, trigger)["EXECUTOR"] is not None
+
+
 def _notified(con, trigger):
     _insert_wake_log(con, trigger_msg_id=trigger, topic_id=TOPIC, recipient="EXECUTOR",
         action=WAKE_ACTION, result="notified", target_role="EXECUTOR", target_session_id=EXECUTOR_SESSION, target_runtime="cc")

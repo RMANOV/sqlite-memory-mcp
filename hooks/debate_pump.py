@@ -564,8 +564,24 @@ def _recipient_has_terminal_reply(
 
 
 def _cursor_reached(cursor: sqlite3.Row | None, trigger_ts: str, trigger_id: str) -> bool:
-    return bool(cursor and cursor["last_processed_ts"] and
-                (str(cursor["last_processed_ts"]), str(cursor["last_processed_msg_id"] or "")) >= (trigger_ts, trigger_id))
+    """Compare acknowledged instants, then message IDs; unknown time is not ACK."""
+    if cursor is None:
+        return False
+    try:
+        # datetime discards digits beyond microseconds; never ACK a false tie.
+        for timestamp in (cursor["last_processed_ts"], trigger_ts):
+            for fraction in re.findall(r"[.,](\d+)", timestamp):
+                if fraction[6:].strip("0"):
+                    return False
+        processed = datetime.fromisoformat(cursor["last_processed_ts"].replace("Z", "+00:00"))
+        triggered = datetime.fromisoformat(trigger_ts.replace("Z", "+00:00"))
+        if processed.tzinfo is None or triggered.tzinfo is None:
+            return False
+        return (
+            processed.astimezone(timezone.utc), str(cursor["last_processed_msg_id"] or "")
+        ) >= (triggered.astimezone(timezone.utc), trigger_id)
+    except (AttributeError, IndexError, KeyError, OverflowError, TypeError, ValueError):
+        return False
 
 
 def _confirmed_delivery_receipt(con: sqlite3.Connection, *, topic: str, trigger: str,
