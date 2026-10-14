@@ -360,7 +360,10 @@ def test_public_tools_expose_refusal_and_fresh_review_can_succeed(db_path, monke
     rid = json.loads(intel_server.reflect_start())["run_id"]
     candidate = json.loads(intel_server.reflect_review(rid))["candidates"][0]
     cid = candidate["candidate_id"]
-    assert candidate["reviewed_state"]["task"]["status"] == "not_started"
+    assert len(candidate["reviewed_state_sha256"]) == 64
+    with get_conn_immediate(db_path) as conn:
+        frozen = dao.get_candidate(conn, cid)["reviewed_state"]
+    assert frozen["task"]["status"] == "not_started"
     assert (
         json.loads(intel_server.reflect_decide(cid, "accept"))["decision"] == "accept"
     )
@@ -382,3 +385,27 @@ def test_public_tools_expose_refusal_and_fresh_review_can_succeed(db_path, monke
     assert fresh["candidate_id"] != cid
     intel_server.reflect_decide(fresh["candidate_id"], "accept")
     assert json.loads(intel_server.reflect_apply(new_rid))["applied"] == 1
+
+
+def test_review_listing_stays_compact_for_large_tasks(db_path, monkeypatch):
+    # Real data had a 295k-char note: inlining the frozen state made a single
+    # candidate ~77k tokens, beyond MCP client output caps.
+    import json
+    import intel_server
+    from db_utils import get_conn
+
+    big = "x" * 300_000
+    with get_conn_immediate(db_path) as conn:
+        apply_task_mutation(conn, "task-1", {"description": big})
+    monkeypatch.setattr(intel_server, "_get_conn", lambda: get_conn(db_path))
+    monkeypatch.setattr(
+        intel_server, "_get_conn_immediate", lambda: get_conn_immediate(db_path)
+    )
+    rid = json.loads(intel_server.reflect_start())["run_id"]
+    review = intel_server.reflect_review(rid)
+    assert len(review) < 20_000
+    cid = json.loads(review)["candidates"][0]["candidate_id"]
+    with get_conn_immediate(db_path) as conn:
+        assert (
+            dao.get_candidate(conn, cid)["reviewed_state"]["task"]["description"] == big
+        )

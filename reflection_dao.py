@@ -12,6 +12,7 @@ C11, C13 (entity MemoryReflection_DreamsAlignmentCorrections).
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -296,9 +297,23 @@ def task_review_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] 
     return {"task": dict(row), "field_versions": [dict(v) for v in versions]}
 
 
-def _decode_review_fields(candidate: dict[str, Any]) -> None:
+def _decode_review_fields(
+    candidate: dict[str, Any], *, full_state: bool = True
+) -> None:
+    """Decode the frozen review state, or reduce it to a digest for listings.
+
+    The state holds the whole task row and every field version, which can be
+    hundreds of KB per candidate; listings carry only its sha256.
+    """
     for key in ("reviewed_state", "apply_error"):
         raw = candidate.pop(key + "_json", None)
+        if key == "reviewed_state" and not full_state:
+            candidate["reviewed_state_sha256"] = (
+                hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                if raw is not None
+                else None
+            )
+            continue
         try:
             candidate[key] = json_loads(raw) if raw is not None else None
         except (ValueError, TypeError):
@@ -413,7 +428,7 @@ def list_candidates(
     out: list[dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        _decode_review_fields(d)
+        _decode_review_fields(d, full_state=False)
         try:
             d["evidence"] = json_loads(d.pop("evidence_json") or "{}")
         except (ValueError, TypeError):
