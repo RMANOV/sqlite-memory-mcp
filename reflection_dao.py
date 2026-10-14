@@ -465,7 +465,9 @@ def decide_candidate(
     return cur.rowcount > 0
 
 
-def record_apply_refusal(conn, candidate_id: str, reason: str, applied_by: str) -> None:
+def record_apply_refusal(
+    conn: sqlite3.Connection, candidate_id: str, reason: str, applied_by: str
+) -> None:
     """Invalidate a candidate durably while preserving its human decision."""
     conn.execute(
         "UPDATE reflection_candidates SET apply_error_json = ? WHERE candidate_id = ?",
