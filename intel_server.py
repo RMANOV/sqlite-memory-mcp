@@ -955,7 +955,7 @@ def reflect_decide(
 
 # Tool 20: reflect_apply
 @mcp.tool()
-@_db_tool(error_mapper=_reflect_run_error_response)
+@_db_tool(write=True, error_mapper=_reflect_run_error_response)
 def reflect_apply(
     conn,
     run_id: str,
@@ -969,6 +969,10 @@ def reflect_apply(
     Idempotent — candidates that already have a snapshot for this run
     are skipped with reason='already_applied'. Entities are skipped in
     MVP (no entity archive primitive yet).
+
+    Approval is bound to the task row and field versions captured by
+    reflect_start. Changed or legacy candidates fail closed with a durable
+    apply_error visible in reflect_review; create a new run to review again.
 
     Args:
         run_id: id of a run in `completed` status. Other statuses error.

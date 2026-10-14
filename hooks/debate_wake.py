@@ -182,7 +182,10 @@ def _unwrap_tool_response(value: Any) -> dict[str, Any] | None:
 def _extract_tool_response(hook_payload: dict[str, Any]) -> dict[str, Any] | None:
     if "tool_response" in hook_payload:
         return _normalize_tool_response(hook_payload["tool_response"])
-    aliases = [hook_payload[key] for key in _HOOK_RESPONSE_KEYS[1:] if key in hook_payload]
+    aliases = [
+        hook_payload[key] for key in _HOOK_RESPONSE_KEYS
+        if key != "tool_response" and key in hook_payload
+    ]
     if aliases:
         return _normalize_tool_response(aliases)
     return _unwrap_tool_response(hook_payload)

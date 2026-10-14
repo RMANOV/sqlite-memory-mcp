@@ -12,8 +12,10 @@ C11, C13 (entity MemoryReflection_DreamsAlignmentCorrections).
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from typing import Any
 
 from db_utils import json_dumps, json_loads, now_iso
@@ -106,9 +108,7 @@ def start_run(conn: sqlite3.Connection, run_id: str) -> bool:
     if row["status"] == "running":
         return False
     if row["status"] in TERMINAL_STATUSES:
-        raise ReflectionStateError(
-            f"cannot_start_terminal_run: status={row['status']}"
-        )
+        raise ReflectionStateError(f"cannot_start_terminal_run: status={row['status']}")
     conn.execute(
         "UPDATE reflection_runs SET status = 'running', started_at = ? WHERE run_id = ?",
         (now_iso(), run_id),
@@ -131,9 +131,7 @@ def finish_run(
     successful transition; False if already terminal.
     """
     if status not in TERMINAL_STATUSES:
-        raise ReflectionStateError(
-            f"finish_requires_terminal_status: got {status}"
-        )
+        raise ReflectionStateError(f"finish_requires_terminal_status: got {status}")
     if error_type is not None and error_type not in VALID_ERROR_TYPES:
         raise ReflectionStateError(f"unknown_error_type: {error_type}")
     row = get_run(conn, run_id)
@@ -168,9 +166,7 @@ def archive_run(conn: sqlite3.Connection, run_id: str) -> bool:
     if row is None:
         raise ReflectionStateError(f"run_not_found: {run_id}")
     if row["status"] not in TERMINAL_STATUSES:
-        raise ReflectionStateError(
-            f"cannot_archive_active_run: status={row['status']}"
-        )
+        raise ReflectionStateError(f"cannot_archive_active_run: status={row['status']}")
     if row["archived_at"] is not None:
         return False
     conn.execute(
@@ -260,6 +256,71 @@ def list_inputs(conn: sqlite3.Connection, run_id: str) -> list[dict[str, Any]]:
 # ── reflection_candidates ────────────────────────────────────────────────
 
 
+@contextmanager
+def candidate_write_transaction(conn: sqlite3.Connection, candidate_id: str):
+    """Serialize checks/writes, including for direct autocommit DAO callers.
+
+    A savepoint preserves the caller's transaction. The no-op UPDATE takes
+    SQLite's writer lock before any guarded reads; a stale outer read
+    transaction fails closed on upgrade. Release never commits an outer txn.
+    """
+    name = "reflection_" + uuid.uuid4().hex
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        conn.execute(
+            "UPDATE reflection_candidates SET candidate_id = candidate_id "
+            "WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+        yield
+        conn.execute(f"RELEASE {name}")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+        raise
+
+
+def task_review_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:
+    """Capture row values and logical field versions, including ABA changes.
+
+    Call under candidate_write_transaction (or an existing write txn) so the
+    two reads describe one state. No timestamp-only freshness assumptions.
+    """
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    versions = conn.execute(
+        "SELECT * FROM task_field_versions WHERE task_id = ? ORDER BY field_name",
+        (task_id,),
+    ).fetchall()
+    return {"task": dict(row), "field_versions": [dict(v) for v in versions]}
+
+
+def _decode_review_fields(
+    candidate: dict[str, Any], *, full_state: bool = True
+) -> None:
+    """Decode the frozen review state, or reduce it to a digest for listings.
+
+    The state holds the whole task row and every field version, which can be
+    hundreds of KB per candidate; listings carry only its sha256.
+    """
+    for key in ("reviewed_state", "apply_error"):
+        raw = candidate.pop(key + "_json", None)
+        if key == "reviewed_state" and not full_state:
+            candidate["reviewed_state_sha256"] = (
+                hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                if raw is not None
+                else None
+            )
+            continue
+        try:
+            candidate[key] = json_loads(raw) if raw is not None else None
+        except (ValueError, TypeError):
+            # A corrupt approval must never authorize a mutation.
+            candidate[key] = {} if key == "apply_error" else None
+
+
 def add_candidate(
     conn: sqlite3.Connection,
     run_id: str,
@@ -277,30 +338,33 @@ def add_candidate(
     if target_kind not in VALID_TARGET_KINDS:
         raise ReflectionStateError(f"unknown_target_kind: {target_kind}")
     cid = candidate_id or _new_id("cand")
-    conn.execute(
-        "INSERT INTO reflection_candidates "
-        "(candidate_id, run_id, candidate_type, suggested_action, target_kind, "
-        "target_ref, evidence_json, proposed_state_json, confidence, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            cid,
-            run_id,
-            candidate_type,
-            suggested_action,
-            target_kind,
-            target_ref,
-            json_dumps(evidence),
-            json_dumps(proposed_state) if proposed_state is not None else None,
-            confidence,
-            now_iso(),
-        ),
-    )
+    with candidate_write_transaction(conn, cid):
+        reviewed_state = (
+            task_review_state(conn, target_ref) if target_kind == "task" else None
+        )
+        conn.execute(
+            "INSERT INTO reflection_candidates "
+            "(candidate_id, run_id, candidate_type, suggested_action, target_kind, "
+            "target_ref, evidence_json, proposed_state_json, confidence, created_at, "
+            "reviewed_state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cid,
+                run_id,
+                candidate_type,
+                suggested_action,
+                target_kind,
+                target_ref,
+                json_dumps(evidence),
+                json_dumps(proposed_state) if proposed_state is not None else None,
+                confidence,
+                now_iso(),
+                json_dumps(reviewed_state) if reviewed_state is not None else None,
+            ),
+        )
     return cid
 
 
-def get_candidate(
-    conn: sqlite3.Connection, candidate_id: str
-) -> dict[str, Any] | None:
+def get_candidate(conn: sqlite3.Connection, candidate_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT * FROM reflection_candidates WHERE candidate_id = ?",
         (candidate_id,),
@@ -308,6 +372,7 @@ def get_candidate(
     if row is None:
         return None
     d = dict(row)
+    _decode_review_fields(d)
     try:
         d["evidence"] = json_loads(d.pop("evidence_json") or "{}")
     except (ValueError, TypeError):
@@ -363,6 +428,7 @@ def list_candidates(
     out: list[dict[str, Any]] = []
     for r in rows:
         d = dict(r)
+        _decode_review_fields(d, full_state=False)
         try:
             d["evidence"] = json_loads(d.pop("evidence_json") or "{}")
         except (ValueError, TypeError):
@@ -378,20 +444,48 @@ def decide_candidate(
     decision: str,
     decided_by: str = "user",
 ) -> bool:
-    """Apply human_decision to a candidate. Validates enum."""
+    """Record a decision about the frozen review state, never refresh it.
+
+    Legacy/missing snapshots are deliberately not backfilled here. Applying
+    them requires a fresh run and review, as does an invalidated candidate.
+    """
     if decision not in VALID_DECISIONS:
         raise ReflectionStateError(f"unknown_decision: {decision}")
-    cur = conn.execute(
-        "UPDATE reflection_candidates SET human_decision = ?, decided_by = ?, "
-        "decided_at = ? WHERE candidate_id = ?",
-        (decision, decided_by, now_iso(), candidate_id),
-    )
+    with candidate_write_transaction(conn, candidate_id):
+        candidate = get_candidate(conn, candidate_id)
+        if candidate and decision == "accept" and candidate["apply_error"] is not None:
+            raise ReflectionStateError(
+                "candidate_requires_new_review: create a new run"
+            )
+        cur = conn.execute(
+            "UPDATE reflection_candidates SET human_decision = ?, decided_by = ?, "
+            "decided_at = ? WHERE candidate_id = ?",
+            (decision, decided_by, now_iso(), candidate_id),
+        )
     return cur.rowcount > 0
 
 
-def candidate_decision_counts(
-    conn: sqlite3.Connection, run_id: str
-) -> dict[str, int]:
+def record_apply_refusal(
+    conn: sqlite3.Connection, candidate_id: str, reason: str, applied_by: str
+) -> None:
+    """Invalidate a candidate durably while preserving its human decision."""
+    conn.execute(
+        "UPDATE reflection_candidates SET apply_error_json = ? WHERE candidate_id = ?",
+        (
+            json_dumps(
+                {
+                    "reason": reason,
+                    "attempted_by": applied_by,
+                    "attempted_at": now_iso(),
+                    "requires_new_review": True,
+                }
+            ),
+            candidate_id,
+        ),
+    )
+
+
+def candidate_decision_counts(conn: sqlite3.Connection, run_id: str) -> dict[str, int]:
     """Aggregate count of candidates per decision (incl. pending=NULL)."""
     rows = conn.execute(
         "SELECT COALESCE(human_decision, 'pending') AS d, COUNT(*) AS c "
@@ -530,8 +624,6 @@ def discard_run(conn: sqlite3.Connection, run_id: str) -> int:
     if row is None:
         raise ReflectionStateError(f"run_not_found: {run_id}")
     if row["status"] not in TERMINAL_STATUSES:
-        raise ReflectionStateError(
-            f"cannot_discard_active_run: status={row['status']}"
-        )
+        raise ReflectionStateError(f"cannot_discard_active_run: status={row['status']}")
     cur = conn.execute("DELETE FROM reflection_runs WHERE run_id = ?", (run_id,))
     return cur.rowcount

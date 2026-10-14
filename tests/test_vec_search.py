@@ -83,6 +83,7 @@ def test_load_vec_returns_false_when_extension_load_fails(monkeypatch):
 def test_vector_search_returns_empty_on_embedding_failure(monkeypatch):
     monkeypatch.setattr(vec_search, "VEC_AVAILABLE", True)
     monkeypatch.setattr(vec_search, "load_vec", lambda conn: True)
+    monkeypatch.setattr(vec_search, "_model", object())
     monkeypatch.setattr(
         vec_search,
         "_embed_text_or_none",
@@ -90,6 +91,57 @@ def test_vector_search_returns_empty_on_embedding_failure(monkeypatch):
     )
 
     assert vec_search.vector_search(object(), "query") == []
+
+
+def test_query_paths_do_not_wait_for_the_first_model_load(monkeypatch):
+    # 14 Oct 2026: the first load ran inside search_nodes' read snapshot for
+    # 4h14m, so no WAL checkpoint could run. Query paths must return at once.
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    loads = []
+
+    def slow_load():
+        loads.append(1)
+        started.set()
+        release.wait(10)
+
+    def no_embedding(text, context):
+        raise AssertionError("query path embedded before the model was ready")
+
+    monkeypatch.setattr(vec_search, "VEC_AVAILABLE", True)
+    monkeypatch.setattr(vec_search, "load_vec", lambda conn: True)
+    monkeypatch.setattr(vec_search, "_model", None)
+    monkeypatch.setattr(vec_search, "_warmup_thread", None)
+    monkeypatch.setattr(vec_search, "_get_model", slow_load)
+    monkeypatch.setattr(vec_search, "_embed_text_or_none", no_embedding)
+    try:
+        assert vec_search.vector_search(object(), "query") == []
+        assert vec_search.task_vector_search(object(), "query") == []
+        assert started.wait(5)
+        assert loads == [1]
+    finally:
+        release.set()
+        vec_search._warmup_thread.join(5)
+
+
+def test_query_path_embeds_once_the_model_is_ready(monkeypatch):
+    seen = []
+
+    class FakeConn:
+        def execute(self, sql, params=()):
+            seen.append(params)
+            return _FakeCursor([{"eid": 1, "distance": 0.1}])
+
+    monkeypatch.setattr(vec_search, "VEC_AVAILABLE", True)
+    monkeypatch.setattr(vec_search, "load_vec", lambda conn: True)
+    monkeypatch.setattr(vec_search, "_model", object())
+    monkeypatch.setattr(vec_search, "_embed_text_or_none", lambda text, context: b"emb")
+
+    assert vec_search.vector_search(FakeConn(), "query", limit=3) == [
+        {"eid": 1, "distance": 0.1}
+    ]
+    assert seen == [(b"emb", 3)]
 
 
 def test_vec_sync_task_returns_false_on_sqlite_error(monkeypatch):

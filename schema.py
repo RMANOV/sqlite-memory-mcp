@@ -1255,6 +1255,8 @@ CREATE TABLE IF NOT EXISTS reflection_candidates (
     target_ref          TEXT NOT NULL,
     evidence_json       TEXT NOT NULL,
     proposed_state_json TEXT NULL,
+    reviewed_state_json TEXT NULL,
+    apply_error_json    TEXT NULL,
     confidence          REAL NULL,
     human_decision      TEXT NULL
         CHECK (human_decision IS NULL OR human_decision IN ('accept','reject','defer')),
@@ -1288,6 +1290,16 @@ CREATE INDEX IF NOT EXISTS idx_reflection_apply_target
 
 
 _MIGRATIONS = [
+    (
+        "SELECT 1 FROM pragma_table_info('reflection_candidates') WHERE name='reviewed_state_json'",
+        "ALTER TABLE reflection_candidates ADD COLUMN reviewed_state_json TEXT NULL",
+        "reflection_candidates.reviewed_state_json column",
+    ),
+    (
+        "SELECT 1 FROM pragma_table_info('reflection_candidates') WHERE name='apply_error_json'",
+        "ALTER TABLE reflection_candidates ADD COLUMN apply_error_json TEXT NULL",
+        "reflection_candidates.apply_error_json column",
+    ),
     (
         "SELECT 1 FROM pragma_table_info('tasks') WHERE name='description'",
         "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT NULL",
