@@ -14,6 +14,10 @@ Design choices baked into MVP:
   action either archives the row or clears a single field. We never
   hard-delete and never auto-merge or auto-fill — those decisions
   warrant their own per-candidate review and aren't safe defaults.
+- Freshness: compare the frozen review state and field versions under a
+  writer lock. Changed/missing review states invalidate the candidate with a
+  durable refusal; a fresh run and review are required.
+- Atomicity: each mutation, ledger update and snapshot share a savepoint.
 - Idempotency: a candidate that already has at least one snapshot
   for this run is skipped with reason="already_applied". This makes
   reflect_apply safe to retry without double-mutating.
@@ -63,30 +67,73 @@ DEFAULT_TASK_ACTION_HANDLERS: dict[str, dict[str, Any]] = {
 }
 
 
-_TASK_SNAPSHOT_FIELDS = (
-    "id",
-    "title",
-    "description",
-    "status",
-    "priority",
-    "section",
-    "due_date",
-    "project",
-    "parent_id",
-    "notes",
-    "type",
-    "updated_at",
-)
+def _apply_candidate(conn, run_id, cid, handlers, applied_by):
+    # The caller holds the writer lock. Re-read the decision and idempotency
+    # marker here: the earlier accepted-candidate list is only a work queue.
+    cand = dao.get_candidate(conn, cid)
+    if cand is None or cand["run_id"] != run_id:
+        return "candidate_not_found"
+    if dao.has_apply_snapshot(conn, run_id, cid):
+        return "already_applied"
+    if cand["human_decision"] != "accept":
+        return "decision_not_accepted"
+    run = dao.get_run(conn, run_id)
+    if run is None or run["status"] != "completed":
+        return "run_not_completed"
+    if cand["apply_error"] is not None:
+        return "candidate_requires_new_review"
+    if cand["target_kind"] != "task":
+        return f"{cand['target_kind']}_apply_not_implemented_in_mvp"
+    handler = handlers.get(cand["candidate_type"])
+    if handler is None:
+        return "no_handler_for_candidate_type"
 
+    current = dao.task_review_state(conn, cand["target_ref"])
+    reviewed = cand["reviewed_state"]
+    reason = None
+    if current is None:
+        reason = "target_not_found"
+    elif not isinstance(reviewed, dict) or set(reviewed) != {"task", "field_versions"}:
+        reason = "missing_review_state"
+    elif reviewed != current:
+        reason = "stale_review"
+    if reason:
+        dao.record_apply_refusal(conn, cid, reason, applied_by)
+        return reason
 
-def _fetch_task_state(
-    conn: sqlite3.Connection, task_id: str
-) -> dict[str, Any] | None:
-    cols = ", ".join(_TASK_SNAPSHOT_FIELDS)
-    row = conn.execute(
-        f"SELECT {cols} FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    return dict(row) if row else None
+    result = apply_task_mutation(
+        conn,
+        cand["target_ref"],
+        handler["changes"],
+        tool_name="reflect_apply",
+        actor_type="reflection",
+        actor_id=run_id,
+        source_kind="reflection_run",
+        source_ref=run_id,
+    )
+    if result.get("updated") != 1:
+        raise dao.ReflectionStateError("task_mutation_not_applied")
+    after = dao.task_review_state(conn, cand["target_ref"])
+    if after is None:
+        raise dao.ReflectionStateError("target_missing_after_mutation")
+    # These writes are in the same savepoint as the mutation and its ledger.
+    # A snapshot failure rolls all of them back before a failure is reported.
+    try:
+        dao.add_apply_snapshot(
+            conn,
+            run_id,
+            cid,
+            target_kind="task",
+            target_ref=cand["target_ref"],
+            before_state=current["task"],
+            after_state=after["task"],
+            applied_by=applied_by,
+        )
+    except Exception as exc:
+        raise dao.ReflectionStateError(
+            f"snapshot_write_failed: {str(exc)[:300]}"
+        ) from exc
+    return None
 
 
 def apply_run(
@@ -120,9 +167,7 @@ def apply_run(
     if run is None:
         raise dao.ReflectionStateError(f"run_not_found: {run_id}")
     if run["status"] != "completed":
-        raise dao.ReflectionStateError(
-            f"run_not_completed: status={run['status']}"
-        )
+        raise dao.ReflectionStateError(f"run_not_completed: status={run['status']}")
 
     rows, _ = dao.list_candidates(
         conn, run_id, decision_filter="accept", limit=dao.MAX_CANDIDATES_PER_RUN
@@ -141,87 +186,22 @@ def apply_run(
 
     for cand in rows:
         cid = cand["candidate_id"]
-        target_kind = cand["target_kind"]
-        target_ref = cand["target_ref"]
-        cand_type = cand["candidate_type"]
-
-        if dao.has_apply_snapshot(conn, run_id, cid):
-            summary["skipped"].append(
-                {"candidate_id": cid, "reason": "already_applied"}
-            )
-            continue
-
-        if target_kind != "task":
-            summary["skipped"].append(
-                {
-                    "candidate_id": cid,
-                    "reason": f"{target_kind}_apply_not_implemented_in_mvp",
-                    "target_kind": target_kind,
-                }
-            )
-            continue
-
-        handler = handlers.get(cand_type)
-        if handler is None:
-            summary["skipped"].append(
-                {
-                    "candidate_id": cid,
-                    "reason": "no_handler_for_candidate_type",
-                    "candidate_type": cand_type,
-                }
-            )
-            continue
-
-        before = _fetch_task_state(conn, target_ref)
-        if before is None:
-            summary["skipped"].append(
-                {
-                    "candidate_id": cid,
-                    "reason": "target_not_found",
-                    "target_ref": target_ref,
-                }
-            )
-            continue
-
         try:
-            apply_task_mutation(
-                conn,
-                target_ref,
-                handler["changes"],
-                tool_name="reflect_apply",
-                actor_type="reflection",
-                actor_id=run_id,
-                source_kind="reflection_run",
-                source_ref=run_id,
-            )
+            with dao.candidate_write_transaction(conn, cid):
+                reason = _apply_candidate(conn, run_id, cid, handlers, applied_by)
         except Exception as exc:
-            summary["failed"].append(
-                {"candidate_id": cid, "error": str(exc)[:300]}
-            )
+            summary["failed"].append({"candidate_id": cid, "error": str(exc)[:300]})
             continue
-
-        after = _fetch_task_state(conn, target_ref) or {}
-
-        try:
-            dao.add_apply_snapshot(
-                conn,
-                run_id,
-                cid,
-                target_kind=target_kind,
-                target_ref=target_ref,
-                before_state=before,
-                after_state=after,
-                applied_by=applied_by,
-            )
-        except Exception as exc:
-            summary["failed"].append(
-                {
-                    "candidate_id": cid,
-                    "error": f"snapshot_write_failed: {str(exc)[:300]}",
-                }
-            )
-            continue
-
-        summary["applied"] += 1
+        if reason is not None:
+            skipped = {"candidate_id": cid, "reason": reason}
+            if reason.endswith("_apply_not_implemented_in_mvp"):
+                skipped["target_kind"] = cand["target_kind"]
+            elif reason == "no_handler_for_candidate_type":
+                skipped["candidate_type"] = cand["candidate_type"]
+            elif reason == "target_not_found":
+                skipped["target_ref"] = cand["target_ref"]
+            summary["skipped"].append(skipped)
+        else:
+            summary["applied"] += 1
 
     return summary
