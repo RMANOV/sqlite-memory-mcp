@@ -70,6 +70,37 @@ def _get_model() -> SentenceTransformer:
     return _model
 
 
+_warmup_lock = threading.Lock()
+_warmup_thread: threading.Thread | None = None
+
+
+def model_ready() -> bool:
+    """True once the model is loaded; otherwise start loading it in the background.
+
+    Query paths run inside the caller's SQLite read snapshot, and the first load
+    can take minutes. A reader parked in a WAL snapshot blocks every checkpoint
+    for that long (14 Oct 2026: one search_nodes held it 4h14m and the WAL grew
+    to 76 MB), so query paths fall back to FTS5 until the model is ready.
+    """
+    global _warmup_thread
+    if _model is not None:
+        return True
+    with _warmup_lock:
+        if _warmup_thread is None or not _warmup_thread.is_alive():
+            _warmup_thread = threading.Thread(
+                target=_warm_model, name="vec-model-warmup", daemon=True
+            )
+            _warmup_thread.start()
+    return False
+
+
+def _warm_model() -> None:
+    try:
+        _get_model()
+    except Exception as exc:  # noqa: BLE001 - a failed warm-up only keeps search on FTS5
+        logger.warning("Embedding model warm-up failed: %s", exc)
+
+
 # ── Extension loader ───────────────────────────────────────────────────
 
 
@@ -217,7 +248,7 @@ def vector_search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list
 
     Returns list of dicts with: eid, name, entity_type, project, distance.
     """
-    if not VEC_AVAILABLE or not load_vec(conn):
+    if not VEC_AVAILABLE or not load_vec(conn) or not model_ready():
         return []
     emb = _embed_text_or_none(query, context="entity_search_query")
     if emb is None:
@@ -504,7 +535,7 @@ def task_vector_search(
 
     Returns list of dicts with task fields + distance.
     """
-    if not VEC_AVAILABLE or not load_vec(conn):
+    if not VEC_AVAILABLE or not load_vec(conn) or not model_ready():
         return []
     emb = _embed_text_or_none(query, context="task_search_query")
     if emb is None:
