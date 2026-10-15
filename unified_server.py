@@ -11,6 +11,10 @@ All tools keep their original names (no prefix).
 
 from __future__ import annotations
 
+import io
+import os
+import sys
+
 from fastmcp import FastMCP
 
 from db_utils import ensure_db_initialized, setup_logger
@@ -61,6 +65,30 @@ mcp.mount(bridge_mcp)
 mcp.mount(collab_mcp)
 
 
+def _serve_stdio_from_private_stdin() -> None:
+    """On Windows, read MCP stdio from a private copy of fd 0 and point fd 0 at NUL.
+
+    While waiting for the next request the transport blocks in the CRT read()
+    on stdin, holding that descriptor's CRT lock. A native library that touches
+    fd 0 while loading (the gfortran runtime inside scipy's OpenBLAS, loaded by
+    the first semantic search) then waits for the client's next message: on
+    14 Oct 2026 one load waited 4h14m. With the reader on its own descriptor
+    the load does not wait.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        private = os.dup(sys.stdin.fileno())
+    except (AttributeError, OSError, ValueError):
+        return  # no usable stdin: keep the default transport behaviour
+    nul = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(nul, 0)
+    os.close(nul)
+    sys.stdin = io.TextIOWrapper(
+        io.open(private, "rb", closefd=True), encoding="utf-8", errors="replace"
+    )
+
+
 def main() -> None:
     ensure_db_initialized()
     maybe_mount_premium_extensions(mcp, server_name="sqlite-unified")
@@ -68,6 +96,7 @@ def main() -> None:
         "Unified server ready: %d mounted servers, tools from 7 domains",
         7,
     )
+    _serve_stdio_from_private_stdin()
     mcp.run(transport="stdio")
 
 
