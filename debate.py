@@ -24,6 +24,7 @@ import sqlite3
 from typing import Any
 
 from db_utils import json_dumps, json_loads, now_iso
+from debate_peer import topic_exists as _peer_topic_exists
 from debate_protocol_v1 import (
     PROTOCOL_VERSION as DEBATE_PROTOCOL_V1,
     SEMANTIC_KINDS,
@@ -437,6 +438,7 @@ def init_debate(
     exists with same roles_json.
     """
     validate_topic_id(topic_id)
+    _reject_peer_topic(conn, topic_id)
     validate_role(created_by_role)
     if not isinstance(title, str) or not title.strip():
         raise DebateError("invalid_title: must be non-empty string")
@@ -570,7 +572,17 @@ def init_debate(
     return out
 
 
+def _reject_peer_topic(conn: sqlite3.Connection, topic_id: str) -> None:
+    """Persisted peer identity cannot acquire legacy roles or side effects."""
+    if _peer_topic_exists(conn, topic_id):
+        raise DebateError(
+            "peer/v1 topic requires debate_peer_* tools",
+            error_type="PROTOCOL_CONFLICT",
+        )
+
+
 def get_debate(conn: sqlite3.Connection, topic_id: str) -> dict[str, Any] | None:
+    _reject_peer_topic(conn, topic_id)
     row = conn.execute(
         "SELECT topic_id, title, state, created_at, created_by_role, "
         "resolve_by, archived_at, roles_json, metadata_json "
@@ -5004,6 +5016,9 @@ def prepare_wake_dry_run(
             "tool_response must be a JSON object",
             error_type="wake_tool_response_invalid",
         )
+    # Even malformed legacy envelopes must not create wake audit rows for a
+    # peer-only discussion. Peer mode has no legacy transport integration.
+    _reject_peer_topic(conn, str(tool_response.get("topic_id") or ""))
     msg_id = str(tool_response.get("msg_id") or "")
     response_schema = str(tool_response.get("schema_version") or "")
     if response_schema != expected_schema_version:

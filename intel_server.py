@@ -100,6 +100,7 @@ from debate import (
     worker_no_action as _debate_worker_no_action_dao,
 )
 from debate_retrieval import search_debate_context as _search_debate_context
+import debate_peer as _peer
 from debate_protocol_v1 import (
     ProtocolV1Error as _ProtocolV1Error,
     get_protocol_state as _debate_protocol_state_dao,
@@ -1195,7 +1196,7 @@ def _debate_error_response(exc: Exception) -> str:
         if getattr(exc, "details", None):
             payload["details"] = exc.details
         return json.dumps(payload, ensure_ascii=False)
-    if isinstance(exc, _ProtocolV1Error):
+    if isinstance(exc, (_ProtocolV1Error, _peer.PeerError)):
         payload = {"error": str(exc), "error_type": exc.error_type}
         if exc.details:
             payload["details"] = exc.details
@@ -1264,6 +1265,11 @@ def debate_init(
         metadata = json.loads(metadata_json) if metadata_json else None
         blind_roles = [r.strip() for r in blind_roles_csv.split(",") if r.strip()]
         with _get_conn_immediate() as conn:
+            if _peer.topic_exists(conn, topic_id):
+                raise _DebateError(
+                    "peer/v1 topic requires debate_peer_* tools",
+                    error_type="PROTOCOL_CONFLICT",
+                )
             if not _debate_topic_exists(conn, topic_id):
                 gate_verdict = evaluate_debate_protocol_creation_gate(
                     conn,
@@ -1319,6 +1325,142 @@ def debate_init(
     except Exception as exc:
         logger.error("debate_init failed: %s", exc, exc_info=True)
         return _debate_error_response(exc)
+
+
+# Peer tools deliberately do not call legacy post/signal/wake functions.
+# A ballot result is a recorded decision, not delivery or execution authority.
+@mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_peer_init(
+    conn,
+    topic_id: str,
+    title: str,
+    members_json: str,
+    creator_member_id: str,
+    author_session_id: str,
+) -> str:
+    """Create an opt-in peer/v1 discussion with 2–32 equal frozen members.
+
+    members_json is an array of unique {member_id, session_id} objects.
+    Session IDs are cooperative local attribution, not authentication.
+    Members can post, propose, and vote; the creator has no extra authority.
+    This mode has no automatic transport, workers, or legacy inbox integration.
+    """
+    try:
+        members = json.loads(members_json)
+    except (TypeError, ValueError) as exc:
+        raise _peer.PeerError(
+            "members_json must be a JSON array", error_type="INVALID_MEMBERS"
+        ) from exc
+    if _debate_topic_exists(conn, topic_id):
+        raise _peer.PeerError(
+            "topic already belongs to a legacy debate",
+            error_type="PROTOCOL_CONFLICT",
+        )
+    if not _peer.topic_exists(conn, topic_id):
+        verdict = evaluate_debate_protocol_creation_gate(
+            conn,
+            server_name="sqlite-intel",
+            tool_name="sqlite-intel.debate_peer_init",
+            actor_id=creator_member_id,
+            payload={"topic_id": topic_id, "protocol_version": "peer/v1"},
+        )
+        if not verdict.get("allowed"):
+            return json.loads(_debate_gate_denied_response(verdict))
+    return _peer.create_topic(
+        conn,
+        topic_id=topic_id,
+        title=title,
+        members=members,
+        creator_member_id=creator_member_id,
+        author_session_id=author_session_id,
+    )
+
+
+@mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_peer_post(
+    conn,
+    topic_id: str,
+    post_id: str,
+    member_id: str,
+    author_session_id: str,
+    body: str,
+) -> str:
+    """Append equal-member discussion. Text never casts a vote or dispatches work.
+
+    Reuse post_id only to retry the exact same post. No read/delivery ACK is
+    inferred, and no CONDUCTOR or judge role is required.
+    """
+    return _peer.post(
+        conn, topic_id=topic_id, post_id=post_id, member_id=member_id,
+        author_session_id=author_session_id, body=body,
+    )
+
+
+@mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_peer_propose(
+    conn,
+    topic_id: str,
+    proposal_id: str,
+    member_id: str,
+    author_session_id: str,
+    body: str,
+) -> str:
+    """Open an immutable proposal. The returned body hash is required to vote.
+
+    Every frozen member may propose. A new wording requires a new proposal ID;
+    proposing does not cast a ballot. No deadline or background timer is added.
+    """
+    return _peer.propose(
+        conn, topic_id=topic_id, proposal_id=proposal_id, member_id=member_id,
+        author_session_id=author_session_id, body=body,
+    )
+
+
+@mcp.tool()
+@_db_tool(write=True, error_mapper=_debate_error_response)
+def debate_peer_vote(
+    conn,
+    topic_id: str,
+    proposal_id: str,
+    member_id: str,
+    author_session_id: str,
+    expected_proposal_hash: str,
+    choice: str,
+) -> str:
+    """Cast approve/reject/abstain once and atomically tally an equal vote.
+
+    Majority is floor(N/2)+1 of all frozen members. Missing votes and abstention
+    never lower N. Same retries are idempotent; conflicting ballots are errors.
+    ACCEPTED/REJECTED/INCONCLUSIVE are terminal recorded outcomes, not commands
+    or permission to execute external actions. Caller identity is cooperative.
+    """
+    return _peer.vote(
+        conn, topic_id=topic_id, proposal_id=proposal_id, member_id=member_id,
+        author_session_id=author_session_id,
+        expected_proposal_hash=expected_proposal_hash, choice=choice,
+    )
+
+
+@mcp.tool()
+@_db_tool(error_mapper=_debate_error_response)
+def debate_peer_read(
+    conn,
+    topic_id: str,
+    limit: int = 50,
+    proposal_id: str | None = None,
+) -> str:
+    """Read peer electorate, posts, proposals and ballots without mutation.
+
+    A filtered proposal exposes its exact hash, tally and missing voters.
+    Reading is not an ACK and never advances legacy cursors or claims.
+    A missing decisive ballot leaves OPEN; there is no silent timeout approval.
+    """
+    return _peer.read_state(
+        conn, topic_id=topic_id, limit=limit, proposal_id=proposal_id,
+    )
 
 
 def _signal_wake_after_commit() -> None:

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from db_utils import get_conn as _get_conn, DB_PATH
+from debate_peer import SCHEMA_SQL as _PEER_SCHEMA_SQL
 
 logger = logging.getLogger("sqlite-kb")
 
@@ -2784,6 +2785,34 @@ def init_db(db_path: str | None = None) -> None:
     try:
         for stmt in _split_schema_sql(_SCHEMA_SQL):
             raw.execute(stmt)
+        # Peer debates occupy a separate namespace. Additive DDL preserves
+        # every legacy/v1 row and runs under this same EXCLUSIVE transaction.
+        for stmt in _PEER_SCHEMA_SQL:
+            raw.execute(stmt)
+        raw.execute("""
+            CREATE TRIGGER IF NOT EXISTS debate_peer_reserve_legacy_id
+            BEFORE INSERT ON debates
+            WHEN EXISTS (SELECT 1 FROM debate_peer_topics WHERE topic_id=NEW.topic_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'topic belongs to peer/v1');
+            END
+        """)
+        raw.execute("""
+            CREATE TRIGGER IF NOT EXISTS debate_peer_reserve_peer_id
+            BEFORE INSERT ON debate_peer_topics
+            WHEN EXISTS (SELECT 1 FROM debates WHERE topic_id=NEW.topic_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'topic belongs to legacy debate');
+            END
+        """)
+        raw.execute("""
+            CREATE TRIGGER IF NOT EXISTS debate_peer_reserve_legacy_rename
+            BEFORE UPDATE OF topic_id ON debates
+            WHEN EXISTS (SELECT 1 FROM debate_peer_topics WHERE topic_id=NEW.topic_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'topic belongs to peer/v1');
+            END
+        """)
         # Run migrations under same EXCLUSIVE lock (SM-01 fix: prevents race)
         #
         # Per-migration lines are DEBUG. With the full migration list re-checked
