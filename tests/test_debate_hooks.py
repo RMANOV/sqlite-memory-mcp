@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import sys
@@ -82,7 +83,20 @@ def test_debate_wake_accepts_post_tool_under_any_mcp_prefix():
 
     assert module._is_target_tool("mcp__sqlite_unified__debate_post_with_recipients")
     assert module._is_target_tool("mcp__sqlite_intel__debate_post_with_recipients")
+    assert module._is_target_tool("mcp__sqlite_memory__debate_post_with_recipients")
     assert not module._is_target_tool("mcp__sqlite_unified__debate_post")
+
+
+def test_wake_default_uses_memory_name_with_restricted_worker(monkeypatch):
+    module = _load_hook_module("debate_wake_memory_name_test", "hooks/debate_wake.py")
+    monkeypatch.delenv("DEBATE_WAKE_MCP_PREFIX", raising=False)
+    monkeypatch.delenv("DEBATE_WAKE_MCP_SERVER", raising=False)
+    prefix, name = module._mcp_server_identity()
+    assert (prefix, name) == ("mcp__sqlite_memory__", "sqlite_memory")
+    config = json.loads(module._claude_mcp_config(name))
+    assert list(config["mcpServers"]) == ["sqlite_memory"]
+    assert Path(config["mcpServers"][name]["args"][0]).name == "debate_worker_server.py"
+    assert len(module._WAKE_TOOL_SUFFIXES) == 6
 
 
 def test_resource_budget_blocks_supercritical_heat_and_large_agent_set():

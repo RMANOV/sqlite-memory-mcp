@@ -410,7 +410,7 @@ def _record_receipt_event(event: dict[str, Any]) -> None:
 
 def _mcp_server_identity() -> tuple[str, str]:
     """Return the configured MCP tool prefix and its validated server name."""
-    prefix = os.environ.get("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_intel__")
+    prefix = os.environ.get("DEBATE_WAKE_MCP_PREFIX", "mcp__sqlite_memory__")
     if (
         not prefix.startswith("mcp__")
         or not prefix.endswith("__")

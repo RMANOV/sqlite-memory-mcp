@@ -93,6 +93,9 @@ def test_bridge_auto_sync_tracks_new_collab_writes_without_retriggering_bridge_p
     [
         "mcp__sqlite_collab__request_publish",
         "mcp__sqlite_unified__create_task_or_note",
+        "mcp__sqlite_memory__create_task_or_note",
+        "mcp__sqlite_memory__share_knowledge",
+        "mcp__sqlite_memory__merge_entities",
     ],
 )
 def test_bridge_auto_sync_tracks_unified_and_collab_writes(
@@ -134,6 +137,28 @@ def test_bridge_auto_sync_tracks_unified_and_collab_writes(
     assert rc == 0
     assert Path(module.DIRTY_FLAG).exists()
     assert len(launches) == 1
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__sqlite_memory__query_tasks",
+        "mcp__sqlite_memory__bridge_push",
+        "mcp__sqlite_memory__debate_peer_post",
+        "mcp__sqlite_memory__debate_peer_vote",
+    ],
+)
+def test_unified_reads_pushes_and_peer_records_do_not_trigger_bridge_sync(
+    tmp_path, monkeypatch, tool_name
+):
+    module = _load_module("bridge_unified_no_sync", ROOT / "hooks" / "bridge_auto_sync.py")
+    module.DIRTY_FLAG = str(tmp_path / "dirty")
+    module.NOTIFY_FILE = str(tmp_path / "notification")
+    monkeypatch.setattr(
+        module, "_launch_worker", lambda: pytest.fail("Unexpected bridge sync")
+    )
+    assert module.main(io.StringIO(json.dumps({"tool_name": tool_name})), io.StringIO()) == 0
+    assert not Path(module.DIRTY_FLAG).exists()
 
 
 def test_hook_worker_treats_no_change_push_as_success(tmp_path, monkeypatch):

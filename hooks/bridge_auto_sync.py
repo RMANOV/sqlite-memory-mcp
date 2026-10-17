@@ -81,6 +81,13 @@ WRITE_TOOLS = {
     "mcp__sqlite_unified__merge_entities",
 }
 
+# The single global memory endpoint uses the same write surface.
+WRITE_TOOLS |= {
+    name.replace("mcp__sqlite_unified__", "mcp__sqlite_memory__", 1)
+    for name in WRITE_TOOLS
+    if name.startswith("mcp__sqlite_unified__")
+}
+
 LEVEL_PREFIX = {
     "info": "BRIDGE SYNC",
     "warning": "BRIDGE WARNING",
