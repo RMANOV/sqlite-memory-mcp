@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from db_utils import (
@@ -241,6 +241,7 @@ def rerank_entities(
 # reason_primary, sort_position; prime mode emits mandate when empty. No field
 # was removed or renamed, so v1 readers stay backward compatible with v0 data.
 READY_CONTEXT_CONTRACT_VERSION = "ready_context.v1"
+READY_CONTEXT_STALE_AFTER_DAYS = 14
 
 READY_STATES = (
     "ready_now",
@@ -646,12 +647,59 @@ def _ready_sort_key(record: dict[str, Any]) -> tuple:
     task = record["task"]
     due = task.get("due_date") or "9999-12-31"
     return (
+        bool(record.get("freshness", {}).get("requires_verification")),
         _READY_STATE_RANK.get(record["ready_state"], 9),
         _READY_URGENCY_RANK.get(record["urgency"], 9),
         priority_sort_key(task),
         due,
         task.get("created_at") or "",
     )
+
+
+def _ready_freshness(
+    task: dict[str, Any], *, due: date | None, today: date
+) -> tuple[dict[str, Any], str]:
+    """Assess metadata age, never infer completion or content verification.
+
+    A future due date remains an intentional schedule even if entered long ago,
+    but cannot refresh an old in_progress or today claim.
+    Otherwise, two weeks without an update requires checking the live source.
+    The explicit evaluation date also keeps historical queries deterministic.
+    """
+    field = "updated_at" if task.get("updated_at") else "created_at"
+    value = task.get(field)
+    try:
+        updated = datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except (AttributeError, TypeError, ValueError):
+        updated = None
+    age = (today - updated).days if updated is not None else None
+    future_schedule = (
+        due is not None
+        and due > today
+        and task.get("status") != "in_progress"
+        and task.get("section") != "today"
+    )
+    if age is None:
+        status = "unknown"
+        warning = "missing or invalid metadata date; verify current status"
+    elif age < 0:
+        status = "future_timestamp"
+        warning = "metadata date is after the evaluation date; verify current status"
+    elif age >= READY_CONTEXT_STALE_AFTER_DAYS and not future_schedule:
+        status = "stale"
+        warning = f"metadata is {age} days old; verify current status before acting"
+    else:
+        status = "scheduled" if age >= READY_CONTEXT_STALE_AFTER_DAYS else "recent"
+        warning = ""
+    return {
+        "status": status,
+        "is_stale": status == "stale",
+        "timestamp_field": field,
+        "reference_date": updated.isoformat() if updated is not None else None,
+        "age_days": age,
+        "stale_after_days": READY_CONTEXT_STALE_AFTER_DAYS,
+        "requires_verification": bool(warning),
+    }, warning
 
 
 def build_ready_record(
@@ -684,16 +732,29 @@ def build_ready_record(
         blockers=blockers,
         reason_codes=reason_codes,
     )
-    stale_warning = (
+    freshness, age_warning = _ready_freshness(task, due=due, today=today)
+    bridge_warning = (
         "bridge/import/updated_at signal requires content-level verification"
         if "bridge_sync_caution" in reason_codes
         else ""
     )
+    stale_warning = "; ".join(filter(None, (age_warning, bridge_warning)))
+    freshness["requires_verification"] = bool(stale_warning)
+    if freshness["requires_verification"] and ready_state == "ready_now":
+        ready_state = "suggested_ready"
+    if age_warning and "stale_but_unresolved" not in reason_codes:
+        reason_codes.append("stale_but_unresolved")
     confidence = "high"
     if blockers or stale_warning:
         confidence = "medium"
-    if ready_state in {"cleanup_candidate", "excluded"}:
+    if age_warning or ready_state in {"cleanup_candidate", "excluded"}:
         confidence = "low"
+
+    next_action = _ready_next_action(task, ready_state=ready_state, blockers=blockers)
+    if stale_warning and ready_state not in {"cleanup_candidate", "excluded"}:
+        next_action = (
+            "Verify current status against the live source or latest operator decision"
+        )
 
     effective_reason_codes = reason_codes or ["stale_but_unresolved"]
 
@@ -723,13 +784,10 @@ def build_ready_record(
             "updated_at": task.get("updated_at"),
             "rule_version": READY_CONTEXT_CONTRACT_VERSION,
         },
-        "next_action": _ready_next_action(
-            task,
-            ready_state=ready_state,
-            blockers=blockers,
-        ),
+        "next_action": next_action,
         "confidence": confidence,
         "stale_warning": stale_warning,
+        "freshness": freshness,
         "task": dict(task),
     }
 
@@ -767,6 +825,7 @@ def attach_ready_metadata(record: dict[str, Any]) -> dict[str, Any]:
     task["_ready_stale_warning"] = record["stale_warning"]
     task["_ready_confidence"] = record["confidence"]
     task["_ready_provenance"] = dict(record["provenance"])
+    task["_ready_freshness"] = dict(record["freshness"])
     # B3 (v1, additive): mirror the new auditable fields onto tray rows.
     task["_ready_reason_primary"] = record.get("reason_primary")
     task["_ready_today_used"] = record.get("today_used")
@@ -830,7 +889,8 @@ def prime_context(
             "Start from top_ready_items; resolve blocked_or_waiting next; treat "
             "cleanup_candidates and explicit_exclusions as review-only. When the "
             "pack is empty, honor the mandate and do NOT invent tasks — query or "
-            "wait for real ones."
+            "wait for real ones. Check freshness and stale_warning before acting; "
+            "recent metadata is not proof of content verification."
         ),
         "today_used": effective_today.isoformat(),
         "items_empty": not records,
