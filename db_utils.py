@@ -8850,8 +8850,55 @@ def import_canonical_facts(
     *,
     remote_event_heads: dict[str, dict[str, Any]] | None = None,
 ) -> int:
+    """Import a complete fact batch without reviving replaced facts.
+
+    The bridge caller catches sqlite3.Error and may commit its outer transaction.
+    A local savepoint therefore protects the batch even when a later row fails.
+    It neither commits nor rolls back unrelated changes in that transaction.
+    """
     if not _sqlite_table_exists(conn, "canonical_facts"):
         return 0
+    for fact in facts:
+        # SQLite TEXT affinity stores numeric 0/False as the nonempty ID '0'.
+        if fact.get("superseded_by_fact_id") not in (None, "") and not fact.get("valid_to"):
+            raise sqlite3.IntegrityError(
+                "canonical_facts lifecycle conflict: superseded_by_fact_id "
+                f"requires valid_to (fact_id={fact.get('fact_id')!r})"
+            )
+
+    # A top-level SAVEPOINT/RELEASE would commit a legacy implicit transaction
+    # before its caller can roll it back. Preserve sqlite3's normal BEGIN mode.
+    opened_transaction = (
+        not conn.in_transaction
+        and conn.isolation_level is not None
+        and getattr(conn, "autocommit", -1)
+        == getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)
+    )
+    if opened_transaction:
+        conn.execute(f"BEGIN {conn.isolation_level}")
+    savepoint = f"canonical_facts_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        imported = _import_canonical_facts_batch(
+            conn, facts, remote_event_heads=remote_event_heads
+        )
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if opened_transaction and not imported:
+            conn.rollback()  # A read-only/no-op import did not open one before.
+        return imported
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def _import_canonical_facts_batch(
+    conn: sqlite3.Connection,
+    facts: list[dict],
+    *,
+    remote_event_heads: dict[str, dict[str, Any]] | None = None,
+) -> int:
     fact_ids = [str(fact.get("fact_id") or "") for fact in facts if fact.get("fact_id")]
     local_rows: dict[str, sqlite3.Row] = {}
     if fact_ids:

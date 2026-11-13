@@ -442,6 +442,7 @@ def promote_candidate(
         "SELECT fact_id FROM canonical_facts "
         "WHERE subject = ? AND predicate = ? AND object_text = ? "
         "AND COALESCE(valid_to, '') = '' "
+        "AND COALESCE(superseded_by_fact_id, '') = '' "
         "ORDER BY updated_at DESC LIMIT 1",
         (row["subject"], row["predicate"], row["object_text"]),
     ).fetchone()
@@ -576,7 +577,8 @@ def promote_candidate(
     competing_rows = conn.execute(
         "SELECT fact_id FROM canonical_facts "
         "WHERE fact_id != ? AND subject = ? AND predicate = ? "
-        "AND object_text != ? AND COALESCE(valid_to, '') = ''",
+        "AND object_text != ? AND COALESCE(valid_to, '') = '' "
+        "AND COALESCE(superseded_by_fact_id, '') = ''",
         (fact_id, row["subject"], row["predicate"], row["object_text"]),
     ).fetchall()
     contradiction_fact_ids = {fact_id}

@@ -600,6 +600,8 @@ def build_context_pack(
         fact_cols.append("valid_from")
     if _sqlite_has_column(conn, "canonical_facts", "valid_to"):
         fact_cols.append("valid_to")
+    if _sqlite_has_column(conn, "canonical_facts", "superseded_by_fact_id"):
+        fact_cols.append("superseded_by_fact_id")
     if _sqlite_has_column(conn, "canonical_facts", "contradiction_count"):
         fact_cols.append("contradiction_count")
     fact_rows = conn.execute(
@@ -612,7 +614,8 @@ def build_context_pack(
     fact_ids_needing_provenance: list[str] = []
     for fact_row in fact_rows:
         f = dict(fact_row)
-        if f.get("valid_to"):
+        if f.get("valid_to") or f.get("superseded_by_fact_id"):
+            # Incomplete legacy/import state must not resurrect a replaced fact.
             continue
         contradiction_count = int(f.get("contradiction_count") or 0)
         if contradiction_count > 0:
