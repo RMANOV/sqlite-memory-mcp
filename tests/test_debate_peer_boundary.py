@@ -32,7 +32,7 @@ MEMBERS = [
     {"member_id": "THIRD", "session_id": "cc-peer_three"},
 ]
 ROLES = [
-    {"role": "CONDUCTOR", "session_id": "codex-old_conductor"},
+    {"role": "ADVOCATE_CODEX", "session_id": "codex-old_conductor"},
     {"role": "EXECUTOR", "session_id": "cc-old_executor"},
     {"role": "ADVOCATE", "session_id": "codex-old_advocate"},
     {"role": "JUDGE", "session_id": "cc-old_judge"},
@@ -87,15 +87,15 @@ def _seed_legacy(conn, topic_id, *, protocol=None):
         topic_id=topic_id,
         title="Preserved legacy history",
         roles=ROLES,
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         protocol_version=protocol,
         blind_roles=["EXECUTOR", "ADVOCATE"] if protocol else None,
     )
     debate.seed_initial_role_bindings(
-        conn, topic_id=topic_id, roles=ROLES, bound_by_role="CONDUCTOR"
+        conn, topic_id=topic_id, roles=ROLES, bound_by_role="ADVOCATE_CODEX"
     )
     debate.transition_state(
-        conn, topic_id=topic_id, role="CONDUCTOR", new_state="ACTIVE",
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", new_state="ACTIVE",
         author_session_id="codex-old_conductor",
     )
     if protocol:
@@ -110,7 +110,7 @@ def _seed_legacy(conn, topic_id, *, protocol=None):
         )
         return
     question = debate.debate_post_with_recipients(
-        conn, topic_id=topic_id, role="CONDUCTOR", priority="M", kind="Q",
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", priority="M", kind="Q",
         body="historyneedle old question", addressed_to=["ADVOCATE"],
         author_session_id="codex-old_conductor",
     )
@@ -120,12 +120,12 @@ def _seed_legacy(conn, topic_id, *, protocol=None):
         author_session_id="codex-old_advocate",
     )
     debate.advance_watermark(
-        conn, topic_id=topic_id, role="CONDUCTOR",
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX",
         processed_up_to_msg_id=question["msg_id"],
         author_session_id="codex-old_conductor",
     )
     debate.debate_post_with_recipients(
-        conn, topic_id=topic_id, role="CONDUCTOR", priority="M", kind="Q",
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", priority="M", kind="Q",
         body="historyneedle pending delivery", addressed_to=["ADVOCATE"],
         author_session_id="codex-old_conductor",
     )
@@ -393,7 +393,7 @@ def test_competing_namespace_creators_persist_exactly_one_owner(tmp_path, protoc
                 else:
                     debate.init_debate(
                         db, topic_id=TOPIC, title="legacy contender", roles=ROLES,
-                        created_by_role="CONDUCTOR", protocol_version=protocol,
+                        created_by_role="ADVOCATE_CODEX", protocol_version=protocol,
                         blind_roles=["EXECUTOR", "ADVOCATE"] if protocol else None,
                     )
                 db.commit()

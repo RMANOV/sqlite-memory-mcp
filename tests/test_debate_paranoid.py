@@ -59,14 +59,14 @@ def test_paranoid_socket_blocked_full_lifecycle(db):
         init_debate(
             db, topic_id="PARANOID_LIFECYCLE", title="no network",
             roles=[
-                {"role": "CONDUCTOR", "session_id": "s-c"},
+                {"role": "ADVOCATE_CODEX", "session_id": "s-c"},
                 {"role": "EXECUTOR", "session_id": "s-e"},
                 {"role": "ADVOCATE", "session_id": "s-a"},
             ],
-            created_by_role="CONDUCTOR",
+            created_by_role="ADVOCATE_CODEX",
         )
         transition_state(
-            db, topic_id="PARANOID_LIFECYCLE", role="CONDUCTOR",
+            db, topic_id="PARANOID_LIFECYCLE", role="ADVOCATE_CODEX",
             new_state="ACTIVE",
         )
         q = post_message(
@@ -96,11 +96,11 @@ def test_paranoid_socket_blocked_full_lifecycle(db):
             db, topic_id="PARANOID_LIFECYCLE", role="EXECUTOR",
         )
         transition_state(
-            db, topic_id="PARANOID_LIFECYCLE", role="CONDUCTOR",
+            db, topic_id="PARANOID_LIFECYCLE", role="ADVOCATE_CODEX",
             new_state="RESOLVED",
         )
         transition_state(
-            db, topic_id="PARANOID_LIFECYCLE", role="CONDUCTOR",
+            db, topic_id="PARANOID_LIFECYCLE", role="ADVOCATE_CODEX",
             new_state="ARCHIVED",
         )
     finally:

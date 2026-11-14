@@ -61,25 +61,14 @@ def _insert_task(
 def _seed_daily_topic(
     conn: sqlite3.Connection, *, session_id: str = "cc-conductor"
 ) -> str:
+    from debate import init_debate, seed_initial_role_bindings
+
     topic_id = dash_topic_id()
-    ts = now_iso()
-    conn.execute(
-        "INSERT INTO debates "
-        "(topic_id, title, state, created_at, created_by_role, roles_json, metadata_json) "
-        "VALUES (?, 'Daily', 'INIT', ?, 'CONDUCTOR', ?, NULL)",
-        (
-            topic_id,
-            ts,
-            json.dumps([{"role": "CONDUCTOR", "session_id": session_id}]),
-        ),
-    )
-    conn.execute(
-        "INSERT INTO debate_role_bindings "
-        "(topic_id, role, session_id, runtime, state, generation, created_at, updated_at, "
-        "retired_at, reason, bound_by_role, bound_by_msg_id) "
-        "VALUES (?, 'CONDUCTOR', ?, 'cc', 'active', 1, ?, ?, NULL, 'test', NULL, NULL)",
-        (topic_id, session_id, ts, ts),
-    )
+    roles = [{"role": "ADVOCATE_CODEX", "session_id": session_id}]
+    init_debate(conn, topic_id=topic_id, title="Daily", roles=roles,
+                created_by_role="ADVOCATE_CODEX")
+    seed_initial_role_bindings(conn, topic_id=topic_id, roles=roles,
+                               bound_by_role="ADVOCATE_CODEX")
     return topic_id
 
 
@@ -190,12 +179,12 @@ def test_dashboard_day_scoped_read(tmp_path):
     ]
 
 
-def test_dashboard_hard_conductor_guard(tmp_path):
+def test_dashboard_current_reviewer_guard(tmp_path):
     conn = _conn(tmp_path / "memory.db")
     _insert_task(conn, "task-alpha", "Alpha")
-    _seed_daily_topic(conn, session_id="cc-conductor-live")
+    _seed_daily_topic(conn, session_id="cc-conductor_live")
 
-    with pytest.raises(PermissionError, match="not active CONDUCTOR"):
+    with pytest.raises(PermissionError, match="not active reviewer"):
         dash_upsert(
             conn,
             task_id="task-alpha",
@@ -211,7 +200,7 @@ def test_dashboard_hard_conductor_guard(tmp_path):
         kind="decision",
         slot="main",
         body="allowed",
-        writer_session="cc-conductor-live",
+        writer_session="cc-conductor_live",
     )
     assert get_daily_dashboard(conn)[0]["body"] == "allowed"
 
@@ -338,7 +327,8 @@ def test_bin_task_dash_set_dash_and_rm_use_temp_db(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="bin/task is a POSIX shell entrypoint")
-def test_bin_task_fb_self_heals_roles_and_posts_to_conductor(tmp_path):
+@pytest.mark.parametrize("reviewer_role", ["ADVOCATE_CODEX", "ADVOCATE"])
+def test_bin_task_fb_self_heals_human_and_uses_existing_reviewer(tmp_path, reviewer_role):
     db_path = tmp_path / "memory.db"
     conn = _conn(db_path)
     topic_id = dash_topic_id()
@@ -347,6 +337,12 @@ def test_bin_task_fb_self_heals_roles_and_posts_to_conductor(tmp_path):
         "(topic_id, title, state, created_at, created_by_role, roles_json, metadata_json) "
         "VALUES (?, 'Daily', 'INIT', ?, 'CONDUCTOR', '[]', NULL)",
         (topic_id, now_iso()),
+    )
+    from debate import add_role_to_debate
+
+    add_role_to_debate(
+        conn, topic_id=topic_id, role=reviewer_role, session_id="codex-reviewer",
+        reason="operator-selected reviewer",
     )
     conn.close()
     home = tmp_path / "home"
@@ -362,7 +358,7 @@ def test_bin_task_fb_self_heals_roles_and_posts_to_conductor(tmp_path):
         capture_output=True,
         check=True,
     )
-    assert "sent to conductor:" in run.stdout
+    assert f"sent to {reviewer_role}:" in run.stdout
 
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -374,14 +370,15 @@ def test_bin_task_fb_self_heals_roles_and_posts_to_conductor(tmp_path):
         )
     }
     assert ("HUMAN", "human-rmanov") in roles
-    assert ("CONDUCTOR", "cc-conductor") in roles
+    assert (reviewer_role, "codex-reviewer") in roles
+    assert all(role != "CONDUCTOR" for role, _ in roles)
     msg = conn.execute(
         "SELECT m.role, m.kind, m.body, r.recipient "
         "FROM debate_messages m JOIN debate_message_recipients r ON r.msg_id=m.msg_id"
     ).fetchone()
     assert msg["role"] == "HUMAN"
     assert msg["kind"] == "Q"
-    assert msg["recipient"] == "CONDUCTOR"
+    assert msg["recipient"] == reviewer_role
     assert "operator says adjust" in msg["body"]
 
 
@@ -576,6 +573,12 @@ def test_bin_task_fb_authors_with_the_existing_human_binding(tmp_path):
     from debate import bind_role_session
 
     bind_role_session(conn, topic_id=topic_id, role="HUMAN", session_id="human-other1", reason="primary")
+    from debate import add_role_to_debate
+
+    add_role_to_debate(
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", session_id="codex-reviewer",
+        reason="operator-selected reviewer",
+    )
     conn.close()
     home = tmp_path / "home"
     (home / ".claude" / "memory").mkdir(parents=True)
@@ -596,3 +599,46 @@ def test_bin_task_fb_authors_with_the_existing_human_binding(tmp_path):
         "SELECT author_session_id, provenance_class FROM debate_messages WHERE role='HUMAN'"
     ).fetchone()
     assert tuple(msg) == ("human-other1", "parent")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bin/task is a POSIX shell entrypoint")
+@pytest.mark.parametrize("reviewers,state,mode", [
+    ([], "active", "legacy"),
+    (["ADVOCATE_CODEX", "ADVOCATE"], "active", "legacy"),
+    (["ADVOCATE_CODEX"], "diagnostic", "legacy"),
+    (["ADVOCATE_CODEX"], "active", "authority"),
+])
+def test_bin_task_fb_refuses_unresolved_reviewer_without_writes(tmp_path, reviewers, state, mode):
+    db_path = tmp_path / "memory.db"
+    conn = _conn(db_path)
+    topic_id = dash_topic_id()
+    from debate import init_debate, seed_initial_role_bindings
+
+    roles = [{"role": role, "session_id": f"codex-reviewer_{i}"} for i, role in enumerate(reviewers)]
+    init_debate(conn, topic_id=topic_id, title="feedback reviewer", roles=roles or [
+        {"role": "EXECUTOR_1", "session_id": "codex-executor"},
+    ], created_by_role="HUMAN")
+    if roles:
+        seed_initial_role_bindings(conn, topic_id=topic_id, roles=roles, bound_by_role="HUMAN")
+        conn.execute("UPDATE debate_role_bindings SET state=?", (state,))
+    if mode == "authority":
+        # Metadata planted by raw SQL is evidence only, never a backed pin.
+        conn.execute("UPDATE debates SET metadata_json=? WHERE topic_id=?", (
+            json.dumps({"governance": {"mode": "authority"}}), topic_id,
+        ))
+    tables = ("debates", "debate_role_bindings", "debate_messages", "debate_message_recipients")
+    before = {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}")] for table in tables}
+    conn.close()
+    env = os.environ.copy()
+    env["TASK_DB"] = str(db_path)
+    script = Path(__file__).resolve().parents[1] / "bin" / "task"
+    run = subprocess.run([str(script), "fb", "task-alp", "operator says adjust"],
+                         env=env, text=True, capture_output=True)
+    assert run.returncode != 0
+    assert "feedback_reviewer_required" in run.stderr
+    conn = sqlite3.connect(str(db_path))
+    try:
+        after = {table: list(conn.execute(f"SELECT * FROM {table}")) for table in tables}
+        assert after == before
+    finally:
+        conn.close()

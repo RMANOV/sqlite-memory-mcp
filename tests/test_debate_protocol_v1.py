@@ -38,7 +38,7 @@ from schema import init_db
 
 
 ROLES = [
-    {"role": "CONDUCTOR", "session_id": "cc-conductor"},
+    {"role": "ADVOCATE_CODEX", "session_id": "cc-conductor"},
     {"role": "EXECUTOR", "session_id": "cc-executor"},
     {"role": "ADVOCATE", "session_id": "codex-advocate"},
     {"role": "JUDGE", "session_id": "cc-judge"},
@@ -63,7 +63,7 @@ def _topic(conn, topic="S7_TEST", *, timeout=300):
         topic_id=topic,
         title="§7 deterministic test",
         roles=ROLES,
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         protocol_version="debate/v1",
         blind_roles=["EXECUTOR", "ADVOCATE"],
         max_rounds=3,
@@ -73,13 +73,13 @@ def _topic(conn, topic="S7_TEST", *, timeout=300):
         conn,
         topic_id=topic,
         roles=ROLES,
-        bound_by_role="CONDUCTOR",
+        bound_by_role="ADVOCATE_CODEX",
         reason="test",
     )
     post_message(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="INFO",
         kind="STATE",
         body="ACTIVE",
@@ -305,7 +305,7 @@ def test_released_blind_projection_replays_claim_passed_by_global_cursor(conn):
     ping = debate_post_with_recipients(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="PING",
         body="bootstrap independent advocate claim",
@@ -345,7 +345,7 @@ def test_released_blind_worker_reads_exact_trigger_behind_parent_cursor(conn):
     ping = debate_post_with_recipients(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="PING",
         body="bootstrap independent advocate claim",
@@ -423,7 +423,7 @@ def test_worker_can_advance_legacy_trigger_addressed_only_to_parent_session(conn
     trigger = post_message(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="PING",
         body="direct parent-session trigger",
@@ -552,7 +552,7 @@ def test_exact_verify_retry_is_rejected_without_round_drift(conn):
         priority="M",
         kind="VERIFY",
         body="contested",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=left["msg_id"],
         protocol_version="debate/v1",
         payload_json=payload,
@@ -570,7 +570,7 @@ def test_exact_verify_retry_is_rejected_without_round_drift(conn):
             priority="M",
             kind="VERIFY",
             body="same machine act retried",
-            addressed_to=["CONDUCTOR"],
+            addressed_to=["ADVOCATE_CODEX"],
             reply_to=left["msg_id"],
             protocol_version="debate/v1",
             payload_json=payload,
@@ -598,7 +598,7 @@ def test_opposing_role_cannot_self_authorize_verify_transition(conn):
             priority="M",
             kind="VERIFY",
             body="self-authorized verification",
-            addressed_to=["CONDUCTOR"],
+            addressed_to=["ADVOCATE_CODEX"],
             reply_to=left["msg_id"],
             protocol_version="debate/v1",
             payload_json={
@@ -640,7 +640,7 @@ def test_unresolved_challenge_from_prior_round_blocks_adjudication(conn):
             priority="M",
             kind="VERIFY",
             body=f"{result}, but the challenge remains",
-            addressed_to=["CONDUCTOR"],
+            addressed_to=["ADVOCATE_CODEX"],
             reply_to=left["msg_id"],
             protocol_version="debate/v1",
             payload_json={"target": left["msg_id"], "result": result, "checks": ["x"]},
@@ -674,7 +674,7 @@ def test_unresolved_challenge_from_prior_round_blocks_adjudication(conn):
         priority="M",
         kind="VERIFY",
         body="all challenges resolved",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=rebut["msg_id"],
         protocol_version="debate/v1",
         payload_json={
@@ -699,7 +699,7 @@ def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
             priority="M",
             kind="VERIFY",
             body=f"contested {expected_round}",
-            addressed_to=["CONDUCTOR"],
+            addressed_to=["ADVOCATE_CODEX"],
             reply_to=left["msg_id"],
             protocol_version="debate/v1",
             payload_json={
@@ -719,7 +719,7 @@ def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
         priority="M",
         kind="DISSENT",
         body="minority report",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=last_verify["msg_id"],
         protocol_version="debate/v1",
         payload_json={
@@ -738,7 +738,7 @@ def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
             priority="M",
             kind="DISSENT",
             body="duplicate",
-            addressed_to=["CONDUCTOR"],
+            addressed_to=["ADVOCATE_CODEX"],
             reply_to=last_verify["msg_id"],
             protocol_version="debate/v1",
             payload_json={
@@ -753,7 +753,7 @@ def test_round_cap_stalemate_one_dissent_and_one_human_packet(conn):
     escalation = debate_post_with_recipients(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="ESCALATE",
         body="human decision required",
@@ -802,7 +802,7 @@ def test_order_swap_stable_verdict_stops_protocol(conn):
         priority="M",
         kind="VERIFY",
         body="verified",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=left["msg_id"],
         protocol_version="debate/v1",
         payload_json={"target": left["msg_id"], "result": "verified", "checks": ["x"]},
@@ -905,7 +905,7 @@ def test_order_swap_disagreement_replay_is_stalemate_noop(conn):
         priority="M",
         kind="VERIFY",
         body="verified",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=left["msg_id"],
         protocol_version="debate/v1",
         payload_json={"target": left["msg_id"], "result": "verified", "checks": ["x"]},
@@ -987,7 +987,7 @@ def test_timeout_role_sweep_and_adaptive_scheduler_are_server_deterministic(conn
     worker_only = debate_post_with_recipients(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="PING",
         body="worker-only cursor must not become the recovered role cursor",

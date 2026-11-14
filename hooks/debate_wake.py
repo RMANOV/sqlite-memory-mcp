@@ -314,8 +314,9 @@ Task:
    worker session id — REQUIRED, it attributes the reply) and
    reply_to="{trigger_msg_id}" for the terminal answer. Do not use bare
    debate_post: unaddressed messages are invisible to the pump.
-5. Address the response to the role(s) named by the trigger, normally
-   CONDUCTOR and any review role that must see it.
+5. Address only current nonretired roles named by the trigger that need the
+   response. Read current bindings when the recipient is unclear; do not
+   invent a default authority or recipient.
 6. Quote the trigger msg_id or the specific msg_id(s) you read.
 7. After a successful post, advance this role/session/topic cursor to the latest
    message you substantively handled, normally the trigger msg_id (your
@@ -334,14 +335,11 @@ def _brief_text(text: str, limit: int = 96) -> str:
     return words[: max(0, limit - 3)].rstrip() + "..."
 
 
-def _default_write_to(role: str) -> str:
-    if role == "EXECUTOR":
-        return "CONDUCTOR,ADVOCATE"
-    if role == "ADVOCATE":
-        return "CONDUCTOR,EXECUTOR"
-    if role == "CONDUCTOR":
-        return "EXECUTOR,ADVOCATE"
-    return "CONDUCTOR"
+def _default_write_to(sender: str) -> str:
+    # Receipt metadata is descriptive, not authority to choose recipients.
+    if sender and sender not in {"UNKNOWN", "CONDUCTOR"}:
+        return sender
+    return "trigger-specified recipients"
 
 
 def _receipt_event(
@@ -359,8 +357,8 @@ def _receipt_event(
         con = sqlite3.connect(db_path)
         try:
             row = con.execute(
-                "SELECT role, body FROM debate_messages WHERE msg_id = ?",
-                (trigger_msg_id,),
+                "SELECT role, body FROM debate_messages WHERE msg_id = ? AND topic_id = ?",
+                (trigger_msg_id, topic_id),
             ).fetchone()
             if row:
                 sender = str(row[0] or "UNKNOWN")
@@ -380,7 +378,7 @@ def _receipt_event(
         "target_runtime": str(target.get("target_runtime") or ""),
         "what": what,
         "will": "check_inbox_and_post_or_no_action",
-        "write_to": _default_write_to(role),
+        "write_to": _default_write_to(sender),
     }
 
 

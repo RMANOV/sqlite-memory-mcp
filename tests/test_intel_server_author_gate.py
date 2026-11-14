@@ -23,7 +23,7 @@ from debate import bind_role_session, init_debate, transition_state  # noqa: E40
 from schema import init_db  # noqa: E402
 
 TOPIC = "GATE1"
-CONDUCTOR = "codex-cond1"
+SENDER_SESSION = "codex-cond1"
 EXECUTOR = "codex-exec1"
 
 
@@ -39,13 +39,13 @@ def gate_db(tmp_path, monkeypatch):
         topic_id=TOPIC,
         title="author gate",
         roles=[
-            {"role": "CONDUCTOR", "session_id": CONDUCTOR},
+            {"role": "ADVOCATE_CODEX", "session_id": SENDER_SESSION},
             {"role": "EXECUTOR", "session_id": EXECUTOR},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(seed, topic_id=TOPIC, role="CONDUCTOR", new_state="ACTIVE")
-    for role, sid in (("CONDUCTOR", CONDUCTOR), ("EXECUTOR", EXECUTOR)):
+    transition_state(seed, topic_id=TOPIC, role="ADVOCATE_CODEX", new_state="ACTIVE")
+    for role, sid in (("ADVOCATE_CODEX", SENDER_SESSION), ("EXECUTOR", EXECUTOR)):
         bind_role_session(
             seed, topic_id=TOPIC, role=role, session_id=sid, reason="primary"
         )
@@ -101,12 +101,12 @@ def _post_q(db_path):
     out = json.loads(
         intel_server.debate_post_with_recipients(
             topic_id=TOPIC,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="H",
             kind="Q",
             body="question",
             addressed_to_csv="EXECUTOR",
-            author_session_id=CONDUCTOR,
+            author_session_id=SENDER_SESSION,
         )
     )
     assert "msg_id" in out, out
@@ -133,15 +133,15 @@ OODA_BODY = "OBSERVE: x\nORIENT: y\nDECIDE: z\nACT: w"
                 priority="H",
                 kind="STATUS",
                 body="x",
-                addressed_to_csv="CONDUCTOR",
+                addressed_to_csv="ADVOCATE_CODEX",
             ),
         ),
-        ("debate_state", dict(topic_id=TOPIC, role="CONDUCTOR", new_state="RESOLVED")),
-        ("debate_escalate", dict(topic_id=TOPIC, role="CONDUCTOR", reason="help")),
-        ("debate_compact", dict(topic_id=TOPIC, role="CONDUCTOR", body=OODA_BODY)),
+        ("debate_state", dict(topic_id=TOPIC, role="ADVOCATE_CODEX", new_state="RESOLVED")),
+        ("debate_escalate", dict(topic_id=TOPIC, role="ADVOCATE_CODEX", reason="help")),
+        ("debate_compact", dict(topic_id=TOPIC, role="ADVOCATE_CODEX", body=OODA_BODY)),
         (
             "debate_close_topic",
-            dict(topic_id=TOPIC, role="CONDUCTOR", new_state="RESOLVED"),
+            dict(topic_id=TOPIC, role="ADVOCATE_CODEX", new_state="RESOLVED"),
         ),
     ],
 )
@@ -230,9 +230,9 @@ def test_resolve_then_archive_by_the_same_conductor_is_attributed(gate_db):
     resolved = json.loads(
         intel_server.debate_state(
             topic_id=TOPIC,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             new_state="RESOLVED",
-            author_session_id=CONDUCTOR,
+            author_session_id=SENDER_SESSION,
         )
     )
     assert resolved.get("new_state") == "RESOLVED", resolved
@@ -242,15 +242,15 @@ def test_resolve_then_archive_by_the_same_conductor_is_attributed(gate_db):
         out = json.loads(
             getattr(intel_server, tool)(
                 topic_id=TOPIC,
-                role="CONDUCTOR",
+                role="ADVOCATE_CODEX",
                 new_state="ARCHIVED",
-                author_session_id=CONDUCTOR,
+                author_session_id=SENDER_SESSION,
             )
         )
         if tool == "debate_close_topic":
             assert out.get("new_state") == "ARCHIVED", out
             assert _provenance(gate_db, out["transition_msg_id"]) == (
-                CONDUCTOR,
+                SENDER_SESSION,
                 "parent",
             )
         else:
@@ -262,16 +262,16 @@ def test_archive_by_an_outsider_or_other_role_holder_is_still_rejected(gate_db):
     json.loads(
         intel_server.debate_state(
             topic_id=TOPIC,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             new_state="RESOLVED",
-            author_session_id=CONDUCTOR,
+            author_session_id=SENDER_SESSION,
         )
     )
     for author in ("cc-outsider9999", EXECUTOR):
         out = json.loads(
             intel_server.debate_close_topic(
                 topic_id=TOPIC,
-                role="CONDUCTOR",
+                role="ADVOCATE_CODEX",
                 new_state="ARCHIVED",
                 author_session_id=author,
             )

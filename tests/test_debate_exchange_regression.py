@@ -53,12 +53,12 @@ def exchange_db(tmp_path):
         topic_id="EXCHANGE1",
         title="exchange regression",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-conductor1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-conductor1"},
             {"role": "EXECUTOR", "session_id": "codex-executor1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(con, topic_id="EXCHANGE1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(con, topic_id="EXCHANGE1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     bind_role_session(
         con,
         topic_id="EXCHANGE1",
@@ -77,7 +77,7 @@ def _trigger(con: sqlite3.Connection, body: str):
     return debate_post_with_recipients(
         con,
         topic_id="EXCHANGE1",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="Q",
         body=body,
@@ -125,7 +125,7 @@ def test_implementation_refusal_audit_is_singleton_across_rescans(exchange_db):
     trigger = debate_post_with_recipients(
         con,
         topic_id="EXCHANGE1",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="Q",
         body="implementation handoff",
@@ -163,7 +163,7 @@ def test_dead_worker_recovery_preserves_messages_and_parent_pending(exchange_db)
         priority="H",
         kind="A",
         body="terminal receipt",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=terminal_trigger["msg_id"],
         vehicle="analysis",
         # Reply ownership (2026-08-23): a worker-scoped trigger needs an

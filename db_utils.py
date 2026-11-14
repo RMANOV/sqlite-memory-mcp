@@ -2308,42 +2308,31 @@ def assert_dashboard_conductor_writer(
     writer_session: str | None,
     day: str | None = None,
     allow_test_override: bool = False,
-) -> None:
-    """Fail closed unless writer_session owns the active CONDUCTOR binding.
+) -> str:
+    """Return the current reviewer role after a cooperative session guard.
 
-    NOTE (ADVOCATE 2026-06-07): this is a COOPERATIVE session-binding guard,
-    NOT an identity proof or security boundary. ``writer_session`` is a
-    caller-supplied string (via ``--writer-session`` / env), so anything that
-    knows the active CONDUCTOR session_id can pass it. The real protection is
-    deployment shape — executors have no CLI/MCP path to this writer — plus the
-    author='conductor'/updated_at audit stamp on every row. Do not rely on this
-    as an authentication mechanism.
+    The historical function name is retained for callers. Session strings are
+    caller-supplied attribution, not OS identity or an authentication boundary.
+    Retired CONDUCTOR bindings never permit new writes.
     """
-    day = day or dash_today()
     if _dashboard_test_override(allow_test_override):
-        return
-    topic_id = dash_topic_id(day)
+        return "test_override"
+    from debate import DebateError, resolve_current_governance_reviewer
+
     writer = str(writer_session or "").strip()
     if not writer:
+        raise PermissionError("dashboard write denied: writer_session required")
+    topic_id = dash_topic_id(day or dash_today())
+    try:
+        reviewer = resolve_current_governance_reviewer(conn, topic_id=topic_id)
+    except DebateError as exc:
+        raise PermissionError(f"dashboard write denied: {exc}") from exc
+    if reviewer["session_id"] != writer:
         raise PermissionError(
-            "dashboard write denied: writer_session required for hard CONDUCTOR guard"
-        )
-    row = conn.execute(
-        "SELECT session_id FROM debate_role_bindings "
-        "WHERE topic_id = ? AND role = 'CONDUCTOR' AND state = 'active' "
-        "ORDER BY generation DESC LIMIT 1",
-        (topic_id,),
-    ).fetchone()
-    if row is None:
-        raise PermissionError(
-            f"dashboard write denied: no active CONDUCTOR binding for {topic_id}"
-        )
-    active = row["session_id"] if isinstance(row, sqlite3.Row) else row[0]
-    if active != writer:
-        raise PermissionError(
-            "dashboard write denied: writer_session is not active CONDUCTOR "
+            "dashboard write denied: writer_session is not active reviewer "
             f"for {topic_id}"
         )
+    return reviewer["role"]
 
 
 def _priority_rank_sql() -> str:
@@ -2413,17 +2402,17 @@ def dash_upsert(
     updated_at: str | None = None,
     allow_test_override: bool = False,
 ) -> dict[str, Any]:
-    """Upsert one daily dashboard item after the hard CONDUCTOR write guard."""
-    ensure_dashboard_schema(conn)
+    """Upsert a dashboard item after checking its current reviewer binding."""
     day = day or dash_today()
     if not _DASHBOARD_DAY_RE.fullmatch(day):
         raise ValueError(f"dashboard day must be YYYY-MM-DD, got {day!r}")
-    assert_dashboard_conductor_writer(
+    author_role = assert_dashboard_conductor_writer(
         conn,
         writer_session=writer_session,
         day=day,
         allow_test_override=allow_test_override,
     )
+    ensure_dashboard_schema(conn)
     task_id = str(task_id or "").strip()
     slot = str(slot or "").strip()
     body = str(body or "").strip()
@@ -2441,12 +2430,12 @@ def dash_upsert(
     conn.execute(
         "INSERT INTO daily_dashboard "
         "(day, task_id, kind, slot, body, priority, src_msg_id, author, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'conductor', ?) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(day, task_id, kind, slot) DO UPDATE SET "
         "body = excluded.body, priority = excluded.priority, "
-        "src_msg_id = excluded.src_msg_id, author = 'conductor', "
+        "src_msg_id = excluded.src_msg_id, author = excluded.author, "
         "updated_at = excluded.updated_at",
-        (day, task_id, kind, slot, body, priority, src_msg_id, ts),
+        (day, task_id, kind, slot, body, priority, src_msg_id, author_role, ts),
     )
     evicted = _enforce_dashboard_caps(conn, day=day, task_id=task_id, kind=kind)
     return {
@@ -2470,8 +2459,7 @@ def dash_retract(
     day: str | None = None,
     allow_test_override: bool = False,
 ) -> int:
-    """Remove one daily dashboard item after the hard CONDUCTOR write guard."""
-    ensure_dashboard_schema(conn)
+    """Remove a dashboard item after checking its current reviewer binding."""
     day = day or dash_today()
     if not _DASHBOARD_DAY_RE.fullmatch(day):
         raise ValueError(f"dashboard day must be YYYY-MM-DD, got {day!r}")
@@ -2481,6 +2469,7 @@ def dash_retract(
         day=day,
         allow_test_override=allow_test_override,
     )
+    ensure_dashboard_schema(conn)
     kind = normalize_dashboard_kind(kind)
     task_id = str(task_id or "").strip()
     slot = str(slot or "").strip()

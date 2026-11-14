@@ -135,10 +135,10 @@ def test_actual_dao_resolution_authoritative_row(wake, tmp_path, monkeypatch):
     con = sqlite3.connect(db, isolation_level=None)
     con.row_factory = sqlite3.Row
     try:
-        init_debate(con, topic_id="NORMALIZE_T1", title="synthetic", roles=[{"role": "CONDUCTOR", "session_id": "s-cond"}, {"role": "EXECUTOR", "session_id": "s-exec"}], created_by_role="CONDUCTOR")
-        transition_state(con, topic_id="NORMALIZE_T1", role="CONDUCTOR", new_state="ACTIVE")
+        init_debate(con, topic_id="NORMALIZE_T1", title="synthetic", roles=[{"role": "ADVOCATE_CODEX", "session_id": "s-cond"}, {"role": "EXECUTOR", "session_id": "s-exec"}], created_by_role="ADVOCATE_CODEX")
+        transition_state(con, topic_id="NORMALIZE_T1", role="ADVOCATE_CODEX", new_state="ACTIVE")
         bind_role_session(con, topic_id="NORMALIZE_T1", role="EXECUTOR", session_id="cc-normalization123", runtime="cc", reason="synthetic fixture")
-        posted = debate_post_with_recipients(con, topic_id="NORMALIZE_T1", role="CONDUCTOR", priority="H", kind="Q", body="synthetic analysis", addressed_to=["EXECUTOR"], vehicle="analysis")
+        posted = debate_post_with_recipients(con, topic_id="NORMALIZE_T1", role="ADVOCATE_CODEX", priority="H", kind="Q", body="synthetic analysis", addressed_to=["EXECUTOR"], vehicle="analysis")
         actual = wake._extract_tool_response({"tool_response": {"content": [{"text": json.dumps(posted)}]}})
         resolved = wake._handle_tool_response(actual)
         assert [t["target_session_id"] for t in resolved["targets"]] == ["cc-normalization123"]

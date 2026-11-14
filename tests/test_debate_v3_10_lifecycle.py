@@ -42,16 +42,93 @@ def topic(tmp_path):
         topic_id="X1",
         title="v3.10 lifecycle",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
             {"role": "EXECUTOR", "session_id": "codex-exec1"},
             {"role": "ADVOCATE", "session_id": "cc-adv1"},
             {"role": "ADVOCATE_DEPUTY", "session_id": "cc-advdep1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(c, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     yield c, "X1"
     c.close()
+
+
+def _authority_grant(conn, tmp_path, topic_id, *, authority_session, target_role,
+                     target_session, action, claims="hold"):
+    """Real phase-A chain (never a seeded CONDUCTOR/authority row): bootstrap the
+    HUMAN from a private 0600 manifest under tmp_path, approve_pin, pin, then an
+    ``authorize`` DECISION by the pinned authority.  Imports are local so a
+    missing surface fails this node only (A1 RED shape), never collection."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    import debate_governance as gov
+    from debate import (
+        governance_approve_pin,
+        governance_bootstrap_human,
+        governance_inventory,
+        governance_pin,
+    )
+
+    gov_dir = tmp_path / "gov"
+    gov_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(gov_dir, 0o700)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def write(name, manifest):
+        path = gov_dir / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return str(path), gov.content_digest("c3-manifest/v1", manifest)
+
+    human = "human-f1op01"
+    inv = governance_inventory(conn, topic_id=topic_id)
+    if not any(b["role"] == "ADVOCATE_CODEX" and b["session_id"] == authority_session
+               and b["state"] == "active" for b in inv["bindings"]):
+        bind_role_session(conn, topic_id=topic_id, role="ADVOCATE_CODEX",
+                          session_id=authority_session, reason="seed authority")
+        inv = governance_inventory(conn, topic_id=topic_id)
+    if human not in inv["active_human_owners"]:
+        path, digest = write("bootstrap.json", {
+            "schema": "governance-bootstrap/v1", "topic_id": topic_id,
+            "expected_topic_fingerprint": inv["topic_fingerprint"],
+            "human_session_id": human, "expires_at": expires, "nonce": "0011223344556677",
+        })
+        governance_bootstrap_human(conn, manifest_path=path, expected_manifest_sha256=digest)
+        inv = governance_inventory(conn, topic_id=topic_id)
+    authority = next(b for b in inv["bindings"] if b["role"] == "ADVOCATE_CODEX"
+                     and b["session_id"] == authority_session and b["state"] == "active")
+    path, digest = write(f"approve-{inv['authority_epoch']}.json", {
+        "schema": "governance-approve/v1", "topic_id": topic_id,
+        "authority_role": "ADVOCATE_CODEX", "authority_session_id": authority_session,
+        "authority_generation": authority["generation"],
+        "expected_authority_fingerprint": authority["fingerprint"],
+        "expected_authority_epoch": inv["authority_epoch"],
+        "human_session_id": human, "expires_at": expires, "nonce": "1122334455667788",
+    })
+    approval = governance_approve_pin(conn, manifest_path=path, expected_manifest_sha256=digest,
+                                      author_session_id=human)
+    governance_pin(conn, topic_id=topic_id, approval_msg_id=approval["msg_id"],
+                   author_session_id=human, manifest_path=path, expected_manifest_sha256=digest)
+    inv = governance_inventory(conn, topic_id=topic_id)
+    target = next(b for b in inv["bindings"] if b["role"] == target_role
+                  and b["session_id"] == target_session)
+    payload = {
+        "schema": "governance/v1", "type": "authorize", "action": action,
+        "topic_id": topic_id, "target_role": target_role, "target_session_id": target_session,
+        "target_fingerprint": target["fingerprint"],
+        "effect": {"state": "retired" if action == "retire_binding" else "diagnostic",
+                   "claims": claims},
+        "expires_at": expires, "nonce": "8877665544332211",
+    }
+    grant = post_message(
+        conn, topic_id=topic_id, role="ADVOCATE_CODEX", priority="H", kind="DECISION",
+        body=f"authorize {action}", payload_json=gov.canonical_json(payload),
+        body_mode="structured", author_session_id=authority_session,
+    )
+    return grant["msg_id"]
 
 
 def _binding_state(conn, topic_id, role, session_id):
@@ -70,15 +147,15 @@ def test_seed_initial_role_bindings_installs_wake_authority_for_roles_json(topic
         conn,
         topic_id=t,
         roles=[
-            {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
             {"role": "EXECUTOR", "session_id": "codex-exec1"},
             {"role": "ADVOCATE", "session_id": "cc-adv1"},
         ],
-        bound_by_role="CONDUCTOR",
+        bound_by_role="ADVOCATE_CODEX",
     )
 
-    assert {row["role"] for row in seeded} == {"CONDUCTOR", "EXECUTOR", "ADVOCATE"}
-    assert _binding_state(conn, t, "CONDUCTOR", "codex-cond1") == "active"
+    assert {row["role"] for row in seeded} == {"ADVOCATE_CODEX", "EXECUTOR", "ADVOCATE"}
+    assert _binding_state(conn, t, "ADVOCATE_CODEX", "codex-cond1") == "active"
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
     assert _binding_state(conn, t, "ADVOCATE", "cc-adv1") == "active"
 
@@ -91,10 +168,10 @@ def test_seed_initial_role_bindings_is_idempotent(topic):
     ]
 
     first = seed_initial_role_bindings(
-        conn, topic_id=t, roles=roles, bound_by_role="CONDUCTOR"
+        conn, topic_id=t, roles=roles, bound_by_role="ADVOCATE_CODEX"
     )
     second = seed_initial_role_bindings(
-        conn, topic_id=t, roles=roles, bound_by_role="CONDUCTOR"
+        conn, topic_id=t, roles=roles, bound_by_role="ADVOCATE_CODEX"
     )
 
     assert len(first) == 1
@@ -133,7 +210,7 @@ def test_debate_state_resolved_retires_active_bindings_atomically(topic):
         body="block close",
     )
 
-    blocked = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    blocked = transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     assert blocked["new_state"] == "ACTIVE"
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
@@ -146,7 +223,7 @@ def test_debate_state_resolved_retires_active_bindings_atomically(topic):
         body="answered",
         reply_to=q["msg_id"],
     )
-    out = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    out = transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     assert out["new_state"] == "RESOLVED"
     assert out["retired_bindings"] == 1
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "retired"
@@ -163,16 +240,19 @@ def test_debate_state_archived_retires_diagnostic_bindings_atomically(topic):
         state="diagnostic",
         reason="diagnostic",
     )
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     assert _binding_state(conn, t, "EXECUTOR", "codex-diag1") == "diagnostic"
 
-    out = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ARCHIVED")
+    out = transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ARCHIVED")
     assert out["new_state"] == "ARCHIVED"
     assert out["retired_bindings"] == 1
     assert _binding_state(conn, t, "EXECUTOR", "codex-diag1") == "retired"
 
 
-def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
+def test_bind_role_rejects_ownership_gap_without_conductor_override(topic, tmp_path):
+    """Phase A contract (packet v1.3 M-A4 row 1): retiring the ACTIVE owner
+    without a replacement needs a consumed authorization grant from the pinned
+    authority; the retired CONDUCTOR DECISION override no longer exists."""
     conn, t = topic
     bind_role_session(
         conn,
@@ -190,15 +270,12 @@ def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
             state="retired",
             reason="retire without replacement",
         )
-    assert exc_info.value.error_type == "conductor_override_required"
+    assert exc_info.value.error_type == "authorization_required"
+    assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
-    override = post_message(
-        conn,
-        topic_id=t,
-        role="CONDUCTOR",
-        priority="H",
-        kind="DECISION",
-        body="allow temporary ownership gap",
+    grant = _authority_grant(
+        conn, tmp_path, t, authority_session="codex-cond1",
+        target_role="EXECUTOR", target_session="codex-exec1", action="retire_binding",
     )
     out = bind_role_session(
         conn,
@@ -206,16 +283,27 @@ def test_bind_role_rejects_ownership_gap_without_conductor_override(topic):
         role="EXECUTOR",
         session_id="codex-exec1",
         state="retired",
-        reason="override retire",
-        conductor_override_msg_id=override["msg_id"],
+        reason="authorized retire",
+        author_session_id="codex-cond1",
+        authorization_msg_id=grant,
     )
     assert out["ownership_gap_override"] is True
+    assert out["authorization_msg_id"] == grant
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "retired"
+    spends = conn.execute(
+        "SELECT authorization_msg_id, target_key FROM debate_authorization_spends "
+        "WHERE authorization_msg_id = ?",
+        (grant,),
+    ).fetchall()
+    assert [tuple(r) for r in spends] == [(grant, "single")]
 
 
 def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_workers(
-    topic,
+    topic, tmp_path,
 ):
+    """Phase A contract (packet v1.3 M-A4 row 2): demoting the ACTIVE owner to
+    diagnostic needs a consumed ``diagnostic_uncover`` grant whose effect
+    retires the worker claims; no authorization → typed refusal, state active."""
     conn, t = topic
     bind_role_session(
         conn,
@@ -227,7 +315,7 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="claimed work",
@@ -250,16 +338,13 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
             state="diagnostic",
             reason="demote without replacement",
         )
-    assert exc_info.value.error_type == "conductor_override_required"
+    assert exc_info.value.error_type == "authorization_required"
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "active"
 
-    override = post_message(
-        conn,
-        topic_id=t,
-        role="CONDUCTOR",
-        priority="H",
-        kind="DECISION",
-        body="allow temporary diagnostic demotion",
+    grant = _authority_grant(
+        conn, tmp_path, t, authority_session="codex-cond1",
+        target_role="EXECUTOR", target_session="codex-exec1",
+        action="diagnostic_uncover", claims="retire",
     )
     out = bind_role_session(
         conn,
@@ -268,7 +353,8 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
         session_id="codex-exec1",
         state="diagnostic",
         reason="diagnostic investigation",
-        conductor_override_msg_id=override["msg_id"],
+        author_session_id="codex-cond1",
+        authorization_msg_id=grant,
     )
     worker = conn.execute(
         "SELECT state FROM debate_worker_claims WHERE worker_session_id = ?",
@@ -276,9 +362,16 @@ def test_demoting_active_binding_to_diagnostic_requires_override_and_retires_wor
     ).fetchone()
 
     assert out["ownership_gap_override"] is True
+    assert out["authorization_msg_id"] == grant
     assert out["retired_worker_claims"] == 1
     assert _binding_state(conn, t, "EXECUTOR", "codex-exec1") == "diagnostic"
     assert worker["state"] == "retired"
+    spends = conn.execute(
+        "SELECT action, target_key FROM debate_authorization_spends "
+        "WHERE authorization_msg_id = ?",
+        (grant,),
+    ).fetchall()
+    assert [tuple(r) for r in spends] == [("diagnostic_uncover", "single")]
 
 
 def test_rotate_requires_cursor_mode_and_copy_missing_cursor_warns(topic):
@@ -334,7 +427,7 @@ def test_rotate_copy_rolls_up_latest_completed_worker_cursor(topic):
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="Q",
         body="worker-owned handoff anchor",
@@ -388,7 +481,7 @@ def test_wake_adapter_signal_only_and_loop_suppressed(topic):
     post = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="wake executor",
@@ -426,7 +519,7 @@ def test_agent_wake_resolution_retries_until_dispatch_is_marked(topic):
     post = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="wake executor",
@@ -471,7 +564,7 @@ def test_direct_session_addressing_rejected_unless_diagnostic_binding(topic):
         debate_post_with_recipients(
             conn,
             topic_id=t,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="M",
             kind="STATUS",
             body="bad direct",
@@ -490,7 +583,7 @@ def test_direct_session_addressing_rejected_unless_diagnostic_binding(topic):
     out = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="STATUS",
         body="diagnostic direct",
@@ -517,7 +610,7 @@ def test_stale_session_binding_does_not_receive_role_addressed_work(topic):
     debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="current only",
@@ -574,7 +667,7 @@ def test_worker_claims_allocate_distinct_workers_and_reuse_duplicate_trigger(top
     first_trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="first task",
@@ -583,7 +676,7 @@ def test_worker_claims_allocate_distinct_workers_and_reuse_duplicate_trigger(top
     second_trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="second task",
@@ -630,7 +723,7 @@ def test_worker_signal_requires_claim_and_inherits_active_parent_binding(topic):
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="worker task",
@@ -674,7 +767,7 @@ def test_worker_cursor_advance_isolated_from_parent_and_other_workers(topic):
     first = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="first task",
@@ -683,7 +776,7 @@ def test_worker_cursor_advance_isolated_from_parent_and_other_workers(topic):
     second = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="second task",
@@ -735,7 +828,7 @@ def test_worker_completion_reuses_claim_and_blocks_duplicate_terminal(topic):
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="one-shot work",
@@ -838,7 +931,7 @@ def test_worker_no_action_completes_claim_and_advances_worker_cursor(topic):
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="wake produced no useful work",
@@ -911,7 +1004,7 @@ def test_worker_no_action_keeps_newer_worker_cursor_when_trigger_is_stale(topic)
     first = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="first stale wake",
@@ -920,7 +1013,7 @@ def test_worker_no_action_keeps_newer_worker_cursor_when_trigger_is_stale(topic)
     second = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="newer wake already processed",
@@ -974,7 +1067,7 @@ def test_worker_no_action_rejects_wrong_trigger(topic):
     first = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="first task",
@@ -983,7 +1076,7 @@ def test_worker_no_action_rejects_wrong_trigger(topic):
     second = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="second task",
@@ -1020,7 +1113,7 @@ def test_worker_reap_removes_completed_claim_and_leaves_audit(topic):
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="cleanup work",
@@ -1070,7 +1163,7 @@ def test_transition_resolved_retires_active_worker_claims(topic):
     trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="in flight",
@@ -1084,7 +1177,7 @@ def test_transition_resolved_retires_active_worker_claims(topic):
         trigger_msg_id=trigger["msg_id"],
     )
 
-    out = transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    out = transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     worker = conn.execute(
         "SELECT state FROM debate_worker_claims WHERE worker_session_id = ?",
         (claim["worker_session_id"],),
@@ -1107,7 +1200,7 @@ def test_nonstanding_decision_claim_survives_cursor_advance_until_terminal_reply
     task = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="do one thing",
@@ -1158,7 +1251,7 @@ def test_standing_false_decision_is_not_resurfaced_as_mandate(topic):
     task = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="one-shot",
@@ -1168,7 +1261,7 @@ def test_standing_false_decision_is_not_resurfaced_as_mandate(topic):
     standing = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="standing mandate",
@@ -1212,7 +1305,7 @@ def test_signal_check_limit_skips_done_one_shot_decisions_without_starving_later
     cursor = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="STATUS",
         body="cursor",
@@ -1229,7 +1322,7 @@ def test_signal_check_limit_skips_done_one_shot_decisions_without_starving_later
         task = debate_post_with_recipients(
             conn,
             topic_id=t,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="H",
             kind="DECISION",
             body=body,
@@ -1248,7 +1341,7 @@ def test_signal_check_limit_skips_done_one_shot_decisions_without_starving_later
     visible = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="STATUS",
         body="later visible work",
@@ -1280,7 +1373,7 @@ def test_stale_nonstanding_decision_claim_reclaim_allows_new_worker_owner(topic)
     task = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="one-shot task",
@@ -1290,7 +1383,7 @@ def test_stale_nonstanding_decision_claim_reclaim_allows_new_worker_owner(topic)
     second_trigger = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="STATUS",
         body="second worker trigger",
@@ -1372,7 +1465,7 @@ def test_stale_nonstanding_decision_claim_reclaim_completes_if_ack_exists(topic)
     task = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="one-shot task",
@@ -1448,7 +1541,7 @@ def test_legacy_null_decision_stays_standing_after_cursor_advance(topic):
     legacy = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="legacy standing mandate",
@@ -1457,7 +1550,7 @@ def test_legacy_null_decision_stays_standing_after_cursor_advance(topic):
     transient = debate_post_with_recipients(
         conn,
         topic_id=t,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="STATUS",
         body="cursor target",

@@ -55,14 +55,14 @@ def _seed(c, topic="ZP_RECOVERY"):
         topic_id=topic,
         title="zero-paste recovery",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond_x"},
+            {"role": "OBSERVER", "session_id": "cc-cond_x"},
             {"role": "WORKER", "session_id": "cc-worker_x"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="OBSERVER",
     )
     # DAO init_debate does not seed bindings (the MCP layer does); bind the
     # worker role so claim_worker_session has an active parent binding.
-    for role, sid in (("CONDUCTOR", "cc-cond_x"), ("WORKER", "cc-worker_x")):
+    for role, sid in (("OBSERVER", "cc-cond_x"), ("WORKER", "cc-worker_x")):
         bind_role_session(
             conn=c,
             topic_id=topic,
@@ -77,7 +77,7 @@ def _post_addressed(c, topic="ZP_RECOVERY", *, body="do work"):
     out = debate_post_with_recipients(
         c,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="OBSERVER",
         priority="H",
         kind="Q",
         body=body,
@@ -194,7 +194,7 @@ def test_trigger_terminal_and_demand_semantics(conn, tmp_path, monkeypatch):
 
     db_path = os.path.join(str(tmp_path), "zero_paste.db")
     monkeypatch.setattr(debate_pump, "DB_PATH", db_path)
-    suppressed = {"CONDUCTOR"}
+    suppressed = {"OBSERVER"}
 
     # Active claim, no reply → in-flight: not terminal, and no NEW spawn needed.
     assert debate_pump._trigger_is_terminal(trigger, suppressed) is False
@@ -216,7 +216,7 @@ def test_trigger_terminal_and_demand_semantics(conn, tmp_path, monkeypatch):
         priority="M",
         kind="A",
         body="done",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["OBSERVER"],
         reply_to=trigger,
         # Reply ownership: the worker is dead/retired, so the reply that makes
         # the trigger terminal comes from the bound parent session.
@@ -246,8 +246,8 @@ def test_completed_claim_is_terminal(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         debate_pump, "DB_PATH", os.path.join(str(tmp_path), "zero_paste.db")
     )
-    assert debate_pump._trigger_is_terminal(trigger, {"CONDUCTOR"}) is True
-    assert debate_pump._estimate_worker_demand(trigger, {"CONDUCTOR"}) == 0
+    assert debate_pump._trigger_is_terminal(trigger, {"OBSERVER"}) is True
+    assert debate_pump._estimate_worker_demand(trigger, {"OBSERVER"}) == 0
 
 
 # ── critical #2: first-start backlog sweep from epoch ───────────────────────
@@ -319,7 +319,7 @@ def test_resolver_re_dispatches_after_worker_death(conn):
     post = debate_post_with_recipients(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="OBSERVER",
         priority="H",
         kind="Q",
         body="do work",
@@ -376,23 +376,23 @@ def test_unbound_addressed_role_is_not_terminal(conn, tmp_path, monkeypatch):
         topic_id=topic,
         title="unbound",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond_u"},
+            {"role": "OBSERVER", "session_id": "cc-cond_u"},
             {"role": "GHOST", "session_id": "cc-ghost_u"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="OBSERVER",
     )
-    # Bind only CONDUCTOR; GHOST is addressed but has NO active binding.
+    # Bind only OBSERVER; GHOST is addressed but has NO active binding.
     bind_role_session(
         conn=conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="OBSERVER",
         session_id="cc-cond_u",
         reason="seed",
     )
     trigger = debate_post_with_recipients(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="OBSERVER",
         priority="H",
         kind="Q",
         body="anyone home?",
@@ -403,14 +403,14 @@ def test_unbound_addressed_role_is_not_terminal(conn, tmp_path, monkeypatch):
     )
     # GHOST unbound → pending work → the cursor must NOT treat it as terminal.
     assert (
-        debate_pump._has_unbound_addressed_recipient(conn, trigger, {"CONDUCTOR"})
+        debate_pump._has_unbound_addressed_recipient(conn, trigger, {"OBSERVER"})
         is True
     )
-    assert debate_pump._trigger_is_terminal(trigger, {"CONDUCTOR"}) is False
+    assert debate_pump._trigger_is_terminal(trigger, {"OBSERVER"}) is False
 
 
 def test_suppressed_only_recipient_is_terminal(conn, tmp_path, monkeypatch):
-    """A message whose only recipient is a suppressed role (CONDUCTOR) is
+    """A message whose only recipient is a suppressed role (OBSERVER) is
     terminal for wake purposes — it must NOT wedge the cursor."""
     import debate_pump
 
@@ -422,16 +422,16 @@ def test_suppressed_only_recipient_is_terminal(conn, tmp_path, monkeypatch):
         priority="M",
         kind="STATUS",
         body="fyi",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["OBSERVER"],
     )["msg_id"]
     monkeypatch.setattr(
         debate_pump, "DB_PATH", os.path.join(str(tmp_path), "zero_paste.db")
     )
     assert (
-        debate_pump._has_unbound_addressed_recipient(conn, reply_like, {"CONDUCTOR"})
+        debate_pump._has_unbound_addressed_recipient(conn, reply_like, {"OBSERVER"})
         is False
     )
-    assert debate_pump._trigger_is_terminal(reply_like, {"CONDUCTOR"}) is True
+    assert debate_pump._trigger_is_terminal(reply_like, {"OBSERVER"}) is True
 
 
 # ── critical #1 end-to-end: cursor holds until terminal (loop-level) ────────
@@ -482,6 +482,8 @@ def test_pump_holds_cursor_until_trigger_is_terminal(conn, tmp_path, monkeypatch
         "argv",
         [
             "debate_pump.py",
+            "--suppress-role",
+            "OBSERVER",
             "--once",
             "--since",
             "1970-01-01T00:00:00Z",
@@ -524,7 +526,7 @@ def test_pump_holds_cursor_until_trigger_is_terminal(conn, tmp_path, monkeypatch
         priority="M",
         kind="A",
         body="done",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["OBSERVER"],
         reply_to=trigger,
         # Reply ownership: attributed reply (bound parent of the WORKER role).
         author_session_id="cc-worker_x",

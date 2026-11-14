@@ -34,11 +34,11 @@ def topic(tmp_path):
     init_debate(
         c, topic_id="X1", title="read-tests",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR", "session_id": "s-exec"},
             {"role": "ADVOCATE", "session_id": "s-adv"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     yield c, "X1"
     c.close()

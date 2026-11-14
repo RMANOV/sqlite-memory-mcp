@@ -39,10 +39,10 @@ def topic(tmp_path):
         topic_id="X1",
         title="post-tests",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR", "session_id": "s-exec"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     yield c, "X1"
     c.close()
@@ -135,13 +135,13 @@ def test_debate_post_reply_to_cross_topic_rejected(topic, tmp_path):
     init_debate(
         conn, topic_id="X2", title="other",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR", "session_id": "s-exec"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     other_q = post_message(
-        conn, topic_id="X2", role="CONDUCTOR",
+        conn, topic_id="X2", role="ADVOCATE_CODEX",
         priority="H", kind="Q", body="from-other-topic",
     )
     with pytest.raises(DebateError, match="reply_to_cross_topic"):
@@ -155,7 +155,7 @@ def test_debate_post_reply_to_cross_topic_rejected(topic, tmp_path):
 def test_debate_post_kind_STATE_triggers_transition(topic):
     conn, t = topic
     out = post_message(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="H", kind="STATE", body="ACTIVE",
     )
     assert out["topic_state"] == "ACTIVE"
@@ -193,9 +193,9 @@ def test_debate_post_kind_WATERMARK_iso_only_now_rejected(topic):
 
 def test_debate_post_blocked_when_state_ARCHIVED(topic):
     conn, t = topic
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE")
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ARCHIVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ARCHIVED")
     with pytest.raises(DebateError, match="topic_archived_read_only"):
         post_message(
             conn, topic_id=t, role="EXECUTOR",
@@ -205,8 +205,8 @@ def test_debate_post_blocked_when_state_ARCHIVED(topic):
 
 def test_debate_post_blocked_when_state_RESOLVED(topic):
     conn, t = topic
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE")
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     with pytest.raises(DebateError, match="topic_resolved_read_only"):
         post_message(
             conn, topic_id=t, role="EXECUTOR",
@@ -217,10 +217,10 @@ def test_debate_post_blocked_when_state_RESOLVED(topic):
 def test_debate_post_STATE_allowed_in_RESOLVED_for_archive_transition(topic):
     """Even on RESOLVED, kind=STATE moving to ARCHIVED is permitted."""
     conn, t = topic
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="ACTIVE")
-    transition_state(conn, topic_id=t, role="CONDUCTOR", new_state="RESOLVED")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="ACTIVE")
+    transition_state(conn, topic_id=t, role="ADVOCATE_CODEX", new_state="RESOLVED")
     out = post_message(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="H", kind="STATE", body="ARCHIVED",
     )
     assert out["topic_state"] == "ARCHIVED"

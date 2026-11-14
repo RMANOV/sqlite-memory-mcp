@@ -60,12 +60,12 @@ def topic(tmp_path):
     init_debate(
         c, topic_id="X1", title="v3.9.3",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
             {"role": "EXECUTOR", "session_id": "cc-exec1"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(c, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     yield c, "X1"
     c.close()
 
@@ -78,13 +78,13 @@ def wrapped_topic(tmp_path):
         init_debate(
             conn, topic_id="X1", title="v3.9.3-wrapped",
             roles=[
-                {"role": "CONDUCTOR", "session_id": "cc-cond1"},
+                {"role": "ADVOCATE_CODEX", "session_id": "cc-cond1"},
                 {"role": "EXECUTOR", "session_id": "cc-exec1"},
             ],
-            created_by_role="CONDUCTOR",
+            created_by_role="ADVOCATE_CODEX",
         )
         transition_state(
-            conn, topic_id="X1", role="CONDUCTOR", new_state="ACTIVE"
+            conn, topic_id="X1", role="ADVOCATE_CODEX", new_state="ACTIVE"
         )
     yield db_path
 
@@ -245,7 +245,7 @@ def test_msg_id_collision_retry_deterministic(topic, monkeypatch):
     monkeypatch.setattr(debate, "new_msg_id", lambda: next(seen))
 
     out = post_message(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="retry-test",
     )
     # The retry loop must consume the 3 collisions and return the
@@ -272,9 +272,9 @@ def test_validate_recipient_legacy_path_fetches_debate(topic):
     """When ``debate=None`` (legacy callers), the helper still SELECTs
     roles_json — preserved for backward compatibility."""
     conn, t = topic
-    # Should not raise — CONDUCTOR is a declared role.
-    _validate_recipient("CONDUCTOR", t, conn)
-    _validate_recipient("CONDUCTOR", t, conn, debate=None)
+    # Should not raise — ADVOCATE_CODEX is a declared role.
+    _validate_recipient("ADVOCATE_CODEX", t, conn)
+    _validate_recipient("ADVOCATE_CODEX", t, conn, debate=None)
 
 
 def test_validate_recipient_passthrough_path_skips_select(topic):
@@ -293,7 +293,7 @@ def test_validate_recipient_passthrough_path_skips_select(topic):
     # Cascade delete the topic row; messages/recipients go too.
     conn.execute("DELETE FROM debates WHERE topic_id = ?", (t,))
     # Pass-through path: succeeds because debate_dict is consumed.
-    _validate_recipient("CONDUCTOR", t, conn, debate=debate_dict)
+    _validate_recipient("ADVOCATE_CODEX", t, conn, debate=debate_dict)
     _validate_recipient("EXECUTOR", t, conn, debate=debate_dict)
     with pytest.raises(DebateError) as direct_exc:
         _validate_recipient("cc-cond1", t, conn, debate=debate_dict)
@@ -303,7 +303,7 @@ def test_validate_recipient_passthrough_path_skips_select(topic):
     )
     # Legacy path: fetches fresh, sees no topic, raises.
     with pytest.raises(DebateError) as exc_info:
-        _validate_recipient("CONDUCTOR", t, conn)
+        _validate_recipient("ADVOCATE_CODEX", t, conn)
     assert exc_info.value.error_type == "topic_not_found"
 
 
@@ -338,7 +338,7 @@ def test_signal_advance_race_storm_under_get_conn_immediate(wrapped_topic):
     with get_conn_immediate(db_path=db) as conn:
         for i in range(4):
             out = debate_post_with_recipients(
-                conn, topic_id="X1", role="CONDUCTOR",
+                conn, topic_id="X1", role="ADVOCATE_CODEX",
                 priority="M", kind="STATUS", body=f"m{i}",
                 addressed_to=["EXECUTOR"],
             )
@@ -403,7 +403,7 @@ def test_post_message_rejects_whitespace_only_body(topic):
     for ws in ("   ", "\t\n", " ", " \n\t \n "):
         with pytest.raises(DebateError, match="invalid_body"):
             post_message(
-                conn, topic_id=t, role="CONDUCTOR",
+                conn, topic_id=t, role="ADVOCATE_CODEX",
                 priority="M", kind="STATUS", body=ws,
             )
 
@@ -412,7 +412,7 @@ def test_post_message_accepts_body_with_internal_whitespace(topic):
     """Whitespace-only is rejected; whitespace AROUND content is OK."""
     conn, t = topic
     out = post_message(
-        conn, topic_id=t, role="CONDUCTOR",
+        conn, topic_id=t, role="ADVOCATE_CODEX",
         priority="M", kind="STATUS", body="  ok  ",
     )
     assert "msg_id" in out

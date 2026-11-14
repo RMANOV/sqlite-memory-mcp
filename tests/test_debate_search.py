@@ -48,7 +48,7 @@ def wrapper_db(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     roles_json = json.dumps(
         [
-            {"role": "CONDUCTOR", "session_id": "codex-cond20260531"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond20260531"},
             {"role": "EXECUTOR_1", "session_id": "codex-exec20260531"},
         ]
     )
@@ -61,7 +61,7 @@ def wrapper_db(tmp_path, monkeypatch):
                 topic_id=topic_id,
                 title=title,
                 roles_json=roles_json,
-                created_by_role="CONDUCTOR",
+                created_by_role="ADVOCATE_CODEX",
                 metadata_json=json.dumps(
                     {"priority_lane": "P2", "priority_reason": "debate_search B5 test"}
                 ),
@@ -72,7 +72,7 @@ def wrapper_db(tmp_path, monkeypatch):
 
 
 # Reply ownership (2026-08-23): public writers require the caller's session.
-_SESSIONS = {"CONDUCTOR": "codex-cond20260531", "EXECUTOR_1": "codex-exec20260531"}
+_SESSIONS = {"ADVOCATE_CODEX": "codex-cond20260531", "EXECUTOR_1": "codex-exec20260531"}
 
 
 def _post(

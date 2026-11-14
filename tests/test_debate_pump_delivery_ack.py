@@ -61,9 +61,9 @@ from schema import init_db  # noqa: E402 - imported after local repo path bootst
 
 TOPIC = "DELIVERY_ACK_T1"
 EXECUTOR_SESSION = "cc-executor_ack1"
-CONDUCTOR_SESSION = "cc-conductor_ack1"
+REVIEWER_SESSION = "cc-conductor_ack1"
 WAKE_ACTION = "post_tool_use_wake"
-SUPPRESSED = {"CONDUCTOR"}
+SUPPRESSED = {"ADVOCATE_CODEX"}
 
 
 @pytest.fixture
@@ -79,13 +79,13 @@ def pump_db(tmp_path, monkeypatch):
         topic_id=TOPIC,
         title="delivery ack contract",
         roles=[
-            {"role": "CONDUCTOR", "session_id": CONDUCTOR_SESSION},
+            {"role": "ADVOCATE_CODEX", "session_id": REVIEWER_SESSION},
             {"role": "EXECUTOR", "session_id": EXECUTOR_SESSION},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
-    transition_state(con, topic_id=TOPIC, role="CONDUCTOR", new_state="ACTIVE")
-    for role, sid in (("CONDUCTOR", CONDUCTOR_SESSION), ("EXECUTOR", EXECUTOR_SESSION)):
+    transition_state(con, topic_id=TOPIC, role="ADVOCATE_CODEX", new_state="ACTIVE")
+    for role, sid in (("ADVOCATE_CODEX", REVIEWER_SESSION), ("EXECUTOR", EXECUTOR_SESSION)):
         bind_role_session(
             con,
             topic_id=TOPIC,
@@ -102,6 +102,8 @@ def pump_db(tmp_path, monkeypatch):
     monkeypatch.setattr(debate_pump, "IS_WINDOWS", False)
     monkeypatch.setenv("DEBATE_RESOURCE_BUDGET", "off")
     monkeypatch.setenv("DEBATE_WAKE_ACTION_NAME", WAKE_ACTION)
+    # Suppression is explicit fixture policy, independent of retired-role defaults.
+    monkeypatch.setenv("DEBATE_PUMP_SUPPRESS_ROLES", ",".join(sorted(SUPPRESSED)))
     monkeypatch.setattr(debate_pump, "_WITHHELD_DELIVERY_LOGGED", {}, raising=False)
     monkeypatch.setattr(debate_pump, "_WITHHELD_DELIVERY_SATURATED", False, raising=False)
     try:
@@ -189,11 +191,11 @@ def _post_impl_ping(con: sqlite3.Connection, body: str = "impl hand-off") -> str
     return debate_post_with_recipients(
         con,
         topic_id=TOPIC,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="PING",
         body=body,
-        addressed_to=["EXECUTOR", "CONDUCTOR"],
+        addressed_to=["EXECUTOR", "ADVOCATE_CODEX"],
         vehicle="implementation",
     )["msg_id"]
 
@@ -202,7 +204,7 @@ def _post_analysis_q(con: sqlite3.Connection, body: str = "analyse this") -> str
     return debate_post_with_recipients(
         con,
         topic_id=TOPIC,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="Q",
         body=body,
@@ -240,7 +242,7 @@ def test_impl_trigger_without_vehicle_stays_pending(pump_db, monkeypatch):
     assert dispatch.calls == []
     queue = _queue(con, trigger)
     assert queue["EXECUTOR"] is None
-    assert queue["CONDUCTOR"] is None
+    assert queue["ADVOCATE_CODEX"] is None
     assert _events("pump_targeted_delivery_completed") == []
     withheld = _events("pump_targeted_delivery_pending_no_vehicle")
     assert [e["msg_id"] for e in withheld] == [trigger]
@@ -282,7 +284,7 @@ def test_impl_trigger_completes_after_signal_cursor_ack(pump_db, monkeypatch):
 
     queue = _queue(con, trigger)
     assert queue["EXECUTOR"] is not None
-    assert queue["CONDUCTOR"] is not None
+    assert queue["ADVOCATE_CODEX"] is not None
     completed = _events("pump_targeted_delivery_completed")
     assert [(e["msg_id"], e["recipients"]) for e in completed] == [(trigger, 2)]
     assert dispatch.calls == []
@@ -342,7 +344,7 @@ def test_impl_trigger_completes_after_recipient_reply(pump_db, monkeypatch):
         priority="M",
         kind="STATUS",
         body="ACK, working on it",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=trigger,
         vehicle="implementation",
     )
@@ -415,7 +417,7 @@ def test_launched_worker_then_reply_completes_without_double_dispatch(
         priority="M",
         kind="A",
         body="done",
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
         reply_to=trigger,
         author_session_id=actual_worker,
     )
@@ -437,7 +439,7 @@ DIAGNOSTIC_SESSION = "cc-diagnostic_ack1"
 def _diagnostic_trigger(con, *, mixed=False):
     bind_role_session(con, topic_id=TOPIC, role="EXECUTOR", session_id=DIAGNOSTIC_SESSION,
                       state="diagnostic", runtime="cc", reason="synthetic diagnostic")
-    return debate_post_with_recipients(con, topic_id=TOPIC, role="CONDUCTOR", priority="H",
+    return debate_post_with_recipients(con, topic_id=TOPIC, role="ADVOCATE_CODEX", priority="H",
         kind="PING", body="exact synthetic diagnostic", addressed_to=["EXECUTOR"] if mixed else [],
         diagnostic_to=[DIAGNOSTIC_SESSION], vehicle="implementation")["msg_id"]
 
@@ -454,7 +456,7 @@ def test_diagnostic_does_not_borrow_role_evidence(pump_db, monkeypatch, borrowed
         _executor_signal_ack(con, parent_evidence)
     else:
         debate_post_with_recipients(con, topic_id=TOPIC, role="EXECUTOR", priority="M", kind="STATUS",
-            body="same role not exact recipient", addressed_to=["CONDUCTOR"], reply_to=trigger, vehicle="implementation")
+            body="same role not exact recipient", addressed_to=["ADVOCATE_CODEX"], reply_to=trigger, vehicle="implementation")
     before = [tuple(row) for row in con.execute("SELECT * FROM debate_signal_state WHERE session_id=?", (EXECUTOR_SESSION,))]
     dispatch = _FakeDispatch(debate_pump.DB_PATH, claim=False)
     assert debate_pump._trigger_is_terminal(trigger, SUPPRESSED) is True
@@ -490,7 +492,7 @@ def test_normal_role_unrelated_diagnostic_cursor_cannot_ack(pump_db, monkeypatch
     con = pump_db
     _diagnostic_trigger(con)
     trigger = _post_impl_ping(con)
-    diagnostic_evidence = debate_post_with_recipients(con, topic_id=TOPIC, role="CONDUCTOR", priority="H",
+    diagnostic_evidence = debate_post_with_recipients(con, topic_id=TOPIC, role="ADVOCATE_CODEX", priority="H",
         kind="PING", body="later genuinely addressed diagnostic evidence", addressed_to=[],
         diagnostic_to=[DIAGNOSTIC_SESSION], vehicle="implementation")["msg_id"]
     debate_signal_check(con, session_id=DIAGNOSTIC_SESSION, role="EXECUTOR", topic_id=TOPIC)
@@ -672,7 +674,7 @@ def test_exact_versioned_receipt_consumption(pump_db, monkeypatch, defect):
     receipt_trigger = _post_analysis_q(con, "unrelated receipt trigger") if defect == "wrong_trigger" else trigger
     receipt_topic = "OTHER_SYNTHETIC_TOPIC" if defect == "wrong_topic" else TOPIC
     if defect == "wrong_topic":
-        init_debate(con, topic_id=receipt_topic, title="unrelated synthetic topic", roles=[{"role":"CONDUCTOR","session_id":"s-othercond"}], created_by_role="CONDUCTOR")
+        init_debate(con, topic_id=receipt_topic, title="unrelated synthetic topic", roles=[{"role":"ADVOCATE_CODEX","session_id":"s-othercond"}], created_by_role="ADVOCATE_CODEX")
     _insert_wake_log(con, trigger_msg_id=receipt_trigger, topic_id=receipt_topic, recipient="EXECUTOR", action="external_agent_spawn", result="real_spawn",
         target_role="EXECUTOR", target_session_id=claim["worker_session_id"], target_runtime="cc", binding_generation=binding["generation"], details=details)
     dispatch = _FakeDispatch(debate_pump.DB_PATH, claim=False)
@@ -778,7 +780,7 @@ def test_real_launcher_receipt_records_prelaunch_parent_and_actual_worker(pump_d
 def test_diagnostic_direct_versioned_receipt_positive(pump_db, monkeypatch):
     con = pump_db
     bind_role_session(con, topic_id=TOPIC, role="EXECUTOR", session_id=DIAGNOSTIC_SESSION, state="diagnostic", runtime="cc", reason="synthetic direct analysis")
-    trigger = debate_post_with_recipients(con, topic_id=TOPIC, role="CONDUCTOR", priority="H", kind="Q", body="direct diagnostic analysis", addressed_to=[], diagnostic_to=[DIAGNOSTIC_SESSION], vehicle="analysis")["msg_id"]
+    trigger = debate_post_with_recipients(con, topic_id=TOPIC, role="ADVOCATE_CODEX", priority="H", kind="Q", body="direct diagnostic analysis", addressed_to=[], diagnostic_to=[DIAGNOSTIC_SESSION], vehicle="analysis")["msg_id"]
     _insert_wake_log(con, trigger_msg_id=trigger, topic_id=TOPIC, recipient=DIAGNOSTIC_SESSION, action=WAKE_ACTION, result="notified",
                      target_role="EXECUTOR", target_session_id=DIAGNOSTIC_SESSION, target_runtime="cc")
     binding = con.execute("SELECT generation FROM debate_role_bindings WHERE topic_id=? AND session_id=?", (TOPIC,DIAGNOSTIC_SESSION)).fetchone()
@@ -795,7 +797,7 @@ def test_diagnostic_direct_versioned_receipt_positive(pump_db, monkeypatch):
 def test_diagnostic_does_not_borrow_same_role_actual_claim(pump_db, monkeypatch):
     con = pump_db
     bind_role_session(con, topic_id=TOPIC, role="EXECUTOR", session_id=DIAGNOSTIC_SESSION, state="diagnostic", runtime="cc", reason="synthetic mixed claim fixture")
-    trigger = debate_post_with_recipients(con, topic_id=TOPIC, role="CONDUCTOR", priority="H", kind="Q", body="valid mixed analysis claim", addressed_to=["EXECUTOR"], diagnostic_to=[DIAGNOSTIC_SESSION], vehicle="analysis")["msg_id"]
+    trigger = debate_post_with_recipients(con, topic_id=TOPIC, role="ADVOCATE_CODEX", priority="H", kind="Q", body="valid mixed analysis claim", addressed_to=["EXECUTOR"], diagnostic_to=[DIAGNOSTIC_SESSION], vehicle="analysis")["msg_id"]
     claim_worker_session(con, topic_id=TOPIC, role="EXECUTOR", parent_session_id=EXECUTOR_SESSION, trigger_msg_id=trigger)
     _notified(con, trigger)
     _insert_wake_log(con, trigger_msg_id=trigger, topic_id=TOPIC, recipient=DIAGNOSTIC_SESSION, action=WAKE_ACTION, result="notified",

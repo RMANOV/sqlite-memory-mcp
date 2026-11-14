@@ -48,11 +48,11 @@ def _seed_topic(c, topic_id="WEEKEND_CODE_RED_DAO"):
         topic_id=topic_id,
         title="Weekend code red DAO test",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "s-cond"},
+            {"role": "ADVOCATE_CODEX", "session_id": "s-cond"},
             {"role": "EXECUTOR", "session_id": "s-exec"},
             {"role": "ADVOCATE", "session_id": "s-adv"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     return topic_id
 
@@ -134,7 +134,7 @@ def test_debate_post_state_invalid_transition_no_persist(conn):
         post_message(
             conn,
             topic_id=topic,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="H",
             kind="STATE",
             body="RESOLVED",
@@ -198,7 +198,7 @@ def test_debate_post_decision_non_Q_no_persist(conn):
         post_message(
             conn,
             topic_id=topic,
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             priority="H",
             kind="DECISION",
             body="conclude something",
@@ -213,7 +213,7 @@ def test_debate_post_decision_non_Q_no_persist(conn):
 def test_debate_post_decision_with_Q_reply_persists(conn):
     """Counterpart: DECISION replying to Q should succeed."""
     topic = _seed_topic(conn)
-    transition_state(conn, topic_id=topic, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="ACTIVE")
     q = post_message(
         conn,
         topic_id=topic,
@@ -225,7 +225,7 @@ def test_debate_post_decision_with_Q_reply_persists(conn):
     out = post_message(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="H",
         kind="DECISION",
         body="answer",
@@ -241,7 +241,7 @@ def test_debate_post_decision_with_Q_reply_persists(conn):
 def test_debate_state_RESOLVED_blocks_open_questions_at_priority(conn, priority):
     """ALL open Qs block RESOLVED, not just H-priority."""
     topic = _seed_topic(conn)
-    transition_state(conn, topic_id=topic, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="ACTIVE")
     post_message(
         conn,
         topic_id=topic,
@@ -251,7 +251,7 @@ def test_debate_state_RESOLVED_blocks_open_questions_at_priority(conn, priority)
         body=f"open {priority} question",
     )
     result = transition_state(
-        conn, topic_id=topic, role="CONDUCTOR", new_state="RESOLVED"
+        conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="RESOLVED"
     )
     assert result["new_state"] == "ACTIVE", (
         f"RESOLVED transition should be blocked by open {priority} Q"
@@ -263,7 +263,7 @@ def test_debate_state_RESOLVED_blocks_open_questions_at_priority(conn, priority)
 def test_debate_state_RESOLVED_admits_DEFERRED_marked_answers(conn):
     """A reply with body starting `[DEFERRED:` counts as matched answer."""
     topic = _seed_topic(conn)
-    transition_state(conn, topic_id=topic, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="ACTIVE")
     q = post_message(
         conn,
         topic_id=topic,
@@ -275,14 +275,14 @@ def test_debate_state_RESOLVED_admits_DEFERRED_marked_answers(conn):
     post_message(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="A",
         body="[DEFERRED:post-weekend-retro] revisit Monday once team available",
         reply_to=q["msg_id"],
     )
     result = transition_state(
-        conn, topic_id=topic, role="CONDUCTOR", new_state="RESOLVED"
+        conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="RESOLVED"
     )
     assert result["new_state"] == "RESOLVED"
     assert result["blocking_questions"] == []
@@ -297,7 +297,7 @@ def test_debate_state_RESOLVED_blocks_unanswered_question_even_if_DEFERRED_unmar
     leaving others unanswered.
     """
     topic = _seed_topic(conn)
-    transition_state(conn, topic_id=topic, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="ACTIVE")
     q1 = post_message(
         conn,
         topic_id=topic,
@@ -309,7 +309,7 @@ def test_debate_state_RESOLVED_blocks_unanswered_question_even_if_DEFERRED_unmar
     post_message(
         conn,
         topic_id=topic,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="M",
         kind="A",
         body="[DEFERRED:later] q1 deferred",
@@ -325,7 +325,7 @@ def test_debate_state_RESOLVED_blocks_unanswered_question_even_if_DEFERRED_unmar
         body="q2 unanswered",
     )
     result = transition_state(
-        conn, topic_id=topic, role="CONDUCTOR", new_state="RESOLVED"
+        conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="RESOLVED"
     )
     assert result["new_state"] == "ACTIVE"
     assert len(result["blocking_questions"]) == 1
@@ -338,7 +338,7 @@ def test_debate_state_RESOLVED_blocks_unanswered_question_even_if_DEFERRED_unmar
 def test_debate_post_compaction_missing_OODA_section_no_persist(conn):
     """COMPACTION body without all 4 OODA section markers raises pre-INSERT."""
     topic = _seed_topic(conn)
-    transition_state(conn, topic_id=topic, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="ACTIVE")
     pre_count = conn.execute(
         "SELECT COUNT(*) FROM debate_messages WHERE topic_id = ?", (topic,)
     ).fetchone()[0]
@@ -361,7 +361,7 @@ def test_debate_post_compaction_missing_OODA_section_no_persist(conn):
 def test_debate_post_compaction_with_full_OODA_persists(conn):
     """COMPACTION with all 4 sections succeeds."""
     topic = _seed_topic(conn)
-    transition_state(conn, topic_id=topic, role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id=topic, role="ADVOCATE_CODEX", new_state="ACTIVE")
     out = post_message(
         conn,
         topic_id=topic,

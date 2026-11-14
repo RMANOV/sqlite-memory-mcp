@@ -37,17 +37,17 @@ def test_e2e_full_lifecycle(tmp_path):
         init_debate(
             c, topic_id="E2E_DEMO", title="full lifecycle",
             roles=[
-                {"role": "CONDUCTOR", "session_id": "sess-c"},
+                {"role": "ADVOCATE_CODEX", "session_id": "sess-c"},
                 {"role": "EXECUTOR", "session_id": "sess-e"},
                 {"role": "ADVOCATE", "session_id": "sess-a"},
             ],
-            created_by_role="CONDUCTOR",
+            created_by_role="ADVOCATE_CODEX",
         )
         assert get_debate(c, "E2E_DEMO")["state"] == "INIT"
 
         # Transition INIT → ACTIVE
         transition_state(
-            c, topic_id="E2E_DEMO", role="CONDUCTOR", new_state="ACTIVE",
+            c, topic_id="E2E_DEMO", role="ADVOCATE_CODEX", new_state="ACTIVE",
         )
         assert get_debate(c, "E2E_DEMO")["state"] == "ACTIVE"
 
@@ -66,7 +66,7 @@ def test_e2e_full_lifecycle(tmp_path):
             priority="INFO", kind="STATUS", body="checkpoint #2 shipped",
         )
         post_message(
-            c, topic_id="E2E_DEMO", role="CONDUCTOR",
+            c, topic_id="E2E_DEMO", role="ADVOCATE_CODEX",
             priority="H", kind="DECISION", body="proceed to resolve",
             reply_to=q["msg_id"],
         )
@@ -94,26 +94,26 @@ def test_e2e_full_lifecycle(tmp_path):
             priority="INFO", kind="WATERMARK", body=last,
         )
         post_message(
-            c, topic_id="E2E_DEMO", role="CONDUCTOR",
+            c, topic_id="E2E_DEMO", role="ADVOCATE_CODEX",
             priority="INFO", kind="WATERMARK", body=last,
         )
 
         # Verify watermarks advanced
-        for role in ("EXECUTOR", "ADVOCATE", "CONDUCTOR"):
+        for role in ("EXECUTOR", "ADVOCATE", "ADVOCATE_CODEX"):
             wm = get_watermark(c, "E2E_DEMO", role)
             assert wm is not None
             assert wm["last_processed_msg_id"] == last
 
         # Transition ACTIVE → RESOLVED (now all Qs answered)
         out = transition_state(
-            c, topic_id="E2E_DEMO", role="CONDUCTOR", new_state="RESOLVED",
+            c, topic_id="E2E_DEMO", role="ADVOCATE_CODEX", new_state="RESOLVED",
         )
         assert out["new_state"] == "RESOLVED"
         assert out["blocking_questions"] == []
 
         # Transition RESOLVED → ARCHIVED
         out = transition_state(
-            c, topic_id="E2E_DEMO", role="CONDUCTOR", new_state="ARCHIVED",
+            c, topic_id="E2E_DEMO", role="ADVOCATE_CODEX", new_state="ARCHIVED",
         )
         assert out["new_state"] == "ARCHIVED"
         debate = get_debate(c, "E2E_DEMO")

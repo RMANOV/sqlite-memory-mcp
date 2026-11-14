@@ -38,7 +38,7 @@ def _init(conn, topic_id, roles):
         topic_id=topic_id,
         title=topic_id,
         roles=roles,
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         require_numbered_executors=True,
     )
 
@@ -54,22 +54,22 @@ def db(tmp_path):
         c,
         "DAY1",
         [
-            {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+            {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
             {"role": "ADVOCATE", "session_id": "cc-advo1"},
         ],
     )
-    for role, session in (("CONDUCTOR", "codex-cond1"), ("ADVOCATE", "cc-advo1")):
+    for role, session in (("ADVOCATE_CODEX", "codex-cond1"), ("ADVOCATE", "cc-advo1")):
         bind_role_session(
             c, topic_id="DAY1", role=role, session_id=session, reason="seed"
         )
-    transition_state(c, topic_id="DAY1", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(c, topic_id="DAY1", role="ADVOCATE_CODEX", new_state="ACTIVE")
     # History: E7 on DAY1 (active), E30 on an older, closed topic (retired).
-    _init(c, "OLD", [{"role": "CONDUCTOR", "session_id": "codex-cond0"}])
+    _init(c, "OLD", [{"role": "ADVOCATE_CODEX", "session_id": "codex-cond0"}])
     add_role_to_debate(
         c, topic_id="OLD", role="EXECUTOR_30", session_id="cc-exec30", reason="old"
     )
-    transition_state(c, topic_id="OLD", role="CONDUCTOR", new_state="ACTIVE")
-    transition_state(c, topic_id="OLD", role="CONDUCTOR", new_state="RESOLVED")
+    transition_state(c, topic_id="OLD", role="ADVOCATE_CODEX", new_state="ACTIVE")
+    transition_state(c, topic_id="OLD", role="ADVOCATE_CODEX", new_state="RESOLVED")
     add_role_to_debate(
         c, topic_id="DAY1", role="EXECUTOR_7", session_id="cc-exec7", reason="seed"
     )
@@ -139,7 +139,7 @@ def test_concurrent_allocations_get_distinct_numbers(db):
 
 def test_same_session_carries_its_number_into_new_topic(db):
     conn, _ = db
-    _init(conn, "DAY2", [{"role": "CONDUCTOR", "session_id": "codex-cond1"}])
+    _init(conn, "DAY2", [{"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"}])
     out = add_role_to_debate(
         conn, topic_id="DAY2", role="EXECUTOR_7", session_id="cc-exec7", reason="roll"
     )
@@ -153,7 +153,7 @@ def test_same_session_carries_its_number_into_new_topic(db):
 
 def test_foreign_session_rejected_on_add(db):
     conn, _ = db
-    _init(conn, "DAY2", [{"role": "CONDUCTOR", "session_id": "codex-cond1"}])
+    _init(conn, "DAY2", [{"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"}])
     with pytest.raises(DebateError) as exc:
         add_role_to_debate(
             conn,
@@ -198,7 +198,7 @@ def test_foreign_session_rejected_on_init_roster(db):
             conn,
             "DAY3",
             [
-                {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+                {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
                 {"role": "EXECUTOR_7", "session_id": "cc-xforeign"},
             ],
         )
@@ -208,7 +208,7 @@ def test_foreign_session_rejected_on_init_roster(db):
 def test_init_roster_bare_executor_allocates(db):
     conn, _ = db
     roles = [
-        {"role": "CONDUCTOR", "session_id": "codex-cond1"},
+        {"role": "ADVOCATE_CODEX", "session_id": "codex-cond1"},
         {"role": "EXECUTOR", "session_id": "cc-execa"},
         {"role": "EXECUTOR", "session_id": "cc-execb"},
     ]
@@ -217,11 +217,11 @@ def test_init_roster_bare_executor_allocates(db):
         topic_id="DAY4",
         title="DAY4",
         roles=roles,
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         require_numbered_executors=True,
     )
     assert [r["role"] for r in out["roles"]] == [
-        "CONDUCTOR",
+        "ADVOCATE_CODEX",
         "EXECUTOR_31",
         "EXECUTOR_32",
     ]
@@ -301,7 +301,7 @@ def test_wrapper_add_role_executor_returns_allocated_label(db, monkeypatch):
             role="EXECUTOR",
             session_id="cc-wrap1",
             reason="join via MCP",
-            bound_by_role="CONDUCTOR",
+            bound_by_role="ADVOCATE_CODEX",
         )
     )
     assert out["role"] == "EXECUTOR_31"
@@ -325,7 +325,7 @@ def _roster(*pairs):
 
 def test_init_retry_with_bare_executor_is_idempotent(db):
     conn, _ = db
-    payload = (("CONDUCTOR", "codex-cond1"), ("EXECUTOR", "cc-new"))
+    payload = (("ADVOCATE_CODEX", "codex-cond1"), ("EXECUTOR", "cc-new"))
     _init(conn, "RETRY", _roster(*payload))
     # Client retry after an MCP timeout: same JSON, no bindings seeded yet.
     again = init_debate(
@@ -333,10 +333,10 @@ def test_init_retry_with_bare_executor_is_idempotent(db):
         topic_id="RETRY",
         title="RETRY",
         roles=_roster(*payload),
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         require_numbered_executors=True,
     )
-    assert [r["role"] for r in again["roles"]] == ["CONDUCTOR", "EXECUTOR_31"]
+    assert [r["role"] for r in again["roles"]] == ["ADVOCATE_CODEX", "EXECUTOR_31"]
 
 
 def test_v1_blind_bare_executor_resolves_to_allocated_number(db):
@@ -345,11 +345,11 @@ def test_v1_blind_bare_executor_resolves_to_allocated_number(db):
         conn,
         topic_id="V1BLIND",
         title="V1BLIND",
-        roles=_roster(("CONDUCTOR", "codex-cond1"), ("EXECUTOR", "cc-execx1")),
-        created_by_role="CONDUCTOR",
+        roles=_roster(("ADVOCATE_CODEX", "codex-cond1"), ("EXECUTOR", "cc-execx1")),
+        created_by_role="ADVOCATE_CODEX",
         require_numbered_executors=True,
         protocol_version="debate/v1",
-        blind_roles=["CONDUCTOR", "EXECUTOR"],
+        blind_roles=["ADVOCATE_CODEX", "EXECUTOR"],
     )
     assert out["roles"][1]["role"] == "EXECUTOR_31"
     assert "EXECUTOR_31" in json.dumps(out["protocol_state"])
@@ -357,21 +357,21 @@ def test_v1_blind_bare_executor_resolves_to_allocated_number(db):
 
 def test_v1_sweep_never_reissues_executor_number(db):
     conn, _ = db
-    roles = _roster(("CONDUCTOR", "codex-cond1"), ("EXECUTOR_7", "cc-exec7"))
+    roles = _roster(("ADVOCATE_CODEX", "codex-cond1"), ("EXECUTOR_7", "cc-exec7"))
     init_debate(
         conn,
         topic_id="V1SWEEP",
         title="V1SWEEP",
         roles=roles,
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
         require_numbered_executors=True,
         protocol_version="debate/v1",
-        blind_roles=["CONDUCTOR", "EXECUTOR_7"],
+        blind_roles=["ADVOCATE_CODEX", "EXECUTOR_7"],
     )
     seed_initial_role_bindings(
-        conn, topic_id="V1SWEEP", roles=roles, bound_by_role="CONDUCTOR", reason="t"
+        conn, topic_id="V1SWEEP", roles=roles, bound_by_role="ADVOCATE_CODEX", reason="t"
     )
-    transition_state(conn, topic_id="V1SWEEP", role="CONDUCTOR", new_state="ACTIVE")
+    transition_state(conn, topic_id="V1SWEEP", role="ADVOCATE_CODEX", new_state="ACTIVE")
     conn.execute(
         "UPDATE debate_role_bindings SET state='retired' "
         "WHERE topic_id='V1SWEEP' AND role='EXECUTOR_7'"

@@ -37,24 +37,24 @@ def topic(tmp_path):
         topic_id="CURSOR_RECONCILE",
         title="cursor reconciliation",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-conductor"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-conductor"},
             {"role": "ADVOCATE", "session_id": "codex-advocate"},
         ],
-        created_by_role="CONDUCTOR",
+        created_by_role="ADVOCATE_CODEX",
     )
     seed_initial_role_bindings(
         conn,
         topic_id="CURSOR_RECONCILE",
         roles=[
-            {"role": "CONDUCTOR", "session_id": "cc-conductor"},
+            {"role": "ADVOCATE_CODEX", "session_id": "cc-conductor"},
             {"role": "ADVOCATE", "session_id": "codex-advocate"},
         ],
-        bound_by_role="CONDUCTOR",
+        bound_by_role="ADVOCATE_CODEX",
     )
     transition_state(
         conn,
         topic_id="CURSOR_RECONCILE",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         new_state="ACTIVE",
     )
     yield conn, "CURSOR_RECONCILE"
@@ -69,7 +69,7 @@ def _address_conductor(conn, topic_id, body):
         priority="H",
         kind="STATUS",
         body=body,
-        addressed_to=["CONDUCTOR"],
+        addressed_to=["ADVOCATE_CODEX"],
     )
 
 
@@ -77,7 +77,7 @@ def _signal_cursor(conn, topic_id, session_id="cc-conductor"):
     return conn.execute(
         "SELECT last_processed_msg_id,last_processed_ts "
         "FROM debate_signal_state "
-        "WHERE session_id=? AND role='CONDUCTOR' AND topic_id=?",
+        "WHERE session_id=? AND role='ADVOCATE_CODEX' AND topic_id=?",
         (session_id, topic_id),
     ).fetchone()
 
@@ -89,7 +89,7 @@ def test_role_watermark_ack_reconciles_active_primary_signal_cursor(topic):
     post_message(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="INFO",
         kind="WATERMARK",
         body=addressed["msg_id"],
@@ -101,7 +101,7 @@ def test_role_watermark_ack_reconciles_active_primary_signal_cursor(topic):
         debate_signal_check(
             conn,
             session_id="cc-conductor",
-            role="CONDUCTOR",
+            role="ADVOCATE_CODEX",
             topic_id=topic_id,
         )["count"]
         == 0
@@ -117,7 +117,7 @@ def test_signal_check_repairs_preexisting_watermark_drift_before_delivery(topic)
         "VALUES (?,?,?,?,?)",
         (
             topic_id,
-            "CONDUCTOR",
+            "ADVOCATE_CODEX",
             addressed["msg_id"],
             addressed["ts"],
             addressed["ts"],
@@ -127,7 +127,7 @@ def test_signal_check_repairs_preexisting_watermark_drift_before_delivery(topic)
     inbox = debate_signal_check(
         conn,
         session_id="cc-conductor",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         topic_id=topic_id,
     )
 
@@ -153,7 +153,7 @@ def test_unaddressed_watermark_target_reconciles_only_addressed_subset(topic):
     post_message(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="INFO",
         kind="WATERMARK",
         body=unaddressed["msg_id"],
@@ -169,7 +169,7 @@ def test_role_watermark_does_not_consume_diagnostic_session_inbox(topic):
     bind_role_session(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         session_id="codex-cond_diag",
         state="diagnostic",
         reason="cursor isolation test",
@@ -188,7 +188,7 @@ def test_role_watermark_does_not_consume_diagnostic_session_inbox(topic):
     post_message(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="INFO",
         kind="WATERMARK",
         body=diagnostic["msg_id"],
@@ -198,7 +198,7 @@ def test_role_watermark_does_not_consume_diagnostic_session_inbox(topic):
     inbox = debate_signal_check(
         conn,
         session_id="codex-cond_diag",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         topic_id=topic_id,
     )
     assert [row["msg_id"] for row in inbox["pending"]] == [diagnostic["msg_id"]]
@@ -211,7 +211,7 @@ def test_older_role_watermark_never_regresses_newer_signal_cursor(topic):
     inbox = debate_signal_check(
         conn,
         session_id="cc-conductor",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         topic_id=topic_id,
     )
     assert [row["msg_id"] for row in inbox["pending"]] == [
@@ -221,7 +221,7 @@ def test_older_role_watermark_never_regresses_newer_signal_cursor(topic):
     debate_signal_advance(
         conn,
         session_id="cc-conductor",
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         topic_id=topic_id,
         last_processed_msg_id=second["msg_id"],
     )
@@ -229,7 +229,7 @@ def test_older_role_watermark_never_regresses_newer_signal_cursor(topic):
     post_message(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="INFO",
         kind="WATERMARK",
         body=first["msg_id"],
@@ -244,7 +244,7 @@ def test_role_watermark_never_advances_derived_worker_cursor(topic):
     claim = claim_worker_session(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         parent_session_id="cc-conductor",
         trigger_msg_id=trigger["msg_id"],
     )
@@ -252,7 +252,7 @@ def test_role_watermark_never_advances_derived_worker_cursor(topic):
     post_message(
         conn,
         topic_id=topic_id,
-        role="CONDUCTOR",
+        role="ADVOCATE_CODEX",
         priority="INFO",
         kind="WATERMARK",
         body=trigger["msg_id"],
