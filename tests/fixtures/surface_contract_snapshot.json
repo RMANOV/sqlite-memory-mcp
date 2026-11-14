@@ -4,6 +4,7 @@
   },
   "console_scripts": {
     "memory-digest": "daily_digest:main",
+    "sqlite-memory-approve": "promotion_governance:main",
     "sqlite-memory-bridge": "bridge_server:main",
     "sqlite-memory-collab": "collab_server:main",
     "sqlite-memory-core": "server:main",

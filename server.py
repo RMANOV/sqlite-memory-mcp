@@ -95,8 +95,9 @@ def _expand_by_relations(
 
     nph = ",".join("?" * len(fresh))
     added = [
-        # Rank 0.0 is deliberate: a neighbour has no BM25 evidence of its own,
-        # so it enters on structure alone and must not outrank a real match.
+        # Rank 0.0 is a neutral structural baseline, without BM25 evidence.
+        # A lexical match wins with identical context signals; contextual
+        # boosts may still prioritize a relevant graph neighbour.
         {
             "eid": r["id"],
             "name": r["name"],

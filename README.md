@@ -5,8 +5,8 @@
 Claude and Codex can share one provenance-rich knowledge graph with approval-aware promotion workflows.
 
 - **Hybrid retrieval** — BM25/FTS5 keyword search fused with optional semantic (sqlite-vec) results via Reciprocal Rank Fusion, so recall does not depend on exact keywords.
-- **Provenance + reviewable promotion** — memory mutations carry provenance, and candidate claims move to canonical facts through an approval-aware promotion gate (`human_confirmed`, plus policy-gated multi-evidence) instead of silent rewrites.
-- **Cross-agent MCP memory with bridge sync** — one local SQLite knowledge graph any MCP client can read and write, with bridge tools that sync shared entities across machines.
+- **Provenance + reviewable promotion** — memory mutations carry provenance; canonical promotion requires a fresh, one-use operator approval bound to the reviewed claim and source. Automatic extraction retains candidates for review.
+- **Cross-agent MCP memory with bridge sync** — one local SQLite knowledge graph any MCP client can read and write, with explicitly authorized private synchronization between trusted devices.
 
 [![CI](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/RMANOV/sqlite-memory-mcp/actions/workflows/ci.yml)
 
@@ -43,8 +43,8 @@ SQLite hits the sweet spot:
 - **Task management** -- Structured task CRUD with typed queries, priorities, sections, due dates, and recurring tasks
 - **Kanban board** -- Optional HTML report generator for visual task overview via GitHub Pages
 - **Cross-project sharing** -- Optional `project` field scopes entities; omit it to share across all projects
-- **Cross-machine sync** -- Bridge tools push/pull shared entities between machines via a private git repo
-- **Provenance + approval-aware promotion** -- Mutations carry provenance; candidate claims promote to canonical facts through a review gate (`human_confirmed` / policy-gated multi-evidence). See [Advanced & operator topics](#advanced--operator-topics)
+- **Cross-machine sync** -- A destination-bound trust policy authorizes selected graph entities plus the full task, attachment and extended-memory transport through a verified private GitHub repository
+- **Provenance + approval-aware promotion** -- Mutations carry provenance; an operator CLI reviews ordinary or lazy candidates and issues a one-use approval for canonical promotion. See [Memory governance](docs/ops/MEMORY_GOVERNANCE.md)
 - **Drop-in compatible core** -- All 9 tools from `@modelcontextprotocol/server-memory` work identically in `sqlite_memory`, with many more tools available from companion servers (see [Tool Reference](#tool-reference) for exact per-server counts)
 - **Zero required dependencies beyond stdlib** -- Only `fastmcp` is required for MCP protocol; `sqlite3` is Python stdlib. Optional `orjson`, `sqlite-vec`, and `sentence-transformers` add speed and semantic search
 - **Automatic FTS sync** -- Full-text index stays in sync with every write operation
@@ -105,7 +105,7 @@ its server / tool counts are unchanged.
 
 ### Intelligence v2 — claims, governance, and provenance
 
-The `sqlite_intel` server turns raw memory into reviewable knowledge. It extracts candidate claims, queues clarifications, records human answers, and promotes claims to canonical facts through an approval-aware gate (`promote_candidate`: `human_confirmed` always allowed; `multi_evidence` is policy-gated; sensitive scopes require explicit human confirmation). Every mutation can carry a provenance link, and `audit_memory` / `replay_memory` make the history inspectable. Consolidation runs through `reflect_audit` (Phase 0.5) — deterministic SQL with no LLM cost per run. See [`docs/REFLECT_AUDIT_DEMO.md`](docs/REFLECT_AUDIT_DEMO.md).
+The `sqlite_intel` server extracts candidate claims, queues clarifications and records reported human answers. New canonical promotion requires an operator CLI approval bound to the current claim, source, evidence and policy. `human_confirmed` alone is not approval; `auto_layer1`, `multi_evidence`, `imported` and lazy confidence accumulation cannot mint new facts. Both ordinary and lazy candidates remain reviewable. A reported human answer does not issue an approval. See [Memory governance](docs/ops/MEMORY_GOVERNANCE.md) for the review workflow, expiry, transactional behavior and the distinction between local approval, trusted replication and historical labels. `audit_memory` / `replay_memory` keep history inspectable. Consolidation runs through `reflect_audit` (Phase 0.5); see [`docs/REFLECT_AUDIT_DEMO.md`](docs/REFLECT_AUDIT_DEMO.md).
 
 ### Debate / multi-agent protocol
 
@@ -425,13 +425,13 @@ Tools are exposed as `@mcp.tool()` endpoints grouped by MCP server. The counts b
 
 ## Bridge Sync (Cross-Machine)
 
-Share knowledge graph entities between machines (e.g., personal laptop + work computer) via a private git repo.
+Synchronize memory between trusted devices through an explicitly authorized private GitHub repository. This transport is **not shared-only**: the entity prefix selects graph entities, while tasks, attachment history, extended memory and the event ledger can include private information from other projects. Every permitted reader must be trusted for that complete payload.
 
 ### How it works
 
 1. Tag entities for sharing by setting `project` to any value starting with `"shared"` (e.g., `"shared"`, `"shared:trading"`, `"shared:hooks"`)
-2. `bridge_push()` first runs a bridge repo safety preflight, then exports shared data to `shared.json`, `index.json`, `tasks/`, and `entities/`, and finally commits and pushes. The v2 payload also includes shared tasks. (`shared.js` — a `window.__BRIDGE_DATA__` mirror of `shared.json` — was derived, never public API, and had no consumer; it is no longer generated or pushed, and a stale tracked copy is untracked automatically.)
-3. `bridge_pull()` on the other machine also runs the same repo safety preflight, does `git pull`, and imports new entities/observations/relations. Task metadata comes from `index.json`, while `description` and `notes` are hydrated from per-task files before the LWW merge. Shared knowledge, public knowledge, and imported ratings are accepted only when they stay bound to a known collaborator identity.
+2. `bridge_push()` requires a global `trusted_device` policy before opening the database or exporting data. It checks the exact GitHub destination, repository identity, private visibility and approved collaborators/deploy keys, including all inventory pages. Missing policy, unknown readers or failed verification block synchronization. The approved transport includes `shared.json`, `index.json`, `tasks/`, `entities/`, attachments and `extended_memory/`, including the complete event ledger. `shared.js` is no longer generated or pushed.
+3. `bridge_pull()` uses the same trust boundary before fetching and importing. Task metadata comes from `index.json`, with descriptions and notes from per-task files before the LWW merge. Trusted-device sync suppresses pending-public promotion, peer publication, releases and Pages even when `BRIDGE_PRIVATE_ONLY` is unset. Other publication APIs require their own authority.
 4. `bridge_status()` shows what's in sync vs only-local vs only-remote
 
 Auto-sync only overwrites bridge-generated artifacts (`shared.json`, `index.json`, `tasks/`, `entities/`, `public_knowledge/`, plus legacy `shared.js` leftovers). If the bridge repo contains user-managed dirty files such as `index.html`, or if generated artifacts were replaced with symlinks/escaped paths, sync now blocks instead of discarding or following them.
@@ -463,6 +463,8 @@ On the second machine, clone instead of init:
 git clone https://github.com/YOUR_USER/memory-bridge.git ~/.claude/memory/bridge
 ```
 
+Before the first sync, configure the global destination and reader policy on each machine as described in [Bridge operations](docs/ops/BRIDGE_OPERATIONS.md#trusted-device-policy). Authenticate `gh` with sufficient repository administration access to enumerate the complete reader set. API errors or insufficient permissions block sync; a previous successful check is not reused as authorization. Existing Git history is preserved, so this guard does not remove information already uploaded or undo exposure caused by making an existing repository public.
+
 Add `BRIDGE_REPO` to the MCP servers that participate in sharing (`sqlite_bridge`, `sqlite_collab`, and usually the rest of the stack so they all see the same paths):
 
 ```json
@@ -488,7 +490,7 @@ create_entities([{
 }])
 
 # Push to bridge repo
-bridge_push()  # pushes all project LIKE 'shared%'
+bridge_push()  # authorized full private transport; graph entity prefix defaults to 'shared'
 
 # On another machine: pull
 bridge_pull()  # imports new entities with dedup
@@ -545,6 +547,8 @@ search_nodes("entity_type:BugFix")
 ```
 
 Results are ranked by BM25 relevance score. The FTS5 index covers entity names, entity types, and the full text of all observations concatenated together.
+
+Contextual reranking preserves the direction of FTS5 and negative RRF ranks: a more negative rank increases the base score when the other signals are equal. Its bounded base keeps the scale used by context-pack thresholds, and internal scores retain full precision. Contextual boosts can still place a structurally relevant neighbor ahead of a lexical match; this is not an absolute lexical-first ordering.
 
 ## Session Tracking
 

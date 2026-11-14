@@ -62,10 +62,21 @@ def compute_composite_score(
 ) -> float:
     """Multiplicative composite score from 6 signals.
 
-    bm25_rank is negative (lower = better match in FTS5), so we invert it.
+    FTS5 and RRF ranks are nonpositive, with lower ranks representing better
+    matches. Zero is neutral for structural/blank-query candidates. Invalid
+    ranks receive a noncompetitive score instead of contaminating the ordering.
     """
-    # Base: invert BM25 rank (FTS5 rank is negative, closer to 0 = worse match)
-    base = 1.0 / (1.0 + abs(bm25_rank))
+    try:
+        if isinstance(bm25_rank, bool) or not math.isfinite(bm25_rank) or bm25_rank > 0:
+            return 0.0
+        strength = -bm25_rank
+        # Keep tiny FTS/RRF ranks near 1 for context-pack relevance thresholds,
+        # while increasing lexical weight monotonically within [1, 2].
+        # This equivalent form also stays nondecreasing at float saturation,
+        # where strength/(1+strength) can reverse adjacent large finite ranks.
+        base = 2.0 - 1.0 / (1.0 + strength)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
 
     # Signal 1: recency
     recency = compute_recency_decay(updated_at)
@@ -81,7 +92,7 @@ def compute_composite_score(
     else:
         graph = 1.0
 
-    # Signal 4: observation richness (log scale, capped)
+    # Signal 4: observation richness (log scale)
     richness = 1.0 + math.log1p(obs_count) / RICHNESS_DIVISOR
 
     # Signal 5: canonical facts existence
@@ -206,8 +217,13 @@ def rerank_entities(
         else:
             hops = 0
 
+        try:
+            rank = r["rank"]
+        except (KeyError, IndexError):  # dict / sqlite3.Row
+            rank = None
+
         score = compute_composite_score(
-            bm25_rank=r["rank"],
+            bm25_rank=rank,
             updated_at=updated_map.get(eid),
             project=r["project"],
             current_project=current_project,
@@ -225,7 +241,9 @@ def rerank_entities(
                     "name": name,
                     "entity_type": r["entity_type"],
                     "project": r["project"],
-                    "_score": round(score, 6),
+                    # Context consumers use this numerically; rounding here
+                    # erases meaningful differences between small FTS ranks.
+                    "_score": score,
                 },
             )
         )

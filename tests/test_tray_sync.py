@@ -327,6 +327,34 @@ def test_periodic_pull_delegates_no_change_check_to_locked_worker(
     assert refreshes == []
 
 
+def test_periodic_pull_reports_policy_denial_without_false_success(bridge_env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "bridge_sync_worker", SimpleNamespace(main=lambda **kw: {
+        "blocked_by_bridge_policy": True, "message": "unapproved destination", "pushed": False,
+        "imported_new": 0, "imported_updated": 0}))
+    window = _DummyWindow(bridge_env)
+    events=[]
+    window._log_sync_event=lambda event,**fields: events.append((event,fields))
+    window._bridge_progress=SimpleNamespace(emit=lambda *args: None)
+    window._bridge_done=SimpleNamespace(emit=lambda *args: pytest.fail("denial reported as successful update"))
+    monkeypatch.setattr(window,"_start_bridge_sync_thread",lambda target,**kwargs: target())
+    window._periodic_pull()
+    assert events[-1][1]["pulled"] is False
+    assert events[-1][1]["error"] == "unapproved destination"
+
+
+def test_policy_denial_does_not_update_last_success_time(bridge_env, monkeypatch):
+    from PyQt6.QtCore import QTimer
+
+    window=_DummyWindow(bridge_env)
+    previous=object()
+    window._last_sync_at=previous
+    window._sync_bar=SimpleNamespace(setValue=lambda _:None,setFormat=lambda _:None)
+    window.status=_CaptureStatus()
+    monkeypatch.setattr(QTimer,"singleShot",lambda *a:None)
+    window._on_sync_done("Sync blocked: unapproved destination")
+    assert window._last_sync_at is previous
+
+
 def test_bootstrap_pull_imports_remote_changes_when_git_head_changes(
     bridge_env, monkeypatch
 ):

@@ -7,11 +7,16 @@ import subprocess
 import sys
 
 import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
+
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import bridge_server
 from schema import init_db
+
+pytestmark = pytest.mark.usefixtures("trusted_device_transport")
 
 
 def _cp(args, returncode=0, stdout="", stderr=""):

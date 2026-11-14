@@ -21,6 +21,9 @@ import os
 import subprocess
 import sys
 
+import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import bridge_merge_driver
@@ -85,6 +88,7 @@ def _sync_fixture(tmp_path, monkeypatch):
 # ── (a) transport fail-closed on the legacy fallback ─────────────────────────
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_full_sync_fails_closed_when_index_json_missing_but_tasks_exist(
     tmp_path, monkeypatch
 ):
@@ -114,6 +118,7 @@ def test_full_sync_fails_closed_when_index_json_missing_but_tasks_exist(
     assert not (bridge_dir / "shared.js").exists()
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_full_sync_fails_closed_when_index_json_is_corrupt(tmp_path, monkeypatch):
     db_path, bridge_dir, calls = _sync_fixture(tmp_path, monkeypatch)
     (bridge_dir / "shared.json").write_text(
@@ -138,6 +143,7 @@ def test_full_sync_fails_closed_when_index_json_is_corrupt(tmp_path, monkeypatch
     assert not any("push" in args for args in calls)
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_pull_only_reports_legacy_fallback_block(tmp_path, monkeypatch):
     db_path, bridge_dir, _calls = _sync_fixture(tmp_path, monkeypatch)
     (bridge_dir / "shared.json").write_text(
@@ -226,6 +232,7 @@ def test_corrupt_per_task_file_degrades_without_content_clobber(tmp_path):
     assert "notes" not in tasks[0]
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_untrack_failure_fails_closed_before_staging_commit_push(tmp_path, monkeypatch):
     # B-UNTRACK-FAIL (verdict c8fe5a57e0f1): if `git rm --cached` fails
     # (index.lock contention, permissions), the sync must stop BEFORE

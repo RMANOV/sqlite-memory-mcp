@@ -12,6 +12,7 @@ import pytest
 import claim_graph
 import db_utils
 import memory_audit
+from promotion_governance import prepare_review, issue_approval
 from context_packer import build_context_pack
 from schema import init_db
 
@@ -228,7 +229,7 @@ def test_explicit_autocommit_remains_autocommit(database):
 
 
 def claim(conn, value):
-    conn.execute("INSERT INTO context_chunks (chunk_id,source_type,source_ref,source_hash,title,body,language,state,enrich_policy,materiality_score,created_at,updated_at) VALUES ('case-chunk','observation','test','hash','Aurora','Aurora','en','enrichable','manual',0.8,?,?)", (TS, TS))
+    conn.execute("INSERT INTO context_chunks (chunk_id,source_type,source_ref,source_hash,title,body,language,state,enrich_policy,materiality_score,created_at,updated_at) VALUES ('case-chunk','text','test','hash','Aurora','Aurora','en','enrichable','manual',0.8,?,?)", (TS, TS))
     conn.execute("INSERT INTO candidate_claims (claim_id,chunk_id,subject,predicate,object_text,object_type,claim_scope,confidence,status,requires_human,created_at,updated_at) VALUES ('case-claim','case-chunk','Aurora service','configuration',?,'text','task',0.95,'candidate',0,?,?)", (value, TS, TS))
 
 
@@ -238,7 +239,9 @@ def test_promotion_does_not_reuse_or_contradict_superseded_legacy_row(database, 
     insert(conn, fact("case-old", "OBSOLETE_SENTINEL"), fact("case-target", "OTHER_SENTINEL"))
     conn.execute("UPDATE canonical_facts SET superseded_by_fact_id='case-target' WHERE fact_id='case-old'")
     claim(conn, "OBSOLETE_SENTINEL" if same_object else "NEW_SENTINEL")
-    result = claim_graph.promote_candidate(conn, "case-claim", mode="human_confirmed")
+    review = prepare_review(conn, "candidate", "case-claim")
+    approval = issue_approval(conn, "candidate", "case-claim", review["content_sha256"])
+    result = claim_graph.promote_candidate(conn, "case-claim", mode="human_confirmed", approval_id=approval["approval_id"])
     assert result["promoted"] is True
     assert result["fact_id"] != "case-old"
     assert not result.get("reused_existing_fact", False)

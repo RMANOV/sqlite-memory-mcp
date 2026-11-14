@@ -429,6 +429,25 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_ce_claim ON claim_evidence(claim_id);
 
+-- Local operator approvals are intentionally absent from bridge transports.
+-- This separates the operator CLI channel from agent-callable MCP tools; it
+-- does not isolate arbitrary programs running with the same OS/database rights.
+CREATE TABLE IF NOT EXISTS promotion_approvals (
+    approval_id          TEXT PRIMARY KEY,
+    contract_version     TEXT NOT NULL,
+    claim_kind           TEXT NOT NULL CHECK (claim_kind IN ('candidate', 'lazy')),
+    claim_id             TEXT NOT NULL,
+    content_sha256       TEXT NOT NULL,
+    approved_at          TEXT NOT NULL,
+    expires_at           TEXT NOT NULL,
+    approved_via         TEXT NOT NULL,
+    consumed_at          TEXT NULL,
+    fact_id              TEXT NULL,
+    normalized_claim_id  TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_promotion_approval_claim
+    ON promotion_approvals(claim_kind, claim_id);
+
 CREATE TABLE IF NOT EXISTS canonical_facts (
     fact_id             TEXT PRIMARY KEY,
     subject             TEXT NOT NULL,
@@ -659,6 +678,12 @@ CREATE TABLE IF NOT EXISTS lazy_claims (
 CREATE INDEX IF NOT EXISTS idx_lc_entity ON lazy_claims(entity_id, status);
 CREATE INDEX IF NOT EXISTS idx_lc_obs    ON lazy_claims(observation_id);
 CREATE INDEX IF NOT EXISTS idx_lc_status ON lazy_claims(status, confidence DESC);
+
+CREATE TABLE IF NOT EXISTS lazy_claim_observations (
+    claim_id       TEXT NOT NULL REFERENCES lazy_claims(claim_id) ON DELETE CASCADE,
+    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    PRIMARY KEY (claim_id, observation_id)
+);
 
 CREATE TABLE IF NOT EXISTS premium_gate_audit (
     audit_id            TEXT PRIMARY KEY,

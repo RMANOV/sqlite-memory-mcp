@@ -7,11 +7,16 @@ import sqlite3
 import subprocess
 
 import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
+
 
 import bridge_sync_worker as worker
 import db_utils as db
 import task_server
 from schema import init_db
+
+pytestmark = pytest.mark.usefixtures("trusted_device_transport")
 
 
 LEGACY = ["2026-01-02T00:00:00+00:00", "peer-a", 0, None]

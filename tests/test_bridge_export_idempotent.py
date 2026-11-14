@@ -13,11 +13,16 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
+
 
 import bridge_sync_worker as worker
 import db_utils as db
 import memory_audit
 from schema import init_db
+
+pytestmark = pytest.mark.usefixtures("trusted_device_transport")
 
 ROOT = Path(__file__).resolve().parent.parent
 PARENT, CHILD, OTHER = "task-parent", "task-child", "task-other"

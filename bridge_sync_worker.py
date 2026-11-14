@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+import bridge_policy
+
 if os.name == "nt":
     import msvcrt
 else:
@@ -37,7 +39,6 @@ from db_utils import (
     git_run,
     git_retry,
     _NOWIN,
-    _env_flag,
     record_memory_conflict,
     serialize_entity,
     export_relations,
@@ -231,15 +232,11 @@ def _recover_non_fast_forward_push(bridge_dir: str) -> tuple[bool, str]:
     called only while the repo sync lock is held.  A fresh fetch is mandatory
     before resetting so ``origin/main`` names the winning remote commit.
     """
-    fetch = git_retry(
-        bridge_dir,
-        "fetch",
-        "origin",
-        "main",
-        timeout=_GIT_PULL_TIMEOUT,
-    )
+    fetch = bridge_policy.run_network_git(bridge_dir, "fetch", timeout=_GIT_PULL_TIMEOUT)
     if fetch.returncode != 0:
         return False, f"fetch failed: {_git_detail(fetch)}"
+    # A destination/access change after fetch must not authorize local recovery.
+    bridge_policy.authorize_bridge(bridge_dir)
     reset = git_retry(
         bridge_dir,
         "reset",
@@ -254,13 +251,7 @@ def _recover_non_fast_forward_push(bridge_dir: str) -> tuple[bool, str]:
 
 def _sync_bridge_repo_fast_forward(bridge_dir: str) -> tuple[bool, str | None]:
     """Fetch remote bridge state without starting conflict-prone rebases."""
-    fetch = git_retry(
-        bridge_dir,
-        "fetch",
-        "origin",
-        "main",
-        timeout=_GIT_PULL_TIMEOUT,
-    )
+    fetch = bridge_policy.run_network_git(bridge_dir, "fetch", timeout=_GIT_PULL_TIMEOUT)
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout).strip()
         return False, f"bridge git fetch failed: {detail or 'unknown git error'}"
@@ -729,8 +720,8 @@ def _export_entities(
     """Export shared entities + observations. Returns (entities_list, entity_ids)."""
     rows = conn.execute(
         "SELECT id, name, entity_type, project, created_at, updated_at "
-        "FROM entities WHERE project LIKE ? ORDER BY name",
-        (f"{project_prefix}%",),
+        "FROM entities WHERE project LIKE ? ESCAPE '\\' ORDER BY name",
+        (project_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
     ).fetchall()
     entities, ids = [], set()
     for e in rows:
@@ -927,6 +918,10 @@ def main(
     """
     bridge_dir = bridge_repo or BRIDGE_REPO
     _db_path = db_path or DB_PATH
+    try:
+        bridge_policy.authorize_bridge(bridge_dir)
+    except bridge_policy.BridgePolicyError as exc:
+        return bridge_policy.blocked_result(exc)
     machine_id = os.environ.get("MACHINE_ID") or socket.gethostname()
     repo_lock = _RepoSyncLock(bridge_dir)
 
@@ -967,7 +962,7 @@ def main(
         }
 
     try:
-        return _main_locked(
+        result = _main_locked(
             progress_callback=progress_callback,
             db_path=_db_path,
             bridge_dir=bridge_dir,
@@ -977,6 +972,22 @@ def main(
             machine_id=machine_id,
             entity_project_prefix=entity_project_prefix,
         )
+        if not result.get("blocked_by_bridge_policy"):
+            result.setdefault("sync_mode", "trusted_device")
+            result.setdefault("private_only", True)
+            result.setdefault("sync_scope", {
+                "graph_entity_prefix": entity_project_prefix,
+                "tasks_attachments_extended_memory": "complete_private_device_replica",
+            })
+        return result
+    except bridge_policy.BridgePolicyError as exc:
+        # A later policy change stops publication; previously authorized local
+        # import/export transactions are not a whole-run rollback boundary.
+        result = bridge_policy.blocked_result(exc)
+        result.pop("imported_new")
+        result.pop("imported_updated")
+        result["local_changes_may_have_occurred"] = True
+        return result
     finally:
         repo_lock.release()
         _SYNC_THREAD_LOCK.release()
@@ -994,7 +1005,12 @@ def _main_locked(
 ) -> dict:
     """Run sync with process/thread locks already held."""
     _db_path = db_path
-    private_only = _env_flag("BRIDGE_PRIVATE_ONLY")
+    try:
+        policy = bridge_policy.authorize_bridge(bridge_dir)
+    except bridge_policy.BridgePolicyError as exc:
+        return bridge_policy.blocked_result(exc)
+    # Primary private-device consent never authorizes peer/public publication.
+    private_only = True
     export_started_at = now_iso()
     promoted_entities = 0
     promoted_tasks = 0
@@ -1371,7 +1387,7 @@ def _main_locked(
         export_index_json(conn, bridge_dir, export_overrides=export_overrides)
 
         _progress(progress_callback, 25, "Exporting per-entity files...")
-        _, entity_rows = export_entity_files(conn, bridge_dir)
+        _, entity_rows = export_entity_files(conn, bridge_dir, project_prefix=entity_project_prefix)
         export_entities_index(conn, bridge_dir, rows=entity_rows)
 
         _progress(progress_callback, 50, "Exporting public knowledge...")
@@ -1582,7 +1598,7 @@ def _main_locked(
             }
 
     _progress(progress_callback, 95, "git push...")
-    push_result = git_retry(bridge_dir, "push", timeout=_GIT_PUSH_TIMEOUT)
+    push_result = bridge_policy.run_network_git(bridge_dir, "push", timeout=_GIT_PUSH_TIMEOUT)
     pushed = push_result.returncode == 0
     push_message = (push_result.stderr or push_result.stdout or "").strip()
     non_fast_forward_recovered = False
@@ -1648,6 +1664,9 @@ def _main_locked(
 
     _progress(progress_callback, 100, "Done")
     response = {
+        "sync_mode": policy["mode"],
+        "sync_scope": {"graph_entity_prefix": entity_project_prefix,
+                       "tasks_attachments_extended_memory": "complete_private_device_replica"},
         "private_only": private_only,
         "entities": n_ent,
         "observations": n_obs,

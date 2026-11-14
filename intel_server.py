@@ -304,21 +304,18 @@ def promote_candidate(
     conn,
     claim_id: str,
     mode: str = "human_confirmed",
+    approval_id: str | None = None,
+    claim_kind: str = "candidate",
 ) -> str:
-    """Governance gate: promote candidate claim to canonical fact.
+    """Consume one fresh operator CLI approval for a candidate or lazy claim.
 
-    Modes:
-    - human_confirmed: explicit human approval (always allowed)
-    - multi_evidence: auto-promotion if enough independent evidence (policy-gated)
-    - imported: bulk import from trusted source
-
-    Sensitive scopes (mapping, validation, bridge, export) require human_confirmed.
-
-    Args:
-        claim_id: ID of the candidate claim
-        mode: Promotion mode (human_confirmed|multi_evidence|imported)
+    Run `python -m promotion_governance --db PATH --kind candidate|lazy
+    --claim-id ID` separately to review the exact source and issue an approval.
+    This tool cannot issue approvals. A mode string or record_human_answer is
+    not approval; only human_confirmed with a matching unused approval_id can
+    promote. This channel boundary does not isolate arbitrary same-UID shell.
     """
-    result = _promote_candidate(conn, claim_id, mode)
+    result = _promote_candidate(conn, claim_id, mode, approval_id, claim_kind)
     logger.info(
         "promote_candidate: claim=%s, mode=%s, status=%s",
         claim_id,
@@ -557,9 +554,10 @@ def enrich_context(conn, depth: str = "quick") -> str:
             all_claims.extend(cr.get("claims", []))
         results["steps"].append({"claims_extracted": claims_total})
 
-        # Step 3b: Auto-promote high-confidence claims
+        # Step 3b: retain candidates until separate operator review.
         promoted = _auto_promote_layer1(conn, all_claims)
-        results["steps"].append({"claims_promoted": len(promoted)})
+        results["steps"].append({"claims_promoted": len(promoted),
+                                 "claims_awaiting_review": len(all_claims)})
         if promoted:
             results["promoted_facts"] = [
                 {

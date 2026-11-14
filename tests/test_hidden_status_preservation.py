@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 
 import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
 
 import bridge_sync_worker as worker
 import db_utils as db
@@ -303,6 +304,7 @@ def test_export_blocks_before_attachment_copy_or_cleanup(
     assert files(bridge) == before
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_public_aged_out_hidden_conflict_blocks_worker_export_and_git(
     case, monkeypatch
 ):

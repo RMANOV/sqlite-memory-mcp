@@ -228,12 +228,13 @@ class BridgeSyncMixin:
                 imported = stats.get("imported_new", 0) + stats.get(
                     "imported_updated", 0
                 )
-                blocked = stats.get("blocked_by_repo_state", False)
+                blocked = any(value is True and (key.startswith("blocked_by_") or key.endswith("_failed"))
+                              for key, value in stats.items())
                 self._log_sync_event(
                     "result",
                     initiator=initiator,
                     mode="pull_only",
-                    pulled=not blocked,
+                    pulled=not blocked and not stats.get("already_running", False),
                     changed=bool(imported),
                     imported=imported,
                     pushed=stats.get("pushed", False),
@@ -309,7 +310,7 @@ class BridgeSyncMixin:
                     blocked_by_safety=stats.get("blocked_by_safety", False),
                 )
 
-                if stats.get("blocked_by_repo_state"):
+                if stats.get("blocked_by_repo_state") or stats.get("blocked_by_bridge_policy"):
                     self._bridge_done.emit(
                         f"Sync blocked: {stats.get('message', 'bridge repo needs attention')}"
                     )
@@ -365,7 +366,7 @@ class BridgeSyncMixin:
     def _on_sync_done(self, msg):
         from PyQt6.QtCore import QTimer
 
-        is_error = msg.startswith("Sync error")
+        is_error = msg.startswith(("Sync error", "Sync blocked", "Sync incomplete"))
         self._sync_bar.setValue(100)
         self._sync_bar.setFormat(msg[:50])
         hide_ms = 15000 if is_error else 4000

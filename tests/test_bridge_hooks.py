@@ -8,6 +8,11 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
+pytestmark = pytest.mark.usefixtures("trusted_device_transport")
+
+
 
 ROOT = Path(__file__).resolve().parent.parent
 

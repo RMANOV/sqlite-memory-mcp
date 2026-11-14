@@ -1,7 +1,7 @@
 """Lazy Enrichment (Layer 2) — inline claim extraction + periodic health sweep.
 
 L2a: add_observations() → auto-extract SPO claims via regex (+5-15ms inline).
-L2b: periodic sweep → dedup, contradictions, staleness, auto-promote.
+L2b: periodic sweep → dedup, contradictions, staleness, review candidates.
 """
 
 from __future__ import annotations
@@ -16,10 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from db_utils import (
-    _sqlite_has_column,
-    add_provenance_link,
     now_iso,
-    record_memory_event,
     tokenize_for_similarity as _tokenize,
 )
 from enrichment_constants import _PREDICATE_BASE_CONFIDENCE
@@ -117,94 +114,52 @@ def extract_inline_claims(
     observation_id: int,
     observation_text: str,
 ) -> int:
-    """Extract SPO claims from observation text via regex.
+    """Extract review candidates from actual observations, never canonical facts.
 
-    Applies adaptive confidence and auto-promotes if >= threshold.
-    Returns count of claims created/updated.
+    One observation is one source. Replays and copied statements under another
+    entity must not inflate the first claim's evidence or confidence.
     """
+    from intelligence_v2 import load_config
+    if not load_config()["enabled"]:
+        return 0
+    actual = conn.execute("SELECT entity_id, content FROM observations WHERE id=?", (observation_id,)).fetchone()
+    if actual is None or actual["entity_id"] != entity_id or actual["content"] != observation_text:
+        return 0
     now = now_iso()
-    patterns = _get_patterns()
     count = 0
-    canonical_facts_has_valid_from: bool | None = None
-
-    for regex, predicate in patterns:
-        for m in regex.finditer(observation_text):
-            subject = m.group(1).strip()
-            object_text = m.group(2).strip()
-
-            # Skip trivially short matches
+    for regex, predicate in _get_patterns():
+        for match in regex.finditer(observation_text):
+            subject, object_text = match.group(1).strip(), match.group(2).strip()
             if len(subject) < 2 or len(object_text) < 2:
                 continue
-
-            # Compute adaptive confidence
             base = _PREDICATE_BASE_CONFIDENCE.get(predicate, 0.5)
             existing = conn.execute(
-                "SELECT claim_id, confidence, status, hit_count FROM lazy_claims "
-                "WHERE subject = ? AND predicate = ? AND object_text = ? "
-                "ORDER BY rowid DESC LIMIT 1",
-                (subject, predicate, object_text),
+                "SELECT claim_id, observation_id, status FROM lazy_claims "
+                "WHERE entity_id=? AND subject=? AND predicate=? AND object_text=? "
+                "ORDER BY rowid DESC LIMIT 1", (entity_id,subject,predicate,object_text),
             ).fetchone()
-
             if existing:
-                if existing["status"] == "rejected":
-                    # Count rejections for penalty
-                    rej_count = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM lazy_claims "
-                        "WHERE subject = ? AND predicate = ? AND object_text = ? "
-                        "AND status = 'rejected'",
-                        (subject, predicate, object_text),
-                    ).fetchone()["cnt"]
-                    confidence = max(0.0, base - REJECTION_PENALTY * rej_count)
-                else:
-                    # One row represents a claim, so evidence must accumulate on
-                    # that row rather than via COUNT(*) over de-duplicated claims.
-                    evidence_count = int(existing["hit_count"] or 1)
-                    boost = min(EVIDENCE_BOOST_CAP, evidence_count * EVIDENCE_BOOST_PER)
-                    confidence = min(1.0, base + boost)
-                # Update existing claim
-                conn.execute(
-                    "UPDATE lazy_claims SET confidence = ?, hit_count = hit_count + 1, "
-                    "updated_at = ? "
-                    "WHERE claim_id = ?",
-                    (confidence, now, existing["claim_id"]),
-                )
+                if existing["status"] != "candidate":
+                    continue
                 claim_id = existing["claim_id"]
+                # Retain known original lineage for pre-upgrade rows; old
+                # inflated hit_count itself is not evidence.
+                conn.execute("INSERT OR IGNORE INTO lazy_claim_observations(claim_id,observation_id) VALUES (?,?)", (claim_id,existing["observation_id"]))
+                changed=conn.execute("INSERT OR IGNORE INTO lazy_claim_observations(claim_id,observation_id) VALUES (?,?)", (claim_id,observation_id)).rowcount
+                if not changed:
+                    continue
+                hits=conn.execute("SELECT count(*) FROM lazy_claim_observations WHERE claim_id=?", (claim_id,)).fetchone()[0]
+                confidence=min(1.0,base+min(EVIDENCE_BOOST_CAP,(hits-1)*EVIDENCE_BOOST_PER))
+                conn.execute("UPDATE lazy_claims SET confidence=?,hit_count=?,updated_at=? WHERE claim_id=?", (confidence,hits,now,claim_id))
             else:
-                # New claim
-                confidence = base
-                claim_id = str(uuid.uuid4())
+                claim_id=str(uuid.uuid4())
                 conn.execute(
-                    "INSERT INTO lazy_claims "
-                    "(claim_id, entity_id, observation_id, subject, predicate, "
-                    "object_text, confidence, hit_count, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'candidate', ?, ?)",
-                    (
-                        claim_id,
-                        entity_id,
-                        observation_id,
-                        subject,
-                        predicate,
-                        object_text,
-                        confidence,
-                        now,
-                        now,
-                    ),
+                    "INSERT INTO lazy_claims(claim_id,entity_id,observation_id,subject,predicate,object_text,confidence,hit_count,status,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,1,'candidate',?,?)",
+                    (claim_id,entity_id,observation_id,subject,predicate,object_text,base,now,now),
                 )
+                conn.execute("INSERT INTO lazy_claim_observations(claim_id,observation_id) VALUES (?,?)", (claim_id,observation_id))
             count += 1
-
-            # Auto-promote if threshold met
-            if confidence >= AUTO_PROMOTE_THRESHOLD:
-                if canonical_facts_has_valid_from is None:
-                    canonical_facts_has_valid_from = _sqlite_has_column(
-                        conn, "canonical_facts", "valid_from"
-                    )
-                auto_promote_claim(
-                    conn,
-                    claim_id,
-                    confidence,
-                    has_valid_from=canonical_facts_has_valid_from,
-                )
-
     return count
 
 
@@ -215,105 +170,12 @@ def auto_promote_claim(
     *,
     has_valid_from: bool | None = None,
 ) -> str | None:
-    """Promote a lazy claim to canonical_facts with validation_mode='auto_lazy'.
+    """Compatibility hook: confidence never authorizes canonical promotion.
 
-    Returns fact_id on success, None if claim not found or already promoted.
+    Use the separate operator CLI with --kind lazy, then consume its approval
+    through promote_candidate. Existing callers retain the no-promotion result.
     """
-    row = conn.execute(
-        "SELECT * FROM lazy_claims WHERE claim_id = ?", (claim_id,)
-    ).fetchone()
-    if not row or row["status"] == "promoted":
-        return None
-
-    now = now_iso()
-    fact_id = f"lf-{uuid.uuid4()}"
-
-    try:
-        columns = [
-            "fact_id",
-            "subject",
-            "predicate",
-            "object_text",
-            "object_type",
-            "fact_scope",
-            "provenance_summary",
-            "confidence",
-            "validation_mode",
-            "source_claim_id",
-            "created_at",
-            "updated_at",
-        ]
-        values: list[Any] = [
-            fact_id,
-            row["subject"],
-            row["predicate"],
-            row["object_text"],
-            "text",
-            "entity",
-            f"Auto-promoted from lazy_claim {claim_id} (evidence accumulation)",
-            confidence,
-            "auto_lazy",
-            None,
-            now,
-            now,
-        ]
-        if has_valid_from is None:
-            has_valid_from = _sqlite_has_column(conn, "canonical_facts", "valid_from")
-        if has_valid_from:
-            columns.append("valid_from")
-            values.append(now)
-        conn.execute(
-            f"INSERT INTO canonical_facts ({', '.join(columns)}) "
-            f"VALUES ({', '.join('?' for _ in columns)})",
-            values,
-        )
-    except (sqlite3.IntegrityError, sqlite3.OperationalError) as e:
-        logger.warning("auto_promote_claim insert failed: %s", e)
-        return None
-
-    conn.execute(
-        "UPDATE lazy_claims SET status = 'promoted', promoted_to_fact_id = ?, "
-        "updated_at = ? WHERE claim_id = ?",
-        (fact_id, now, claim_id),
-    )
-    add_provenance_link(
-        conn,
-        subject_kind="fact",
-        subject_ref=fact_id,
-        source_kind="lazy_claim",
-        source_ref=claim_id,
-        excerpt=f"Auto-promoted from lazy_claim {claim_id}",
-        confidence=confidence,
-        created_at=now,
-    )
-    add_provenance_link(
-        conn,
-        subject_kind="fact",
-        subject_ref=fact_id,
-        source_kind="observation",
-        source_ref=str(row["observation_id"]),
-        excerpt=f"Observation {row['observation_id']} for entity {row['entity_id']}",
-        confidence=confidence,
-        created_at=now,
-    )
-    record_memory_event(
-        conn,
-        event_type="fact_promote",
-        aggregate_kind="fact",
-        aggregate_id=fact_id,
-        tool_name="lazy_enrichment.auto_promote_claim",
-        event_ts=now,
-        new_value={
-            "claim_id": claim_id,
-            "subject": row["subject"],
-            "predicate": row["predicate"],
-            "object": row["object_text"],
-            "mode": "auto_lazy",
-        },
-        source_kind="lazy_claim",
-        source_ref=claim_id,
-    )
-    return fact_id
+    return None
 
 
 # ── L2b: Periodic health sweep ─────────────────────────────────────────────
@@ -461,34 +323,8 @@ def detect_stale_entities(
 
 
 def promote_ready_claims(conn: sqlite3.Connection) -> list[dict]:
-    """Auto-promote claims with confidence >= threshold."""
-    results: list[dict] = []
-    try:
-        ready = conn.execute(
-            "SELECT claim_id, confidence FROM lazy_claims "
-            "WHERE status = 'candidate' AND confidence >= ?",
-            (AUTO_PROMOTE_THRESHOLD,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return results
-
-    has_valid_from = _sqlite_has_column(conn, "canonical_facts", "valid_from")
-    for row in ready:
-        fact_id = auto_promote_claim(
-            conn,
-            row["claim_id"],
-            row["confidence"],
-            has_valid_from=has_valid_from,
-        )
-        if fact_id:
-            results.append(
-                {
-                    "claim_id": row["claim_id"],
-                    "fact_id": fact_id,
-                    "confidence": row["confidence"],
-                }
-            )
-    return results
+    """Compatibility hook: automatic sweeps leave candidates for review."""
+    return []
 
 
 def run_health_sweep(conn: sqlite3.Connection) -> dict:
@@ -499,12 +335,18 @@ def run_health_sweep(conn: sqlite3.Connection) -> dict:
     report["contradictions"] = detect_contradictions(conn)
     report["stale_entities"] = detect_stale_entities(conn)
     report["promoted"] = promote_ready_claims(conn)
+    report["review_candidates"] = [dict(row) for row in conn.execute(
+        "SELECT claim_id,confidence,hit_count FROM lazy_claims "
+        "WHERE status='candidate' AND confidence>=? ORDER BY confidence DESC,claim_id",
+        (AUTO_PROMOTE_THRESHOLD,),
+    )]
 
     report["summary"] = {
         "duplicates_found": len(report["near_duplicates"]),
         "contradictions_found": len(report["contradictions"]),
         "stale_entities_found": len(report["stale_entities"]),
         "claims_promoted": len(report["promoted"]),
+        "claims_awaiting_review": len(report["review_candidates"]),
     }
     return report
 

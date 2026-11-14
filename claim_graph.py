@@ -4,7 +4,7 @@ Phase 2 of Intelligence v2:
 - Typed (Subject, Predicate, Object, Scope) claim extraction from text
 - Evidence attachment with provenance tracking
 - Governance gates for promotion to canonical facts
-- Human-required vs auto-promotable scope policies
+- Separate operator review before any new canonical promotion
 """
 
 from __future__ import annotations
@@ -117,6 +117,18 @@ def _detect_scope(text: str) -> str:
     return max(scores, key=scores.get)
 
 
+def _resolve_review_scope(body: str, claimed_scope: str | None, human_required_scopes: list[str]):
+    """Preserve every detected sensitive flag despite a caller's scope hint."""
+    lower = body.lower()
+    sensitive = sorted(scope for scope in human_required_scopes
+                       if any(word in lower for word in _SCOPE_KEYWORDS.get(scope, ())))
+    detected = _detect_scope(body)
+    effective = claimed_scope or detected
+    if sensitive and effective not in sensitive:
+        effective = detected if detected in sensitive else sensitive[0]
+    return effective, sensitive
+
+
 def _extract_spo_tuples(text: str) -> list[dict[str, Any]]:
     """Extract (Subject, Predicate, Object) tuples from text using patterns."""
     tuples: list[dict[str, Any]] = []
@@ -196,10 +208,11 @@ def extract_candidate_claims(
 
     # Extract SPO tuples
     tuples = _extract_spo_tuples(body)
-    scope = scope_hint or _detect_scope(body)
+    scope, _ = _resolve_review_scope(body, scope_hint, config.get("human_required_scopes", []))
 
-    # Determine if human confirmation required
-    requires_human = scope in config.get("human_required_scopes", [])
+    # All canonical promotions require separate operator review, whatever the
+    # heuristic confidence or source scope. The flag now tells the same truth.
+    requires_human = True
 
     claims_created: list[dict[str, Any]] = []
     now = now_iso()
@@ -313,138 +326,62 @@ def extract_candidate_claims(
 # Promotion modes
 PROMOTION_MODES = ("human_confirmed", "multi_evidence", "imported", "auto_layer1")
 
-# Minimum evidence count for auto-promotion
-_MIN_EVIDENCE_FOR_AUTO = 3
-_MIN_CONFIDENCE_FOR_AUTO = 0.7
-
 
 def promote_candidate(
     conn: sqlite3.Connection,
     claim_id: str,
     mode: str = "human_confirmed",
+    approval_id: str | None = None,
+    claim_kind: str = "candidate",
 ) -> dict[str, Any]:
-    """Governance gate: candidate → canonical_fact.
+    """Promote only a fresh snapshot approved through the separate operator CLI.
 
-    Modes:
-    - human_confirmed: explicit human approval (always allowed)
-    - multi_evidence: multiple independent evidence points (policy-gated)
-    - imported: bulk import from trusted source
-
-    Returns dict with: claim_id, promoted, fact_id, reason.
+    A mode string or agent-reported human answer is not approval. Automatic
+    confidence/evidence modes retain candidates for review, never mint facts.
+    Trusted bridge replication is a separate operation, not this promotion API.
     """
-    config = load_config()
-    started = now_iso()
+    if mode != "human_confirmed":
+        return {"claim_id": claim_id, "promoted": False,
+                "reason": "Automatic/imported promotion modes require operator review",
+                "review_required": True}
+    from promotion_governance import consume_approval
+    return consume_approval(conn, claim_kind, claim_id, approval_id)
 
-    if not config["enabled"]:
-        return {"status": "disabled"}
 
-    if mode not in PROMOTION_MODES:
-        return {
-            "error": f"Invalid promotion mode: {mode}. Use one of: {PROMOTION_MODES}"
-        }
+def _write_approved_candidate(
+    conn: sqlite3.Connection,
+    row: dict[str, Any],
+    *,
+    approval_id: str,
+    content_sha256: str,
+) -> dict[str, Any]:
+    """Internal writer: the caller holds the checked approval/savepoint.
 
-    row = conn.execute(
-        "SELECT * FROM candidate_claims WHERE claim_id = ?", (claim_id,)
-    ).fetchone()
-    if row is None:
-        return {"error": f"Claim '{claim_id}' not found"}
-
+    Not an MCP entrypoint or a boundary against arbitrary local Python.
+    Required provenance, events and graph writes must propagate failures.
+    """
+    claim_id = row["claim_id"]
     claim_scope = row["claim_scope"]
-    status = row["status"]
-    requires_human = bool(row["requires_human"])
-
-    if status != "candidate":
-        return {"error": f"Claim status is '{status}', expected 'candidate'"}
-
-    # Governance gate: sensitive scopes require human confirmation
-    human_required_scopes = config.get("human_required_scopes", [])
-    auto_promote_scopes = config.get("auto_promote_scopes", [])
-
-    if claim_scope in human_required_scopes and mode != "human_confirmed":
-        log_enrichment_run(
-            conn,
-            "promote_candidate",
-            "blocked",
-            claim_id,
-            reason_code=f"human_required_for_{claim_scope}",
-            started_at=started,
-        )
-        return {
-            "claim_id": claim_id,
-            "promoted": False,
-            "reason": f"Scope '{claim_scope}' requires human confirmation. "
-            f"Use mode='human_confirmed' to promote.",
-        }
-
-    # Auto Layer 1: confidence-only check, no evidence count requirement
-    if mode == "auto_layer1":
-        if claim_scope not in auto_promote_scopes:
-            log_enrichment_run(
-                conn,
-                "promote_candidate",
-                "blocked",
-                claim_id,
-                reason_code=f"scope_{claim_scope}_not_auto",
-                started_at=started,
-            )
-            return {
-                "claim_id": claim_id,
-                "promoted": False,
-                "reason": f"Scope '{claim_scope}' not in auto_promote_scopes.",
-            }
-        if row["confidence"] < _MIN_CONFIDENCE_FOR_AUTO:
-            return {
-                "claim_id": claim_id,
-                "promoted": False,
-                "reason": f"Confidence {row['confidence']:.2f} < {_MIN_CONFIDENCE_FOR_AUTO}",
-            }
-        if requires_human:
-            return {
-                "claim_id": claim_id,
-                "promoted": False,
-                "reason": "Claim requires human confirmation",
-            }
-
-    # Multi-evidence validation
-    if mode == "multi_evidence":
-        if claim_scope not in auto_promote_scopes:
-            return {
-                "claim_id": claim_id,
-                "promoted": False,
-                "reason": f"Scope '{claim_scope}' not in auto_promote_scopes. "
-                f"Only {auto_promote_scopes} allow multi_evidence promotion.",
-            }
-
-        evidence_count = conn.execute(
-            "SELECT COUNT(*) FROM claim_evidence WHERE claim_id = ?", (claim_id,)
-        ).fetchone()[0]
-
-        if evidence_count < _MIN_EVIDENCE_FOR_AUTO:
-            return {
-                "claim_id": claim_id,
-                "promoted": False,
-                "reason": f"Insufficient evidence ({evidence_count}/{_MIN_EVIDENCE_FOR_AUTO}) "
-                f"for auto-promotion.",
-            }
-
-        if row["confidence"] < _MIN_CONFIDENCE_FOR_AUTO:
-            return {
-                "claim_id": claim_id,
-                "promoted": False,
-                "reason": f"Confidence {row['confidence']:.2f} below threshold "
-                f"{_MIN_CONFIDENCE_FOR_AUTO}.",
-            }
-
+    mode = "human_confirmed"
+    started = now_iso()
+    approval_provenance = {"approval_id": approval_id,
+                           "content_sha256": content_sha256,
+                           "approved_via": "operator_cli"}
     # Promote: create canonical fact
     now = now_iso()
+    evidence_rows = conn.execute(
+        "SELECT evidence_type, evidence_ref, excerpt, source_start, source_end "
+        "FROM claim_evidence WHERE claim_id = ?", (claim_id,),
+    ).fetchall()
 
     existing_same = conn.execute(
         "SELECT fact_id FROM canonical_facts "
         "WHERE subject = ? AND predicate = ? AND object_text = ? "
+        "AND fact_scope = ? AND object_type = ? "
         "AND COALESCE(valid_to, '') = '' "
         "AND COALESCE(superseded_by_fact_id, '') = '' "
         "ORDER BY updated_at DESC LIMIT 1",
-        (row["subject"], row["predicate"], row["object_text"]),
+        (row["subject"], row["predicate"], row["object_text"], row["claim_scope"], row["object_type"]),
     ).fetchone()
     if existing_same:
         fact_id = existing_same["fact_id"]
@@ -453,15 +390,7 @@ def promote_candidate(
             "updated_at = ? WHERE claim_id = ?",
             (fact_id, now, claim_id),
         )
-        add_provenance_link(
-            conn,
-            subject_kind="fact",
-            subject_ref=fact_id,
-            source_kind="claim",
-            source_ref=claim_id,
-            excerpt=f"Existing fact reinforced by claim {claim_id}",
-            created_at=now,
-        )
+        _add_promotion_lineage(conn, row, fact_id, evidence_rows, now, approval_id)
         record_memory_event(
             conn,
             event_type="fact_reinforce",
@@ -469,7 +398,7 @@ def promote_candidate(
             aggregate_id=fact_id,
             tool_name="sqlite-intel.promote_candidate",
             event_ts=now,
-            new_value={"claim_id": claim_id, "mode": mode},
+            new_value={"claim_id": claim_id, "mode": mode, **approval_provenance},
             source_kind="claim",
             source_ref=claim_id,
         )
@@ -487,13 +416,8 @@ def promote_candidate(
 
     fact_id = _new_id()
 
-    # Build provenance summary
-    evidence_rows = conn.execute(
-        "SELECT evidence_type, evidence_ref, excerpt, source_start, source_end "
-        "FROM claim_evidence WHERE claim_id = ?",
-        (claim_id,),
-    ).fetchall()
-    provenance = f"Promoted via {mode} from claim {claim_id}. "
+    # Build provenance summary from the reviewed source set.
+    provenance = f"Promoted via operator CLI approval {approval_id} from claim {claim_id}. "
     provenance += f"Evidence: {len(evidence_rows)} sources "
     provenance += (
         "("
@@ -533,46 +457,7 @@ def promote_candidate(
         "updated_at = ? WHERE claim_id = ?",
         (fact_id, now, claim_id),
     )
-    add_provenance_link(
-        conn,
-        subject_kind="fact",
-        subject_ref=fact_id,
-        source_kind="claim",
-        source_ref=claim_id,
-        excerpt=f"Promoted from claim {claim_id}",
-        confidence=row["confidence"],
-        created_at=now,
-    )
-    for ev in evidence_rows:
-        add_provenance_link(
-            conn,
-            subject_kind="fact",
-            subject_ref=fact_id,
-            source_kind=ev["evidence_type"],
-            source_ref=ev["evidence_ref"],
-            span_start=ev["source_start"],
-            span_end=ev["source_end"],
-            excerpt=ev["excerpt"],
-            confidence=row["confidence"],
-            created_at=now,
-        )
-
-    # Create impact edge: source_chunk → promoted fact
-    try:
-        from impact_graph import add_impact_edge
-
-        add_impact_edge(
-            conn,
-            source_kind="chunk",
-            source_ref=row["chunk_id"],
-            target_kind="fact",
-            target_ref=fact_id,
-            impact_type="informs",
-            impact_score=row["confidence"],
-            rationale=f"Claim {claim_id} promoted via {mode}",
-        )
-    except Exception as e:
-        _log.debug("impact_graph link failed: %s", e)
+    _add_promotion_lineage(conn, row, fact_id, evidence_rows, now, approval_id)
 
     competing_rows = conn.execute(
         "SELECT fact_id FROM canonical_facts "
@@ -624,6 +509,7 @@ def promote_candidate(
             "object": row["object_text"],
             "claim_id": claim_id,
             "mode": mode,
+            **approval_provenance,
         },
         source_kind="claim",
         source_ref=claim_id,
@@ -645,26 +531,35 @@ def promote_candidate(
     }
 
 
+def _add_promotion_lineage(conn, row, fact_id, evidence_rows, now, approval_id):
+    """Required lineage is identical for new facts and existing-fact reuse."""
+    claim_id = row["claim_id"]
+    add_provenance_link(
+        conn, subject_kind="fact", subject_ref=fact_id,
+        source_kind="claim", source_ref=claim_id,
+        excerpt=f"Operator-approved claim {claim_id}",
+        confidence=row["confidence"], created_at=now,
+    )
+    for evidence in evidence_rows:
+        add_provenance_link(
+            conn, subject_kind="fact", subject_ref=fact_id,
+            source_kind=evidence["evidence_type"], source_ref=evidence["evidence_ref"],
+            span_start=evidence["source_start"], span_end=evidence["source_end"],
+            excerpt=evidence["excerpt"], confidence=row["confidence"], created_at=now,
+        )
+    from impact_graph import add_impact_edge
+    add_impact_edge(
+        conn, source_kind="chunk", source_ref=row["chunk_id"],
+        target_kind="fact", target_ref=fact_id, impact_type="informs",
+        impact_score=row["confidence"],
+        rationale=f"Claim {claim_id} promoted via operator approval {approval_id}",
+    )
+
+
 def auto_promote_layer1(
     conn: sqlite3.Connection,
     claims: list[dict[str, Any]],
     threshold: float = 0.7,
 ) -> list[dict[str, Any]]:
-    """Auto-promote high-confidence Layer 1 claims. Returns list of promoted results."""
-    promoted = []
-    for c in claims:
-        if c.get("requires_human"):
-            continue
-        if c.get("confidence", 0) < threshold:
-            continue
-        # Dedup check against existing canonical facts
-        exists = conn.execute(
-            "SELECT 1 FROM canonical_facts WHERE subject = ? AND predicate = ? AND object_text = ?",
-            (c["subject"], c["predicate"], c["object"]),
-        ).fetchone()
-        if exists:
-            continue
-        result = promote_candidate(conn, c["claim_id"], mode="auto_layer1")
-        if result.get("promoted"):
-            promoted.append(result)
-    return promoted
+    """Compatibility hook: extracted claims stay candidates for operator review."""
+    return []

@@ -120,13 +120,80 @@ unresolved parent edges and field clocks, while bootstrap attachment cleanup
 could drop bytes whose metadata had not arrived. Synthetic regressions also
 cover repeat imports with a causal ledger, parent arrival and explicit clears.
 
-For a synchronization limited to the configured private Git bridge, set
-`BRIDGE_PRIVATE_ONLY=1` in the worker process. This skips pending-public promotion,
-peer delivery, public releases and Cloudflare deployment even when external
-targets are configured. It does not choose or validate the repository, redact
-existing bridge data or change other-machine configuration. The default remains
-off. Set `MACHINE_ID` to the intended provenance identity; otherwise the worker
-uses the hostname. Attachment preservation is a separate opt-in described above.
+The `trusted_device` transport always skips pending-public promotion, peer
+delivery, public releases and Cloudflare deployment. An unset or false
+`BRIDGE_PRIVATE_ONLY` cannot enable those channels. Set `MACHINE_ID` to the
+intended provenance identity; otherwise the worker uses the hostname.
+Attachment preservation is a separate opt-in described above.
+
+## Trusted-device policy
+
+This bridge is a complete private-device transport for tasks, attachments and
+extended memory, including event old/new values and payloads. The entity prefix
+only selects graph entities and their relations. `visibility=private` means
+nonpublic; it does not exclude a record from this trusted transport. Every
+approved reader must be trusted with the complete payload.
+
+Create an owner-controlled global JSON file at
+`$XDG_CONFIG_HOME/sqlite-memory-mcp/bridge-policy.json`, or
+`~/.config/sqlite-memory-mcp/bridge-policy.json` when `XDG_CONFIG_HOME` is unset.
+`SQLITE_MEMORY_BRIDGE_POLICY` may select another global file outside the bridge
+repository. On POSIX it must be owned by the running account and must not be
+group/world writable; mode `0600` is appropriate.
+
+Example shape — replace the path, repository and numeric IDs with the values
+verified for your destination:
+
+```json
+{
+  "version": 1,
+  "mode": "trusted_device",
+  "bridge_path": "/home/user/.claude/memory/bridge",
+  "remote_url": "git@github.com:YOUR_USER/memory-bridge.git",
+  "repository": "YOUR_USER/memory-bridge",
+  "repository_id": 123456789,
+  "owner_id": 12345678,
+  "allowed_collaborators": ["YOUR_USER"],
+  "allowed_deploy_key_ids": []
+}
+```
+
+`bridge_path` must be the resolved absolute path. The approved remote is one
+canonical `github.com` SSH or HTTPS URL and must match both actual fetch and push
+routing. URL rewriting, alternate push routing, multiple destinations and
+different `pushurl` targets are refused. Git operations use explicit destination
+and refspec arguments. The default behavior without valid policy is refusal,
+including force sync, pull-only and the legacy hook entrypoint.
+
+The supported topology is a normal, non-bare checkout with its Git directory,
+common directory and index inside `bridge_path/.git`. Linked worktrees and
+separate Git directories are refused. Inherited Git repository/index/object or
+configuration-routing overrides are refused as well. Validation checks Git's
+effective worktree and index, so changing `cwd` alone cannot authorize a
+different checkout or an external index.
+
+Authenticate the GitHub CLI with repository administration access. Checks pin the
+GitHub API host and verify the stable repository ID, owner ID, name and private
+visibility. All collaborator, deploy-key and invitation pages are inspected.
+The current collaborator and key sets must be subsets of the configured
+allowlists; the owner must be included, and pending invitations block sync.
+This does not enumerate account-level SSH keys, OAuth tokens or all GitHub App
+access. Do not interpret an empty deploy-key list as proof that no credentials
+can access the account.
+
+Policy verification precedes request-driven database opening, persistent locks
+and export. Every actual fetch/push attempt, including retry and recovery,
+rechecks authorization. API failure, timeout, malformed results or insufficient
+permissions block the operation; there is no cached-success fallback. Tray and
+MCP surfaces report the refusal rather than successful delivery.
+
+Verification and remote publication cannot be one atomic GitHub operation:
+permissions can change after a check. A refusal after an earlier authorized
+import/export prevents subsequent publication and delivery stamps; it does not
+retroactively roll back that local work. Making a repository public immediately
+exposes its existing history. This guard does not rewrite history, redact old
+commits or protect against arbitrary code running with the same OS/account
+privileges. Configure and review every participating device separately.
 
 Run the preservation regression gate with the normal bridge smoke checks:
 

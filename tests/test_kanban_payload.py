@@ -25,6 +25,9 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import bridge_sync_worker  # noqa: E402
@@ -319,6 +322,7 @@ def _git_cp(args, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_sync_worker_pull_only_regenerates_corrupt_kanban_payload(
     tmp_path, monkeypatch
 ):
@@ -384,6 +388,7 @@ def test_sync_worker_pull_only_regenerates_corrupt_kanban_payload(
     assert len(data["tasks"][0]["description"]) <= KANBAN_COLLAPSE_MAX
 
 
+@pytest.mark.usefixtures("trusted_device_transport")
 def test_parse_guard_failure_does_not_block_pull_only(tmp_path, monkeypatch):
     """Even if the guard itself blows up, pull_only must complete (never block)."""
     db_path = str(tmp_path / "memory.db")

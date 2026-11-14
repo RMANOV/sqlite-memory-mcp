@@ -34,6 +34,7 @@ from db_utils import (
     validate_github_username as _validate_github_user,
 )
 from bridge_sync_worker import main as _bridge_sync_main
+import bridge_policy
 from schema import (
     error as _error,
     is_valid_timestamp as _is_valid_timestamp,
@@ -111,9 +112,20 @@ def _is_known_collaborator(
 # ═══════════════════════════════════════════════════════════════════════════
 @mcp.tool()
 def bridge_push(tag: str = "shared", force: bool = False) -> str:
-    """Run the canonical locked bridge worker and return the MCP result envelope."""
+    """Sync an explicitly trusted private device replica.
+
+    tag selects graph entities only. Tasks, attachments and extended memory are
+    complete private transport; this is not shared-only filtering.
+    """
     if not Path(BRIDGE_REPO).is_dir():
         return _error(f"Bridge repo not found at {BRIDGE_REPO}")
+
+    try:
+        bridge_policy.authorize_bridge(BRIDGE_REPO)
+    except bridge_policy.BridgePolicyError as exc:
+        result = bridge_policy.blocked_result(exc)
+        result["error"] = result["message"]
+        return json.dumps(result)
 
     stats = _bridge_sync_main(
         db_path=_active_db_path(),
@@ -141,6 +153,13 @@ def bridge_pull() -> str:
     """Run the canonical locked bridge worker in import-only mode."""
     if not Path(BRIDGE_REPO).is_dir():
         return _error(f"Bridge repo not found at {BRIDGE_REPO}")
+
+    try:
+        bridge_policy.authorize_bridge(BRIDGE_REPO)
+    except bridge_policy.BridgePolicyError as exc:
+        result = bridge_policy.blocked_result(exc)
+        result["error"] = result["message"]
+        return json.dumps(result)
 
     stats = _bridge_sync_main(
         db_path=_active_db_path(),

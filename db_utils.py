@@ -1989,7 +1989,11 @@ def ensure_bridge_repo_ready(repo_dir: str) -> tuple[bool, str | None]:
     if branch.stdout.strip() == "HEAD":
         checkout = git_run(repo_dir, "checkout", "main")
         if checkout.returncode != 0:
-            git_run(repo_dir, "fetch", "origin")
+            from bridge_policy import run_network_git
+
+            fetched = run_network_git(repo_dir, "fetch")
+            if fetched.returncode != 0:
+                return False, "authorized bridge recovery fetch failed"
             checkout = git_run(repo_dir, "checkout", "-B", "main", "origin/main")
         if checkout.returncode != 0:
             detail = (checkout.stderr or checkout.stdout).strip()
@@ -8003,9 +8007,9 @@ def migrate_to_per_task_files(bridge_dir: str) -> bool:
 
 
 def export_entity_files(
-    conn: sqlite3.Connection, bridge_dir: str
+    conn: sqlite3.Connection, bridge_dir: str, project_prefix: str = "shared"
 ) -> tuple[list[int], list[sqlite3.Row]]:
-    """Export shared entities to per-entity JSON files in entities/ directory.
+    """Export graph entities with the literal prefix to private transport files.
 
     Each file: entities/{id}.json with full observations.
     Returns (exported_ids, entity_rows) — pass rows to export_entities_index().
@@ -8015,10 +8019,14 @@ def export_entity_files(
 
     rows = conn.execute(
         f"SELECT {ENTITY_EXPORT_COLS} FROM entities "
-        "WHERE project LIKE 'shared%' ORDER BY name"
+        "WHERE project LIKE ? ESCAPE '\\' ORDER BY name",
+        (project_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
     ).fetchall()
 
     if not rows:
+        for stale in entities_dir.glob("*.json"):
+            if stale.stem.isdecimal() and not stale.is_symlink():
+                stale.unlink()
         return [], []
 
     # Batch-fetch all observations for shared entities (avoid N+1)
@@ -8058,7 +8066,7 @@ def export_entity_files(
     # Clean stale files (entities no longer in DB)
     active_ids = {str(eid) for eid in exported}
     for f in entities_dir.glob("*.json"):
-        if f.stem not in active_ids:
+        if f.stem.isdecimal() and f.stem not in active_ids and not f.is_symlink():
             f.unlink()
 
     return exported, list(rows)

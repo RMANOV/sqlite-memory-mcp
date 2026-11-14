@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import obsidian_publish as op
 from claim_graph import promote_candidate
+from promotion_governance import prepare_review, issue_approval
 from memory_audit import govern_fact
 from schema import init_db
 
@@ -104,7 +105,7 @@ def _add_promoted_fact(conn, *, subject, predicate, obj, scope="general"):
         "chunk_id, session_id, entity_id, source_type, source_ref, source_hash, "
         "title, body, language, state, enrich_policy, materiality_score, "
         "created_at, updated_at) VALUES "
-        "(?, NULL, NULL, 'observation', ?, ?, ?, ?, 'en', 'enriched', 'manual', "
+        "(?, NULL, NULL, 'text', ?, ?, ?, ?, 'en', 'enrichable', 'manual', "
         "0.9, ?, ?)",
         (chunk_id, chunk_id, chunk_id, "t", "body", TS, TS),
     )
@@ -116,7 +117,9 @@ def _add_promoted_fact(conn, *, subject, predicate, obj, scope="general"):
         "VALUES (?, ?, ?, ?, ?, 'text', ?, 0.95, 'candidate', 0, ?, ?)",
         (claim_id, chunk_id, subject, predicate, obj, scope, TS, TS),
     )
-    res = promote_candidate(conn, claim_id, mode="human_confirmed")
+    review = prepare_review(conn, "candidate", claim_id)
+    approval = issue_approval(conn, "candidate", claim_id, review["content_sha256"])
+    res = promote_candidate(conn, claim_id, mode="human_confirmed", approval_id=approval["approval_id"])
     assert res.get("promoted") is True, res
     return res["fact_id"]
 

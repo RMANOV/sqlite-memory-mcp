@@ -28,6 +28,7 @@ sqlite-memory-unified = "unified_server:main"
 sqlite-memory-n8n = "n8n_server:main"
 sqlite-memory-doctor = "install_doctor:main"
 sqlite-memory-debate-ops = "debate_ops:main"
+sqlite-memory-approve = "promotion_governance:main"
 sqlite-memory-demo = "demo_flow:main"
 task-tray = "task_tray:main"
 memory-digest = "daily_digest:main"
@@ -44,6 +45,7 @@ py-modules = [
     "auto_archive",
     "bridge_merge_driver",
     "bridge_peer_sync",
+    "bridge_policy",
     "bridge_server",
     "bridge_sync_worker",
     "claim_confidence",
@@ -84,6 +86,7 @@ py-modules = [
     "premium_runtime",
     "prediction_calibration",
     "premium_task_tray",
+    "promotion_governance",
     "recurring_tasks",
     "reflection",
     "query_classification",

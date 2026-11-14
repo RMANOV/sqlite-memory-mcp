@@ -8,6 +8,9 @@ import sys
 from datetime import timedelta
 
 import pytest
+from bridge_transport_fixture import trusted_device_transport  # noqa: F401
+
+
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -21,6 +24,8 @@ from bridge_sync_worker import (
 )
 import db_utils
 from schema import init_db
+
+pytestmark = pytest.mark.usefixtures("trusted_device_transport")
 
 
 def _write_pages_privacy_shell(bridge_dir):
@@ -1155,10 +1160,12 @@ def test_bridge_sync_worker_prunes_shared_js_and_keeps_transport(tmp_path, monke
     assert add_calls
     assert set(add_calls[-1][1:]) == set(bridge_sync_worker.BRIDGE_GIT_STAGE_PATHS)
 
-    assert peer_calls and peer_calls[0][0] == db_path
-    assert result["assigned_task_recipients"] == 1
-    assert result["knowledge_shared"] == 2
-    assert result["github_release"] == "public-v-test"
+    # Trusted-device consent authorizes the private transport only.
+    assert not peer_calls
+    assert result["private_only"] is True
+    assert "assigned_task_recipients" not in result
+    assert "knowledge_shared" not in result
+    assert "github_release" not in result
 
 
 def test_bridge_sync_worker_git_add_failure_fails_closed_without_commit_or_push(

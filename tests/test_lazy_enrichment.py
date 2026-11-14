@@ -72,6 +72,11 @@ def conn():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE lazy_claim_observations (
+            claim_id TEXT NOT NULL REFERENCES lazy_claims(claim_id),
+            observation_id INTEGER NOT NULL REFERENCES observations(id),
+            PRIMARY KEY(claim_id, observation_id)
+        );
         CREATE TABLE entity_access_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -140,7 +145,8 @@ class TestInlineExtraction:
     def test_evidence_accumulation(self, conn):
         eid = _add_entity(conn, "MyApp")
         obs1_id = _add_obs(conn, eid, "MyApp uses Redis for caching.")
-        obs2_id = _add_obs(conn, eid, "MyApp uses Redis for session storage.")
+        second_text = "MyApp uses Redis for caching. Another local report."
+        obs2_id = _add_obs(conn, eid, second_text)
 
         extract_inline_claims(conn, eid, obs1_id, "MyApp uses Redis for caching.")
         claim1 = conn.execute(
@@ -149,7 +155,7 @@ class TestInlineExtraction:
         conf1 = claim1["confidence"]
 
         # Second mention of same claim should boost confidence
-        extract_inline_claims(conn, eid, obs2_id, "MyApp uses Redis for caching.")
+        extract_inline_claims(conn, eid, obs2_id, second_text)
         claim2 = conn.execute(
             "SELECT confidence, hit_count FROM lazy_claims "
             "WHERE subject = 'MyApp' AND object_text LIKE '%Redis for caching%'"
@@ -157,13 +163,14 @@ class TestInlineExtraction:
         assert claim2["confidence"] > conf1
         assert claim2["hit_count"] == 2
 
-    def test_repeated_evidence_reaches_auto_promotion_threshold(self, conn):
+    def test_repeated_evidence_remains_a_review_candidate(self, conn):
         eid = _add_entity(conn, "EvidenceApp")
         text = "EvidenceApp uses Redis for caching."
 
         for index in range(4):
-            obs_id = _add_obs(conn, eid, f"evidence observation {index}")
-            extract_inline_claims(conn, eid, obs_id, text)
+            source = text + f" Supporting report {index}."
+            obs_id = _add_obs(conn, eid, source)
+            extract_inline_claims(conn, eid, obs_id, source)
 
         claim = conn.execute(
             "SELECT confidence, hit_count, status, promoted_to_fact_id "
@@ -171,10 +178,11 @@ class TestInlineExtraction:
         ).fetchone()
         assert claim["hit_count"] == 4
         assert claim["confidence"] >= 0.85
-        assert claim["status"] == "promoted"
-        assert claim["promoted_to_fact_id"]
+        assert claim["status"] == "candidate"
+        assert claim["promoted_to_fact_id"] is None
+        assert conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
 
-    def test_rejection_penalty(self, conn):
+    def test_rejection_is_preserved_without_reinforcement(self, conn):
         eid = _add_entity(conn, "TestTool")
         obs_id = _add_obs(conn, eid, "TestTool uses Docker for deployment.")
         extract_inline_claims(conn, eid, obs_id, "TestTool uses Docker for deployment.")
@@ -184,16 +192,15 @@ class TestInlineExtraction:
             "UPDATE lazy_claims SET status = 'rejected' WHERE entity_id = ?", (eid,)
         )
 
-        # Re-extract: should get penalty
-        obs_id2 = _add_obs(conn, eid, "TestTool uses Docker for deployment again.")
-        extract_inline_claims(
-            conn, eid, obs_id2, "TestTool uses Docker for deployment."
-        )
+        # A new source cannot revive the rejected statement.
+        source = "TestTool uses Docker for deployment. Another report."
+        obs_id2 = _add_obs(conn, eid, source)
+        extract_inline_claims(conn, eid, obs_id2, source)
         claim = conn.execute(
             "SELECT confidence FROM lazy_claims WHERE entity_id = ? AND status = 'rejected'",
             (eid,),
         ).fetchone()
-        assert claim["confidence"] < 0.6  # base for "uses" is 0.6, penalty applied
+        assert claim["confidence"] == 0.6
 
     def test_short_match_skipped(self, conn):
         eid = _add_entity(conn, "X")
@@ -204,7 +211,7 @@ class TestInlineExtraction:
 
 
 class TestAutoPromotion:
-    def test_promote_high_confidence(self, conn):
+    def test_high_confidence_does_not_authorize_promotion(self, conn):
         eid = _add_entity(conn, "StableProject")
         obs_id = _add_obs(conn, eid, "StableProject depends on PostgreSQL.")
 
@@ -218,22 +225,15 @@ class TestAutoPromotion:
         )
 
         fact_id = auto_promote_claim(conn, "test-claim", 0.9)
-        assert fact_id is not None
-        assert fact_id.startswith("lf-")
+        assert fact_id is None
 
         # Check claim status updated
         claim = conn.execute(
             "SELECT * FROM lazy_claims WHERE claim_id = 'test-claim'"
         ).fetchone()
-        assert claim["status"] == "promoted"
-        assert claim["promoted_to_fact_id"] == fact_id
-
-        # Check canonical fact created
-        fact = conn.execute(
-            "SELECT * FROM canonical_facts WHERE fact_id = ?", (fact_id,)
-        ).fetchone()
-        assert fact["subject"] == "StableProject"
-        assert fact["validation_mode"] == "auto_lazy"
+        assert claim["status"] == "candidate"
+        assert claim["promoted_to_fact_id"] is None
+        assert conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
 
     def test_no_double_promote(self, conn):
         eid = _add_entity(conn, "AlreadyPromoted")
@@ -374,8 +374,8 @@ class TestPromoteReady:
         )
 
         promoted = promote_ready_claims(conn)
-        assert len(promoted) == 1
-        assert promoted[0]["claim_id"] == "batch1"
+        assert promoted == []
+        assert conn.execute("SELECT count(*) FROM lazy_claims WHERE status='candidate'").fetchone()[0] == 2
 
 
 class TestHealthSweep:

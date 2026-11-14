@@ -68,6 +68,13 @@ def notify(level, message):
 def git_run(*args, cwd=None):
     """Run git command, return (success, output)."""
     try:
+        if args and args[0] in ("fetch", "push", "pull"):
+            if SERVER_DIR not in sys.path:
+                sys.path.insert(0, SERVER_DIR)
+            from bridge_policy import run_network_git
+
+            r = run_network_git(cwd or BRIDGE_REPO, args[0], timeout=30)
+            return r.returncode == 0, r.stdout.strip() + r.stderr.strip()
         kwargs = dict(
             cwd=cwd or BRIDGE_REPO,
             capture_output=True,
@@ -153,7 +160,9 @@ def preflight_git_check():
     if SERVER_DIR not in sys.path:
         sys.path.insert(0, SERVER_DIR)
     try:
+        from bridge_policy import authorize_bridge
         from db_utils import ensure_bridge_repo_ready
+        authorize_bridge(BRIDGE_REPO)
     except Exception as exc:
         msg = f"cannot load bridge preflight helper: {exc}"
         logging.warning("Preflight blocked: %s", msg)
@@ -284,6 +293,17 @@ def main(progress_callback=None):
                 progress_callback(pct, label)
             except Exception:
                 pass  # UI callback failure must not break sync
+
+    # No persistent lock, repo recovery or DB-opening tool before authority.
+    try:
+        if SERVER_DIR not in sys.path:
+            sys.path.insert(0, SERVER_DIR)
+        from bridge_policy import authorize_bridge
+
+        authorize_bridge(BRIDGE_REPO)
+    except Exception as exc:
+        notify("warning", f"BRIDGE: policy refused sync — {exc}")
+        return
 
     fail_count = _read_fail_count()
     if fail_count >= MAX_FAILURES:
