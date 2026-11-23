@@ -37,11 +37,86 @@ _DEPTH_LIMITS = {
 # ── Core: Explain Impact ─────────────────────────────────────────────────
 
 
+def _context_pack_impact(
+    conn: sqlite3.Connection, source_kind: str, source_ref: str
+) -> dict[str, Any]:
+    """Follow recorded fact provenance to packs, including retained summaries."""
+    if not source_kind or not source_ref:
+        return {"error": "source_kind and source_ref are required"}
+    rows = conn.execute(
+        """
+        WITH facts(fact_id) AS (
+            SELECT subject_ref FROM provenance_links
+            WHERE source_kind = :kind AND source_ref = :ref AND subject_kind = 'fact'
+            UNION
+            SELECT fact_id FROM canonical_facts WHERE :kind = 'fact' AND fact_id = :ref
+        ), targets AS (
+            SELECT DISTINCT f.fact_id, l.subject_kind, l.subject_ref
+            FROM facts f JOIN provenance_links l
+              ON l.source_kind = 'fact' AND l.source_ref = f.fact_id
+            WHERE l.subject_kind IN ('context_pack', 'artifact')
+        ), pack_facts(fact_id, pack_id) AS (
+            SELECT fact_id, subject_ref FROM targets WHERE subject_kind = 'context_pack'
+            UNION
+            SELECT t.fact_id, a.scope_ref
+            FROM targets t JOIN memory_artifacts a ON t.subject_ref = a.artifact_id
+            WHERE t.subject_kind = 'artifact' AND a.artifact_kind = 'summary'
+              AND a.scope_kind = 'context_pack'
+        )
+        SELECT f.fact_id, pf.pack_id, cp.pack_id IS NOT NULL AS available,
+               cp.pack_type, cp.target_ref, summary.artifact_id
+        FROM facts f
+        LEFT JOIN pack_facts pf ON pf.fact_id = f.fact_id
+        LEFT JOIN context_packs cp ON cp.pack_id = pf.pack_id
+        LEFT JOIN memory_artifacts summary ON summary.artifact_kind = 'summary'
+              AND summary.scope_kind = 'context_pack' AND summary.scope_ref = pf.pack_id
+        ORDER BY pf.pack_id, f.fact_id, summary.artifact_id
+        """,
+        {"kind": source_kind, "ref": source_ref},
+    )
+    fact_ids = set()
+    by_pack = {}
+    for fact_id, pack_id, available, pack_type, target_ref, summary_id in rows:
+        fact_ids.add(fact_id)
+        if pack_id is None:
+            continue
+        pack = by_pack.setdefault(
+            pack_id,
+            {
+                "pack_id": pack_id,
+                "available": bool(available),
+                "pack_type": pack_type,
+                "target_ref": target_ref,
+                "fact_ids": set(),
+                "summary_ids": set(),
+            },
+        )
+        pack["fact_ids"].add(fact_id)
+        if summary_id is not None:
+            pack["summary_ids"].add(summary_id)
+
+    packs = []
+    missing_packs = []
+    for pack in by_pack.values():
+        pack["fact_ids"] = sorted(pack["fact_ids"])
+        pack["summary_ids"] = sorted(pack["summary_ids"])
+        (packs if pack["available"] else missing_packs).append(pack)
+    return {
+        "view": "context_packs",
+        "source_kind": source_kind,
+        "source_ref": source_ref,
+        "fact_ids": sorted(fact_ids),
+        "packs": packs,
+        "missing_packs": missing_packs,
+    }
+
+
 def explain_impact(
     conn: sqlite3.Connection,
     source_kind: str = "chunk",
     source_ref: str = "",
     depth: str = "standard",
+    view: str = "impact_edges",
 ) -> dict[str, Any]:
     """Show downstream impact of a knowledge change via bounded BFS.
 
@@ -53,6 +128,11 @@ def explain_impact(
 
     if not config["enabled"]:
         return {"status": "disabled"}
+
+    if view == "context_packs":
+        return _context_pack_impact(conn, source_kind, source_ref)
+    if view != "impact_edges":
+        return {"error": "view must be impact_edges or context_packs"}
 
     if source_kind not in SOURCE_KINDS:
         return {

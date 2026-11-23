@@ -158,6 +158,17 @@ than an optional extra.
 | `sqlite_entity` (`entity_server.py`) | Task-entity linking, overlap detection, entity merging. | Entity hygiene; useful once your graph is large enough to need de-duplication. |
 | `sqlite_intel` (`intel_server.py`) | Intelligence layer: context assessment/enrichment, claim extraction and promotion, fact governance, memory audit, reflect/consolidation, and the multi-agent **Debate Protocol**. | **Governance / audit plus power-user** surface, not required for baseline memory. The largest and most advanced surface; the debate tools coordinate multiple agents — treat them as power-user features. See `docs/DEBATE_PROTOCOL.md` and `docs/ops/DEBATE_OPERATIONS.md`. |
 
+### Trace context packs affected by a source
+
+In `sqlite_intel` or `sqlite_unified`, call `explain_impact` with
+`{"view":"context_packs","source_kind":"seed","source_ref":"predicate_vocabulary"}`.
+This follows recorded provenance from a source through its facts to distinct
+packs. Use `source_kind="fact"` and a fact ID to start at one fact.
+`packs` lists current pack IDs, types, targets, supporting fact IDs and scoped
+summary IDs. `missing_packs` lists referenced pack IDs without a current pack
+row, including IDs recoverable from retained summaries. An unmatched source
+returns empty lists. The default view continues to use ranked impact edges.
+
 ### Search
 
 Search defaults to SQLite FTS5 BM25 ranking over entity names, types, and
