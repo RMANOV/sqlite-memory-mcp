@@ -356,6 +356,86 @@ def test_persisted_context_pack_materializes_summary_artifact_v2(conn):
     assert prov >= 1
 
 
+def test_explain_context_pack_impact_uses_recorded_paths_and_keeps_missing_packs(conn):
+    from impact_graph import explain_impact
+
+    _insert_task(
+        conn, "t", "Generator Interface", "Check both Generator Interface facts."
+    )
+    for fact in ("fact-a", "fact-b"):
+        _insert_fact(
+            conn,
+            fact,
+            subject="Generator Interface",
+            predicate="defines",
+            object_text=fact,
+        )
+        conn.execute(
+            "UPDATE provenance_links SET source_kind='seed', source_ref='dictionary' "
+            "WHERE subject_kind='fact' AND subject_ref=?",
+            (fact,),
+        )
+    pack_id = build_context_pack(
+        conn, pack_type="executor", target_ref="t", token_budget=1500
+    )["pack_id"]
+    summary_id = conn.execute(
+        "SELECT artifact_id FROM memory_artifacts WHERE scope_kind='context_pack' AND scope_ref=?",
+        (pack_id,),
+    ).fetchone()[0]
+    conn.execute("PRAGMA query_only=ON")
+    result = explain_impact(conn, "seed", "dictionary", view="context_packs")
+    assert result["fact_ids"] == ["fact-a", "fact-b"]
+    assert result["packs"] == [
+        {
+            "pack_id": pack_id,
+            "available": True,
+            "pack_type": "executor",
+            "target_ref": "t",
+            "fact_ids": ["fact-a", "fact-b"],
+            "summary_ids": [summary_id],
+        }
+    ]
+    assert result["missing_packs"] == []
+    assert explain_impact(conn, "fact", "fact-a", view="context_packs")["packs"][0][
+        "fact_ids"
+    ] == ["fact-a"]
+    empty = explain_impact(conn, "seed", "unknown", view="context_packs")
+    assert not empty["fact_ids"] and not empty["packs"] and not empty["missing_packs"]
+
+    conn.execute("PRAGMA query_only=OFF")
+    conn.execute("DELETE FROM context_packs WHERE pack_id=?", (pack_id,))
+    conn.execute(
+        "DELETE FROM provenance_links WHERE subject_kind='context_pack' AND subject_ref=?",
+        (pack_id,),
+    )
+    conn.execute("PRAGMA query_only=ON")
+    stale = explain_impact(conn, "seed", "dictionary", view="context_packs")
+    assert stale["packs"] == []
+    assert stale["missing_packs"] == [
+        {
+            "pack_id": pack_id,
+            "available": False,
+            "pack_type": None,
+            "target_ref": None,
+            "fact_ids": ["fact-a", "fact-b"],
+            "summary_ids": [summary_id],
+        }
+    ]
+
+
+def test_default_impact_view_keeps_ranked_edges(conn):
+    from impact_graph import explain_impact
+
+    _insert_fact(conn, "f", subject="System", predicate="has", object_text="inputs")
+    conn.execute(
+        "INSERT INTO impact_edges VALUES ('edge', 'fact', 'f', 'export', 'x', 'informs', 1, NULL, 'now')"
+    )
+    implicit = explain_impact(conn, "fact", "f")
+    assert implicit == explain_impact(conn, "fact", "f", view="impact_edges")
+    assert implicit["total_impacts"] == 1
+    assert implicit["impacts_by_kind"]["export"][0]["target_ref"] == "x"
+
+
 def test_prune_context_pack_history_removes_artifacts_and_provenance(conn):
     for index in range(5):
         pack_id = f"pack-prune-{index}"
@@ -401,15 +481,24 @@ def test_prune_context_pack_history_removes_artifacts_and_provenance(conn):
 
     _prune_context_pack_history(conn, "executor", "task-prune", keep=2)
 
-    assert conn.execute(
-        "SELECT COUNT(*) FROM context_packs WHERE target_ref='task-prune'"
-    ).fetchone()[0] == 2
-    assert conn.execute(
-        "SELECT COUNT(*) FROM memory_artifacts "
-        "WHERE scope_kind='context_pack' AND scope_ref LIKE 'pack-prune-%'"
-    ).fetchone()[0] == 2
-    assert conn.execute(
-        "SELECT COUNT(*) FROM provenance_links "
-        "WHERE (subject_kind='context_pack' AND subject_ref LIKE 'pack-prune-%') "
-        "OR (subject_kind='artifact' AND subject_ref LIKE 'artifact-prune-%')"
-    ).fetchone()[0] == 4
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM context_packs WHERE target_ref='task-prune'"
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM memory_artifacts "
+            "WHERE scope_kind='context_pack' AND scope_ref LIKE 'pack-prune-%'"
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM provenance_links "
+            "WHERE (subject_kind='context_pack' AND subject_ref LIKE 'pack-prune-%') "
+            "OR (subject_kind='artifact' AND subject_ref LIKE 'artifact-prune-%')"
+        ).fetchone()[0]
+        == 4
+    )

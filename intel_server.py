@@ -379,6 +379,7 @@ def explain_impact(
     source_kind: str = "chunk",
     source_ref: str = "",
     depth: str = "standard",
+    view: str = "impact_edges",
 ) -> str:
     """Show downstream impact of a knowledge change via bounded BFS.
 
@@ -387,11 +388,15 @@ def explain_impact(
     propagated impact score.
 
     Args:
-        source_kind: Type of source (chunk|claim|fact)
+        source_kind: For impact_edges, chunk|claim|fact. For context_packs,
+            a recorded provenance source kind such as seed, or fact.
         source_ref: ID of the source entity
-        depth: Traversal depth (quick=1, standard=3, deep=5)
+        depth: Traversal depth for impact_edges (quick=1, standard=3, deep=5).
+        view: impact_edges for ranked impacts, or context_packs to list distinct
+            current and missing packs, contributing fact IDs and summary IDs.
+            This read-only provenance view follows a fixed source-to-fact-to-pack route.
     """
-    result = _explain_impact(conn, source_kind, source_ref, depth)
+    result = _explain_impact(conn, source_kind, source_ref, depth, view)
     logger.info(
         "explain_impact: %s=%s, depth=%s, impacts=%d",
         source_kind,
@@ -561,8 +566,12 @@ def enrich_context(conn, depth: str = "quick") -> str:
 
         # Step 3b: retain candidates until separate operator review.
         promoted = _auto_promote_layer1(conn, all_claims)
-        results["steps"].append({"claims_promoted": len(promoted),
-                                 "claims_awaiting_review": len(all_claims)})
+        results["steps"].append(
+            {
+                "claims_promoted": len(promoted),
+                "claims_awaiting_review": len(all_claims),
+            }
+        )
         if promoted:
             results["promoted_facts"] = [
                 {
@@ -1396,8 +1405,12 @@ def debate_peer_post(
     inferred, and no CONDUCTOR or judge role is required.
     """
     return _peer.post(
-        conn, topic_id=topic_id, post_id=post_id, member_id=member_id,
-        author_session_id=author_session_id, body=body,
+        conn,
+        topic_id=topic_id,
+        post_id=post_id,
+        member_id=member_id,
+        author_session_id=author_session_id,
+        body=body,
     )
 
 
@@ -1417,8 +1430,12 @@ def debate_peer_propose(
     proposing does not cast a ballot. No deadline or background timer is added.
     """
     return _peer.propose(
-        conn, topic_id=topic_id, proposal_id=proposal_id, member_id=member_id,
-        author_session_id=author_session_id, body=body,
+        conn,
+        topic_id=topic_id,
+        proposal_id=proposal_id,
+        member_id=member_id,
+        author_session_id=author_session_id,
+        body=body,
     )
 
 
@@ -1441,9 +1458,13 @@ def debate_peer_vote(
     or permission to execute external actions. Caller identity is cooperative.
     """
     return _peer.vote(
-        conn, topic_id=topic_id, proposal_id=proposal_id, member_id=member_id,
+        conn,
+        topic_id=topic_id,
+        proposal_id=proposal_id,
+        member_id=member_id,
         author_session_id=author_session_id,
-        expected_proposal_hash=expected_proposal_hash, choice=choice,
+        expected_proposal_hash=expected_proposal_hash,
+        choice=choice,
     )
 
 
@@ -1462,7 +1483,10 @@ def debate_peer_read(
     A missing decisive ballot leaves OPEN; there is no silent timeout approval.
     """
     return _peer.read_state(
-        conn, topic_id=topic_id, limit=limit, proposal_id=proposal_id,
+        conn,
+        topic_id=topic_id,
+        limit=limit,
+        proposal_id=proposal_id,
     )
 
 
