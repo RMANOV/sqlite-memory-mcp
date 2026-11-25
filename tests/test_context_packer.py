@@ -1,5 +1,6 @@
 """Focused tests for task-scoped context pack relevance and preview mode."""
 
+from datetime import datetime, timedelta, timezone
 import os
 import sqlite3
 import sys
@@ -48,14 +49,25 @@ def _insert_chunk(
     body: str,
     materiality: float = 0.8,
     source_ref: str = "observation-ref",
+    entity_id: int | None = None,
 ) -> None:
     ts = "2026-03-24T10:00:00+00:00"
     conn.execute(
         "INSERT INTO context_chunks ("
         "chunk_id, session_id, entity_id, source_type, source_ref, source_hash, "
         "title, body, language, state, enrich_policy, materiality_score, created_at, updated_at"
-        ") VALUES (?, NULL, NULL, 'observation', ?, ?, ?, ?, 'bg', 'enrichable', 'manual', ?, ?, ?)",
-        (chunk_id, source_ref, f"hash-{chunk_id}", title, body, materiality, ts, ts),
+        ") VALUES (?, NULL, ?, 'observation', ?, ?, ?, ?, 'bg', 'enrichable', 'manual', ?, ?, ?)",
+        (
+            chunk_id,
+            entity_id,
+            source_ref,
+            f"hash-{chunk_id}",
+            title,
+            body,
+            materiality,
+            ts,
+            ts,
+        ),
     )
 
 
@@ -119,6 +131,64 @@ def test_vector_only_entity_hits_are_normalized_for_common_reranker(conn, monkey
     )
 
     assert result["by_id"] == {42: 0.9}
+
+
+def test_task_pack_admits_chunk_matched_through_fts_entity_id(conn, monkeypatch):
+    import context_packer
+    import vec_search
+
+    monkeypatch.setattr(vec_search, "VEC_AVAILABLE", False)
+    load_config = context_packer.load_config
+    monkeypatch.setattr(
+        context_packer,
+        "load_config",
+        lambda: {**load_config(), "advanced_context_enabled": False},
+    )
+
+    query = "hydraulic pressure calibration manifold"
+    task_id = "task-fts-chunk"
+    _insert_task(conn, task_id, query)
+
+    # Equal two-half-life recency makes the relevance gate distinguish the
+    # inverted rank transform from one that rewards a strong text match.
+    timestamp = (datetime.now(timezone.utc) - timedelta(days=28)).isoformat()
+    conn.executemany(
+        "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+        "VALUES (?, 'concept', ?, ?)",
+        [
+            (name, timestamp, timestamp)
+            for name in ("Station Atlas", "Boreal", "Orion", "Lynx", "Vega")
+        ],
+    )
+    entity_id = conn.execute(
+        "SELECT id FROM entities WHERE name = 'Station Atlas'"
+    ).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+        (entity_id, query, timestamp),
+    )
+    # The chunk can qualify only through the entity's retrieval score.
+    _insert_chunk(
+        conn,
+        "atlas-limit",
+        title="Service notes",
+        body="Valve limit at forty-two",
+        entity_id=entity_id,
+    )
+    _insert_chunk(
+        conn,
+        "boreal-noise",
+        title="Default setting",
+        body="Unrelated default value",
+    )
+
+    result = build_context_pack(
+        conn, pack_type="executor", target_ref=task_id, persist=False
+    )
+
+    assert result["sections"]["chunks"] == 1
+    assert "Valve limit at forty-two" in result["body"]
+    assert "Unrelated default value" not in result["body"]
 
 
 def test_task_scoped_pack_matches_snake_case_tool_keyword(conn):
