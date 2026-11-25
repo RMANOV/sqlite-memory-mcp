@@ -7,12 +7,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
 
 from smart_retrieval import (
     RERANKING_POOL_SIZE,
     compute_composite_score,
     compute_recency_decay,
 )
+
+
+def _score_rank(rank):
+    return compute_composite_score(
+        bm25_rank=rank,
+        updated_at=None,
+        project=None,
+        current_project=None,
+        obs_count=0,
+        relation_hops=0,
+        has_canonical_facts=False,
+        in_active_session=False,
+    )
 
 
 class TestRecencyDecay:
@@ -39,6 +53,17 @@ class TestRecencyDecay:
 
 
 class TestCompositeScore:
+    @pytest.mark.parametrize(
+        ("stronger_rank", "weaker_rank"),
+        [(-5.0, -0.5), (-2 / 61, -1 / 80)],
+        ids=["fts5", "rrf"],
+    )
+    def test_stronger_match_has_higher_score(self, stronger_rank, weaker_rank):
+        assert _score_rank(stronger_rank) > _score_rank(weaker_rank)
+
+    def test_zero_rank_preserves_neutral_base_score(self):
+        assert _score_rank(0.0) == 0.5
+
     def test_baseline(self):
         score = compute_composite_score(
             bm25_rank=-5.0,
